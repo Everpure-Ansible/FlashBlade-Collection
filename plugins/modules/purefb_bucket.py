@@ -389,12 +389,12 @@ def create_bucket(module, blade):
                             ],
                             default_retention=module.params["default_retention"],
                         ),
-                        versioning="none",
+                        versioning=None,
                     )
                 else:
                     bucket = BucketPatch(
                         retention_lock=module.params["retention_lock"],
-                        versioning="none",
+                        versioning=None,
                     )
 
             if CONTEXT_API_VERSION in api_version:

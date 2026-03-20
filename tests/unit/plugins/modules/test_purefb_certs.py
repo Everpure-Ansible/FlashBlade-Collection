@@ -94,6 +94,8 @@ class TestPurefbCerts:
             "days": 3650,
             "key_algorithm": None,
             "export_file": None,
+            "certificate_type": None,
+            "subject_alternative_names": None,
         }
         mock_module.check_mode = False
         mock_ansible_module.return_value = mock_module
@@ -168,6 +170,8 @@ class TestPurefbCerts:
             "days": 3650,
             "key_algorithm": None,
             "export_file": None,
+            "certificate_type": None,
+            "subject_alternative_names": None,
         }
         mock_module.check_mode = False
         mock_ansible_module.return_value = mock_module
@@ -269,6 +273,8 @@ class TestPurefbCerts:
             "days": 3650,
             "key_algorithm": None,
             "export_file": None,
+            "certificate_type": None,
+            "subject_alternative_names": None,
         }
         mock_module.check_mode = True  # This is the key - check_mode enabled
         mock_ansible_module.return_value = mock_module
@@ -302,10 +308,8 @@ class TestPurefbCerts:
     @patch("plugins.modules.purefb_certs.AnsibleModule")
     @patch("plugins.modules.purefb_certs.HAS_PYPURECLIENT", True)
     @patch("plugins.modules.purefb_certs.HAS_PYCOUNTRY", True)
-    def test_main_delete_cert_management_fails(
-        self, mock_ansible_module, mock_get_system
-    ):
-        """Test delete_cert fails when trying to delete management certificate"""
+    def test_main_delete_cert_global_fails(self, mock_ansible_module, mock_get_system):
+        """Test delete_cert fails when trying to delete global certificate"""
         # Setup mock module
         mock_module = Mock()
         # Make exit_json and fail_json raise exceptions to stop execution
@@ -313,7 +317,7 @@ class TestPurefbCerts:
         mock_module.fail_json = Mock(side_effect=SystemExit)
         mock_module.params = {
             "state": "absent",
-            "name": "management",
+            "name": "global",
             "common_name": None,
             "country": None,
             "province": None,
@@ -330,6 +334,8 @@ class TestPurefbCerts:
             "days": 3650,
             "key_algorithm": None,
             "export_file": None,
+            "certificate_type": None,
+            "subject_alternative_names": None,
         }
         mock_module.check_mode = False
         mock_ansible_module.return_value = mock_module
@@ -354,7 +360,7 @@ class TestPurefbCerts:
         # Verify fail_json was called
         mock_module.fail_json.assert_called_once()
         call_args = mock_module.fail_json.call_args[1]
-        assert "management SSL cannot be deleted" in call_args["msg"]
+        assert "Global certificate cannot be deleted" in call_args["msg"]
 
     @patch("plugins.modules.purefb_certs.get_system")
     @patch("plugins.modules.purefb_certs.AnsibleModule")
@@ -386,6 +392,8 @@ class TestPurefbCerts:
             "days": 3650,
             "key_algorithm": None,
             "export_file": None,
+            "certificate_type": None,
+            "subject_alternative_names": None,
         }
         mock_module.check_mode = False
         mock_ansible_module.return_value = mock_module

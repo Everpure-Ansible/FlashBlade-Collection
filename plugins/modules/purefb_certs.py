@@ -269,7 +269,9 @@ def update_cert(module, blade):
             if res.status_code != 200:
                 module.fail_json(
                     msg="Updating existing SSL certificate {0} failed. Error: {1} {2}".format(
-                        module.params["name"], get_error_message(res), module.params["generate"]
+                        module.params["name"],
+                        get_error_message(res),
+                        module.params["generate"],
                     )
                 )
     else:
@@ -358,7 +360,6 @@ def delete_cert(module, blade):
                 )
             )
     module.exit_json(changed=changed)
-
 
 
 def export_cert(module, blade):

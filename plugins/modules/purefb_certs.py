@@ -76,7 +76,6 @@ options:
     - Name of file to contain Certificate Signing Request when `status sign`
     - Name of file to export the current SSL Certificate when `status export`
     - File will be overwritten if it already exists
-  # The below parameters are for self-signed certificates or changing the CSR
   country:
     type: str
     description:

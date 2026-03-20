@@ -54,19 +54,43 @@ sys.modules["tty"] = MagicMock()
 
 # Mock ansible_collections module structure
 mock_collections = MagicMock()
-mock_collections.purestorage.flashblade.plugins.module_utils.purefb.get_system = MagicMock()
-mock_collections.purestorage.flashblade.plugins.module_utils.purefb.purefb_argument_spec = MagicMock()
-mock_collections.purestorage.flashblade.plugins.module_utils.common.get_filesystem = MagicMock()
-mock_collections.purestorage.flashblade.plugins.module_utils.common.get_error_message = MagicMock()
+mock_collections.purestorage.flashblade.plugins.module_utils.purefb.get_system = (
+    MagicMock()
+)
+mock_collections.purestorage.flashblade.plugins.module_utils.purefb.purefb_argument_spec = (
+    MagicMock()
+)
+mock_collections.purestorage.flashblade.plugins.module_utils.common.get_filesystem = (
+    MagicMock()
+)
+mock_collections.purestorage.flashblade.plugins.module_utils.common.get_error_message = (
+    MagicMock()
+)
 sys.modules["ansible_collections"] = mock_collections
 sys.modules["ansible_collections.purestorage"] = mock_collections.purestorage
-sys.modules["ansible_collections.purestorage.flashblade"] = mock_collections.purestorage.flashblade
-sys.modules["ansible_collections.purestorage.flashblade.plugins"] = mock_collections.purestorage.flashblade.plugins
-sys.modules["ansible_collections.purestorage.flashblade.plugins.module_utils"] = mock_collections.purestorage.flashblade.plugins.module_utils
-sys.modules["ansible_collections.purestorage.flashblade.plugins.module_utils.purefb"] = mock_collections.purestorage.flashblade.plugins.module_utils.purefb
-sys.modules["ansible_collections.purestorage.flashblade.plugins.module_utils.common"] = mock_collections.purestorage.flashblade.plugins.module_utils.common
+sys.modules["ansible_collections.purestorage.flashblade"] = (
+    mock_collections.purestorage.flashblade
+)
+sys.modules["ansible_collections.purestorage.flashblade.plugins"] = (
+    mock_collections.purestorage.flashblade.plugins
+)
+sys.modules["ansible_collections.purestorage.flashblade.plugins.module_utils"] = (
+    mock_collections.purestorage.flashblade.plugins.module_utils
+)
+sys.modules[
+    "ansible_collections.purestorage.flashblade.plugins.module_utils.purefb"
+] = mock_collections.purestorage.flashblade.plugins.module_utils.purefb
+sys.modules[
+    "ansible_collections.purestorage.flashblade.plugins.module_utils.common"
+] = mock_collections.purestorage.flashblade.plugins.module_utils.common
 
-from plugins.modules.purefb_fs import main, create_fs, delete_fs, eradicate_fs, modify_fs
+from plugins.modules.purefb_fs import (
+    main,
+    create_fs,
+    delete_fs,
+    eradicate_fs,
+    modify_fs,
+)
 
 
 class TestPurefbFs:
@@ -353,10 +377,12 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "delete_link": False,
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "delete_link": False,
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -472,11 +498,13 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "state": "present",
-            "smb_aclmode": "native",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "state": "present",
+                "smb_aclmode": "native",
+            }
+        )
         mock_module.params = params
         # Make fail_json raise an exception to stop execution (like real Ansible)
         mock_module.fail_json.side_effect = SystemExit(1)
@@ -513,12 +541,14 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "3T",
-            "nfs_rules": "*(rw,no_root_squash)",
-            "group_ownership": None,
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "3T",
+                "nfs_rules": "*(rw,no_root_squash)",
+                "group_ownership": None,
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -577,12 +607,14 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "nfs_rules": "*(rw,no_root_squash)",
-            "group_ownership": None,
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "nfs_rules": "*(rw,no_root_squash)",
+                "group_ownership": None,
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -635,10 +667,12 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "delete_link": False,
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "delete_link": False,
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -763,7 +797,9 @@ class TestPurefbFs:
 
         # This would normally be caught by module initialization
         # but we test the HAS_PYPURECLIENT flag
-        assert not __import__("plugins.modules.purefb_fs").modules.purefb_fs.HAS_PYPURECLIENT
+        assert not __import__(
+            "plugins.modules.purefb_fs"
+        ).modules.purefb_fs.HAS_PYPURECLIENT
 
     @patch("plugins.modules.purefb_fs.get_filesystem")
     @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
@@ -773,11 +809,13 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "snapshot": True,
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "snapshot": True,
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -807,11 +845,13 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "fastremove": True,
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "fastremove": True,
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -841,11 +881,13 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "hard_limit": True,
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "hard_limit": True,
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -875,10 +917,12 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -910,11 +954,13 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "policy": "test-policy",
-            "policy_state": "present",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "policy": "test-policy",
+                "policy_state": "present",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -981,11 +1027,13 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "policy": "test-policy",
-            "policy_state": "absent",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "policy": "test-policy",
+                "policy_state": "absent",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -1048,10 +1096,12 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "user_quota": "100G",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "user_quota": "100G",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -1108,10 +1158,12 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "group_quota": "200G",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "group_quota": "200G",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -1167,10 +1219,12 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "http": True,
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "http": True,
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -1224,10 +1278,12 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "nfsv3": False,  # Change from True to False
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "nfsv3": False,  # Change from True to False
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -1281,10 +1337,12 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "nfsv4": False,  # Change from True to False
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "nfsv4": False,  # Change from True to False
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -1338,10 +1396,12 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "nfs_rules": "10.0.0.0/8(rw)",  # Change rules
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "nfs_rules": "10.0.0.0/8(rw)",  # Change rules
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -1395,10 +1455,12 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "promote": True,
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "promote": True,
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -1452,10 +1514,12 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "writable": False,
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "writable": False,
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -1509,10 +1573,12 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "writable": True,
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "writable": True,
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -1566,10 +1632,12 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "snapshot": True,
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "snapshot": True,
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -1623,10 +1691,12 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "fastremove": True,
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "fastremove": True,
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -1680,10 +1750,12 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "hard_limit": True,
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "hard_limit": True,
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -1737,10 +1809,12 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "safeguard_acls": True,
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "safeguard_acls": True,
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -1794,10 +1868,12 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "access_control": "independent",  # Change from shared
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "access_control": "independent",  # Change from shared
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -1851,10 +1927,12 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "state": "present",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "state": "present",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -1908,11 +1986,13 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "policy": "test-policy",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "policy": "test-policy",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -1947,11 +2027,13 @@ class TestPurefbFs:
         mock_module.check_mode = False
         mock_module.fail_json.side_effect = Exception("fail_json")
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "policy": "invalid-policy",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "policy": "invalid-policy",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -1996,13 +2078,15 @@ class TestPurefbFs:
         mock_module.check_mode = False
         mock_module.fail_json.side_effect = Exception("fail_json")
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "access_control": "nfs",
-            "nfsv3": False,
-            "nfsv4": False,
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "access_control": "nfs",
+                "nfsv3": False,
+                "nfsv4": False,
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -2032,12 +2116,14 @@ class TestPurefbFs:
         mock_module.check_mode = False
         mock_module.fail_json.side_effect = Exception("fail_json")
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "access_control": "smb",
-            "smb": False,
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "access_control": "smb",
+                "smb": False,
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -2066,10 +2152,12 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "export_policy": "new-export-policy",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "export_policy": "new-export-policy",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -2127,10 +2215,12 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "export_policy": "new-export-policy",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "export_policy": "new-export-policy",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -2187,11 +2277,13 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "smb": True,
-            "share_policy": "new-share-policy",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "smb": True,
+                "share_policy": "new-share-policy",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -2250,11 +2342,13 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "smb": True,
-            "client_policy": "new-client-policy",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "smb": True,
+                "client_policy": "new-client-policy",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -2316,10 +2410,12 @@ class TestPurefbFs:
         mock_module.check_mode = False
         mock_module.fail_json.side_effect = Exception("fail_json")
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "export_policy": "new-export-policy",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "export_policy": "new-export-policy",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -2381,11 +2477,13 @@ class TestPurefbFs:
         mock_module.check_mode = False
         mock_module.fail_json.side_effect = Exception("fail_json")
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "smb": True,
-            "share_policy": "new-share-policy",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "smb": True,
+                "share_policy": "new-share-policy",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -2449,11 +2547,13 @@ class TestPurefbFs:
         mock_module.check_mode = False
         mock_module.fail_json.side_effect = Exception("fail_json")
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "smb": True,
-            "client_policy": "new-client-policy",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "smb": True,
+                "client_policy": "new-client-policy",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -2518,11 +2618,13 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "user_quota": "100G",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "user_quota": "100G",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -2552,11 +2654,13 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "group_quota": "200G",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "group_quota": "200G",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -2580,19 +2684,23 @@ class TestPurefbFs:
 
     @patch("plugins.modules.purefb_fs.get_filesystem")
     @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
-    def test_create_fs_safeguard_acls_with_invalid_access_control(self, mock_get_filesystem):
+    def test_create_fs_safeguard_acls_with_invalid_access_control(
+        self, mock_get_filesystem
+    ):
         """Test creating filesystem with safeguard ACLs and invalid access control"""
         # Setup mocks
         mock_module = Mock()
         mock_module.check_mode = False
         mock_module.fail_json.side_effect = Exception("fail_json")
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "safeguard_acls": True,
-            "access_control": "mode-bits",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "safeguard_acls": True,
+                "access_control": "mode-bits",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -2621,12 +2729,14 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "smb": False,
-            "nfs_rules": "",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "smb": False,
+                "nfs_rules": "",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -2657,10 +2767,12 @@ class TestPurefbFs:
         mock_module.check_mode = False
         mock_module.fail_json.side_effect = Exception("fail_json")
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "policy": "invalid-policy",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "policy": "invalid-policy",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -2720,10 +2832,12 @@ class TestPurefbFs:
         mock_module.check_mode = False
         mock_module.fail_json.side_effect = Exception("fail_json")
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "policy": "test-policy",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "policy": "test-policy",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -2791,12 +2905,14 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "nfs": True,
-            "export_policy": "test-export-policy",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "nfs": True,
+                "export_policy": "test-export-policy",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -2837,12 +2953,14 @@ class TestPurefbFs:
         mock_module.check_mode = False
         mock_module.fail_json.side_effect = Exception("fail_json")
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "nfs": True,
-            "export_policy": "test-export-policy",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "nfs": True,
+                "export_policy": "test-export-policy",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -2883,12 +3001,14 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "smb": True,
-            "client_policy": "test-client-policy",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "smb": True,
+                "client_policy": "test-client-policy",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -2927,12 +3047,14 @@ class TestPurefbFs:
         mock_module.check_mode = False
         mock_module.fail_json.side_effect = Exception("fail_json")
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "smb": True,
-            "client_policy": "test-client-policy",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "smb": True,
+                "client_policy": "test-client-policy",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -2973,12 +3095,14 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "smb": True,
-            "share_policy": "test-share-policy",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "smb": True,
+                "share_policy": "test-share-policy",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -3017,12 +3141,14 @@ class TestPurefbFs:
         mock_module.check_mode = False
         mock_module.fail_json.side_effect = Exception("fail_json")
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "smb": True,
-            "share_policy": "test-share-policy",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "smb": True,
+                "share_policy": "test-share-policy",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -3063,10 +3189,12 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": None,  # No size specified
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": None,  # No size specified
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -3095,11 +3223,13 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "context": "test-context",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "context": "test-context",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -3131,12 +3261,14 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "policy": "test-policy",
-            "context": "test-context",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "policy": "test-policy",
+                "context": "test-context",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -3183,12 +3315,14 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "policy": "test-policy",
-            "context": "test-context",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "policy": "test-policy",
+                "context": "test-context",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -3230,14 +3364,16 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "smb": True,
-            "nfsv3": False,
-            "nfsv4": False,
-            "nfs_rules": "*(rw)",  # Should be cleared
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "smb": True,
+                "nfsv3": False,
+                "nfsv4": False,
+                "nfs_rules": "*(rw)",  # Should be cleared
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -3266,11 +3402,13 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "state": "absent",
-            "eradicate": True,
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "state": "absent",
+                "eradicate": True,
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -3305,11 +3443,13 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "state": "absent",
-            "eradicate": True,
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "state": "absent",
+                "eradicate": True,
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -3350,11 +3490,13 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "policy": "test-policy",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "policy": "test-policy",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -3405,11 +3547,13 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "policy": "nonexistent-policy",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "policy": "nonexistent-policy",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -3444,7 +3588,10 @@ class TestPurefbFs:
         mock_module.fail_json.assert_called()
         call_args = mock_module.fail_json.call_args[1]
         # The error message should contain "doesn't exist" when get_policies fails
-        assert "doesn't exist" in call_args["msg"] or "Failed to apply policy" in call_args["msg"]
+        assert (
+            "doesn't exist" in call_args["msg"]
+            or "Failed to apply policy" in call_args["msg"]
+        )
 
         # Verify cleanup was attempted
         mock_blade.patch_file_systems.assert_called()
@@ -3456,13 +3603,15 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "nfsv3": True,
-            "export_policy": "test-export-policy",
-            "context": "test-context",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "nfsv3": True,
+                "export_policy": "test-export-policy",
+                "context": "test-context",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -3500,13 +3649,15 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "smb": True,
-            "client_policy": "test-client-policy",
-            "context": "test-context",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "smb": True,
+                "client_policy": "test-client-policy",
+                "context": "test-context",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -3521,7 +3672,10 @@ class TestPurefbFs:
 
         mock_version_217.__eq__ = version_eq
         mock_version_210.__eq__ = version_eq
-        mock_blade.get_versions.return_value.items = [mock_version_217, mock_version_210]
+        mock_blade.get_versions.return_value.items = [
+            mock_version_217,
+            mock_version_210,
+        ]
 
         mock_get_filesystem.return_value = None
 
@@ -3544,13 +3698,15 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "smb": True,
-            "share_policy": "test-share-policy",
-            "context": "test-context",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "smb": True,
+                "share_policy": "test-share-policy",
+                "context": "test-context",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -3565,7 +3721,10 @@ class TestPurefbFs:
 
         mock_version_217.__eq__ = version_eq
         mock_version_210.__eq__ = version_eq
-        mock_blade.get_versions.return_value.items = [mock_version_217, mock_version_210]
+        mock_blade.get_versions.return_value.items = [
+            mock_version_217,
+            mock_version_210,
+        ]
 
         mock_get_filesystem.return_value = None
 
@@ -3588,13 +3747,15 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "smb": True,
-            "continuous_availability": True,
-            "context": "test-context",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "smb": True,
+                "continuous_availability": True,
+                "context": "test-context",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -3628,13 +3789,15 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "smb": True,
-            "group_ownership": "creator",
-            "context": "test-context",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "smb": True,
+                "group_ownership": "creator",
+                "context": "test-context",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -3668,13 +3831,15 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         params = self.get_default_params()
-        params.update({
-            "name": "test-fs",
-            "size": "1T",
-            "smb": True,  # Need SMB enabled to trigger the storage class logic path
-            "storage_class": "test-class",
-            "context": "test-context",
-        })
+        params.update(
+            {
+                "name": "test-fs",
+                "size": "1T",
+                "smb": True,  # Need SMB enabled to trigger the storage class logic path
+                "storage_class": "test-class",
+                "context": "test-context",
+            }
+        )
         mock_module.params = params
 
         mock_blade = Mock()
@@ -3700,6 +3865,3 @@ class TestPurefbFs:
 
         # Verify storage class was set with context
         assert mock_blade.patch_file_systems.call_count >= 1
-
-
-

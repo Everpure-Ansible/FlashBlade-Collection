@@ -35,7 +35,7 @@ options:
     - I(present) will create or import an SSL certificate including self signed certificates
     - I(absent) will delete an existing SSL certificate
     - I(sign) will construct a Certificate Signing request (CSR) from an existing (self signed) certificate
-    - I(export) will export the exisitng SSL certificate
+    - I(export) will export the existing SSL certificate
     - I(import) will import or create a provided certificate.
     default: present
     choices: [ absent, present, import, export, sign ]
@@ -266,10 +266,9 @@ def update_cert(module, blade):
             )
             if res.status_code != 200:
                 module.fail_json(
-                    msg="Updating existing SSL certificate {0} failed. Error: {1} {2}".format(
+                    msg="Updating existing SSL certificate {0} failed. Error: {1}".format(
                         module.params["name"],
                         get_error_message(res),
-                        module.params["generate"],
                     )
                 )
     else:
@@ -280,15 +279,16 @@ def update_cert(module, blade):
             private_key=module.params["key"],
             passphrase=module.params["passphrase"],
         )
-    res = blade.patch_certificates(
-        names=[module.params["name"]], certificate=certificate
-    )
-    if res.status_code != 200:
-        module.fail_json(
-            msg="Updating existing SSL certificate {0} failed. Error: {1}".format(
-                module.params["name"], get_error_message(res)
+        if not module.check_mode:
+            res = blade.patch_certificates(
+                names=[module.params["name"]], certificate=certificate
             )
-        )
+            if res.status_code != 200:
+                module.fail_json(
+                    msg="Updating existing SSL certificate {0} failed. Error: {1}".format(
+                        module.params["name"], get_error_message(res)
+                    )
+                )
     module.exit_json(changed=changed)
 
 
@@ -353,7 +353,7 @@ def delete_cert(module, blade):
         res = blade.delete_certificates(names=[module.params["name"]])
         if res.status_code != 200:
             module.fail_json(
-                msg="Failed to delete {0} SSL certifcate. Error: {1}".format(
+                msg="Failed to delete {0} SSL certificate. Error: {1}".format(
                     module.params["name"], get_error_message(res)
                 )
             )

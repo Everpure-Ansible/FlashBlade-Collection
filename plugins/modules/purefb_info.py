@@ -139,7 +139,7 @@ def generate_default_dict(blade):
     default_info["certificates"] = blade.get_certificates().total_item_count
     default_info["total_capacity"] = list(blade.get_arrays_space().items)[0].capacity
     default_info["api_versions"] = api_version
-    default_info["policies"] = blade.get_policies().total_item_count
+    default_info["policies"] = blade.get_policies_all().total_item_count
     default_info["certificate_groups"] = blade.get_certificate_groups().total_item_count
     default_info["fs_replicas"] = blade.get_file_system_replica_links().total_item_count
     default_info["remote_credentials"] = (
@@ -767,7 +767,7 @@ def generate_array_conn_dict(blade):
 
 def generate_policies_dict(blade):
     policies_info = {}
-    policies = list(blade.get_policies().items)
+    policies = list(blade.get_policies_all().items)
     for policy in policies:
         policy = policy.name
         policies_info[policy] = {

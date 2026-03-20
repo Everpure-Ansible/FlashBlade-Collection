@@ -1,0 +1,3 @@
+bugfixes:
+ - purefb_info - Updated to use get_policies_all() instead of deprecated get_policies() method
+

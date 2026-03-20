@@ -54,10 +54,10 @@ options:
     - Includes the "-----BEGIN CERTIFICATE-----" and "-----END CERTIFICATE-----" lines
     - Does not exceed 3000 characters in length
   intermediate_cert:
-    aliases: [ intermediate_cert ]
+    aliases: [ intermeadiate_cert ]
     type: str
     description:
-    - Intermediate certificate provided by the CA
+    - Intermeadiate certificate provided by the CA
   key:
     aliases: [ private_key ]
     type: str
@@ -429,7 +429,7 @@ def main():
             key_size=dict(type="int", choices=[1024, 2048, 4096]),
             certificate=dict(type="str", no_log=True, aliases=["contents"]),
             intermediate_cert=dict(
-                type="str", no_log=True, aliases=["intermediate_cert"]
+                type="str", no_log=True, aliases=["intermeadiate_cert"]
             ),
             key=dict(type="str", no_log=True, aliases=["private_key"]),
             export_file=dict(type="str"),

@@ -76,8 +76,7 @@ options:
     - Name of file to contain Certificate Signing Request when `status sign`
     - Name of file to export the current SSL Certificate when `status export`
     - File will be overwritten if it already exists
-
-  The below parameters are for self-signed certificates or changing the CSR
+  # The below parameters are for self-signed certificates or changing the CSR
   country:
     type: str
     description:
@@ -141,7 +140,6 @@ options:
     description:
     - The alternative names that are secured by this certificate.
         Alternative names may be IP addresses, DNS names, or URIs.
-
     version_added: "1.22.0"
 extends_documentation_fragment:
 - purestorage.flashblade.purestorage.fb
@@ -420,7 +418,7 @@ def main():
                 choices=["absent", "present", "import", "export", "sign"],
             ),
             generate=dict(type="bool"),
-            name=dict(type="str"),
+            name=dict(type="str", required=True),
             certificate_type=dict(type="str", choices=["external", "array"]),
             country=dict(type="str"),
             province=dict(type="str"),

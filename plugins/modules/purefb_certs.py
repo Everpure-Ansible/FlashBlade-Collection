@@ -28,7 +28,7 @@ options:
     description:
     - Name of the SSL Certificate
     type: str
-    required
+    required: true
   state:
     description:
     - Action for the module to perform
@@ -40,11 +40,11 @@ options:
     default: present
     choices: [ absent, present, import, export, sign ]
     type: str
-    required
   certificate_type:
-    description: Type can be "array" for FlashBlade as server or "external" for FlashBlade as client (e.g. access to AD).
-    default: external
+    description:
+    - Type can be "array" for FlashBlade as server or "external" for FlashBlade as client (e.g. access to AD).
     type: str
+    choices: [ external, array ]
   certificate:
     aliases: [ contents ]
     type: str
@@ -76,7 +76,7 @@ options:
     - Name of file to contain Certificate Signing Request when `status sign`
     - Name of file to export the current SSL Certificate when `status export`
     - File will be overwritten if it already exists
-  
+
   The below parameters are for self-signed certificates or changing the CSR
   country:
     type: str
@@ -141,7 +141,7 @@ options:
     description:
     - The alternative names that are secured by this certificate.
         Alternative names may be IP addresses, DNS names, or URIs.
-        
+
     version_added: "1.22.0"
 extends_documentation_fragment:
 - purestorage.flashblade.purestorage.fb
@@ -210,7 +210,6 @@ try:
         CertificatePost,
         CertificateSigningRequestPost,
         Reference,
-        Certificate,
         CertificatePatch,
     )
 except ImportError:
@@ -257,10 +256,11 @@ def update_cert(module, blade):
             state=module.params["province"],
             days=module.params["days"],
             subject_alternative_names=module.params["subject_alternative_names"],
-    )            
+        )
         if not module.check_mode:
+            generate = None
             if module.params["generate"]:
-                generate="True"
+                generate = "True"
             res = blade.patch_certificates(
                 names=[module.params["name"]],
                 generate_new_key=generate,
@@ -330,7 +330,7 @@ def create_cert(module, blade):
                 private_key=module.params["key"],
                 passphrase=module.params["passphrase"],
             )
-                    
+
     if not module.check_mode:
         res = blade.post_certificates(
             names=[module.params["name"]], certificate=certificate
@@ -392,7 +392,7 @@ def create_csr(module, blade):
             locality=module.params["locality"],
             organization=module.params["organization"],
             organizational_unit=module.params["org_unit"],
-            state=module.params["province"],            
+            state=module.params["province"],
             subject_alternative_names=module.params["subject_alternative_names"],
         )
         csr = list(
@@ -406,7 +406,8 @@ def create_csr(module, blade):
 
 
 def main():
-    # Do not set defaults, if you do you will have to craft each call to make sure you are not trying to write values that are read-only given the other parameters
+    # Do not set defaults, if you do you will have to craft each call to make sure
+    # you are not trying to write values that are read-only given the other parameters
     # Exceptions: state, you must want to do some action
     #
     argument_spec = purefb_argument_spec()
@@ -479,14 +480,13 @@ def main():
                     module.params["country"].upper()
                 )
             )
-            
-            
+
     if not module.params["certificate_type"]:
-        if ( module.params["key"] or not module.params["certificate"] ):
+        if module.params["key"] or not module.params["certificate"]:
             module.params["certificate_type"] = "array"
-    else:
-        module.params["certificate_type"] = "external"
-            
+        else:
+            module.params["certificate_type"] = "external"
+
     state = module.params["state"]
     certificate_type = module.params["certificate_type"]
 
@@ -507,7 +507,7 @@ def main():
     elif exists and state == "import" and certificate_type == "external":
         module.fail_json(msg="External Certificates cannot be reimported")
     elif exists and state == "import":
-        update_cert(module,blade)
+        update_cert(module, blade)
     elif state == "export":
         export_cert(module, blade)
     elif exists and state == "absent":

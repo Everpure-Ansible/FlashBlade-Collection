@@ -35,7 +35,7 @@ options:
     - I(present) will create or import an SSL certificate including self signed certificates
     - I(absent) will delete an existing SSL certificate
     - I(sign) will construct a Certificate Signing request (CSR) from an existing (self signed) certificate
-    - I(export) will export the exisitng SSL certificate
+    - I(export) will export the existing SSL certificate
     - I(import) will import or create a provided certificate.
     default: present
     choices: [ absent, present, import, export, sign ]
@@ -54,10 +54,10 @@ options:
     - Includes the "-----BEGIN CERTIFICATE-----" and "-----END CERTIFICATE-----" lines
     - Does not exceed 3000 characters in length
   intermediate_cert:
-    aliases: [ intermeadiate_cert ]
+    aliases: [ intermediate_cert ]
     type: str
     description:
-    - Intermeadiate certificate provided by the CA
+    - Intermediate certificate provided by the CA
   key:
     aliases: [ private_key ]
     type: str
@@ -266,10 +266,9 @@ def update_cert(module, blade):
             )
             if res.status_code != 200:
                 module.fail_json(
-                    msg="Updating existing SSL certificate {0} failed. Error: {1} {2}".format(
+                    msg="Updating existing SSL certificate {0} failed. Error: {1}".format(
                         module.params["name"],
                         get_error_message(res),
-                        module.params["generate"],
                     )
                 )
     else:
@@ -353,7 +352,7 @@ def delete_cert(module, blade):
         res = blade.delete_certificates(names=[module.params["name"]])
         if res.status_code != 200:
             module.fail_json(
-                msg="Failed to delete {0} SSL certifcate. Error: {1}".format(
+                msg="Failed to delete {0} SSL certificate. Error: {1}".format(
                     module.params["name"], get_error_message(res)
                 )
             )
@@ -430,7 +429,7 @@ def main():
             key_size=dict(type="int", choices=[1024, 2048, 4096]),
             certificate=dict(type="str", no_log=True, aliases=["contents"]),
             intermediate_cert=dict(
-                type="str", no_log=True, aliases=["intermeadiate_cert"]
+                type="str", no_log=True, aliases=["intermediate_cert"]
             ),
             key=dict(type="str", no_log=True, aliases=["private_key"]),
             export_file=dict(type="str"),

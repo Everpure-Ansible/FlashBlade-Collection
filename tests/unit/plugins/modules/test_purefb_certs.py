@@ -476,7 +476,9 @@ class TestPurefbCerts:
         mock_cert_response = Mock()
         mock_cert_response.status_code = 200
         mock_cert = Mock()
-        mock_cert.certificate = "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----"
+        mock_cert.certificate = (
+            "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----"
+        )
         mock_cert_response.items = [mock_cert]
         mock_blade.get_certificates.return_value = mock_cert_response
 
@@ -659,9 +661,7 @@ class TestPurefbCerts:
     @patch("plugins.modules.purefb_certs.AnsibleModule")
     @patch("plugins.modules.purefb_certs.HAS_PYPURECLIENT", True)
     @patch("plugins.modules.purefb_certs.HAS_PYCOUNTRY", True)
-    def test_main_create_csr_old_api_fails(
-        self, mock_ansible_module, mock_get_system
-    ):
+    def test_main_create_csr_old_api_fails(self, mock_ansible_module, mock_get_system):
         """Test create_csr fails on old API version"""
         # Setup mock module
         mock_module = Mock()

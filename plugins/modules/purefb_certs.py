@@ -134,7 +134,7 @@ options:
     - Generate a new private key.
     - If not selected, the certificate will use the existing key
     - Required when changing key-size or key-algorithm
-  subject_alternative_names
+  subject_alternative_names:
     type: array of str
     description:
     - The alternative names that are secured by this certificate.

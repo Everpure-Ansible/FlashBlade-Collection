@@ -32,9 +32,9 @@ options:
   state:
     description:
     - Action for the module to perform
-    - I(present) will create or import an SSL certificate including self-signed certificates
+    - I(present) will create or import an SSL certificate including self signed certificates
     - I(absent) will delete an existing SSL certificate
-    - I(sign) will construct a Certificate Signing request (CSR) from an existing (self-signed-)certificate
+    - I(sign) will construct a Certificate Signing request (CSR) from an existing (self signed) certificate
     - I(export) will export the exisitng SSL certificate
     - I(import) will import or create a provided certificate.
     default: present
@@ -42,7 +42,7 @@ options:
     type: str
   certificate_type:
     description:
-    - Type can be "array" for FlashBlade as server or "external" for FlashBlade as client (e.g. access to AD).
+    - Type can be I(array) for FlashBlade as server or I(external) for FlashBlade as client (e.g. access to AD).
     type: str
     choices: [ external, array ]
   certificate:
@@ -62,7 +62,7 @@ options:
     aliases: [ private_key ]
     type: str
     description:
-    - Certificates of type "array" must have a private key
+    - Certificates of type I(array) must have a private key
     - If the Certificate Signed Request (CSR) was not constructed on the system
       or the private key has changed since construction of the CSR, provide
       a new private key here

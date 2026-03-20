@@ -547,7 +547,7 @@ def create_fs(module, blade):
                     )
                 if res.status_code != 200:
                     module.fail_json(
-                        msg="Filesystem {0} created, but failed to set continuous availability"
+                        msg="Filesystem {0} created, but failed to set continuous availability. "
                         "Error: {1}".format(
                             module.params["name"],
                             get_error_message(res),
@@ -569,7 +569,7 @@ def create_fs(module, blade):
                     )
                 if res.status_code != 200:
                     module.fail_json(
-                        msg="Filesystem {0} created, but failed to set group ownership"
+                        msg="Filesystem {0} created, but failed to set group ownership. "
                         "Error: {1}".format(
                             module.params["name"],
                             get_error_message(res),

@@ -1,4 +1,3 @@
 minor_changes:
- - purefb_info - Updated to use get_policies_all() instead of deprecated get_policies() method
- - purefb_info - Added breakdown of policy counts by type (snapshot_policies, access_policies, nfs_policies, smb_share_policies, smb_client_policies, network_policies, worm_policies, telemetry_metrics_policies)
+ - purefb_info - Updated to use get_policies_all() method and added policy type breakdown to default output
 

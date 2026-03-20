@@ -163,6 +163,9 @@ def generate_default_dict(blade):
     default_info["worm_policies"] = sum(
         1 for p in all_policies if p.policy_type == "worm"
     )
+    default_info["telemetry_metrics_policies"] = sum(
+        1 for p in all_policies if p.policy_type == "telemetry-metrics"
+    )
     default_info["certificate_groups"] = blade.get_certificate_groups().total_item_count
     default_info["fs_replicas"] = blade.get_file_system_replica_links().total_item_count
     default_info["remote_credentials"] = (

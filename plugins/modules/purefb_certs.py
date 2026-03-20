@@ -135,10 +135,11 @@ options:
     - If not selected, the certificate will use the existing key
     - Required when changing key-size or key-algorithm
   subject_alternative_names:
-    type: array of str
+    type: list
+    elements: str
     description:
     - The alternative names that are secured by this certificate.
-        Alternative names may be IP addresses, DNS names, or URIs.
+    - Alternative names may be IP addresses, DNS names, or URIs.
     version_added: "1.22.0"
 extends_documentation_fragment:
 - purestorage.flashblade.purestorage.fb
@@ -416,7 +417,7 @@ def main():
                 default="present",
                 choices=["absent", "present", "import", "export", "sign"],
             ),
-            generate=dict(type="bool"),
+            generate=dict(type="bool", default=False),
             name=dict(type="str", required=True),
             certificate_type=dict(type="str", choices=["external", "array"]),
             country=dict(type="str"),
@@ -436,7 +437,7 @@ def main():
             passphrase=dict(type="str", no_log=True),
             days=dict(type="int"),
             key_algorithm=dict(type="str", choices=["rsa", "ec", "ed448", "ed25519"]),
-            subject_alternative_names=dict(type="str"),
+            subject_alternative_names=dict(type="list", elements="str"),
         )
     )
 

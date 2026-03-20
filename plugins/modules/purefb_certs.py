@@ -42,7 +42,7 @@ options:
     type: str
   certificate_type:
     description:
-    - Type can be I(array) for FlashBlade as server or I(external) for FlashBlade as client (e.g. access to AD).
+    - Type can be I(array) for FlashBlade as server or I(external) for FlashBlade as client (eg access to AD).
     type: str
     choices: [ external, array ]
   certificate:

@@ -28,18 +28,56 @@ options:
     description:
     - Name of the SSL Certificate
     type: str
-    default: management
+    required
   state:
     description:
     - Action for the module to perform
-    - I(present) will create or re-create an SSL certificate
+    - I(present) will create or import an SSL certificate including self-signed certificates
     - I(absent) will delete an existing SSL certificate
-    - I(sign) will construct a Certificate Signing request (CSR)
+    - I(sign) will construct a Certificate Signing request (CSR) from an existing (self-signed-)certificate
     - I(export) will export the exisitng SSL certificate
-    - I(import) will import a CA provided certificate.
+    - I(import) will import or create a provided certificate.
     default: present
     choices: [ absent, present, import, export, sign ]
     type: str
+    required
+  certificate_type:
+    description: Type can be "array" for FlashBlade as server or "external" for FlashBlade as client (e.g. access to AD).
+    default: external
+    type: str
+  certificate:
+    aliases: [ contents ]
+    type: str
+    description:
+    - Required for I(import)
+    - A valid signed certicate in PEM format (Base64 encoded)
+    - Includes the "-----BEGIN CERTIFICATE-----" and "-----END CERTIFICATE-----" lines
+    - Does not exceed 3000 characters in length
+  intermediate_cert:
+    aliases: [ intermeadiate_cert ]
+    type: str
+    description:
+    - Intermeadiate certificate provided by the CA
+  key:
+    aliases: [ private_key ]
+    type: str
+    description:
+    - Certificates of type "array" must have a private key
+    - If the Certificate Signed Request (CSR) was not constructed on the system
+      or the private key has changed since construction of the CSR, provide
+      a new private key here
+  passphrase:
+    type: str
+    description:
+    - Passphrase if the private key is encrypted
+  export_file:
+    type: str
+    description:
+    - Name of file to contain Certificate Signing Request when `status sign`
+    - Name of file to export the current SSL Certificate when `status export`
+    - File will be overwritten if it already exists
+  
+  The below parameters are for self-signed certificates or changing the CSR
   country:
     type: str
     description:
@@ -80,10 +118,13 @@ options:
     type: int
     description:
     - The key size in bits if you generate a new private key
-    default: 2048
     choices: [ 1024, 2048, 4096 ]
+  key_algorithm:
+    type: str
+    description:
+    - The key algorithm used to generate the certificate.
+    choices: [ rsa, ec, ed448, ed25519 ]
   days:
-    default: 3650
     type: int
     description:
     - The number of valid days for the self-signed certificate being generated
@@ -94,49 +135,20 @@ options:
     description:
     - Generate a new private key.
     - If not selected, the certificate will use the existing key
-  certificate:
-    aliases: [ contents ]
-    type: str
+    - Required when changing key-size or key-algorithm
+  subject_alternative_names
+    type: array of str
     description:
-    - Required for I(import)
-    - A valid signed certicate in PEM format (Base64 encoded)
-    - Includes the "-----BEGIN CERTIFICATE-----" and "-----END CERTIFICATE-----" lines
-    - Does not exceed 3000 characters in length
-  intermediate_cert:
-    aliases: [ intermeadiate_cert ]
-    type: str
-    description:
-    - Intermeadiate certificate provided by the CA
-  key:
-    aliases: [ private_key ]
-    type: str
-    description:
-    - If the Certificate Signed Request (CSR) was not constructed on the system
-      or the private key has changed since construction the CSR, provide
-      a new private key here
-  passphrase:
-    type: str
-    description:
-    - Passphrase if the private key is encrypted
-  export_file:
-    type: str
-    description:
-    - Name of file to contain Certificate Signing Request when `status sign`
-    - Name of file to export the current SSL Certificate when `status export`
-    - File will be overwritten if it already exists
-  key_algorithm:
-    type: str
-    description:
-    - The key algorithm used to generate the certificate.
-    - This field can only be specified when creating a new self-signed certificate
-    choices: [ rsa, ec, ed448, ed25519 ]
+    - The alternative names that are secured by this certificate.
+        Alternative names may be IP addresses, DNS names, or URIs.
+        
     version_added: "1.22.0"
 extends_documentation_fragment:
 - purestorage.flashblade.purestorage.fb
 """
 
 EXAMPLES = r"""
-- name: Create SSL certifcate foo
+- name: Create self-signed SSL certifcate foo
   purestorage.flashblade.purefb_certs:
     name: foo
     key_size: 4096
@@ -157,18 +169,22 @@ EXAMPLES = r"""
 
 - name: Request CSR
   purestorage.flashblade.purefb_certs:
+    name: foo
     state: sign
+    export_file: <filepath>
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
 - name: Request CSR with updated fields
   purestorage.flashblade.purefb_certs:
+    name: foo
     state: sign
+    export_file: <filepath>
     org_unit: Development
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
-- name: Regenerate key for SSL foo
+- name: Regenerate key for self-signed SSL foo
   purestorage.flashblade.purefb_certs:
     generate: true
     name: foo
@@ -180,6 +196,7 @@ EXAMPLES = r"""
     state: import
     name: foo
     certificate: "{{lookup('file', 'example.crt') }}"
+    key: "{{lookup('file', 'example.key') }}
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 """
@@ -222,104 +239,39 @@ CSR_API_VERSION = "2.20"
 def update_cert(module, blade):
     """Update existing SSL Certificate"""
     api_versions = list(blade.get_versions().items)
-    changed = False
+
     if CSR_API_VERSION in api_versions:
-        current_cert = list(
-            blade.get_certificates(names=[module.params["name"]]).items
-        )[0]
-        new_cert = current_cert.copy()
-        if module.params["certificate"] and module.params["certificate"] != getattr(
-            current_cert, "certificate", None
-        ):
-            new_cert.certificate = module.params["certificate"]
-        else:
-            new_cert.certificate = getattr(current_cert, "certificate", None)
-        if module.params["intermediate_cert"] and module.params[
-            "intermediate_cert"
-        ] != getattr(current_cert, "intermediate_certificate", None):
-            new_cert.intermediate_certificate = module.params["intermediate_cert"]
-        else:
-            new_cert.intermediate_certificate = getattr(
-                current_cert, "intermediate_certificate", None
+        changed = True
+        certificate = CertificatePatch(
+            certificate=module.params["certificate"],
+            intermediate_certificate=module.params["intermediate_cert"],
+            private_key=module.params["key"],
+            passphrase=module.params["passphrase"],
+            common_name=module.params["common_name"],
+            country=module.params["country"],
+            email=module.params["email"],
+            key_size=module.params["key_size"],
+            locality=module.params["locality"],
+            organization=module.params["organization"],
+            organizational_unit=module.params["org_unit"],
+            state=module.params["province"],
+            days=module.params["days"],
+            subject_alternative_names=module.params["subject_alternative_names"],
+    )            
+        if not module.check_mode:
+            if module.params["generate"]:
+                generate="True"
+            res = blade.patch_certificates(
+                names=[module.params["name"]],
+                generate_new_key=generate,
+                certificate=certificate,
             )
-        if module.params["common_name"] and module.params["common_name"] != getattr(
-            current_cert, "common_name", None
-        ):
-            new_cert.common_name = module.params["common_name"]
-        else:
-            new_cert.common_name = getattr(current_cert, "common_name", None)
-        if module.params["country"] and module.params["country"] != getattr(
-            current_cert, "country", None
-        ):
-            new_cert.country = module.params["country"]
-        else:
-            new_cert.country = getattr(current_cert, "country")
-        if module.params["email"] and module.params["email"] != getattr(
-            current_cert, "email", None
-        ):
-            new_cert.email = module.params["email"]
-        else:
-            new_cert.email = getattr(current_cert, "email", None)
-        if module.params["key_size"] and module.params["key_size"] != getattr(
-            current_cert, "key_size", None
-        ):
-            new_cert.key_size = module.params["key_size"]
-        else:
-            new_cert.key_size = getattr(current_cert, "key_size", None)
-        if module.params["locality"] and module.params["locality"] != getattr(
-            current_cert, "locality", None
-        ):
-            new_cert.locality = module.params["locality"]
-        else:
-            new_cert.locality = getattr(current_cert, "locality", None)
-        if module.params["province"] and module.params["province"] != getattr(
-            current_cert, "state", None
-        ):
-            new_cert.state = module.params["province"]
-        else:
-            new_cert.state = getattr(current_cert, "state", None)
-        if module.params["organization"] and module.params["organization"] != getattr(
-            current_cert, "organization", None
-        ):
-            new_cert.organization = module.params["organization"]
-        else:
-            new_cert.organization = getattr(current_cert, "organization", None)
-        if module.params["org_unit"] and module.params["org_unit"] != getattr(
-            current_cert, "organizational_unit", None
-        ):
-            new_cert.organizational_unit = module.params["org_unit"]
-        else:
-            new_cert.organizational_unit = getattr(
-                current_cert, "organizational_unit", None
-            )
-        if module.params["key_algorithm"] and module.params["key_algorithm"] != getattr(
-            current_cert, "key_algorithm", None
-        ):
-            new_cert.key_algorithm = module.params["key_algorithm"]
-        else:
-            new_cert.key_algorithm = getattr(current_cert, "key_algorithm", None)
-        if new_cert != current_cert:
-            changed = True
-            certificate = CertificatePatch(
-                certificate=new_cert.certificate,
-                intermediate_certificate=getattr(
-                    new_cert, "intermediate_certificate", None
-                ),
-                private_key=module.params["key"],
-                passphrase=module.params["passphrase"],
-            )
-            if not module.check_mode:
-                res = blade.patch_certificates(
-                    names=[module.params["name"]],
-                    certificate=certificate,
-                    generate_new_key=module.params["generate"],
-                )
-                if res.status_code != 200:
-                    module.fail_json(
-                        msg="Updating existing SSL certificate {0} failed. Error: {1}".format(
-                            module.params["name"], get_error_message(res)
-                        )
+            if res.status_code != 200:
+                module.fail_json(
+                    msg="Updating existing SSL certificate {0} failed. Error: {1} {2}".format(
+                        module.params["name"], get_error_message(res), module.params["generate"]
                     )
+                )
     else:
         changed = True
         certificate = CertificatePatch(
@@ -328,26 +280,29 @@ def update_cert(module, blade):
             private_key=module.params["key"],
             passphrase=module.params["passphrase"],
         )
-        res = blade.patch_certificates(
-            names=[module.params["name"]], certificate=certificate
-        )
-        if res.status_code != 200:
-            module.fail_json(
-                msg="Updating existing SSL certificate {0} failed. Error: {1}".format(
-                    module.params["name"], get_error_message(res)
-                )
+    res = blade.patch_certificates(
+        names=[module.params["name"]], certificate=certificate
+    )
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Updating existing SSL certificate {0} failed. Error: {1}".format(
+                module.params["name"], get_error_message(res)
             )
+        )
     module.exit_json(changed=changed)
 
 
 def create_cert(module, blade):
+    # let the rest-api itself deal with errors
     changed = True
     api_versions = list(blade.get_versions().items)
-    if CERT_TYPE_VERSION in api_versions:
+    if CSR_API_VERSION in api_versions:
         certificate = CertificatePost(
+            certificate_type=module.params["certificate_type"],
             certificate=module.params["certificate"],
             intermediate_certificate=module.params["intermediate_cert"],
-            certificate_type="appliance",
+            private_key=module.params["key"],
+            passphrase=module.params["passphrase"],
             common_name=module.params["common_name"],
             country=module.params["country"],
             email=module.params["email"],
@@ -356,25 +311,26 @@ def create_cert(module, blade):
             organization=module.params["organization"],
             organizational_unit=module.params["org_unit"],
             state=module.params["province"],
-            status="self-signed",
             days=module.params["days"],
+            subject_alternative_names=module.params["subject_alternative_names"],
         )
     else:
-        certificate = CertificatePost(
-            certificate=module.params["certificate"],
-            intermediate_certificate=module.params["intermediate_cert"],
-            certificate_type="appliance",
-            common_name=module.params["common_name"],
-            country=module.params["country"],
-            email=module.params["email"],
-            key_size=module.params["key_size"],
-            locality=module.params["locality"],
-            organization=module.params["organization"],
-            organizational_unit=module.params["org_unit"],
-            state=module.params["province"],
-            status="self-signed",
-            days=module.params["days"],
-        )
+        if CERT_TYPE_VERSION in api_versions:
+            certificate = CertificatePost(
+                certificate_type=module.params["certificate_type"],
+                certificate=module.params["certificate"],
+                intermediate_certificate=module.params["intermediate_cert"],
+                private_key=module.params["key"],
+                passphrase=module.params["passphrase"],
+            )
+        else:
+            certificate = CertificatePost(
+                certificate=module.params["certificate"],
+                intermediate_certificate=module.params["intermediate_cert"],
+                private_key=module.params["key"],
+                passphrase=module.params["passphrase"],
+            )
+                    
     if not module.check_mode:
         res = blade.post_certificates(
             names=[module.params["name"]], certificate=certificate
@@ -391,8 +347,8 @@ def create_cert(module, blade):
 
 def delete_cert(module, blade):
     changed = True
-    if module.params["name"] == "management":
-        module.fail_json(msg="management SSL cannot be deleted")
+    if module.params["name"] == "global":
+        module.fail_json(msg="Global certificate cannot be deleted")
     if not module.check_mode:
         res = blade.delete_certificates(names=[module.params["name"]])
         if res.status_code != 200:
@@ -403,35 +359,6 @@ def delete_cert(module, blade):
             )
     module.exit_json(changed=changed)
 
-
-def import_cert(module, blade):
-    """Import a CA provided SSL certificate"""
-    changed = True
-    if not module.check_mode:
-        if CERT_TYPE_VERSION in list(blade.get_versions().items):
-            certificate = CertificatePost(
-                certificate_type="external",
-                certificate=module.params["certificate"],
-                status="imported",
-            )
-        else:
-            certificate = CertificatePost(
-                certificate=module.params["certificate"],
-                intermediate_certificate=module.params["intermediate_cert"],
-                key_size=module.params["key_size"],
-                passphrase=module.params["passphrase"],
-                status="imported",
-            )
-        res = blade.post_certificates(
-            names=[module.params["name"]], certificate=certificate
-        )
-        if res.status_code != 200:
-            module.fail_json(
-                msg="Importing Certificate failed. Error: {0}".format(
-                    get_error_message(res)
-                )
-            )
-    module.exit_json(changed=changed)
 
 
 def export_cert(module, blade):
@@ -456,48 +383,17 @@ def create_csr(module, blade):
     Output the result to a specified file
     """
     changed = True
-    current_attr = Certificate()
-    res = blade.get_certificates(names=[module.params["name"]])
-    if res.status_code == 200:
-        current_attr = list(res.items)[0]
-    if module.params["common_name"] and module.params["common_name"] != getattr(
-        current_attr, "common_name", None
-    ):
-        current_attr.common_name = module.params["common_name"]
-    if module.params["country"] and module.params["country"] != getattr(
-        current_attr, "country", None
-    ):
-        current_attr.country = module.params["country"]
-    if module.params["email"] and module.params["email"] != getattr(
-        current_attr, "email", None
-    ):
-        current_attr.email = module.params["email"]
-    if module.params["locality"] and module.params["locality"] != getattr(
-        current_attr, "locality", None
-    ):
-        current_attr.locality = module.params["locality"]
-    if module.params["province"] and module.params["province"] != getattr(
-        current_attr, "state", None
-    ):
-        current_attr.state = module.params["province"]
-    if module.params["organization"] and module.params["organization"] != getattr(
-        current_attr, "organization", None
-    ):
-        current_attr.organization = module.params["organization"]
-    if module.params["org_unit"] and module.params["org_unit"] != getattr(
-        current_attr, "organizational_unit", None
-    ):
-        current_attr.organizational_unit = module.params["org_unit"]
     if not module.check_mode:
         certificate = CertificateSigningRequestPost(
             certificate=Reference(name=module.params["name"]),
-            common_name=getattr(current_attr, "common_name", None),
-            country=getattr(current_attr, "country", None),
-            email=getattr(current_attr, "email", None),
-            locality=getattr(current_attr, "locality", None),
-            state=getattr(current_attr, "state", None),
-            organization=getattr(current_attr, "organization", None),
-            organizational_unit=getattr(current_attr, "organizational_unit", None),
+            common_name=module.params["common_name"],
+            country=module.params["country"],
+            email=module.params["email"],
+            locality=module.params["locality"],
+            organization=module.params["organization"],
+            organizational_unit=module.params["org_unit"],
+            state=module.params["province"],            
+            subject_alternative_names=module.params["subject_alternative_names"],
         )
         csr = list(
             blade.post_certificates_certificate_signing_requests(
@@ -510,6 +406,9 @@ def create_csr(module, blade):
 
 
 def main():
+    # Do not set defaults, if you do you will have to craft each call to make sure you are not trying to write values that are read-only given the other parameters
+    # Exceptions: state, you must want to do some action
+    #
     argument_spec = purefb_argument_spec()
     argument_spec.update(
         dict(
@@ -518,8 +417,9 @@ def main():
                 default="present",
                 choices=["absent", "present", "import", "export", "sign"],
             ),
-            generate=dict(type="bool", default=False),
-            name=dict(type="str", default="management"),
+            generate=dict(type="bool"),
+            name=dict(type="str"),
+            certificate_type=dict(type="str", choices=["external", "array"]),
             country=dict(type="str"),
             province=dict(type="str"),
             locality=dict(type="str"),
@@ -527,7 +427,7 @@ def main():
             org_unit=dict(type="str"),
             common_name=dict(type="str"),
             email=dict(type="str"),
-            key_size=dict(type="int", default=2048, choices=[1024, 2048, 4096]),
+            key_size=dict(type="int", choices=[1024, 2048, 4096]),
             certificate=dict(type="str", no_log=True, aliases=["contents"]),
             intermediate_cert=dict(
                 type="str", no_log=True, aliases=["intermeadiate_cert"]
@@ -535,8 +435,9 @@ def main():
             key=dict(type="str", no_log=True, aliases=["private_key"]),
             export_file=dict(type="str"),
             passphrase=dict(type="str", no_log=True),
-            days=dict(type="int", default=3650),
+            days=dict(type="int"),
             key_algorithm=dict(type="str", choices=["rsa", "ec", "ed448", "ed25519"]),
+            subject_alternative_names=dict(type="str"),
         )
     )
 
@@ -578,11 +479,16 @@ def main():
                     module.params["country"].upper()
                 )
             )
+            
+            
+    if not module.params["certificate_type"]:
+        if ( module.params["key"] or not module.params["certificate"] ):
+            module.params["certificate_type"] = "array"
+    else:
+        module.params["certificate_type"] = "external"
+            
     state = module.params["state"]
-    if state in ["present"]:
-        if not module.params["common_name"]:
-            module.params["common_name"] = list(blade.get_arrays().items)[0].name
-        module.params["common_name"] = module.params["common_name"][:64]
+    certificate_type = module.params["certificate_type"]
 
     exists = bool(
         blade.get_certificates(names=[module.params["name"]]).status_code == 200
@@ -597,9 +503,11 @@ def main():
             module.fail_json(msg="Purity//FB 4.6.3+ is required for CSRs")
         create_csr(module, blade)
     elif not exists and state == "import":
-        import_cert(module, blade)
-    elif exists and state == "import":
+        create_cert(module, blade)
+    elif exists and state == "import" and certificate_type == "external":
         module.fail_json(msg="External Certificates cannot be reimported")
+    elif exists and state == "import":
+        update_cert(module,blade)
     elif state == "export":
         export_cert(module, blade)
     elif exists and state == "absent":

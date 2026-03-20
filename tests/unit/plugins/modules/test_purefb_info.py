@@ -391,7 +391,37 @@ class TestPurefbInfo:
         mock_blade.get_object_store_accounts.return_value.total_item_count = 2
         mock_blade.get_blades.return_value.total_item_count = 4
         mock_blade.get_certificates.return_value.total_item_count = 1
-        mock_blade.get_policies.return_value.total_item_count = 6
+
+        # Mock policies with different types
+        mock_policy_snapshot = Mock()
+        mock_policy_snapshot.policy_type = "snapshot"
+        mock_policy_access = Mock()
+        mock_policy_access.policy_type = "access"
+        mock_policy_nfs = Mock()
+        mock_policy_nfs.policy_type = "nfs"
+        mock_policy_smb_share = Mock()
+        mock_policy_smb_share.policy_type = "smb_share"
+        mock_policy_smb_client = Mock()
+        mock_policy_smb_client.policy_type = "smb_client"
+        mock_policy_network = Mock()
+        mock_policy_network.policy_type = "network"
+        mock_policy_worm = Mock()
+        mock_policy_worm.policy_type = "worm"
+        mock_policy_telemetry = Mock()
+        mock_policy_telemetry.policy_type = "telemetry-metrics"
+
+        mock_blade.get_policies_all.return_value.total_item_count = 8
+        mock_blade.get_policies_all.return_value.items = [
+            mock_policy_snapshot,
+            mock_policy_access,
+            mock_policy_nfs,
+            mock_policy_smb_share,
+            mock_policy_smb_client,
+            mock_policy_network,
+            mock_policy_worm,
+            mock_policy_telemetry,
+        ]
+
         mock_blade.get_certificate_groups.return_value.total_item_count = 2
         mock_blade.get_file_system_replica_links.return_value.total_item_count = 0
         mock_blade.get_object_store_remote_credentials.return_value.total_item_count = 0
@@ -473,6 +503,26 @@ class TestPurefbInfo:
         assert result["total_capacity"] == 1000000000
         assert "EULA" in result
         assert result["EULA"] == "Signed"
+
+        # Verify policy counts
+        assert "policies" in result
+        assert result["policies"] == 8
+        assert "snapshot_policies" in result
+        assert result["snapshot_policies"] == 1
+        assert "access_policies" in result
+        assert result["access_policies"] == 1
+        assert "nfs_policies" in result
+        assert result["nfs_policies"] == 1
+        assert "smb_share_policies" in result
+        assert result["smb_share_policies"] == 1
+        assert "smb_client_policies" in result
+        assert result["smb_client_policies"] == 1
+        assert "network_policies" in result
+        assert result["network_policies"] == 1
+        assert "worm_policies" in result
+        assert result["worm_policies"] == 1
+        assert "telemetry_metrics_policies" in result
+        assert result["telemetry_metrics_policies"] == 1
 
     def test_generate_perf_dict(self):
         """Test generate_perf_dict function"""

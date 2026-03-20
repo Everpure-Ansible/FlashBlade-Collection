@@ -139,7 +139,33 @@ def generate_default_dict(blade):
     default_info["certificates"] = blade.get_certificates().total_item_count
     default_info["total_capacity"] = list(blade.get_arrays_space().items)[0].capacity
     default_info["api_versions"] = api_version
-    default_info["policies"] = blade.get_policies().total_item_count
+    default_info["policies"] = blade.get_policies_all().total_item_count
+    # Count policies by type
+    all_policies = list(blade.get_policies_all().items)
+    default_info["snapshot_policies"] = sum(
+        1 for p in all_policies if p.policy_type == "snapshot"
+    )
+    default_info["access_policies"] = sum(
+        1 for p in all_policies if p.policy_type == "access"
+    )
+    default_info["nfs_policies"] = sum(
+        1 for p in all_policies if p.policy_type == "nfs"
+    )
+    default_info["smb_share_policies"] = sum(
+        1 for p in all_policies if p.policy_type == "smb_share"
+    )
+    default_info["smb_client_policies"] = sum(
+        1 for p in all_policies if p.policy_type == "smb_client"
+    )
+    default_info["network_policies"] = sum(
+        1 for p in all_policies if p.policy_type == "network"
+    )
+    default_info["worm_policies"] = sum(
+        1 for p in all_policies if p.policy_type == "worm"
+    )
+    default_info["telemetry_metrics_policies"] = sum(
+        1 for p in all_policies if p.policy_type == "telemetry-metrics"
+    )
     default_info["certificate_groups"] = blade.get_certificate_groups().total_item_count
     default_info["fs_replicas"] = blade.get_file_system_replica_links().total_item_count
     default_info["remote_credentials"] = (
@@ -767,7 +793,7 @@ def generate_array_conn_dict(blade):
 
 def generate_policies_dict(blade):
     policies_info = {}
-    policies = list(blade.get_policies().items)
+    policies = list(blade.get_policies_all().items)
     for policy in policies:
         policy = policy.name
         policies_info[policy] = {

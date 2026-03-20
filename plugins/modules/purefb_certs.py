@@ -28,7 +28,7 @@ options:
     description:
     - Name of the SSL Certificate
     type: str
-    required
+    required: true
   state:
     description:
     - Action for the module to perform
@@ -40,7 +40,6 @@ options:
     default: present
     choices: [ absent, present, import, export, sign ]
     type: str
-    required
   certificate_type:
     description: Type can be "array" for FlashBlade as server or "external" for FlashBlade as client (e.g. access to AD).
     default: external
@@ -418,7 +417,7 @@ def main():
                 choices=["absent", "present", "import", "export", "sign"],
             ),
             generate=dict(type="bool"),
-            name=dict(type="str"),
+            name=dict(type="str", required=True),
             certificate_type=dict(type="str", choices=["external", "array"]),
             country=dict(type="str"),
             province=dict(type="str"),

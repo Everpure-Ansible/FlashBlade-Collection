@@ -279,15 +279,16 @@ def update_cert(module, blade):
             private_key=module.params["key"],
             passphrase=module.params["passphrase"],
         )
-    res = blade.patch_certificates(
-        names=[module.params["name"]], certificate=certificate
-    )
-    if res.status_code != 200:
-        module.fail_json(
-            msg="Updating existing SSL certificate {0} failed. Error: {1}".format(
-                module.params["name"], get_error_message(res)
+        if not module.check_mode:
+            res = blade.patch_certificates(
+                names=[module.params["name"]], certificate=certificate
             )
-        )
+            if res.status_code != 200:
+                module.fail_json(
+                    msg="Updating existing SSL certificate {0} failed. Error: {1}".format(
+                        module.params["name"], get_error_message(res)
+                    )
+                )
     module.exit_json(changed=changed)
 
 

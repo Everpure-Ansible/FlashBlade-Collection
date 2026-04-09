@@ -66,7 +66,7 @@ options:
     - The encryption types that will be supported for use by clients for Kerberos authentication
     type: list
     elements: str
-    choices: [ aes256-sha1, aes128-sha1, aes256-cts-hmac-sha1-96, aes128-cts-hmac-sha1-96, arcfour-hma ]
+    choices: [ aes256-sha1, aes128-sha1, aes256-cts-hmac-sha1-96, aes128-cts-hmac-sha1-96, arcfour-hmac ]
     default: aes256-sha1
   join_ou:
     description:
@@ -490,7 +490,7 @@ def main():
                     "aes128-sha1",
                     "aes256-cts-hmac-sha1-96",
                     "aes128-cts-hmac-sha1-96",
-                    "arcfour-hma",
+                    "arcfour-hmac",
                 ],
                 default=["aes256-sha1"],
             ),

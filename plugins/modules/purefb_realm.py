@@ -167,10 +167,8 @@ def make_realm(module, blade):
                     module.params["name"], get_error_message(res)
                 )
             )
-    policy = None
     if module.params["qos_policy"]:
-        policy = get_policy(module, blade)
-        if policy:
+        if get_policy(module, blade):
             res = blade.post_qos_policies_members(
                 policy_names=[module.params["qos_policy"]],
                 member_names=[module.params["name"]],

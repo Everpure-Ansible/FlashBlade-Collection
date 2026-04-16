@@ -3870,12 +3870,18 @@ class TestPurefbFs:
     @patch("plugins.modules.purefb_fs.get_filesystem")
     @patch("plugins.modules.purefb_fs.get_system")
     def test_create_fs_with_realm_success(self, mock_get_system, mock_get_filesystem):
-        """Test creating filesystem with realm succeeds on API 2.19+"""
+        """Test creating filesystem with realm succeeds on API 2.19+
+
+        When creating a filesystem in a realm:
+        - name parameter is just the filesystem name (no realm prefix)
+        - realm parameter specifies which realm to use
+        - FlashBlade creates it as 'realm::filesystem' internally
+        """
         mock_module = Mock()
         mock_module.check_mode = False
         mock_module.params = self.get_default_params()
-        mock_module.params["name"] = "production-realm::prod-fs"
-        mock_module.params["realm"] = "production-realm"
+        mock_module.params["name"] = "prod-fs"  # Just filesystem name
+        mock_module.params["realm"] = "production-realm"  # Realm specified separately
         mock_module.params["state"] = "present"
 
         mock_blade = Mock()
@@ -3923,7 +3929,7 @@ class TestPurefbFs:
         mock_module.check_mode = False
         mock_module.fail_json = Mock(side_effect=SystemExit)
         mock_module.params = self.get_default_params()
-        mock_module.params["name"] = "production-realm::prod-fs"
+        mock_module.params["name"] = "prod-fs"  # Just filesystem name
         mock_module.params["realm"] = "production-realm"
         mock_module.params["state"] = "present"
 
@@ -3962,7 +3968,7 @@ class TestPurefbFs:
         mock_module.check_mode = False
         mock_module.fail_json = Mock(side_effect=SystemExit)
         mock_module.params = self.get_default_params()
-        mock_module.params["name"] = "nonexistent-realm::test-fs"
+        mock_module.params["name"] = "test-fs"  # Just filesystem name
         mock_module.params["realm"] = "nonexistent-realm"
         mock_module.params["state"] = "present"
 
@@ -4006,7 +4012,7 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.exit_json = Mock()
         mock_module.params = self.get_default_params()
-        mock_module.params["name"] = "production-realm::test-fs"
+        mock_module.params["name"] = "test-fs"  # Just filesystem name
         mock_module.params["realm"] = "production-realm"
         mock_module.params["state"] = "present"
         mock_module.check_mode = True

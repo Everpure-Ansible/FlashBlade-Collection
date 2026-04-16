@@ -255,12 +255,13 @@ EXAMPLES = """
 
 - name: Create new filesystem in realm
   purestorage.flashblade.purefb_fs:
-    name: production-realm::prod-fs
+    name: prod-fs
     size: 5T
     realm: production-realm
     state: present
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+  # Filesystem will be created as 'production-realm::prod-fs'
 
 - name: Modify filesystem that belongs to a realm
   purestorage.flashblade.purefb_fs:
@@ -270,8 +271,8 @@ EXAMPLES = """
     state: present
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
-  # Note: Realm association cannot be changed after creation
-  # The filesystem will remain in 'production-realm'
+  # Note: Use full realm::filesystem name for modifications
+  # Realm association cannot be changed after creation
 
 - name: Delete filesystem named foo
   purestorage.flashblade.purefb_fs:
@@ -299,7 +300,7 @@ EXAMPLES = """
 
     - name: Create filesystem in the realm
       purestorage.flashblade.purefb_fs:
-        name: production-realm::prod-database
+        name: prod-database
         size: 50T
         realm: production-realm
         nfsv4: true
@@ -307,8 +308,9 @@ EXAMPLES = """
         state: present
         fb_url: 10.10.10.2
         api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+      # Creates filesystem as 'production-realm::prod-database'
 
-    - name: Expand the filesystem (realm association persists)
+    - name: Expand the filesystem (use full realm::filesystem name)
       purestorage.flashblade.purefb_fs:
         name: production-realm::prod-database
         size: 100T

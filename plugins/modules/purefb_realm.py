@@ -185,19 +185,12 @@ def make_realm(module, blade):
 def update_realm(module, blade):
     """Update Realm QoS Policy"""
     changed = False
-    current_policy = getattr(
-        getattr(
-            (lambda x: next(iter(x), None))(
-                blade.get_qos_policies_members(
-                    member_types=["realms"], member_names=["test"]
-                ).items
-            ),
-            "policy",
-            None,
-        ),
-        "name",
-        None,
-    )
+    # Get current QoS policy for the realm
+    policy_members = blade.get_qos_policies_members(
+        member_types=["realms"], member_names=[module.params["name"]]
+    ).items
+    first_member = next(iter(policy_members), None)
+    current_policy = getattr(getattr(first_member, "policy", None), "name", None)
     if module.params["qos_policy"] and current_policy != module.params["qos_policy"]:
         changed = True
         if not module.check_mode:

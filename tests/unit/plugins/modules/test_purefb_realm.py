@@ -72,12 +72,6 @@ sys.modules[
 
 from plugins.modules.purefb_realm import (
     main,
-    make_realm,
-    delete_realm,
-    eradicate_realm,
-    recover_realm,
-    rename_realm,
-    update_realm,
     get_realm,
     get_pending_realm,
     get_policy,

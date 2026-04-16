@@ -255,7 +255,7 @@ EXAMPLES = """
 
 - name: Create new filesystem in realm
   purestorage.flashblade.purefb_fs:
-    name: realm-fs
+    name: production-realm::prod-fs
     size: 5T
     realm: production-realm
     state: present
@@ -264,7 +264,7 @@ EXAMPLES = """
 
 - name: Modify filesystem that belongs to a realm
   purestorage.flashblade.purefb_fs:
-    name: realm-fs
+    name: production-realm::prod-fs
     size: 10T
     nfsv4: false
     state: present
@@ -299,7 +299,7 @@ EXAMPLES = """
 
     - name: Create filesystem in the realm
       purestorage.flashblade.purefb_fs:
-        name: prod-database
+        name: production-realm::prod-database
         size: 50T
         realm: production-realm
         nfsv4: true
@@ -310,7 +310,7 @@ EXAMPLES = """
 
     - name: Expand the filesystem (realm association persists)
       purestorage.flashblade.purefb_fs:
-        name: prod-database
+        name: production-realm::prod-database
         size: 100T
         state: present
         fb_url: 10.10.10.2
@@ -318,7 +318,7 @@ EXAMPLES = """
 
     - name: Modify filesystem settings (realm unchanged)
       purestorage.flashblade.purefb_fs:
-        name: prod-database
+        name: production-realm::prod-database
         user_quota: 20T
         group_quota: 15T
         hard_limit: true

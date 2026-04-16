@@ -3874,6 +3874,7 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.check_mode = False
         mock_module.params = self.get_default_params()
+        mock_module.params["name"] = "production-realm::prod-fs"
         mock_module.params["realm"] = "production-realm"
         mock_module.params["state"] = "present"
 
@@ -3922,6 +3923,7 @@ class TestPurefbFs:
         mock_module.check_mode = False
         mock_module.fail_json = Mock(side_effect=SystemExit)
         mock_module.params = self.get_default_params()
+        mock_module.params["name"] = "production-realm::prod-fs"
         mock_module.params["realm"] = "production-realm"
         mock_module.params["state"] = "present"
 
@@ -3960,6 +3962,7 @@ class TestPurefbFs:
         mock_module.check_mode = False
         mock_module.fail_json = Mock(side_effect=SystemExit)
         mock_module.params = self.get_default_params()
+        mock_module.params["name"] = "nonexistent-realm::test-fs"
         mock_module.params["realm"] = "nonexistent-realm"
         mock_module.params["state"] = "present"
 
@@ -4003,6 +4006,7 @@ class TestPurefbFs:
         mock_module = Mock()
         mock_module.exit_json = Mock()
         mock_module.params = self.get_default_params()
+        mock_module.params["name"] = "production-realm::test-fs"
         mock_module.params["realm"] = "production-realm"
         mock_module.params["state"] = "present"
         mock_module.check_mode = True

@@ -288,47 +288,6 @@ EXAMPLES = """
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
-- name: Complete realm-based filesystem lifecycle example
-  block:
-    - name: Create a realm first
-      purestorage.flashblade.purefb_realm:
-        name: production-realm
-        qos_policy: high-performance-qos
-        state: present
-        fb_url: 10.10.10.2
-        api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
-
-    - name: Create filesystem in the realm
-      purestorage.flashblade.purefb_fs:
-        name: prod-database
-        size: 50T
-        realm: production-realm
-        nfsv4: true
-        user_quota: 10T
-        state: present
-        fb_url: 10.10.10.2
-        api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
-      # Creates filesystem as 'production-realm::prod-database'
-
-    - name: Expand the filesystem (use full realm::filesystem name)
-      purestorage.flashblade.purefb_fs:
-        name: production-realm::prod-database
-        size: 100T
-        state: present
-        fb_url: 10.10.10.2
-        api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
-
-    - name: Modify filesystem settings (realm unchanged)
-      purestorage.flashblade.purefb_fs:
-        name: production-realm::prod-database
-        user_quota: 20T
-        group_quota: 15T
-        hard_limit: true
-        state: present
-        fb_url: 10.10.10.2
-        api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
-      # Filesystem remains in production-realm with inherited QoS policy
-
 - name: Eradicate filesystem named foo
   purestorage.flashblade.purefb_fs:
     name: foo

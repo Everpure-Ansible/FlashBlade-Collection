@@ -239,7 +239,7 @@ options:
     - To move a filesystem to a different realm, the filesystem must be destroyed and recreated.
     - If the realm has a QoS policy, the filesystem will inherit it unless overridden.
     type: str
-    version_added: "1.26.0"
+    version_added: "1.25.0"
 extends_documentation_fragment:
     - purestorage.flashblade.purestorage.fb
 """

@@ -231,6 +231,15 @@ options:
     type: str
     default: ""
     version_added: "1.22.0"
+  realm:
+    description:
+    - Name of the realm to associate the filesystem with.
+    - Requires Purity//FB 4.6.1+ (REST API 2.19+).
+    - Can only be set at filesystem creation time.
+    - To move a filesystem to a different realm, the filesystem must be destroyed and recreated.
+    - If the realm has a QoS policy, the filesystem will inherit it unless overridden.
+    type: str
+    version_added: "1.26.0"
 extends_documentation_fragment:
     - purestorage.flashblade.purestorage.fb
 """
@@ -240,6 +249,15 @@ EXAMPLES = """
   purestorage.flashblade.purefb_fs:
     name: foo
     size: 1T
+    state: present
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Create new filesystem in realm
+  purestorage.flashblade.purefb_fs:
+    name: realm-fs
+    size: 5T
+    realm: production-realm
     state: present
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
@@ -334,6 +352,7 @@ SMB_POLICY_API_VERSION = "2.10"
 CA_API_VERSION = "2.12"
 GOWNER_API_VERSION = "2.13"
 CONTEXT_API_VERSION = "2.17"
+REALM_API_VERSION = "2.19"
 
 
 def create_fs(module, blade):
@@ -341,6 +360,21 @@ def create_fs(module, blade):
     changed = True
     api_version = list(blade.get_versions().items)
     if not module.check_mode:
+        # Validate realm if provided
+        if module.params["realm"]:
+            if REALM_API_VERSION not in api_version:
+                module.fail_json(
+                    msg="Realm support requires Purity//FB 4.6.1+ (REST API 2.19+)"
+                )
+            # Check realm exists
+            realm_check = blade.get_realms(
+                destroyed=False, names=[module.params["realm"]]
+            )
+            if realm_check.status_code != 200:
+                module.fail_json(
+                    msg="Realm '{0}' does not exist".format(module.params["realm"])
+                )
+
         if not module.params["nfs_rules"]:
             module.params["nfs_rules"] = "*(rw,no_root_squash)"
         if module.params["size"]:
@@ -398,6 +432,11 @@ def create_fs(module, blade):
             ),
             default_user_quota=user_quota,
             default_group_quota=group_quota,
+            realm=(
+                Reference(name=module.params["realm"])
+                if module.params["realm"]
+                else None
+            ),
         )
         if CONTEXT_API_VERSION in api_version:
             res = blade.post_file_systems(
@@ -1190,6 +1229,7 @@ def main():
             cancel_in_progress=dict(type="bool", default=False),
             context=dict(type="str", default=""),
             storage_class=dict(type="str"),
+            realm=dict(type="str"),
         )
     )
 

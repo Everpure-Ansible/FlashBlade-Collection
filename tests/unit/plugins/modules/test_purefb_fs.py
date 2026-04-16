@@ -131,6 +131,7 @@ class TestPurefbFs:
             "cancel_in_progress": False,
             "context": "",
             "storage_class": None,
+            "realm": None,
         }
 
     @patch("plugins.modules.purefb_fs.get_filesystem")
@@ -3865,3 +3866,206 @@ class TestPurefbFs:
 
         # Verify storage class was set with context
         assert mock_blade.patch_file_systems.call_count >= 1
+
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.get_system")
+    def test_create_fs_with_realm_success(self, mock_get_system, mock_get_filesystem):
+        """Test creating filesystem with realm succeeds on API 2.19+"""
+        mock_module = Mock()
+        mock_module.check_mode = False
+        mock_module.params = self.get_default_params()
+        mock_module.params["realm"] = "production-realm"
+        mock_module.params["state"] = "present"
+
+        mock_blade = Mock()
+        # Mock API version 2.19+
+        versions = []
+        for ver in ["2.19", "2.20"]:
+            mock_ver = Mock()
+            mock_ver.version = ver
+            mock_ver.__eq__ = lambda self, other: self.version == other
+            versions.append(mock_ver)
+        mock_blade.get_versions.return_value.items = versions
+
+        mock_get_filesystem.return_value = None
+
+        # Mock realm exists
+        mock_realm_response = Mock()
+        mock_realm_response.status_code = 200
+        mock_blade.get_realms.return_value = mock_realm_response
+
+        # Mock successful filesystem creation
+        mock_fs_response = Mock()
+        mock_fs_response.status_code = 200
+        mock_blade.post_file_systems.return_value = mock_fs_response
+
+        mock_get_system.return_value = mock_blade
+
+        # Call function
+        create_fs(mock_module, mock_blade)
+
+        # Verify realm was checked
+        mock_blade.get_realms.assert_called_once_with(
+            destroyed=False, names=["production-realm"]
+        )
+
+        # Verify filesystem was created
+        mock_blade.post_file_systems.assert_called_once()
+
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.get_system")
+    def test_create_fs_with_realm_old_api_fails(
+        self, mock_get_system, mock_get_filesystem
+    ):
+        """Test creating filesystem with realm fails on old API version"""
+        mock_module = Mock()
+        mock_module.check_mode = False
+        mock_module.fail_json = Mock(side_effect=SystemExit)
+        mock_module.params = self.get_default_params()
+        mock_module.params["realm"] = "production-realm"
+        mock_module.params["state"] = "present"
+
+        mock_blade = Mock()
+        # Mock old API version (before 2.19)
+        versions = []
+        for ver in ["2.10", "2.15"]:
+            mock_ver = Mock()
+            mock_ver.version = ver
+            mock_ver.__eq__ = lambda self, other: self.version == other
+            versions.append(mock_ver)
+        mock_blade.get_versions.return_value.items = versions
+
+        mock_get_filesystem.return_value = None
+        mock_get_system.return_value = mock_blade
+
+        # Call function - should fail with API version error
+        try:
+            create_fs(mock_module, mock_blade)
+        except SystemExit:
+            pass
+
+        # Verify fail_json was called with API version message
+        assert mock_module.fail_json.called
+        call_args = mock_module.fail_json.call_args[1]
+        assert "Purity//FB 4.6.1+" in call_args["msg"]
+        assert "REST API 2.19+" in call_args["msg"]
+
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.get_system")
+    def test_create_fs_with_nonexistent_realm_fails(
+        self, mock_get_system, mock_get_filesystem
+    ):
+        """Test creating filesystem with nonexistent realm fails"""
+        mock_module = Mock()
+        mock_module.check_mode = False
+        mock_module.fail_json = Mock(side_effect=SystemExit)
+        mock_module.params = self.get_default_params()
+        mock_module.params["realm"] = "nonexistent-realm"
+        mock_module.params["state"] = "present"
+
+        mock_blade = Mock()
+        # Mock API version 2.19+
+        versions = []
+        for ver in ["2.19"]:
+            mock_ver = Mock()
+            mock_ver.version = ver
+            mock_ver.__eq__ = lambda self, other: self.version == other
+            versions.append(mock_ver)
+        mock_blade.get_versions.return_value.items = versions
+
+        mock_get_filesystem.return_value = None
+
+        # Mock realm does not exist
+        mock_realm_response = Mock()
+        mock_realm_response.status_code = 400
+        mock_blade.get_realms.return_value = mock_realm_response
+
+        mock_get_system.return_value = mock_blade
+
+        # Call function - should fail
+        try:
+            create_fs(mock_module, mock_blade)
+        except SystemExit:
+            pass
+
+        # Verify fail_json was called
+        assert mock_module.fail_json.called
+        call_args = mock_module.fail_json.call_args[1]
+        assert "does not exist" in call_args["msg"]
+        assert "nonexistent-realm" in call_args["msg"]
+
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.get_system")
+    def test_create_fs_with_realm_check_mode(
+        self, mock_get_system, mock_get_filesystem
+    ):
+        """Test creating filesystem with realm in check mode"""
+        mock_module = Mock()
+        mock_module.exit_json = Mock()
+        mock_module.params = self.get_default_params()
+        mock_module.params["realm"] = "production-realm"
+        mock_module.params["state"] = "present"
+        mock_module.check_mode = True
+
+        mock_blade = Mock()
+        # Mock API version 2.19+
+        versions = []
+        for ver in ["2.19"]:
+            mock_ver = Mock()
+            mock_ver.version = ver
+            mock_ver.__eq__ = lambda self, other: self.version == other
+            versions.append(mock_ver)
+        mock_blade.get_versions.return_value.items = versions
+
+        mock_get_filesystem.return_value = None
+        mock_get_system.return_value = mock_blade
+
+        # Call function
+        create_fs(mock_module, mock_blade)
+
+        # In check mode, no API calls should be made
+        mock_blade.get_realms.assert_not_called()
+        mock_blade.post_file_systems.assert_not_called()
+
+        # exit_json should be called with changed=True
+        mock_module.exit_json.assert_called_once()
+        call_args = mock_module.exit_json.call_args[1]
+        assert call_args["changed"] is True
+
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.get_system")
+    def test_create_fs_without_realm(self, mock_get_system, mock_get_filesystem):
+        """Test creating filesystem without realm works as before"""
+        mock_module = Mock()
+        mock_module.check_mode = False
+        mock_module.params = self.get_default_params()
+        mock_module.params["realm"] = None  # No realm
+        mock_module.params["state"] = "present"
+
+        mock_blade = Mock()
+        # Mock API version 2.19+
+        versions = []
+        for ver in ["2.19"]:
+            mock_ver = Mock()
+            mock_ver.version = ver
+            mock_ver.__eq__ = lambda self, other: self.version == other
+            versions.append(mock_ver)
+        mock_blade.get_versions.return_value.items = versions
+
+        mock_get_filesystem.return_value = None
+
+        # Mock successful filesystem creation
+        mock_fs_response = Mock()
+        mock_fs_response.status_code = 200
+        mock_blade.post_file_systems.return_value = mock_fs_response
+
+        mock_get_system.return_value = mock_blade
+
+        # Call function
+        create_fs(mock_module, mock_blade)
+
+        # Verify realm was not checked (since none provided)
+        mock_blade.get_realms.assert_not_called()
+
+        # Verify filesystem was created
+        mock_blade.post_file_systems.assert_called_once()

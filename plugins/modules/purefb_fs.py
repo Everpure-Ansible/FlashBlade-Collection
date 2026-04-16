@@ -373,7 +373,7 @@ def create_fs(module, blade):
     api_version = list(blade.get_versions().items)
     if not module.check_mode:
         # Validate realm if provided
-        if module.params["realm"]:
+        if module.params.get("realm"):
             if REALM_API_VERSION not in api_version:
                 module.fail_json(
                     msg="Realm support requires Purity//FB 4.6.1+ (REST API 2.19+)"
@@ -445,8 +445,8 @@ def create_fs(module, blade):
             default_user_quota=user_quota,
             default_group_quota=group_quota,
             realm=(
-                Reference(name=module.params["realm"])
-                if module.params["realm"]
+                Reference(name=module.params.get("realm"))
+                if module.params.get("realm")
                 else None
             ),
         )

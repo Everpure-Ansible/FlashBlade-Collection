@@ -94,6 +94,8 @@ class TestPurefbCerts:
             "days": 3650,
             "key_algorithm": None,
             "export_file": None,
+            "certificate_type": None,
+            "subject_alternative_names": None,
         }
         mock_module.check_mode = False
         mock_ansible_module.return_value = mock_module
@@ -168,6 +170,8 @@ class TestPurefbCerts:
             "days": 3650,
             "key_algorithm": None,
             "export_file": None,
+            "certificate_type": None,
+            "subject_alternative_names": None,
         }
         mock_module.check_mode = False
         mock_ansible_module.return_value = mock_module
@@ -269,6 +273,8 @@ class TestPurefbCerts:
             "days": 3650,
             "key_algorithm": None,
             "export_file": None,
+            "certificate_type": None,
+            "subject_alternative_names": None,
         }
         mock_module.check_mode = True  # This is the key - check_mode enabled
         mock_ansible_module.return_value = mock_module
@@ -302,10 +308,8 @@ class TestPurefbCerts:
     @patch("plugins.modules.purefb_certs.AnsibleModule")
     @patch("plugins.modules.purefb_certs.HAS_PYPURECLIENT", True)
     @patch("plugins.modules.purefb_certs.HAS_PYCOUNTRY", True)
-    def test_main_delete_cert_management_fails(
-        self, mock_ansible_module, mock_get_system
-    ):
-        """Test delete_cert fails when trying to delete management certificate"""
+    def test_main_delete_cert_global_fails(self, mock_ansible_module, mock_get_system):
+        """Test delete_cert fails when trying to delete global certificate"""
         # Setup mock module
         mock_module = Mock()
         # Make exit_json and fail_json raise exceptions to stop execution
@@ -313,7 +317,7 @@ class TestPurefbCerts:
         mock_module.fail_json = Mock(side_effect=SystemExit)
         mock_module.params = {
             "state": "absent",
-            "name": "management",
+            "name": "global",
             "common_name": None,
             "country": None,
             "province": None,
@@ -330,6 +334,8 @@ class TestPurefbCerts:
             "days": 3650,
             "key_algorithm": None,
             "export_file": None,
+            "certificate_type": None,
+            "subject_alternative_names": None,
         }
         mock_module.check_mode = False
         mock_ansible_module.return_value = mock_module
@@ -354,7 +360,7 @@ class TestPurefbCerts:
         # Verify fail_json was called
         mock_module.fail_json.assert_called_once()
         call_args = mock_module.fail_json.call_args[1]
-        assert "management SSL cannot be deleted" in call_args["msg"]
+        assert "Global certificate cannot be deleted" in call_args["msg"]
 
     @patch("plugins.modules.purefb_certs.get_system")
     @patch("plugins.modules.purefb_certs.AnsibleModule")
@@ -386,6 +392,8 @@ class TestPurefbCerts:
             "days": 3650,
             "key_algorithm": None,
             "export_file": None,
+            "certificate_type": None,
+            "subject_alternative_names": None,
         }
         mock_module.check_mode = False
         mock_ansible_module.return_value = mock_module
@@ -414,6 +422,1099 @@ class TestPurefbCerts:
 
         # Verify delete_certificates was called
         mock_blade.delete_certificates.assert_called_once_with(names=["test-cert"])
+
+        # Verify exit_json was called with changed=True
+        mock_module.exit_json.assert_called_once()
+        call_args = mock_module.exit_json.call_args[1]
+        assert call_args["changed"] is True
+
+    @patch("plugins.modules.purefb_certs.pycountry")
+    @patch("plugins.modules.purefb_certs.get_system")
+    @patch("plugins.modules.purefb_certs.AnsibleModule")
+    @patch("plugins.modules.purefb_certs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_certs.HAS_PYCOUNTRY", True)
+    def test_main_export_cert_success(
+        self, mock_ansible_module, mock_get_system, mock_pycountry
+    ):
+        """Test export_cert successfully exports certificate"""
+        # Setup mock module
+        mock_module = Mock()
+        mock_module.exit_json = Mock(side_effect=SystemExit)
+        mock_module.fail_json = Mock(side_effect=SystemExit)
+        mock_module.params = {
+            "state": "export",
+            "name": "test-cert",
+            "export_file": "test_cert.pem",
+            "common_name": None,
+            "country": None,
+            "province": None,
+            "locality": None,
+            "organization": None,
+            "org_unit": None,
+            "email": None,
+            "key_size": None,
+            "certificate": None,
+            "intermediate_cert": None,
+            "key": None,
+            "passphrase": None,
+            "generate": False,
+            "days": None,
+            "key_algorithm": None,
+            "certificate_type": None,
+            "subject_alternative_names": None,
+        }
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        # Mock blade
+        mock_blade = Mock()
+        mock_version = Mock()
+        mock_version.version = "2.15"
+        mock_blade.get_versions.return_value.items = [mock_version]
+
+        # Certificate exists
+        mock_cert_response = Mock()
+        mock_cert_response.status_code = 200
+        mock_cert = Mock()
+        mock_cert.certificate = (
+            "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----"
+        )
+        mock_cert_response.items = [mock_cert]
+        mock_blade.get_certificates.return_value = mock_cert_response
+
+        mock_get_system.return_value = mock_blade
+
+        # Mock file operations
+        with patch("builtins.open", create=True) as mock_open:
+            mock_file = Mock()
+            mock_open.return_value.__enter__.return_value = mock_file
+
+            # Call main
+            try:
+                main()
+            except SystemExit:
+                pass
+
+            # Verify file was written
+            mock_open.assert_called_once_with("test_cert.pem", "w", encoding="utf-8")
+            mock_file.write.assert_called_once_with(
+                "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----"
+            )
+
+        # Verify exit_json was called with changed=True
+        mock_module.exit_json.assert_called_once()
+        call_args = mock_module.exit_json.call_args[1]
+        assert call_args["changed"] is True
+
+    @patch("plugins.modules.purefb_certs.pycountry")
+    @patch("plugins.modules.purefb_certs.get_system")
+    @patch("plugins.modules.purefb_certs.AnsibleModule")
+    @patch("plugins.modules.purefb_certs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_certs.HAS_PYCOUNTRY", True)
+    def test_main_export_cert_failure(
+        self, mock_ansible_module, mock_get_system, mock_pycountry
+    ):
+        """Test export_cert fails when certificate doesn't exist"""
+        # Setup mock module
+        mock_module = Mock()
+        mock_module.exit_json = Mock(side_effect=SystemExit)
+        mock_module.fail_json = Mock(side_effect=SystemExit)
+        mock_module.params = {
+            "state": "export",
+            "name": "nonexistent-cert",
+            "export_file": "test_cert.pem",
+            "common_name": None,
+            "country": None,
+            "province": None,
+            "locality": None,
+            "organization": None,
+            "org_unit": None,
+            "email": None,
+            "key_size": None,
+            "certificate": None,
+            "intermediate_cert": None,
+            "key": None,
+            "passphrase": None,
+            "generate": False,
+            "days": None,
+            "key_algorithm": None,
+            "certificate_type": None,
+            "subject_alternative_names": None,
+        }
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        # Mock blade
+        mock_blade = Mock()
+        mock_version = Mock()
+        mock_version.version = "2.15"
+        mock_blade.get_versions.return_value.items = [mock_version]
+
+        # Certificate doesn't exist
+        mock_cert_response = Mock()
+        mock_cert_response.status_code = 400
+        mock_error = Mock()
+        mock_error.message = "Certificate not found"
+        mock_cert_response.errors = [mock_error]
+        mock_blade.get_certificates.return_value = mock_cert_response
+
+        mock_get_system.return_value = mock_blade
+
+        # Call main - expect failure
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        # Verify fail_json was called
+        mock_module.fail_json.assert_called_once()
+        call_args = mock_module.fail_json.call_args[1]
+        assert "Exporting Certificate failed" in call_args["msg"]
+
+    @patch("plugins.modules.purefb_certs.pycountry")
+    @patch("plugins.modules.purefb_certs.get_system")
+    @patch("plugins.modules.purefb_certs.AnsibleModule")
+    @patch("plugins.modules.purefb_certs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_certs.HAS_PYCOUNTRY", True)
+    def test_main_create_csr_success(
+        self, mock_ansible_module, mock_get_system, mock_pycountry
+    ):
+        """Test create_csr successfully creates CSR"""
+        # Setup mock module
+        mock_module = Mock()
+        mock_module.exit_json = Mock(side_effect=SystemExit)
+        mock_module.fail_json = Mock(side_effect=SystemExit)
+        mock_module.params = {
+            "state": "sign",
+            "name": "test-cert",
+            "export_file": "test_csr.pem",
+            "common_name": "test.example.com",
+            "country": "US",
+            "province": "CA",
+            "locality": "SF",
+            "organization": "Test Org",
+            "org_unit": "IT",
+            "email": "test@example.com",
+            "key_size": None,
+            "certificate": None,
+            "intermediate_cert": None,
+            "key": None,
+            "passphrase": None,
+            "generate": False,
+            "days": None,
+            "key_algorithm": None,
+            "certificate_type": None,
+            "subject_alternative_names": ["alt.example.com"],
+        }
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        # Mock blade with CSR API support
+        mock_blade = Mock()
+        mock_version = Mock()
+        mock_version.version = "2.20"
+        mock_blade.get_versions.return_value.items = ["2.20"]
+
+        # Certificate exists
+        mock_blade.get_certificates.return_value.status_code = 200
+
+        # Mock CSR response
+        mock_csr_item = Mock()
+        mock_csr_item.certificate_signing_request = [
+            "-----BEGIN CERTIFICATE REQUEST-----\n",
+            "CSR_CONTENT\n",
+            "-----END CERTIFICATE REQUEST-----\n",
+        ]
+        mock_csr_response = Mock()
+        mock_csr_response.items = [mock_csr_item]
+        mock_blade.post_certificates_certificate_signing_requests.return_value = (
+            mock_csr_response
+        )
+
+        mock_get_system.return_value = mock_blade
+
+        # Mock pycountry
+        mock_country = Mock()
+        mock_pycountry.countries.get.return_value = mock_country
+
+        # Mock file operations
+        with patch("builtins.open", create=True) as mock_open:
+            mock_file = Mock()
+            mock_open.return_value.__enter__.return_value = mock_file
+
+            # Call main
+            try:
+                main()
+            except SystemExit:
+                pass
+
+            # Verify file was written
+            mock_open.assert_called_once_with("test_csr.pem", "w", encoding="utf-8")
+            mock_file.writelines.assert_called_once()
+
+        # Verify exit_json was called with changed=True
+        mock_module.exit_json.assert_called_once()
+        call_args = mock_module.exit_json.call_args[1]
+        assert call_args["changed"] is True
+
+    @patch("plugins.modules.purefb_certs.get_system")
+    @patch("plugins.modules.purefb_certs.AnsibleModule")
+    @patch("plugins.modules.purefb_certs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_certs.HAS_PYCOUNTRY", True)
+    def test_main_create_csr_old_api_fails(self, mock_ansible_module, mock_get_system):
+        """Test create_csr fails on old API version"""
+        # Setup mock module
+        mock_module = Mock()
+        mock_module.exit_json = Mock(side_effect=SystemExit)
+        mock_module.fail_json = Mock(side_effect=SystemExit)
+        mock_module.params = {
+            "state": "sign",
+            "name": "test-cert",
+            "export_file": "test_csr.pem",
+            "common_name": None,
+            "country": None,
+            "province": None,
+            "locality": None,
+            "organization": None,
+            "org_unit": None,
+            "email": None,
+            "key_size": None,
+            "certificate": None,
+            "intermediate_cert": None,
+            "key": None,
+            "passphrase": None,
+            "generate": False,
+            "days": None,
+            "key_algorithm": None,
+            "certificate_type": None,
+            "subject_alternative_names": None,
+        }
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        # Mock blade with old API version
+        mock_blade = Mock()
+        mock_version = Mock()
+        mock_version.version = "2.15"
+        mock_blade.get_versions.return_value.items = ["2.15"]
+
+        mock_get_system.return_value = mock_blade
+
+        # Call main - expect failure
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        # Verify fail_json was called
+        mock_module.fail_json.assert_called_once()
+        call_args = mock_module.fail_json.call_args[1]
+        assert "Purity//FB 4.6.3+ is required for CSRs" in call_args["msg"]
+
+    @patch("plugins.modules.purefb_certs.get_system")
+    @patch("plugins.modules.purefb_certs.AnsibleModule")
+    @patch("plugins.modules.purefb_certs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_certs.HAS_PYCOUNTRY", True)
+    def test_main_invalid_email(self, mock_ansible_module, mock_get_system):
+        """Test validation fails for invalid email"""
+        # Setup mock module
+        mock_module = Mock()
+        mock_module.exit_json = Mock(side_effect=SystemExit)
+        mock_module.fail_json = Mock(side_effect=SystemExit)
+        mock_module.params = {
+            "state": "sign",
+            "name": "test-cert",
+            "export_file": "test_csr.pem",
+            "common_name": "test.example.com",
+            "country": None,
+            "province": None,
+            "locality": None,
+            "organization": None,
+            "org_unit": None,
+            "email": "invalid-email",  # Invalid email
+            "key_size": None,
+            "certificate": None,
+            "intermediate_cert": None,
+            "key": None,
+            "passphrase": None,
+            "generate": False,
+            "days": None,
+            "key_algorithm": None,
+            "certificate_type": None,
+            "subject_alternative_names": None,
+        }
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        # Mock blade
+        mock_blade = Mock()
+        mock_blade.get_versions.return_value.items = ["2.20"]
+        mock_get_system.return_value = mock_blade
+
+        # Call main - expect failure
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        # Verify fail_json was called
+        mock_module.fail_json.assert_called_once()
+        call_args = mock_module.fail_json.call_args[1]
+        assert "is not valid" in call_args["msg"]
+
+    @patch("plugins.modules.purefb_certs.pycountry")
+    @patch("plugins.modules.purefb_certs.get_system")
+    @patch("plugins.modules.purefb_certs.AnsibleModule")
+    @patch("plugins.modules.purefb_certs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_certs.HAS_PYCOUNTRY", True)
+    def test_main_invalid_country_length(
+        self, mock_ansible_module, mock_get_system, mock_pycountry
+    ):
+        """Test validation fails for invalid country code length"""
+        # Setup mock module
+        mock_module = Mock()
+        mock_module.exit_json = Mock(side_effect=SystemExit)
+        mock_module.fail_json = Mock(side_effect=SystemExit)
+        mock_module.params = {
+            "state": "sign",
+            "name": "test-cert",
+            "export_file": "test_csr.pem",
+            "common_name": "test.example.com",
+            "country": "USA",  # Invalid - should be 2 letters
+            "province": None,
+            "locality": None,
+            "organization": None,
+            "org_unit": None,
+            "email": None,
+            "key_size": None,
+            "certificate": None,
+            "intermediate_cert": None,
+            "key": None,
+            "passphrase": None,
+            "generate": False,
+            "days": None,
+            "key_algorithm": None,
+            "certificate_type": None,
+            "subject_alternative_names": None,
+        }
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        # Mock blade
+        mock_blade = Mock()
+        mock_blade.get_versions.return_value.items = ["2.20"]
+        mock_get_system.return_value = mock_blade
+
+        # Call main - expect failure
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        # Verify fail_json was called
+        mock_module.fail_json.assert_called_once()
+        call_args = mock_module.fail_json.call_args[1]
+        assert "two-letter country" in call_args["msg"]
+
+    @patch("plugins.modules.purefb_certs.pycountry")
+    @patch("plugins.modules.purefb_certs.get_system")
+    @patch("plugins.modules.purefb_certs.AnsibleModule")
+    @patch("plugins.modules.purefb_certs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_certs.HAS_PYCOUNTRY", True)
+    def test_main_invalid_country_code(
+        self, mock_ansible_module, mock_get_system, mock_pycountry
+    ):
+        """Test validation fails for invalid country code"""
+        # Setup mock module
+        mock_module = Mock()
+        mock_module.exit_json = Mock(side_effect=SystemExit)
+        mock_module.fail_json = Mock(side_effect=SystemExit)
+        mock_module.params = {
+            "state": "sign",
+            "name": "test-cert",
+            "export_file": "test_csr.pem",
+            "common_name": "test.example.com",
+            "country": "XX",  # Invalid ISO code
+            "province": None,
+            "locality": None,
+            "organization": None,
+            "org_unit": None,
+            "email": None,
+            "key_size": None,
+            "certificate": None,
+            "intermediate_cert": None,
+            "key": None,
+            "passphrase": None,
+            "generate": False,
+            "days": None,
+            "key_algorithm": None,
+            "certificate_type": None,
+            "subject_alternative_names": None,
+        }
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        # Mock blade
+        mock_blade = Mock()
+        mock_blade.get_versions.return_value.items = ["2.20"]
+        mock_get_system.return_value = mock_blade
+
+        # Mock pycountry - return None for invalid code
+        mock_pycountry.countries.get.return_value = None
+
+        # Call main - expect failure
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        # Verify fail_json was called
+        mock_module.fail_json.assert_called_once()
+        call_args = mock_module.fail_json.call_args[1]
+        assert "ISO 3166-1 code" in call_args["msg"]
+
+    @patch("plugins.modules.purefb_certs.AnsibleModule")
+    @patch("plugins.modules.purefb_certs.HAS_PYPURECLIENT", False)
+    @patch("plugins.modules.purefb_certs.HAS_PYCOUNTRY", True)
+    def test_main_no_pypureclient(self, mock_ansible_module):
+        """Test module fails when pypureclient is not installed"""
+        # Setup mock module
+        mock_module = Mock()
+        mock_module.exit_json = Mock(side_effect=SystemExit)
+        mock_module.fail_json = Mock(side_effect=SystemExit)
+        mock_module.params = {
+            "state": "present",
+            "name": "test-cert",
+            "export_file": None,
+            "common_name": None,
+            "country": None,
+            "province": None,
+            "locality": None,
+            "organization": None,
+            "org_unit": None,
+            "email": None,
+            "key_size": None,
+            "certificate": "cert_content",
+            "intermediate_cert": None,
+            "key": "key_content",
+            "passphrase": None,
+            "generate": False,
+            "days": None,
+            "key_algorithm": None,
+            "certificate_type": None,
+            "subject_alternative_names": None,
+        }
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        # Call main - expect failure
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        # Verify fail_json was called
+        mock_module.fail_json.assert_called_once()
+        call_args = mock_module.fail_json.call_args[1]
+        assert "py-pure-client sdk is required" in call_args["msg"]
+
+    @patch("plugins.modules.purefb_certs.AnsibleModule")
+    @patch("plugins.modules.purefb_certs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_certs.HAS_PYCOUNTRY", False)
+    def test_main_no_pycountry(self, mock_ansible_module):
+        """Test module fails when pycountry is not installed"""
+        # Setup mock module
+        mock_module = Mock()
+        mock_module.exit_json = Mock(side_effect=SystemExit)
+        mock_module.fail_json = Mock(side_effect=SystemExit)
+        mock_module.params = {
+            "state": "present",
+            "name": "test-cert",
+            "export_file": None,
+            "common_name": None,
+            "country": None,
+            "province": None,
+            "locality": None,
+            "organization": None,
+            "org_unit": None,
+            "email": None,
+            "key_size": None,
+            "certificate": "cert_content",
+            "intermediate_cert": None,
+            "key": "key_content",
+            "passphrase": None,
+            "generate": False,
+            "days": None,
+            "key_algorithm": None,
+            "certificate_type": None,
+            "subject_alternative_names": None,
+        }
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        # Call main - expect failure
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        # Verify fail_json was called
+        mock_module.fail_json.assert_called_once()
+        call_args = mock_module.fail_json.call_args[1]
+        assert "pycountry sdk is required" in call_args["msg"]
+
+    @patch("plugins.modules.purefb_certs.pycountry")
+    @patch("plugins.modules.purefb_certs.get_system")
+    @patch("plugins.modules.purefb_certs.AnsibleModule")
+    @patch("plugins.modules.purefb_certs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_certs.HAS_PYCOUNTRY", True)
+    def test_main_update_cert_old_api(
+        self, mock_ansible_module, mock_get_system, mock_pycountry
+    ):
+        """Test update_cert with old API version (< 2.20)"""
+        # Setup mock module
+        mock_module = Mock()
+        mock_module.exit_json = Mock(side_effect=SystemExit)
+        mock_module.fail_json = Mock(side_effect=SystemExit)
+        mock_module.params = {
+            "state": "present",
+            "name": "existing-cert",
+            "export_file": None,
+            "common_name": None,
+            "country": None,
+            "province": None,
+            "locality": None,
+            "organization": None,
+            "org_unit": None,
+            "email": None,
+            "key_size": None,
+            "certificate": "new_cert_content",
+            "intermediate_cert": "intermediate_content",
+            "key": "new_key_content",
+            "passphrase": "secret",
+            "generate": False,
+            "days": None,
+            "key_algorithm": None,
+            "certificate_type": None,
+            "subject_alternative_names": None,
+        }
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        # Mock blade with old API version
+        mock_blade = Mock()
+        mock_version = Mock()
+        mock_version.version = "2.15"
+        mock_blade.get_versions.return_value.items = ["2.15"]
+
+        # Certificate exists
+        mock_blade.get_certificates.return_value.status_code = 200
+
+        # Mock successful patch
+        mock_patch_response = Mock()
+        mock_patch_response.status_code = 200
+        mock_blade.patch_certificates.return_value = mock_patch_response
+
+        mock_get_system.return_value = mock_blade
+
+        # Call main
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        # Verify patch_certificates was called (old API path)
+        mock_blade.patch_certificates.assert_called_once()
+        call_args = mock_blade.patch_certificates.call_args
+
+        # Verify it was called with basic parameters (not extended)
+        assert "names" in call_args[1]
+        assert "certificate" in call_args[1]
+        # Should NOT have generate_new_key (that's only for new API)
+        assert "generate_new_key" not in call_args[1]
+
+        # Verify exit_json was called with changed=True
+        mock_module.exit_json.assert_called_once()
+        call_args = mock_module.exit_json.call_args[1]
+        assert call_args["changed"] is True
+
+    @patch("plugins.modules.purefb_certs.pycountry")
+    @patch("plugins.modules.purefb_certs.get_system")
+    @patch("plugins.modules.purefb_certs.AnsibleModule")
+    @patch("plugins.modules.purefb_certs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_certs.HAS_PYCOUNTRY", True)
+    def test_main_update_cert_new_api(
+        self, mock_ansible_module, mock_get_system, mock_pycountry
+    ):
+        """Test update_cert with new API version (>= 2.20)"""
+        # Setup mock module
+        mock_module = Mock()
+        mock_module.exit_json = Mock(side_effect=SystemExit)
+        mock_module.fail_json = Mock(side_effect=SystemExit)
+        mock_module.params = {
+            "state": "present",
+            "name": "existing-cert",
+            "export_file": None,
+            "common_name": "test.example.com",
+            "country": "US",
+            "province": "CA",
+            "locality": "SF",
+            "organization": "Test Org",
+            "org_unit": "IT",
+            "email": "test@example.com",
+            "key_size": 2048,
+            "certificate": "new_cert_content",
+            "intermediate_cert": "intermediate_content",
+            "key": "new_key_content",
+            "passphrase": "secret",
+            "generate": True,
+            "days": 365,
+            "key_algorithm": None,
+            "certificate_type": None,
+            "subject_alternative_names": ["alt.example.com"],
+        }
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        # Mock blade with new API version
+        mock_blade = Mock()
+        mock_blade.get_versions.return_value.items = ["2.20"]
+
+        # Certificate exists
+        mock_blade.get_certificates.return_value.status_code = 200
+
+        # Mock successful patch
+        mock_patch_response = Mock()
+        mock_patch_response.status_code = 200
+        mock_blade.patch_certificates.return_value = mock_patch_response
+
+        mock_get_system.return_value = mock_blade
+
+        # Mock pycountry
+        mock_country = Mock()
+        mock_pycountry.countries.get.return_value = mock_country
+
+        # Call main
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        # Verify patch_certificates was called (new API path)
+        mock_blade.patch_certificates.assert_called_once()
+        call_args = mock_blade.patch_certificates.call_args
+
+        # Verify it was called with extended parameters
+        assert "names" in call_args[1]
+        assert "certificate" in call_args[1]
+        assert "generate_new_key" in call_args[1]
+        assert call_args[1]["generate_new_key"] == "True"
+
+        # Verify exit_json was called with changed=True
+        mock_module.exit_json.assert_called_once()
+        call_args = mock_module.exit_json.call_args[1]
+        assert call_args["changed"] is True
+
+    @patch("plugins.modules.purefb_certs.pycountry")
+    @patch("plugins.modules.purefb_certs.get_system")
+    @patch("plugins.modules.purefb_certs.AnsibleModule")
+    @patch("plugins.modules.purefb_certs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_certs.HAS_PYCOUNTRY", True)
+    def test_main_update_cert_new_api_fails(
+        self, mock_ansible_module, mock_get_system, mock_pycountry
+    ):
+        """Test update_cert fails with new API version"""
+        # Setup mock module
+        mock_module = Mock()
+        mock_module.exit_json = Mock(side_effect=SystemExit)
+        mock_module.fail_json = Mock(side_effect=SystemExit)
+        mock_module.params = {
+            "state": "present",
+            "name": "existing-cert",
+            "export_file": None,
+            "common_name": "test.example.com",
+            "country": "US",
+            "province": None,
+            "locality": None,
+            "organization": None,
+            "org_unit": None,
+            "email": "test@example.com",
+            "key_size": None,
+            "certificate": "new_cert_content",
+            "intermediate_cert": None,
+            "key": "new_key_content",
+            "passphrase": None,
+            "generate": False,
+            "days": None,
+            "key_algorithm": None,
+            "certificate_type": None,
+            "subject_alternative_names": None,
+        }
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        # Mock blade with new API version
+        mock_blade = Mock()
+        mock_blade.get_versions.return_value.items = ["2.20"]
+
+        # Certificate exists
+        mock_blade.get_certificates.return_value.status_code = 200
+
+        # Mock failed patch
+        mock_patch_response = Mock()
+        mock_patch_response.status_code = 400
+        mock_error = Mock()
+        mock_error.message = "Invalid certificate"
+        mock_patch_response.errors = [mock_error]
+        mock_blade.patch_certificates.return_value = mock_patch_response
+
+        mock_get_system.return_value = mock_blade
+
+        # Mock pycountry
+        mock_country = Mock()
+        mock_pycountry.countries.get.return_value = mock_country
+
+        # Call main - expect failure
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        # Verify fail_json was called
+        mock_module.fail_json.assert_called_once()
+        call_args = mock_module.fail_json.call_args[1]
+        assert "Updating existing SSL certificate" in call_args["msg"]
+
+    @patch("plugins.modules.purefb_certs.pycountry")
+    @patch("plugins.modules.purefb_certs.get_system")
+    @patch("plugins.modules.purefb_certs.AnsibleModule")
+    @patch("plugins.modules.purefb_certs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_certs.HAS_PYCOUNTRY", True)
+    def test_main_update_cert_old_api_fails(
+        self, mock_ansible_module, mock_get_system, mock_pycountry
+    ):
+        """Test update_cert fails with old API version"""
+        # Setup mock module
+        mock_module = Mock()
+        mock_module.exit_json = Mock(side_effect=SystemExit)
+        mock_module.fail_json = Mock(side_effect=SystemExit)
+        mock_module.params = {
+            "state": "present",
+            "name": "existing-cert",
+            "export_file": None,
+            "common_name": None,
+            "country": None,
+            "province": None,
+            "locality": None,
+            "organization": None,
+            "org_unit": None,
+            "email": None,
+            "key_size": None,
+            "certificate": "new_cert_content",
+            "intermediate_cert": None,
+            "key": "new_key_content",
+            "passphrase": None,
+            "generate": False,
+            "days": None,
+            "key_algorithm": None,
+            "certificate_type": None,
+            "subject_alternative_names": None,
+        }
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        # Mock blade with old API version
+        mock_blade = Mock()
+        mock_blade.get_versions.return_value.items = ["2.15"]
+
+        # Certificate exists
+        mock_blade.get_certificates.return_value.status_code = 200
+
+        # Mock failed patch
+        mock_patch_response = Mock()
+        mock_patch_response.status_code = 400
+        mock_error = Mock()
+        mock_error.message = "Invalid certificate"
+        mock_patch_response.errors = [mock_error]
+        mock_blade.patch_certificates.return_value = mock_patch_response
+
+        mock_get_system.return_value = mock_blade
+
+        # Call main - expect failure
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        # Verify fail_json was called
+        mock_module.fail_json.assert_called_once()
+        call_args = mock_module.fail_json.call_args[1]
+        assert "Updating existing SSL certificate" in call_args["msg"]
+
+    @patch("plugins.modules.purefb_certs.pycountry")
+    @patch("plugins.modules.purefb_certs.get_system")
+    @patch("plugins.modules.purefb_certs.AnsibleModule")
+    @patch("plugins.modules.purefb_certs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_certs.HAS_PYCOUNTRY", True)
+    def test_main_create_cert_new_api_fails(
+        self, mock_ansible_module, mock_get_system, mock_pycountry
+    ):
+        """Test create_cert fails with new API version"""
+        # Setup mock module
+        mock_module = Mock()
+        mock_module.exit_json = Mock(side_effect=SystemExit)
+        mock_module.fail_json = Mock(side_effect=SystemExit)
+        mock_module.params = {
+            "state": "present",
+            "name": "new-cert",
+            "export_file": None,
+            "common_name": "test.example.com",
+            "country": "US",
+            "province": None,
+            "locality": None,
+            "organization": None,
+            "org_unit": None,
+            "email": "test@example.com",
+            "key_size": None,
+            "certificate": "cert_content",
+            "intermediate_cert": None,
+            "key": "key_content",
+            "passphrase": None,
+            "generate": False,
+            "days": None,
+            "key_algorithm": None,
+            "certificate_type": "self-signed",
+            "subject_alternative_names": None,
+        }
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        # Mock blade with new API version
+        mock_blade = Mock()
+        mock_blade.get_versions.return_value.items = ["2.20"]
+
+        # Certificate doesn't exist
+        mock_blade.get_certificates.return_value.status_code = 400
+
+        # Mock failed post
+        mock_post_response = Mock()
+        mock_post_response.status_code = 400
+        mock_error = Mock()
+        mock_error.message = "Invalid certificate"
+        mock_post_response.errors = [mock_error]
+        mock_blade.post_certificates.return_value = mock_post_response
+
+        mock_get_system.return_value = mock_blade
+
+        # Mock pycountry
+        mock_country = Mock()
+        mock_pycountry.countries.get.return_value = mock_country
+
+        # Call main - expect failure
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        # Verify fail_json was called
+        mock_module.fail_json.assert_called_once()
+        call_args = mock_module.fail_json.call_args[1]
+        assert "Creating SSL certificate" in call_args["msg"]
+
+    @patch("plugins.modules.purefb_certs.pycountry")
+    @patch("plugins.modules.purefb_certs.get_system")
+    @patch("plugins.modules.purefb_certs.AnsibleModule")
+    @patch("plugins.modules.purefb_certs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_certs.HAS_PYCOUNTRY", True)
+    def test_main_delete_cert_fails(
+        self, mock_ansible_module, mock_get_system, mock_pycountry
+    ):
+        """Test delete_cert fails"""
+        # Setup mock module
+        mock_module = Mock()
+        mock_module.exit_json = Mock(side_effect=SystemExit)
+        mock_module.fail_json = Mock(side_effect=SystemExit)
+        mock_module.params = {
+            "state": "absent",
+            "name": "test-cert",
+            "export_file": None,
+            "common_name": None,
+            "country": None,
+            "province": None,
+            "locality": None,
+            "organization": None,
+            "org_unit": None,
+            "email": None,
+            "key_size": None,
+            "certificate": None,
+            "intermediate_cert": None,
+            "key": None,
+            "passphrase": None,
+            "generate": False,
+            "days": None,
+            "key_algorithm": None,
+            "certificate_type": None,
+            "subject_alternative_names": None,
+        }
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        # Mock blade
+        mock_blade = Mock()
+        mock_blade.get_versions.return_value.items = ["2.15"]
+
+        # Certificate exists
+        mock_blade.get_certificates.return_value.status_code = 200
+
+        # Mock failed delete
+        mock_delete_response = Mock()
+        mock_delete_response.status_code = 400
+        mock_error = Mock()
+        mock_error.message = "Cannot delete certificate"
+        mock_delete_response.errors = [mock_error]
+        mock_blade.delete_certificates.return_value = mock_delete_response
+
+        mock_get_system.return_value = mock_blade
+
+        # Call main - expect failure
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        # Verify fail_json was called
+        mock_module.fail_json.assert_called_once()
+        call_args = mock_module.fail_json.call_args[1]
+        assert "Failed to delete" in call_args["msg"]
+
+    @patch("plugins.modules.purefb_certs.pycountry")
+    @patch("plugins.modules.purefb_certs.get_system")
+    @patch("plugins.modules.purefb_certs.AnsibleModule")
+    @patch("plugins.modules.purefb_certs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_certs.HAS_PYCOUNTRY", True)
+    def test_main_reimport_external_cert_fails(
+        self, mock_ansible_module, mock_get_system, mock_pycountry
+    ):
+        """Test reimporting external certificate fails"""
+        # Setup mock module
+        mock_module = Mock()
+        mock_module.exit_json = Mock(side_effect=SystemExit)
+        mock_module.fail_json = Mock(side_effect=SystemExit)
+        mock_module.params = {
+            "state": "import",
+            "name": "external-cert",
+            "export_file": None,
+            "common_name": None,
+            "country": None,
+            "province": None,
+            "locality": None,
+            "organization": None,
+            "org_unit": None,
+            "email": None,
+            "key_size": None,
+            "certificate": "cert_content",
+            "intermediate_cert": None,
+            "key": None,  # No key - will be auto-detected as external
+            "passphrase": None,
+            "generate": False,
+            "days": None,
+            "key_algorithm": None,
+            "certificate_type": None,
+            "subject_alternative_names": None,
+        }
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        # Mock blade
+        mock_blade = Mock()
+        mock_blade.get_versions.return_value.items = ["2.15"]
+
+        # Certificate exists and is external
+        mock_cert_response = Mock()
+        mock_cert_response.status_code = 200
+        mock_cert = Mock()
+        mock_cert.certificate_type = "external"
+        mock_cert_response.items = [mock_cert]
+        mock_blade.get_certificates.return_value = mock_cert_response
+
+        mock_get_system.return_value = mock_blade
+
+        # Call main - expect failure
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        # Verify fail_json was called
+        mock_module.fail_json.assert_called_once()
+        call_args = mock_module.fail_json.call_args[1]
+        assert "External Certificates cannot be reimported" in call_args["msg"]
+
+    @patch("plugins.modules.purefb_certs.pycountry")
+    @patch("plugins.modules.purefb_certs.get_system")
+    @patch("plugins.modules.purefb_certs.AnsibleModule")
+    @patch("plugins.modules.purefb_certs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_certs.HAS_PYCOUNTRY", True)
+    def test_main_import_existing_cert(
+        self, mock_ansible_module, mock_get_system, mock_pycountry
+    ):
+        """Test importing over existing non-external certificate"""
+        # Setup mock module
+        mock_module = Mock()
+        mock_module.exit_json = Mock(side_effect=SystemExit)
+        mock_module.fail_json = Mock(side_effect=SystemExit)
+        mock_module.params = {
+            "state": "import",
+            "name": "existing-cert",
+            "export_file": None,
+            "common_name": None,
+            "country": None,
+            "province": None,
+            "locality": None,
+            "organization": None,
+            "org_unit": None,
+            "email": None,
+            "key_size": None,
+            "certificate": "cert_content",
+            "intermediate_cert": None,
+            "key": "key_content",
+            "passphrase": None,
+            "generate": False,
+            "days": None,
+            "key_algorithm": None,
+            "certificate_type": None,
+            "subject_alternative_names": None,
+        }
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        # Mock blade
+        mock_blade = Mock()
+        mock_blade.get_versions.return_value.items = ["2.15"]
+
+        # Certificate exists and is NOT external
+        mock_cert_response = Mock()
+        mock_cert_response.status_code = 200
+        mock_cert = Mock()
+        mock_cert.certificate_type = "self-signed"
+        mock_cert_response.items = [mock_cert]
+        mock_blade.get_certificates.return_value = mock_cert_response
+
+        # Mock successful patch
+        mock_patch_response = Mock()
+        mock_patch_response.status_code = 200
+        mock_blade.patch_certificates.return_value = mock_patch_response
+
+        mock_get_system.return_value = mock_blade
+
+        # Call main
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        # Verify patch_certificates was called (update path)
+        mock_blade.patch_certificates.assert_called_once()
 
         # Verify exit_json was called with changed=True
         mock_module.exit_json.assert_called_once()

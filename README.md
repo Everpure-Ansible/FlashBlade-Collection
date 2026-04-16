@@ -130,6 +130,7 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_policy - manage the filesystem snapshot policies for a FlashBlade
 - purefb_proxy - manage the phone home HTTP proxy settings for a FlashBlade
 - purefb_ra - manage the Remote Assist connections on a FlashBlade
+- purefb_realm - manage the Realms for a FlashBlade
 - purefb_remote_cred - manage the Object Store Remote Credentials on a FlashBlade
 - purefb_s3acc - manage the object store accounts on a FlashBlade
 - purefb_s3user - manage the object atore users on a FlashBlade

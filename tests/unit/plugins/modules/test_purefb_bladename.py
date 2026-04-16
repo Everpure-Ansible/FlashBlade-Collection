@@ -8,13 +8,67 @@ from __future__ import absolute_import, division, print_function
 __metaclass__ = type
 
 import sys
+import multiprocessing
+import ctypes
 from unittest.mock import Mock, patch, MagicMock
+
+# Mock multiprocessing context for Windows
+if sys.platform == "win32":
+    original_get_context = multiprocessing.get_context
+
+    def mock_get_context(method=None):
+        if method == "fork":
+            return original_get_context("spawn")
+        return original_get_context(method)
+
+    multiprocessing.get_context = mock_get_context
+
+    # Mock ctypes LoadLibrary to prevent Windows errors
+    original_load_library = ctypes.cdll.LoadLibrary
+
+    def mock_load_library(name):
+        if name is None or not isinstance(name, str):
+            return MagicMock()
+        try:
+            return original_load_library(name)
+        except (OSError, TypeError):
+            return MagicMock()
+
+    ctypes.cdll.LoadLibrary = mock_load_library
 
 # Mock external dependencies before importing module
 sys.modules["pypureclient"] = MagicMock()
 sys.modules["pypureclient.flashblade"] = MagicMock()
 sys.modules["urllib3"] = MagicMock()
 sys.modules["distro"] = MagicMock()
+# Mock Unix-specific modules for Windows compatibility
+sys.modules["grp"] = MagicMock()
+sys.modules["fcntl"] = MagicMock()
+sys.modules["pwd"] = MagicMock()
+sys.modules["syslog"] = MagicMock()
+# Mock termios with required constants
+mock_termios = MagicMock()
+mock_termios.TCSAFLUSH = 2
+sys.modules["termios"] = mock_termios
+sys.modules["tty"] = MagicMock()
+
+# Mock ansible_collections module structure
+sys.modules["ansible_collections"] = MagicMock()
+sys.modules["ansible_collections.purestorage"] = MagicMock()
+sys.modules["ansible_collections.purestorage.flashblade"] = MagicMock()
+sys.modules["ansible_collections.purestorage.flashblade.plugins"] = MagicMock()
+sys.modules["ansible_collections.purestorage.flashblade.plugins.module_utils"] = (
+    MagicMock()
+)
+sys.modules[
+    "ansible_collections.purestorage.flashblade.plugins.module_utils.purefb"
+] = MagicMock()
+sys.modules[
+    "ansible_collections.purestorage.flashblade.plugins.module_utils.common"
+] = MagicMock()
+sys.modules[
+    "ansible_collections.purestorage.flashblade.plugins.module_utils.version"
+] = MagicMock()
 
 from plugins.modules.purefb_bladename import main, update_name
 

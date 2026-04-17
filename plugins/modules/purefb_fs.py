@@ -371,25 +371,12 @@ def create_fs(module, blade):
     """Create Filesystem"""
     changed = True
     api_version = list(blade.get_versions().items)
-    if not module.check_mode:
-        # Determine realm from either realm parameter or name prefix (realm::fs)
-        realm_name = None
-        if module.params.get("realm"):
-            realm_name = module.params["realm"]
-        elif "::" in module.params["name"]:
-            # Extract realm from name (e.g., "production::prod-fs" -> "production")
-            realm_name = module.params["name"].split("::")[0]
 
-        # Validate realm if present
-        if realm_name:
-            if REALM_API_VERSION not in api_version:
-                module.fail_json(
-                    msg="Realm support requires Purity//FB 4.6.1+ (REST API 2.19+)"
-                )
-            # Check realm exists
-            realm_check = blade.get_realms(destroyed=False, names=[realm_name])
-            if realm_check.status_code != 200:
-                module.fail_json(msg="Realm '{0}' does not exist".format(realm_name))
+    # Realm validation is now done in main()
+    # Just determine if this is a realm filesystem for conditional logic
+    realm_name = "::" in module.params["name"]
+
+    if not module.check_mode:
 
         if not module.params["nfs_rules"]:
             module.params["nfs_rules"] = "*(rw,no_root_squash)"
@@ -1287,13 +1274,33 @@ def main():
     state = module.params["state"]
     blade = get_system(module)
 
-    # Handle realm parameter - construct qualified name if needed
+    # Handle realm parameter - validate and construct qualified name
     # This happens BEFORE filesystem lookup so all functions work with qualified name
-    if module.params.get("realm") and "::" not in module.params["name"]:
-        # Construct qualified name: realm::filesystem
-        module.params["name"] = "{0}::{1}".format(
-            module.params["realm"], module.params["name"]
-        )
+    realm_name = None
+
+    # Determine realm from either parameter or name prefix
+    if module.params.get("realm"):
+        realm_name = module.params["realm"]
+        # Construct qualified name if not already present
+        if "::" not in module.params["name"]:
+            module.params["name"] = "{0}::{1}".format(
+                module.params["realm"], module.params["name"]
+            )
+    elif "::" in module.params["name"]:
+        # Extract realm from name (e.g., "production::prod-fs" -> "production")
+        realm_name = module.params["name"].split("::")[0]
+
+    # Validate realm exists if one is specified
+    if realm_name and not module.check_mode:
+        api_version = list(blade.get_versions().items)
+        if REALM_API_VERSION not in api_version:
+            module.fail_json(
+                msg="Realm support requires Purity//FB 4.6.1+ (REST API 2.19+)"
+            )
+        # Check realm exists
+        realm_check = blade.get_realms(destroyed=False, names=[realm_name])
+        if realm_check.status_code != 200:
+            module.fail_json(msg="Realm '{0}' does not exist".format(realm_name))
 
     # Now check if filesystem exists (using qualified name if realm was provided)
     fsys = get_filesystem(module, blade)

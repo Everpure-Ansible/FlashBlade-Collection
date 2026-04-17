@@ -809,8 +809,17 @@ def modify_fs(module, blade):
     if module.params["nfsv4"] != fsys.nfs.v4_1_enabled:
         new_fsys["nfsv4"] = module.params["nfsv4"]
         mod_fs = True
+
+    # Check if this is a realm filesystem (has :: in name)
+    is_realm_fs = "::" in module.params["name"]
+
     if module.params["nfs_rules"] is not None:
-        if sorted(fsys.nfs.rules) != sorted(module.params["nfs_rules"]):
+        if is_realm_fs and module.params["nfs_rules"] != "":
+            module.warn(
+                "nfs_rules parameter is not supported for realm filesystems and will be ignored. "
+                "NFS rules cannot be modified for filesystems in realms."
+            )
+        elif sorted(fsys.nfs.rules) != sorted(module.params["nfs_rules"]):
             new_fsys["nfs_rules"] = module.params["nfs_rules"]
             mod_fs = True
     if module.params["user_quota"] and user_quota != fsys.default_user_quota:

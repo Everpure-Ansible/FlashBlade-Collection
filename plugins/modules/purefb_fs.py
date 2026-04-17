@@ -437,41 +437,41 @@ def create_fs(module, blade):
         elif "::" in module.params["name"]:
             realm_name = module.params["name"].split("::")[0]
 
-        # Build FileSystemPost object
-        # Note: Realm filesystems can ONLY have provisioned parameter at creation
-        # All other settings must be applied via PATCH after creation
-        if realm_name:
-            # Warn user if they specified parameters that will be ignored
-            if module.params.get("nfs_rules") and module.params["nfs_rules"] != "":
-                module.warn(
-                    "nfs_rules parameter is not supported for realm filesystems and will be ignored. "
-                    "NFS rules cannot be set at creation time for filesystems in realms."
-                )
-
-            # Realm filesystems: ONLY provisioned parameter allowed at creation
-            # Note: user_quota, group_quota, and hard_limit ARE supported for realm filesystems
-            fs_obj = FileSystemPost(provisioned=size)
-        else:
-            # Full parameters for non-realm filesystems
-            fs_obj = FileSystemPost(
-                provisioned=size,
-                fast_remove_directory_enabled=module.params["fastremove"],
-                hard_limit_enabled=module.params["hard_limit"],
-                snapshot_directory_enabled=module.params["snapshot"],
-                nfs=Nfs(
-                    v3_enabled=module.params["nfsv3"],
-                    v4_1_enabled=module.params["nfsv4"],
-                    rules=module.params["nfs_rules"],
-                ),
-                smb=SmbPost(enabled=module.params["smb"]),
-                http=Http(enabled=module.params["http"]),
-                multi_protocol=MultiProtocolPost(
-                    safeguard_acls=module.params["safeguard_acls"],
-                    access_control_style=module.params["access_control"],
-                ),
-                default_user_quota=user_quota,
-                default_group_quota=group_quota,
+        # Warn user if they specified nfs_rules for realm filesystems
+        if (
+            realm_name
+            and module.params.get("nfs_rules")
+            and module.params["nfs_rules"] != ""
+        ):
+            module.warn(
+                "nfs_rules parameter is not supported for realm filesystems and will be ignored. "
+                "NFS rules cannot be set at creation time for filesystems in realms."
             )
+
+        # Build FileSystemPost object
+        # For realm filesystems: exclude nfs_rules (set to empty string)
+        # For non-realm filesystems: include all parameters
+        nfs_rules_value = "" if realm_name else module.params["nfs_rules"]
+
+        fs_obj = FileSystemPost(
+            provisioned=size,
+            fast_remove_directory_enabled=module.params["fastremove"],
+            hard_limit_enabled=module.params["hard_limit"],
+            snapshot_directory_enabled=module.params["snapshot"],
+            nfs=Nfs(
+                v3_enabled=module.params["nfsv3"],
+                v4_1_enabled=module.params["nfsv4"],
+                rules=nfs_rules_value,
+            ),
+            smb=SmbPost(enabled=module.params["smb"]),
+            http=Http(enabled=module.params["http"]),
+            multi_protocol=MultiProtocolPost(
+                safeguard_acls=module.params["safeguard_acls"],
+                access_control_style=module.params["access_control"],
+            ),
+            default_user_quota=user_quota,
+            default_group_quota=group_quota,
+        )
         # Construct filesystem name - if realm provided, prepend realm::
         # (realm_name was already determined above when building fs_obj)
         fs_name = module.params["name"]

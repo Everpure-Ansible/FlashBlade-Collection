@@ -288,7 +288,7 @@ EXAMPLES = """
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
-- name: the iss that ven thou hth ansible Eradicate filesystem named foo
+- name: Eradicate filesystem named foo
   purestorage.flashblade.purefb_fs:
     name: foo
     state: absent
@@ -447,13 +447,9 @@ def create_fs(module, blade):
                     "nfs_rules parameter is not supported for realm filesystems and will be ignored. "
                     "NFS rules cannot be set at creation time for filesystems in realms."
                 )
-            if module.params.get("hard_limit"):
-                module.warn(
-                    "hard_limit parameter is not supported for realm filesystems and will be ignored."
-                )
 
             # Realm filesystems: ONLY provisioned parameter allowed at creation
-            # Note: user_quota and group_quota ARE supported for realm filesystems
+            # Note: user_quota, group_quota, and hard_limit ARE supported for realm filesystems
             fs_obj = FileSystemPost(provisioned=size)
         else:
             # Full parameters for non-realm filesystems

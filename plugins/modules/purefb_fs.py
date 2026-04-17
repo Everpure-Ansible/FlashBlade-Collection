@@ -430,10 +430,18 @@ def create_fs(module, blade):
             module.fail_json(
                 msg="ACL Safeguarding cannot be enabled if access_control is mode-bits or independent."
             )
+        # Determine if this is a realm filesystem
+        realm_name = None
+        if module.params.get("realm"):
+            realm_name = module.params["realm"]
+        elif "::" in module.params["name"]:
+            realm_name = module.params["name"].split("::")[0]
+
+        # Build FileSystemPost object
+        # Note: hard_limit_enabled is not valid for realm filesystems
         fs_obj = FileSystemPost(
             provisioned=size,
             fast_remove_directory_enabled=module.params["fastremove"],
-            hard_limit_enabled=module.params["hard_limit"],
             snapshot_directory_enabled=module.params["snapshot"],
             nfs=Nfs(
                 v3_enabled=module.params["nfsv3"],
@@ -449,15 +457,15 @@ def create_fs(module, blade):
             default_user_quota=user_quota,
             default_group_quota=group_quota,
         )
+
+        # Add hard_limit_enabled only for non-realm filesystems
+        if not realm_name and module.params["hard_limit"]:
+            fs_obj.hard_limit_enabled = module.params["hard_limit"]
         # Construct filesystem name - if realm provided, prepend realm::
+        # (realm_name was already determined above when building fs_obj)
         fs_name = module.params["name"]
-        realm_name = None
-        if module.params.get("realm"):
-            fs_name = "{0}::{1}".format(module.params["realm"], module.params["name"])
-            realm_name = module.params["realm"]
-        elif "::" in module.params["name"]:
-            # Realm specified in name prefix
-            realm_name = module.params["name"].split("::")[0]
+        if realm_name and "::" not in fs_name:
+            fs_name = "{0}::{1}".format(realm_name, fs_name)
 
         # Build post_file_systems call with optional parameters
         post_kwargs = {
@@ -469,15 +477,15 @@ def create_fs(module, blade):
         if CONTEXT_API_VERSION in api_version:
             post_kwargs["context_names"] = [module.params["context"]]
 
-        # Add default_exports="" for realm filesystems
+        # Add default_exports=[] for realm filesystems (empty list, not string)
         if realm_name:
-            post_kwargs["default_exports"] = ""
+            post_kwargs["default_exports"] = []
 
         res = blade.post_file_systems(**post_kwargs)
         if res.status_code != 200:
             module.fail_json(
                 msg="Failed to create filesystem {0}. Error: {1}".format(
-                    module.params["name"], get_error_message(res)
+                    fs_name, get_error_message(res)
                 )
             )
         if module.params["policy"]:

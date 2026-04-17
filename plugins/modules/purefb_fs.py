@@ -438,29 +438,42 @@ def create_fs(module, blade):
             realm_name = module.params["name"].split("::")[0]
 
         # Build FileSystemPost object
-        # Note: hard_limit_enabled is not valid for realm filesystems
-        fs_obj = FileSystemPost(
-            provisioned=size,
-            fast_remove_directory_enabled=module.params["fastremove"],
-            snapshot_directory_enabled=module.params["snapshot"],
-            nfs=Nfs(
-                v3_enabled=module.params["nfsv3"],
-                v4_1_enabled=module.params["nfsv4"],
-                rules=module.params["nfs_rules"],
-            ),
-            smb=SmbPost(enabled=module.params["smb"]),
-            http=Http(enabled=module.params["http"]),
-            multi_protocol=MultiProtocolPost(
-                safeguard_acls=module.params["safeguard_acls"],
-                access_control_style=module.params["access_control"],
-            ),
-            default_user_quota=user_quota,
-            default_group_quota=group_quota,
-        )
-
-        # Add hard_limit_enabled only for non-realm filesystems
-        if not realm_name and module.params["hard_limit"]:
-            fs_obj.hard_limit_enabled = module.params["hard_limit"]
+        # Note: Realm filesystems have restrictions on supported parameters
+        if realm_name:
+            # Minimal parameters for realm filesystems
+            fs_obj = FileSystemPost(
+                provisioned=size,
+                fast_remove_directory_enabled=module.params["fastremove"],
+                snapshot_directory_enabled=module.params["snapshot"],
+                nfs=Nfs(
+                    v3_enabled=module.params["nfsv3"],
+                    v4_1_enabled=module.params["nfsv4"],
+                    rules=module.params["nfs_rules"],
+                ),
+                smb=SmbPost(enabled=module.params["smb"]),
+                http=Http(enabled=module.params["http"]),
+            )
+        else:
+            # Full parameters for non-realm filesystems
+            fs_obj = FileSystemPost(
+                provisioned=size,
+                fast_remove_directory_enabled=module.params["fastremove"],
+                hard_limit_enabled=module.params["hard_limit"],
+                snapshot_directory_enabled=module.params["snapshot"],
+                nfs=Nfs(
+                    v3_enabled=module.params["nfsv3"],
+                    v4_1_enabled=module.params["nfsv4"],
+                    rules=module.params["nfs_rules"],
+                ),
+                smb=SmbPost(enabled=module.params["smb"]),
+                http=Http(enabled=module.params["http"]),
+                multi_protocol=MultiProtocolPost(
+                    safeguard_acls=module.params["safeguard_acls"],
+                    access_control_style=module.params["access_control"],
+                ),
+                default_user_quota=user_quota,
+                default_group_quota=group_quota,
+            )
         # Construct filesystem name - if realm provided, prepend realm::
         # (realm_name was already determined above when building fs_obj)
         fs_name = module.params["name"]

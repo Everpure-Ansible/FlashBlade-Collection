@@ -447,20 +447,13 @@ def create_fs(module, blade):
                     "nfs_rules parameter is not supported for realm filesystems and will be ignored. "
                     "NFS rules cannot be set at creation time for filesystems in realms."
                 )
-            if module.params.get("user_quota"):
-                module.warn(
-                    "user_quota parameter is not supported for realm filesystems and will be ignored."
-                )
-            if module.params.get("group_quota"):
-                module.warn(
-                    "group_quota parameter is not supported for realm filesystems and will be ignored."
-                )
             if module.params.get("hard_limit"):
                 module.warn(
                     "hard_limit parameter is not supported for realm filesystems and will be ignored."
                 )
 
-            # Realm filesystems: ONLY provisioned parameter allowed
+            # Realm filesystems: ONLY provisioned parameter allowed at creation
+            # Note: user_quota and group_quota ARE supported for realm filesystems
             fs_obj = FileSystemPost(provisioned=size)
         else:
             # Full parameters for non-realm filesystems

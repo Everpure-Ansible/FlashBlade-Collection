@@ -444,12 +444,10 @@ def create_fs(module, blade):
             ),
             default_user_quota=user_quota,
             default_group_quota=group_quota,
-            realm=(
-                Reference(name=module.params.get("realm"))
-                if module.params.get("realm")
-                else None
-            ),
         )
+        # Add realm if provided (must be done after FileSystemPost creation)
+        if module.params.get("realm"):
+            fs_obj.realm = Reference(name=module.params.get("realm"))
         if CONTEXT_API_VERSION in api_version:
             res = blade.post_file_systems(
                 names=[module.params["name"]],

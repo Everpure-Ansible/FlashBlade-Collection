@@ -372,20 +372,24 @@ def create_fs(module, blade):
     changed = True
     api_version = list(blade.get_versions().items)
     if not module.check_mode:
-        # Validate realm if provided
+        # Determine realm from either realm parameter or name prefix (realm::fs)
+        realm_name = None
         if module.params.get("realm"):
+            realm_name = module.params["realm"]
+        elif "::" in module.params["name"]:
+            # Extract realm from name (e.g., "production::prod-fs" -> "production")
+            realm_name = module.params["name"].split("::")[0]
+
+        # Validate realm if present
+        if realm_name:
             if REALM_API_VERSION not in api_version:
                 module.fail_json(
                     msg="Realm support requires Purity//FB 4.6.1+ (REST API 2.19+)"
                 )
             # Check realm exists
-            realm_check = blade.get_realms(
-                destroyed=False, names=[module.params["realm"]]
-            )
+            realm_check = blade.get_realms(destroyed=False, names=[realm_name])
             if realm_check.status_code != 200:
-                module.fail_json(
-                    msg="Realm '{0}' does not exist".format(module.params["realm"])
-                )
+                module.fail_json(msg="Realm '{0}' does not exist".format(realm_name))
 
         if not module.params["nfs_rules"]:
             module.params["nfs_rules"] = "*(rw,no_root_squash)"

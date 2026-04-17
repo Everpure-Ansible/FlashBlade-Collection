@@ -4080,6 +4080,62 @@ class TestPurefbFs:
         # Verify filesystem was created
         mock_blade.post_file_systems.assert_called_once()
 
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.get_system")
+    def test_create_fs_with_realm_prefix_in_name_validates_realm(
+        self, mock_get_system, mock_get_filesystem
+    ):
+        """Test that realm is validated when specified in filesystem name
+
+        When user provides name='production::prod-fs' (realm prefix in name),
+        the module should extract the realm and validate it exists.
+        """
+        mock_module = Mock()
+        mock_module.check_mode = False
+        mock_module.fail_json = Mock(side_effect=SystemExit)
+        mock_module.params = self.get_default_params()
+        mock_module.params["name"] = "production-realm::prod-fs"  # Realm in name
+        mock_module.params["realm"] = None  # No realm parameter
+        mock_module.params["state"] = "present"
+
+        mock_blade = Mock()
+        # Mock API version 2.19+
+        versions = []
+        for ver in ["2.19"]:
+            mock_ver = Mock()
+            mock_ver.version = ver
+            mock_ver.__eq__ = lambda self, other: self.version == other
+            versions.append(mock_ver)
+        mock_blade.get_versions.return_value.items = versions
+
+        mock_get_filesystem.return_value = None
+
+        # Mock realm does not exist
+        mock_realm_response = Mock()
+        mock_realm_response.status_code = 400
+        mock_blade.get_realms.return_value = mock_realm_response
+
+        mock_get_system.return_value = mock_blade
+
+        # Call create_fs - should fail
+        from plugins.modules.purefb_fs import create_fs
+
+        try:
+            create_fs(mock_module, mock_blade)
+        except SystemExit:
+            pass
+
+        # Verify realm was checked (extracted from name)
+        mock_blade.get_realms.assert_called_once_with(
+            destroyed=False, names=["production-realm"]
+        )
+
+        # Verify fail_json was called
+        assert mock_module.fail_json.called
+        call_args = mock_module.fail_json.call_args[1]
+        assert "does not exist" in call_args["msg"]
+        assert "production-realm" in call_args["msg"]
+
     def test_modify_fs_with_realm_association_succeeds(self):
         """Test modifying a filesystem that has a realm association works correctly
 

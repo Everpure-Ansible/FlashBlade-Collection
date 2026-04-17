@@ -472,15 +472,10 @@ def create_fs(module, blade):
             default_user_quota=user_quota,
             default_group_quota=group_quota,
         )
-        # Construct filesystem name - if realm provided, prepend realm::
-        # (realm_name was already determined above when building fs_obj)
-        fs_name = module.params["name"]
-        if realm_name and "::" not in fs_name:
-            fs_name = "{0}::{1}".format(realm_name, fs_name)
-
-        # Build post_file_systems call with optional parameters
+        # Filesystem name is already qualified in main() if realm parameter was provided
+        # Just use it directly from module.params["name"]
         post_kwargs = {
-            "names": [fs_name],
+            "names": [module.params["name"]],
             "file_system": fs_obj,
         }
 
@@ -496,7 +491,7 @@ def create_fs(module, blade):
         if res.status_code != 200:
             module.fail_json(
                 msg="Failed to create filesystem {0}. Error: {1}".format(
-                    fs_name, get_error_message(res)
+                    module.params["name"], get_error_message(res)
                 )
             )
         if module.params["policy"]:
@@ -1292,19 +1287,16 @@ def main():
     state = module.params["state"]
     blade = get_system(module)
 
-    # Check if filesystem exists
-    # If realm is provided and filesystem name doesn't include realm prefix,
-    # also check for realm::filesystem format
+    # Handle realm parameter - construct qualified name if needed
+    # This happens BEFORE filesystem lookup so all functions work with qualified name
+    if module.params.get("realm") and "::" not in module.params["name"]:
+        # Construct qualified name: realm::filesystem
+        module.params["name"] = "{0}::{1}".format(
+            module.params["realm"], module.params["name"]
+        )
+
+    # Now check if filesystem exists (using qualified name if realm was provided)
     fsys = get_filesystem(module, blade)
-    if not fsys and module.params.get("realm") and "::" not in module.params["name"]:
-        # Try looking for realm::filesystem format
-        original_name = module.params["name"]
-        qualified_name = "{0}::{1}".format(module.params["realm"], original_name)
-        module.params["name"] = qualified_name
-        fsys = get_filesystem(module, blade)
-        # If not found with qualified name, restore original name for creation
-        if not fsys:
-            module.params["name"] = original_name
 
     if module.params["eradicate"] and state == "present":
         module.warn("Eradicate flag ignored without state=absent")

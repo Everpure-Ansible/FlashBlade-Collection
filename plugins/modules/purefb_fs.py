@@ -451,18 +451,29 @@ def create_fs(module, blade):
         )
         # Construct filesystem name - if realm provided, prepend realm::
         fs_name = module.params["name"]
+        realm_name = None
         if module.params.get("realm"):
             fs_name = "{0}::{1}".format(module.params["realm"], module.params["name"])
+            realm_name = module.params["realm"]
+        elif "::" in module.params["name"]:
+            # Realm specified in name prefix
+            realm_name = module.params["name"].split("::")[0]
 
         # Build post_file_systems call with optional parameters
+        post_kwargs = {
+            "names": [fs_name],
+            "file_system": fs_obj,
+        }
+
+        # Add context if API supports it
         if CONTEXT_API_VERSION in api_version:
-            res = blade.post_file_systems(
-                names=[fs_name],
-                file_system=fs_obj,
-                context_names=[module.params["context"]],
-            )
-        else:
-            res = blade.post_file_systems(names=[fs_name], file_system=fs_obj)
+            post_kwargs["context_names"] = [module.params["context"]]
+
+        # Add default_exports="" for realm filesystems
+        if realm_name:
+            post_kwargs["default_exports"] = ""
+
+        res = blade.post_file_systems(**post_kwargs)
         if res.status_code != 200:
             module.fail_json(
                 msg="Failed to create filesystem {0}. Error: {1}".format(

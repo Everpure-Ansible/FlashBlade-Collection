@@ -288,7 +288,7 @@ EXAMPLES = """
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
-- name: Eradicate filesystem named foo
+- name: the iss that ven thou hth ansible Eradicate filesystem named foo
   purestorage.flashblade.purefb_fs:
     name: foo
     state: absent
@@ -445,19 +445,20 @@ def create_fs(module, blade):
             default_user_quota=user_quota,
             default_group_quota=group_quota,
         )
-        # Add realm if provided (must be done after FileSystemPost creation)
+        # Construct filesystem name - if realm provided, prepend realm::
+        fs_name = module.params["name"]
         if module.params.get("realm"):
-            fs_obj.realm = Reference(name=module.params.get("realm"))
+            fs_name = "{0}::{1}".format(module.params["realm"], module.params["name"])
+
+        # Build post_file_systems call with optional parameters
         if CONTEXT_API_VERSION in api_version:
             res = blade.post_file_systems(
-                names=[module.params["name"]],
+                names=[fs_name],
                 file_system=fs_obj,
                 context_names=[module.params["context"]],
             )
         else:
-            res = blade.post_file_systems(
-                names=[module.params["name"]], file_system=fs_obj
-            )
+            res = blade.post_file_systems(names=[fs_name], file_system=fs_obj)
         if res.status_code != 200:
             module.fail_json(
                 msg="Failed to create filesystem {0}. Error: {1}".format(

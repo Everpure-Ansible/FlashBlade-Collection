@@ -231,6 +231,15 @@ options:
     type: str
     default: ""
     version_added: "1.22.0"
+  realm:
+    description:
+    - Name of the realm to associate the filesystem with.
+    - Requires Purity//FB 4.6.1+ (REST API 2.19+).
+    - Can only be set at filesystem creation time.
+    - To move a filesystem to a different realm, the filesystem must be destroyed and recreated.
+    - If the realm has a QoS policy, the filesystem will inherit it unless overridden.
+    type: str
+    version_added: "1.25.0"
 extends_documentation_fragment:
     - purestorage.flashblade.purestorage.fb
 """
@@ -243,6 +252,27 @@ EXAMPLES = """
     state: present
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Create new filesystem in realm
+  purestorage.flashblade.purefb_fs:
+    name: prod-fs
+    size: 5T
+    realm: production-realm
+    state: present
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+  # Filesystem will be created as 'production-realm::prod-fs'
+
+- name: Modify filesystem that belongs to a realm
+  purestorage.flashblade.purefb_fs:
+    name: production-realm::prod-fs
+    size: 10T
+    nfsv4: false
+    state: present
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+  # Note: Use full realm::filesystem name for modifications
+  # Realm association cannot be changed after creation
 
 - name: Delete filesystem named foo
   purestorage.flashblade.purefb_fs:
@@ -334,13 +364,16 @@ SMB_POLICY_API_VERSION = "2.10"
 CA_API_VERSION = "2.12"
 GOWNER_API_VERSION = "2.13"
 CONTEXT_API_VERSION = "2.17"
+REALM_API_VERSION = "2.19"
 
 
 def create_fs(module, blade):
     """Create Filesystem"""
     changed = True
     api_version = list(blade.get_versions().items)
+
     if not module.check_mode:
+
         if not module.params["nfs_rules"]:
             module.params["nfs_rules"] = "*(rw,no_root_squash)"
         if module.params["size"]:
@@ -380,6 +413,29 @@ def create_fs(module, blade):
             module.fail_json(
                 msg="ACL Safeguarding cannot be enabled if access_control is mode-bits or independent."
             )
+        # Determine if this is a realm filesystem
+        realm_name = None
+        if module.params.get("realm"):
+            realm_name = module.params["realm"]
+        elif "::" in module.params["name"]:
+            realm_name = module.params["name"].split("::")[0]
+
+        # Warn user if they specified nfs_rules for realm filesystems
+        if (
+            realm_name
+            and module.params.get("nfs_rules")
+            and module.params["nfs_rules"] != ""
+        ):
+            module.warn(
+                "nfs_rules parameter is not supported for realm filesystems and will be ignored. "
+                "NFS rules cannot be set at creation time for filesystems in realms."
+            )
+
+        # Build FileSystemPost object
+        # For realm filesystems: exclude nfs_rules (set to empty string)
+        # For non-realm filesystems: include all parameters
+        nfs_rules_value = "" if realm_name else module.params["nfs_rules"]
+
         fs_obj = FileSystemPost(
             provisioned=size,
             fast_remove_directory_enabled=module.params["fastremove"],
@@ -388,7 +444,7 @@ def create_fs(module, blade):
             nfs=Nfs(
                 v3_enabled=module.params["nfsv3"],
                 v4_1_enabled=module.params["nfsv4"],
-                rules=module.params["nfs_rules"],
+                rules=nfs_rules_value,
             ),
             smb=SmbPost(enabled=module.params["smb"]),
             http=Http(enabled=module.params["http"]),
@@ -399,16 +455,22 @@ def create_fs(module, blade):
             default_user_quota=user_quota,
             default_group_quota=group_quota,
         )
+        # Filesystem name is already qualified in main() if realm parameter was provided
+        # Just use it directly from module.params["name"]
+        post_kwargs = {
+            "names": [module.params["name"]],
+            "file_system": fs_obj,
+        }
+
+        # Add context if API supports it
         if CONTEXT_API_VERSION in api_version:
-            res = blade.post_file_systems(
-                names=[module.params["name"]],
-                file_system=fs_obj,
-                context_names=[module.params["context"]],
-            )
-        else:
-            res = blade.post_file_systems(
-                names=[module.params["name"]], file_system=fs_obj
-            )
+            post_kwargs["context_names"] = [module.params["context"]]
+
+        # Add default_exports=[""] for realm filesystems (list with empty string)
+        if realm_name:
+            post_kwargs["default_exports"] = [""]
+
+        res = blade.post_file_systems(**post_kwargs)
         if res.status_code != 200:
             module.fail_json(
                 msg="Failed to create filesystem {0}. Error: {1}".format(
@@ -725,8 +787,17 @@ def modify_fs(module, blade):
     if module.params["nfsv4"] != fsys.nfs.v4_1_enabled:
         new_fsys["nfsv4"] = module.params["nfsv4"]
         mod_fs = True
+
+    # Check if this is a realm filesystem (has :: in name)
+    is_realm_fs = "::" in module.params["name"]
+
     if module.params["nfs_rules"] is not None:
-        if sorted(fsys.nfs.rules) != sorted(module.params["nfs_rules"]):
+        if is_realm_fs and module.params["nfs_rules"] != "":
+            module.warn(
+                "nfs_rules parameter is not supported for realm filesystems and will be ignored. "
+                "NFS rules cannot be modified for filesystems in realms."
+            )
+        elif sorted(fsys.nfs.rules) != sorted(module.params["nfs_rules"]):
             new_fsys["nfs_rules"] = module.params["nfs_rules"]
             mod_fs = True
     if module.params["user_quota"] and user_quota != fsys.default_user_quota:
@@ -1190,6 +1261,7 @@ def main():
             cancel_in_progress=dict(type="bool", default=False),
             context=dict(type="str", default=""),
             storage_class=dict(type="str"),
+            realm=dict(type="str"),
         )
     )
 
@@ -1197,6 +1269,36 @@ def main():
 
     state = module.params["state"]
     blade = get_system(module)
+
+    # Handle realm parameter - validate and construct qualified name
+    # This happens BEFORE filesystem lookup so all functions work with qualified name
+    realm_name = None
+
+    # Determine realm from either parameter or name prefix
+    if module.params.get("realm"):
+        realm_name = module.params["realm"]
+        # Construct qualified name if not already present
+        if "::" not in module.params["name"]:
+            module.params["name"] = "{0}::{1}".format(
+                module.params["realm"], module.params["name"]
+            )
+    elif "::" in module.params["name"]:
+        # Extract realm from name (e.g., "production::prod-fs" -> "production")
+        realm_name = module.params["name"].split("::")[0]
+
+    # Validate realm exists if one is specified
+    if realm_name and not module.check_mode:
+        api_version = list(blade.get_versions().items)
+        if REALM_API_VERSION not in api_version:
+            module.fail_json(
+                msg="Realm support requires Purity//FB 4.6.1+ (REST API 2.19+)"
+            )
+        # Check realm exists
+        realm_check = blade.get_realms(destroyed=False, names=[realm_name])
+        if realm_check.status_code != 200:
+            module.fail_json(msg="Realm '{0}' does not exist".format(realm_name))
+
+    # Now check if filesystem exists (using qualified name if realm was provided)
     fsys = get_filesystem(module, blade)
 
     if module.params["eradicate"] and state == "present":

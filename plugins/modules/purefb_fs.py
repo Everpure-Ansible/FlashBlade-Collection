@@ -1249,7 +1249,20 @@ def main():
 
     state = module.params["state"]
     blade = get_system(module)
+
+    # Check if filesystem exists
+    # If realm is provided and filesystem name doesn't include realm prefix,
+    # also check for realm::filesystem format
     fsys = get_filesystem(module, blade)
+    if not fsys and module.params.get("realm") and "::" not in module.params["name"]:
+        # Try looking for realm::filesystem format
+        original_name = module.params["name"]
+        qualified_name = "{0}::{1}".format(module.params["realm"], original_name)
+        module.params["name"] = qualified_name
+        fsys = get_filesystem(module, blade)
+        # If not found with qualified name, restore original name for creation
+        if not fsys:
+            module.params["name"] = original_name
 
     if module.params["eradicate"] and state == "present":
         module.warn("Eradicate flag ignored without state=absent")

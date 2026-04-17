@@ -4098,3 +4098,63 @@ class TestPurefbFs:
         # 4. Realm association persists after modification (cannot be changed)
 
         assert True  # Documentation test - realm doesn't affect modify operations
+
+    @patch("plugins.modules.purefb_fs.modify_fs")
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.get_system")
+    @patch("plugins.modules.purefb_fs.AnsibleModule")
+    def test_main_modify_fs_using_name_and_realm_params(
+        self, mock_ansible_module, mock_get_system, mock_get_filesystem, mock_modify_fs
+    ):
+        """Test that providing name='fs' and realm='realm' allows modification
+
+        When a filesystem exists as 'realm::fs' and user provides:
+        - name='fs' (just filesystem name)
+        - realm='realm'
+
+        The module should find the existing filesystem and call modify_fs
+        instead of trying to create it.
+        """
+        # Setup mock module
+        mock_module = Mock()
+        mock_module.check_mode = False
+        mock_module.params = self.get_default_params()
+        mock_module.params["name"] = "prod-fs"
+        mock_module.params["realm"] = "production-realm"
+        mock_module.params["state"] = "present"
+        mock_module.params["size"] = "10T"
+        mock_ansible_module.return_value = mock_module
+
+        # Mock blade
+        mock_blade = Mock()
+        mock_blade.get_versions.return_value.items = ["2.19"]
+        mock_get_system.return_value = mock_blade
+
+        # Mock get_filesystem behavior:
+        # First call with name='prod-fs' returns None (not found)
+        # Second call with name='production-realm::prod-fs' returns the filesystem
+        mock_fs = Mock()
+        mock_fs.name = "production-realm::prod-fs"
+        mock_fs.provisioned = 1099511627776
+
+        def get_fs_side_effect(module, blade):
+            # Return filesystem when called with qualified name
+            if module.params["name"] == "production-realm::prod-fs":
+                return mock_fs
+            return None
+
+        mock_get_filesystem.side_effect = get_fs_side_effect
+
+        # Call main
+        from plugins.modules.purefb_fs import main
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        # Verify modify_fs was called (not create_fs)
+        mock_modify_fs.assert_called_once()
+
+        # Verify the module name was updated to qualified format
+        assert mock_module.params["name"] == "production-realm::prod-fs"

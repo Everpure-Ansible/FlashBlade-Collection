@@ -440,11 +440,9 @@ def create_fs(module, blade):
         # Build FileSystemPost object
         # Note: Realm filesystems have restrictions on supported parameters
         if realm_name:
-            # Minimal parameters for realm filesystems
+            # Minimal parameters for realm filesystems - only provisioned and protocols
             fs_obj = FileSystemPost(
                 provisioned=size,
-                fast_remove_directory_enabled=module.params["fastremove"],
-                snapshot_directory_enabled=module.params["snapshot"],
                 nfs=Nfs(
                     v3_enabled=module.params["nfsv3"],
                     v4_1_enabled=module.params["nfsv4"],
@@ -486,8 +484,8 @@ def create_fs(module, blade):
             "file_system": fs_obj,
         }
 
-        # Add context if API supports it (but NOT for realm filesystems)
-        if CONTEXT_API_VERSION in api_version and not realm_name:
+        # Add context if API supports it
+        if CONTEXT_API_VERSION in api_version:
             post_kwargs["context_names"] = [module.params["context"]]
 
         # Add default_exports=[] for realm filesystems (empty list, not string)

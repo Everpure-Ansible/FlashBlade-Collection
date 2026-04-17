@@ -4136,6 +4136,56 @@ class TestPurefbFs:
         assert "does not exist" in call_args["msg"]
         assert "production-realm" in call_args["msg"]
 
+    @patch("plugins.modules.purefb_fs.delete_fs")
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.get_system")
+    @patch("plugins.modules.purefb_fs.AnsibleModule")
+    def test_delete_fs_using_name_and_realm_params(
+        self, mock_ansible_module, mock_get_system, mock_get_filesystem, mock_delete_fs
+    ):
+        """Test that realm parameter works for delete operations
+
+        User can delete a realm filesystem using name='fs' + realm='realm' params
+        instead of having to use the full qualified name='realm::fs'
+        """
+        mock_module = Mock()
+        mock_module.check_mode = False
+        mock_module.params = self.get_default_params()
+        mock_module.params["name"] = "prod-fs"
+        mock_module.params["realm"] = "production-realm"
+        mock_module.params["state"] = "absent"
+        mock_ansible_module.return_value = mock_module
+
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+
+        # Mock filesystem exists with qualified name (not destroyed)
+        mock_fs = Mock()
+        mock_fs.name = "production-realm::prod-fs"
+        mock_fs.destroyed = False
+
+        def get_fs_side_effect(module, blade):
+            # Return filesystem when called with qualified name
+            if module.params["name"] == "production-realm::prod-fs":
+                return mock_fs
+            return None
+
+        mock_get_filesystem.side_effect = get_fs_side_effect
+
+        # Call main
+        from plugins.modules.purefb_fs import main
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        # Verify delete_fs was called
+        mock_delete_fs.assert_called_once()
+
+        # Verify the module name was updated to qualified format
+        assert mock_module.params["name"] == "production-realm::prod-fs"
+
     def test_modify_fs_with_realm_association_succeeds(self):
         """Test modifying a filesystem that has a realm association works correctly
 

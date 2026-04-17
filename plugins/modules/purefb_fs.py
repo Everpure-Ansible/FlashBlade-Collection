@@ -438,19 +438,30 @@ def create_fs(module, blade):
             realm_name = module.params["name"].split("::")[0]
 
         # Build FileSystemPost object
-        # Note: Realm filesystems have restrictions on supported parameters
+        # Note: Realm filesystems can ONLY have provisioned parameter at creation
+        # All other settings must be applied via PATCH after creation
         if realm_name:
-            # Minimal parameters for realm filesystems - only provisioned and protocols
-            fs_obj = FileSystemPost(
-                provisioned=size,
-                nfs=Nfs(
-                    v3_enabled=module.params["nfsv3"],
-                    v4_1_enabled=module.params["nfsv4"],
-                    rules=module.params["nfs_rules"],
-                ),
-                smb=SmbPost(enabled=module.params["smb"]),
-                http=Http(enabled=module.params["http"]),
-            )
+            # Warn user if they specified parameters that will be ignored
+            if module.params.get("nfs_rules") and module.params["nfs_rules"] != "":
+                module.warn(
+                    "nfs_rules parameter is not supported for realm filesystems and will be ignored. "
+                    "NFS rules cannot be set at creation time for filesystems in realms."
+                )
+            if module.params.get("user_quota"):
+                module.warn(
+                    "user_quota parameter is not supported for realm filesystems and will be ignored."
+                )
+            if module.params.get("group_quota"):
+                module.warn(
+                    "group_quota parameter is not supported for realm filesystems and will be ignored."
+                )
+            if module.params.get("hard_limit"):
+                module.warn(
+                    "hard_limit parameter is not supported for realm filesystems and will be ignored."
+                )
+
+            # Realm filesystems: ONLY provisioned parameter allowed
+            fs_obj = FileSystemPost(provisioned=size)
         else:
             # Full parameters for non-realm filesystems
             fs_obj = FileSystemPost(
@@ -488,9 +499,9 @@ def create_fs(module, blade):
         if CONTEXT_API_VERSION in api_version:
             post_kwargs["context_names"] = [module.params["context"]]
 
-        # Add default_exports=[] for realm filesystems (empty list, not string)
+        # Add default_exports=[""] for realm filesystems (list with empty string)
         if realm_name:
-            post_kwargs["default_exports"] = []
+            post_kwargs["default_exports"] = [""]
 
         res = blade.post_file_systems(**post_kwargs)
         if res.status_code != 200:

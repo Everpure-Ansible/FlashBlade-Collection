@@ -372,10 +372,6 @@ def create_fs(module, blade):
     changed = True
     api_version = list(blade.get_versions().items)
 
-    # Realm validation is now done in main()
-    # Just determine if this is a realm filesystem for conditional logic
-    realm_name = "::" in module.params["name"]
-
     if not module.check_mode:
 
         if not module.params["nfs_rules"]:

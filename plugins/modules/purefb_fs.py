@@ -486,20 +486,13 @@ def create_fs(module, blade):
             "file_system": fs_obj,
         }
 
-        # Add context if API supports it
-        if CONTEXT_API_VERSION in api_version:
+        # Add context if API supports it (but NOT for realm filesystems)
+        if CONTEXT_API_VERSION in api_version and not realm_name:
             post_kwargs["context_names"] = [module.params["context"]]
 
         # Add default_exports=[] for realm filesystems (empty list, not string)
         if realm_name:
             post_kwargs["default_exports"] = []
-
-        # DEBUG: Log what we're sending to the API
-        import json
-        module.warn("DEBUG: fs_name = {0}".format(fs_name))
-        module.warn("DEBUG: realm_name = {0}".format(realm_name))
-        module.warn("DEBUG: post_kwargs keys = {0}".format(list(post_kwargs.keys())))
-        module.warn("DEBUG: fs_obj dict = {0}".format(json.dumps(fs_obj.to_dict(), default=str, indent=2)))
 
         res = blade.post_file_systems(**post_kwargs)
         if res.status_code != 200:

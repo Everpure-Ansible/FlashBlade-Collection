@@ -59,6 +59,14 @@ options:
     choices: [ "vip" ]
     default: vip
     type: str
+  attached_server:
+    description:
+        - Name of the server you want to attach to the interface
+        - To attach to a server on a Realm, set the value to realm-1::server-1
+        - Only 1 server per Network Interface.
+    required: false
+    type: str
+
 extends_documentation_fragment:
     - everpure.flashblade.everpure.fb
 """
@@ -68,6 +76,15 @@ EXAMPLES = """
   everpure.flashblade.purefb_network:
     name: foo
     address: 10.21.200.23
+    state: present
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Create a new network interface named foo with attached server named server-1 in a Realm named realm-1
+  everpure.flashblade.purefb_network:
+    name: foo
+    address: 10.21.200.23
+    attached_server: realm-1::server-1
     state: present
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
@@ -105,6 +122,11 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.purefb import 
 from ansible_collections.everpure.flashblade.plugins.module_utils.common import (
     get_error_message,
 )
+from ansible_collections.everpure.flashblade.plugins.module_utils.version import (
+    LooseVersion,
+)
+
+SERVERS_API_VERSION = "2.16"
 
 
 def get_iface(module, blade):
@@ -119,13 +141,18 @@ def create_iface(module, blade):
     """Create Network Interface"""
     changed = True
     if not module.check_mode:
+        network_interface = NetworkInterface(
+            address=module.params["address"],
+            services=[module.params["services"]],
+            type=module.params["itype"],
+        )
+        if module.params["attached_server"]:
+            network_interface.attached_server = {
+                "name": module.params["attached_server"]
+            }
         res = blade.post_network_interfaces(
             names=[module.params["name"]],
-            network_interface=NetworkInterface(
-                address=module.params["address"],
-                services=[module.params["services"]],
-                type=module.params["itype"],
-            ),
+            network_interface=network_interface,
         )
         if res.status_code != 200:
             module.fail_json(
@@ -155,6 +182,22 @@ def modify_iface(module, blade):
                         module.params["name"], get_error_message(res)
                     )
                 )
+        elif module.params["attached_server"] != iface.attached_server:
+            """If the attached server is different, it will be moved to the new server"""
+            changed = True
+            if not module.check_mode:
+                res = blade.patch_network_interfaces(
+                    names=[module.params["name"]],
+                    network_interface=NetworkInterfacePatch(
+                        attached_server=module.params["attached_server"]
+                    ),
+                )
+                if res.status_code != 200:
+                    module.fail_json(
+                        msg="Failed to modify Interface {0}. Error: {1}".format(
+                            module.params["name"], get_error_message(res)
+                        )
+                    )
     module.exit_json(changed=changed)
 
 
@@ -181,6 +224,7 @@ def main():
             address=dict(type="str"),
             services=dict(type="str", default="data", choices=["data", "replication"]),
             itype=dict(type="str", default="vip", choices=["vip"]),
+            attached_server=dict(type="str", required=False),
         )
     )
 
@@ -192,10 +236,17 @@ def main():
 
     if not HAS_PYPURECLIENT:
         module.fail_json(msg="py-pure-client sdk is required for this module")
-
     state = module.params["state"]
     blade = get_system(module)
     iface = get_iface(module, blade)
+
+    api_version = list(blade.get_versions().items)
+    if LooseVersion(SERVERS_API_VERSION) > LooseVersion(api_version):
+        module.fail_json(
+            msg="Module requires API version {0} or greater. Current version: {1}".format(
+                SERVERS_API_VERSION, api_version
+            )
+        )
 
     if state == "present" and not iface:
         create_iface(module, blade)

@@ -71,6 +71,8 @@ from plugins.modules.purefb_info import (
     generate_perf_dict,
     generate_config_dict,
     generate_password_policies_dict,
+    generate_file_system_exports_dict,
+    generate_fs_dict,
 )
 
 
@@ -769,3 +771,143 @@ class TestPurefbInfo:
         assert policy_info["password_history"] is None
         assert policy_info["min_password_age"] is None
         assert policy_info["max_password_age"] is None
+
+    # ==== file_system_exports generator ====
+
+    def _mk_export(
+        self,
+        export_name,
+        policy_type,
+        filesystem,
+        server,
+        policy_name=None,
+        share_policy_name=None,
+    ):
+        """Build a mock FileSystemExport shaped like pypureclient returns.
+
+        policy_type is UPPERCASE ("NFS" / "SMB") because
+        pypureclient.flashblade.FileSystemExport.policy_type reports it that
+        way. Passing lowercase here would mask the case-branch mismatch bug
+        the generator is guarding against.
+        """
+        exp = Mock()
+        exp.export_name = export_name
+        exp.policy_type = policy_type
+        member = Mock()
+        member.name = filesystem
+        exp.member = member
+        srv = Mock()
+        srv.name = server
+        exp.server = srv
+        if policy_name:
+            pol = Mock()
+            pol.name = policy_name
+            exp.policy = pol
+        else:
+            exp.policy = None
+        if share_policy_name:
+            sp = Mock()
+            sp.name = share_policy_name
+            exp.share_policy = sp
+        else:
+            exp.share_policy = None
+        return exp
+
+    def test_generate_file_system_exports_dict_nfs_populates_export_policy(self):
+        """An NFS export must expose export_policy and leave client/share None.
+
+        Guards against the lowercase-vs-uppercase policy_type comparison bug
+        where every policy field silently came back None in production.
+        """
+        mock_blade = Mock()
+        mock_blade.get_file_system_exports.return_value.items = [
+            self._mk_export(
+                "fs1_nfs",
+                "NFS",
+                "fs1",
+                "_array_server",
+                policy_name="nfs_pol1",
+            ),
+        ]
+
+        result = generate_file_system_exports_dict(mock_blade)
+
+        assert result == [
+            {
+                "export_name": "fs1_nfs",
+                "type": "NFS",
+                "filesystem": "fs1",
+                "server": "_array_server",
+                "export_policy": "nfs_pol1",
+                "client_policy": None,
+                "share_policy": None,
+            }
+        ]
+
+    def test_generate_file_system_exports_dict_smb_populates_client_and_share(self):
+        """An SMB export must expose client_policy and share_policy and leave
+        export_policy None. Same case-branch guard as the NFS test."""
+        mock_blade = Mock()
+        mock_blade.get_file_system_exports.return_value.items = [
+            self._mk_export(
+                "fs1_smb",
+                "SMB",
+                "fs1",
+                "_array_server",
+                policy_name="smb_client_pol1",
+                share_policy_name="smb_share_pol1",
+            ),
+        ]
+
+        result = generate_file_system_exports_dict(mock_blade)
+
+        assert result[0]["type"] == "SMB"
+        assert result[0]["export_policy"] is None
+        assert result[0]["client_policy"] == "smb_client_pol1"
+        assert result[0]["share_policy"] == "smb_share_pol1"
+
+    def test_generate_fs_dict_scopes_exports_per_filesystem(self):
+        """generate_fs_dict must scope its file_system_exports list to the
+        current filesystem only. A global list leak would attribute exports
+        of other filesystems to this one."""
+        mock_blade = Mock()
+
+        fs1 = Mock()
+        fs1.name = "fs1"
+        fs1.fast_remove_directory_enabled = False
+        fs1.snapshot_directory_enabled = False
+        fs1.provisioned = 0
+        fs1.destroyed = False
+        fs1.nfs = Mock(
+            rules=None, v3_enabled=True, v4_1_enabled=True, export_policy=None
+        )
+        fs1.smb = Mock(
+            acl_mode=None,
+            client_policy=None,
+            share_policy=None,
+            continuous_availability_enabled=False,
+        )
+        fs1.multi_protocol = Mock(safeguard_acls=None, access_control_style=None)
+        fs1.hard_limit_enabled = False
+        fs1.promotion_status = None
+        fs1.requested_promotion_state = None
+        fs1.writable = True
+        fs1.source = None
+        fs1.location = None
+        fs1.default_group_quota = 0
+        fs1.default_user_quota = 0
+        fs1.http = Mock(enabled=False)
+
+        mock_blade.get_file_systems.return_value.items = [fs1]
+        mock_blade.get_quotas_groups.return_value.items = []
+        mock_blade.get_quotas_users.return_value.items = []
+
+        exports = [
+            {"filesystem": "fs1", "type": "NFS", "export_name": "fs1_nfs"},
+            {"filesystem": "other_fs", "type": "SMB", "export_name": "other"},
+        ]
+
+        result = generate_fs_dict(mock_blade, exports=exports)
+
+        assert len(result["fs1"]["file_system_exports"]) == 1
+        assert result["fs1"]["file_system_exports"][0]["export_name"] == "fs1_nfs"

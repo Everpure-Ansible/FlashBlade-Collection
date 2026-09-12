@@ -4269,3 +4269,132 @@ class TestPurefbFs:
 
         # Verify the module name was updated to qualified format
         assert mock_module.params["name"] == "production-realm::prod-fs"
+
+    # ==== deprecation warnings for legacy FS-level policy fields ====
+
+    def _mk_module_for_deprecation(
+        self,
+        export_policy=None,
+        share_policy=None,
+        client_policy=None,
+    ):
+        """Minimal AnsibleModule mock sized to reach the three deprecation
+        call sites in create_fs. Only the deprecation-track fields vary."""
+        mock_module = Mock()
+        mock_module.check_mode = False
+        mock_module.params = {
+            "name": "test-fs",
+            "size": "1T",
+            "nfsv3": True,
+            "nfsv4": True,
+            "nfs_rules": None,
+            "smb": False,
+            "http": False,
+            "snapshot": False,
+            "fastremove": False,
+            "hard_limit": False,
+            "user_quota": None,
+            "group_quota": None,
+            "policy": None,
+            "access_control": "shared",
+            "safeguard_acls": True,
+            "export_policy": export_policy,
+            "share_policy": share_policy,
+            "client_policy": client_policy,
+            "continuous_availability": True,
+            "context": "",
+            "storage_class": None,
+            "group_ownership": None,
+        }
+        return mock_module
+
+    @patch("plugins.modules.purefb_fs.FileSystemPost")
+    @patch("plugins.modules.purefb_fs.Nfs")
+    @patch("plugins.modules.purefb_fs.SmbPost")
+    @patch("plugins.modules.purefb_fs.Http")
+    @patch("plugins.modules.purefb_fs.MultiProtocolPost")
+    @patch("plugins.modules.purefb_fs.human_to_bytes")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    def test_deprecation_fires_for_each_legacy_policy_field(
+        self,
+        mock_human_to_bytes,
+        mock_multi_protocol,
+        mock_http,
+        mock_smb,
+        mock_nfs,
+        mock_fs_post,
+    ):
+        """Supplying export_policy / share_policy / client_policy explicitly
+        must trigger a module.deprecate() call for each - one per field.
+        Guards the deprecation surface: removing any of these silently is
+        exactly what this test would catch."""
+        mock_module = self._mk_module_for_deprecation(
+            export_policy="nfs_pol1",
+            share_policy="smb_share_pol1",
+            client_policy="smb_client_pol1",
+        )
+        mock_blade = Mock()
+        mock_blade.get_versions.return_value.items = ["2.17"]
+        mock_human_to_bytes.return_value = 1099511627776
+        mock_resp = Mock()
+        mock_resp.status_code = 200
+        mock_blade.post_file_systems.return_value = mock_resp
+
+        create_fs(mock_module, mock_blade)
+
+        emitted = [c.args[0] for c in mock_module.deprecate.call_args_list]
+        assert any("export_policy is deprecated" in msg for msg in emitted)
+        assert any("share_policy is deprecated" in msg for msg in emitted)
+        assert any("client_policy is deprecated" in msg for msg in emitted)
+        # Every deprecation must be versioned 3.0.0 for the export-migration set
+        for c in mock_module.deprecate.call_args_list:
+            if any(
+                needle in c.args[0]
+                for needle in (
+                    "export_policy is deprecated",
+                    "share_policy is deprecated",
+                    "client_policy is deprecated",
+                )
+            ):
+                assert c.kwargs["version"] == "3.0.0"
+                assert c.kwargs["collection_name"] == "everpure.flashblade"
+
+    @patch("plugins.modules.purefb_fs.FileSystemPost")
+    @patch("plugins.modules.purefb_fs.Nfs")
+    @patch("plugins.modules.purefb_fs.SmbPost")
+    @patch("plugins.modules.purefb_fs.Http")
+    @patch("plugins.modules.purefb_fs.MultiProtocolPost")
+    @patch("plugins.modules.purefb_fs.human_to_bytes")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    def test_no_deprecation_when_legacy_policy_fields_omitted(
+        self,
+        mock_human_to_bytes,
+        mock_multi_protocol,
+        mock_http,
+        mock_smb,
+        mock_nfs,
+        mock_fs_post,
+    ):
+        """No deprecation warning fires for a policy field the caller did
+        not supply. Guards against a regression where the guard flips from
+        `is not None` to truthy, or the guard is removed entirely - either
+        would spam every existing user."""
+        mock_module = self._mk_module_for_deprecation()
+        mock_blade = Mock()
+        mock_blade.get_versions.return_value.items = ["2.17"]
+        mock_human_to_bytes.return_value = 1099511627776
+        mock_resp = Mock()
+        mock_resp.status_code = 200
+        mock_blade.post_file_systems.return_value = mock_resp
+
+        create_fs(mock_module, mock_blade)
+
+        for c in mock_module.deprecate.call_args_list:
+            assert not any(
+                needle in c.args[0]
+                for needle in (
+                    "export_policy is deprecated",
+                    "share_policy is deprecated",
+                    "client_policy is deprecated",
+                )
+            )

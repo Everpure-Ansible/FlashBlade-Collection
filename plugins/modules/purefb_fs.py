@@ -172,7 +172,13 @@ options:
     default: true
   export_policy:
     description:
-    - Name of NFS export policy to assign to filesystem
+    - Name of NFS export policy to assign to filesystem.
+    - Deprecated. This writes the legacy C(nfs.export_policy) field
+      on the filesystem, which Purity//FB marks as deprecated. Use the
+      M(everpure.flashblade.purefb_export) module's C(export_policy)
+      option to attach NFS export policies via the dedicated File
+      System Exports endpoints.
+      This parameter will be removed in 3.0.0.
     type: str
     version_added: "1.9.0"
   share_policy:
@@ -180,6 +186,12 @@ options:
     - Name of SMB share policy to assign to filesystem
     - Only valid with REST 2.10 or higher
     - Remove policy with empty string
+    - Deprecated. This writes the legacy C(smb.share_policy) field
+      on the filesystem, which Purity//FB marks as deprecated. Use the
+      M(everpure.flashblade.purefb_export) module's C(share_policy)
+      option to attach SMB share policies via the dedicated File
+      System Exports endpoints.
+      This parameter will be removed in 3.0.0.
     type: str
     version_added: "1.12.0"
   client_policy:
@@ -187,6 +199,12 @@ options:
     - Name of SMB client policy to assign to filesystem
     - Only valid with REST 2.10 or higher
     - Remove policy with empty string
+    - Deprecated. This writes the legacy C(smb.client_policy) field
+      on the filesystem, which Purity//FB marks as deprecated. Use the
+      M(everpure.flashblade.purefb_export) module's C(client_policy)
+      option to attach SMB client policies via the dedicated File
+      System Exports endpoints.
+      This parameter will be removed in 3.0.0.
     type: str
     version_added: "1.12.0"
   continuous_availability:
@@ -324,6 +342,44 @@ EXAMPLES = """
     state: present
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Attach export_policy to filesystem foo (deprecated - prefer purefb_export)
+  everpure.flashblade.purefb_fs:
+    name: foo
+    export_policy: nfs_pol1
+    state: present
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Create filesystem foo (modern workflow - attach policies via purefb_export)
+  everpure.flashblade.purefb_fs:
+    name: foo
+    size: 1T
+    smb: true
+    state: present
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Attach NFS export policy to filesystem foo via purefb_export
+  everpure.flashblade.purefb_export:
+    name: foo_nfs
+    filesystem: foo
+    type: NFS
+    export_policy: nfs_pol1
+    state: present
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Attach SMB share and client policies to filesystem foo via purefb_export
+  everpure.flashblade.purefb_export:
+    name: foo_smb
+    filesystem: foo
+    type: SMB
+    share_policy: smb_share_pol1
+    client_policy: smb_client_pol1
+    state: present
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 """
 
 RETURN = """
@@ -449,6 +505,33 @@ def create_fs(module, blade):
                 )
             else:
                 nfs_kwargs["rules"] = module.params["nfs_rules"]
+        if module.params["export_policy"] is not None:
+            module.deprecate(
+                "export_policy is deprecated. Use the purefb_export "
+                "module's export_policy option to attach NFS export "
+                "policies via the dedicated File System Exports "
+                "endpoints.",
+                version="3.0.0",
+                collection_name="everpure.flashblade",
+            )
+        if module.params["share_policy"] is not None:
+            module.deprecate(
+                "share_policy is deprecated. Use the purefb_export "
+                "module's share_policy option to attach SMB share "
+                "policies via the dedicated File System Exports "
+                "endpoints.",
+                version="3.0.0",
+                collection_name="everpure.flashblade",
+            )
+        if module.params["client_policy"] is not None:
+            module.deprecate(
+                "client_policy is deprecated. Use the purefb_export "
+                "module's client_policy option to attach SMB client "
+                "policies via the dedicated File System Exports "
+                "endpoints.",
+                version="3.0.0",
+                collection_name="everpure.flashblade",
+            )
 
         # Build FileSystemPost object
         fs_obj = FileSystemPost(
@@ -996,6 +1079,33 @@ def modify_fs(module, blade):
                         get_error_message(res),
                     )
                 )
+    if module.params["export_policy"] is not None:
+        module.deprecate(
+            "export_policy is deprecated. Use the purefb_export "
+            "module's export_policy option to attach NFS export "
+            "policies via the dedicated File System Exports "
+            "endpoints.",
+            version="3.0.0",
+            collection_name="everpure.flashblade",
+        )
+    if module.params["share_policy"] is not None:
+        module.deprecate(
+            "share_policy is deprecated. Use the purefb_export "
+            "module's share_policy option to attach SMB share "
+            "policies via the dedicated File System Exports "
+            "endpoints.",
+            version="3.0.0",
+            collection_name="everpure.flashblade",
+        )
+    if module.params["client_policy"] is not None:
+        module.deprecate(
+            "client_policy is deprecated. Use the purefb_export "
+            "module's client_policy option to attach SMB client "
+            "policies via the dedicated File System Exports "
+            "endpoints.",
+            version="3.0.0",
+            collection_name="everpure.flashblade",
+        )
     if module.params["nfs_rules"] is not None:
         module.deprecate(
             "nfs_rules is deprecated. Use export_policy instead.",

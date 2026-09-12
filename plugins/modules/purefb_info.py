@@ -36,6 +36,15 @@ options:
         capacity, network, subnets, lags, filesystems, snapshots, buckets,
         replication, policies, arrays, accounts, admins, ad, kerberos,
         drives, servers and fleet.
+      - The C(filesystems) subset surfaces the legacy file system keys
+        C(nfs_rules), C(export_policy), C(smb_client_policy) and
+        C(smb_share_policy). Purity//FB marks the underlying fields as
+        deprecated in favour of File System Exports, so these keys may
+        return C(null) in future releases. Read export policy
+        assignments from the per-filesystem C(file_system_exports)
+        list (and the top-level C(file_system_exports) view under
+        C(subset=filesystems)/C(subset=all)) instead. These keys will
+        be removed from this module in 3.0.0.
     required: false
     type: list
     elements: str
@@ -1238,7 +1247,7 @@ def generate_object_store_accounts_dict(blade):
     return account_info
 
 
-def generate_fs_dict(blade):
+def generate_fs_dict(blade, exports=None):
     fs_info = {}
     for fsystem in blade.get_file_systems().items:
         share = fsystem.name
@@ -1291,6 +1300,10 @@ def generate_fs_dict(blade):
             ),
             "multi_protocol_safeguard_acls": getattr(multi, "safeguard_acls", None),
         }
+        if exports is not None:
+            fs_info[share]["file_system_exports"] = [
+                e for e in exports if e.get("filesystem") == share
+            ]
 
         # Group quotas
         for group_quota in blade.get_quotas_groups(file_system_names=[share]).items:
@@ -1353,6 +1366,39 @@ def generate_servers_dict(blade):
             "directory_services": [ds.name for ds in server.directory_services],
         }
     return servers_info
+
+
+def generate_file_system_exports_dict(blade):
+    """Return the list of File System Exports for the whole array.
+
+    Requires REST API 2.16+ (SERVERS_API_VERSION). Callers must gate on
+    the API version before invoking; this helper does not check.
+    """
+    exports = []
+    for exp in blade.get_file_system_exports().items:
+        member = getattr(exp, "member", None)
+        server = getattr(exp, "server", None)
+        policy = getattr(exp, "policy", None)
+        share_policy = getattr(exp, "share_policy", None)
+        ptype = getattr(exp, "policy_type", None)
+        exports.append(
+            {
+                "export_name": getattr(exp, "export_name", None),
+                "type": ptype,
+                "filesystem": getattr(member, "name", None),
+                "server": getattr(server, "name", None),
+                "export_policy": (
+                    getattr(policy, "name", None) if ptype == "NFS" else None
+                ),
+                "client_policy": (
+                    getattr(policy, "name", None) if ptype == "SMB" else None
+                ),
+                "share_policy": (
+                    getattr(share_policy, "name", None) if ptype == "SMB" else None
+                ),
+            }
+        )
+    return exports
 
 
 def generate_fleet_dict(blade):
@@ -1438,7 +1484,22 @@ def main():
     if "subnets" in subset or "all" in subset:
         info["subnet"] = generate_subnet_dict(blade)
     if "filesystems" in subset or "all" in subset:
-        info["filesystems"] = generate_fs_dict(blade)
+        module.deprecate(
+            "The filesystems subset keys nfs_rules, export_policy, "
+            "smb_client_policy and smb_share_policy are deprecated. "
+            "Purity//FB marks the underlying nfs.* and smb.* fields as "
+            "deprecated in favour of File System Exports; these keys "
+            "may return null in future releases. Read export policy "
+            "assignments from the per-filesystem file_system_exports "
+            "list (and the top-level file_system_exports view) instead.",
+            version="3.0.0",
+            collection_name="everpure.flashblade",
+        )
+        exports_list = None
+        if SERVERS_API_VERSION in api_versions:
+            exports_list = generate_file_system_exports_dict(blade)
+            info["file_system_exports"] = exports_list
+        info["filesystems"] = generate_fs_dict(blade, exports_list)
     if "admins" in subset or "all" in subset:
         info["admins"] = generate_admin_dict(blade)
     if "snapshots" in subset or "all" in subset:

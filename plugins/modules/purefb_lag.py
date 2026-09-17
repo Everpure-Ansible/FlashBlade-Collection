@@ -56,7 +56,7 @@ EXAMPLES = r"""
   everpure.flashblade.purefb_lag:
     name: lag2
     ports:
-    - ch1.eth2
+      - ch1.eth2
     fb_url: 10.10.10.2
     api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
 
@@ -64,8 +64,8 @@ EXAMPLES = r"""
   everpure.flashblade.purefb_lag:
     name: lag2
     ports:
-    - ch1.eth2
-    - ch1.eth4
+      - ch1.eth2
+      - ch1.eth4
     fb_url: 10.10.10.2
     api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
 

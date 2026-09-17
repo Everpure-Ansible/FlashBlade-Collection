@@ -75,8 +75,8 @@ EXAMPLES = r"""
     name: foo
     ca_certificate: kmip_ca_cert
     uris:
-    - 1.1.1.1:8888
-    - 2.3.3.3:9999
+      - 1.1.1.1:8888
+      - 2.3.3.3:9999
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
 
@@ -84,8 +84,8 @@ EXAMPLES = r"""
   everpure.flashblade.purefb_kmip:
     name: foo
     uris:
-    - 3.3.3.3:8888
-    - 4.4.4.4:9999
+      - 3.3.3.3:8888
+      - 4.4.4.4:9999
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
 

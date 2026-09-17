@@ -53,15 +53,15 @@ EXAMPLES = r"""
   everpure.flashblade.purefb_certgrp:
     name: test_grp
     certifcates:
-    - cert1
-    - cert2
+      - cert1
+      - cert2
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
 - name: Delete a certifcate from a group
   everpure.flashblade.purefb_certgrp:
     name: test_grp
     certificates:
-    - cert2
+      - cert2
     state: absent
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6

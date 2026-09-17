@@ -160,8 +160,8 @@ EXAMPLES = r"""
     enable: true
     nis_domain: "acme.com"
     nis_servers:
-    - "1.1.1.1"
-    - "2.2.2.2"
+      - "1.1.1.1"
+      - "2.2.2.2"
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 

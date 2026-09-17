@@ -78,7 +78,7 @@ EXAMPLES = r"""
     state: present
     name: syslog1
     services:
-    - data-audit
+      - data-audit
     address: syslog1.com
     protocol: udp
     fb_url: 10.10.10.2

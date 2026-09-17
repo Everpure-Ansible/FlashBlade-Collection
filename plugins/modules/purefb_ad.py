@@ -148,17 +148,17 @@ EXAMPLES = r"""
     password: Password
     join_ou: "CN=FakeOU"
     encryption:
-    - aes128-cts-hmac-sha1-96
-    - aes256-cts-hmac-sha1-96
+      - aes128-cts-hmac-sha1-96
+      - aes256-cts-hmac-sha1-96
     kerberos_servers:
-    - kdc.acme.com
+      - kdc.acme.com
     directory_servers:
-    - ldap.acme.com
+      - ldap.acme.com
     service_principals:
-    - "nfs/vip1.flashblade.acme.com"
-    - "HOST/vip2.flashblade.acme.com"
+      - "nfs/vip1.flashblade.acme.com"
+      - "HOST/vip2.flashblade.acme.com"
     global_catalog_servers:
-    - gc1.flashblade.acme.com
+      - gc1.flashblade.acme.com
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
@@ -171,9 +171,9 @@ EXAMPLES = r"""
     password: Password
     existing: true
     kerberos_servers:
-    - kdc.acme.com
+      - kdc.acme.com
     directory_servers:
-    - ldap.acme.com
+      - ldap.acme.com
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
@@ -182,13 +182,13 @@ EXAMPLES = r"""
     name: ad_account
     server: local_server
     encryption:
-    - aes256-cts-hmac-sha1-96
+      - aes256-cts-hmac-sha1-96
     kerberos_servers:
-    - kdc.acme.com
+      - kdc.acme.com
     directory_servers:
-    - ldap.acme.com
+      - ldap.acme.com
     service_principals:
-    - "HOST/vip1.flashblade.acme.com"
+      - "HOST/vip1.flashblade.acme.com"
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 

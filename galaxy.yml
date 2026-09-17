@@ -19,3 +19,40 @@ dependencies: {}
 repository: https://github.com/Everpure-Ansible/FlashBlade-Collection
 documentation: https://docs.ansible.com/ansible/latest/collections/everpure/flashblade/index.html#plugins-in-everpure-flashblade
 issues: https://github.com/Everpure-Ansible/FlashBlade-Collection/issues
+# Anything shipped here is installed onto every customer system and pulled into
+# execution environment images, so the tarball is kept to user-facing content.
+# changelogs/changelog.yaml is deliberately NOT excluded - it ships alongside
+# the rendered CHANGELOG.rst.
+build_ignore:
+  - tests/integration
+  - tests/unit
+  - extensions/molecule
+  - docs
+  - collections
+  - .github
+  - .ansible
+  - .tox
+  - .venv
+  - .vscode
+  - .pytest_cache
+  - .pre-commit-config.yaml
+  # Vendor catalogue metadata, not Ansible configuration
+  - settings.json
+  # Development tooling with no meaning inside an installed collection.
+  # pytest.ini in particular forces coverage reporting on anyone running
+  # pytest from within the collection tree.
+  - pytest.ini
+  - .yamllint
+  - .gitignore
+  - .git-blame-ignore-revs
+  # Build artifact regenerated at release time
+  - changelogs/.plugin-cache.yaml
+  # MANIFEST declares README.md as the collection readme; this is a duplicate
+  - README.rst
+  # Release archives. ansible-galaxy already skips its own
+  # everpure-flashblade-*.tar.gz, but not one built under another namespace.
+  - "*.tar.gz"
+  - "*.tgz"
+  - "*.zip"
+  # Empty placeholders that keep otherwise-empty directories in git
+  - "**/.keep"

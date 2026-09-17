@@ -410,11 +410,11 @@ EXAMPLES = r"""
     name: test_policy_with_members
     policy_type: snapshot
     filesystem:
-    - fs1
-    - fs2
+      - fs1
+      - fs2
     replica_link:
-    - rl1
-    - rl2
+      - rl1
+      - rl2
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
 - name: Create a snapshot policy with rules

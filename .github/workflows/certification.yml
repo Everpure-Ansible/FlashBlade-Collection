@@ -37,3 +37,58 @@ jobs:
     #   ansible-core-version: '2.17.0'
     #   python-versions: '["3.7", "3.8", "3.9", "3.10", "3.11", "3.12"]'
     #   collection-root: 'ansible_collections/junipernetworks/junos'
+
+  # The checker above runs against the source tree. Automation Hub runs against
+  # the built artifact, which galaxy.yml build_ignore strips content from - so
+  # the two see different collections. everpure.flasharray 1.45.0 was rejected
+  # for exactly that gap: build_ignore removed tests/unit, but the sanity ignore
+  # file that referenced those files still shipped, and "ignores" errors on an
+  # entry whose target does not exist. This job builds the collection the way
+  # Automation Hub receives it and runs sanity on that.
+  sanity-on-built-artifact:
+    name: Sanity on built artifact (ansible-core ${{ matrix.ansible }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The lowest version requires_ansible allows is what a reviewer will
+        # use, and it is what selects tests/sanity/ignore-2.16.txt if present.
+        ansible: ["2.16", "2.17", "2.18"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ansible-core ${{ matrix.ansible }}
+        run: pip install "ansible-core>=${{ matrix.ansible }},<${{ matrix.ansible }}.99"
+
+      - name: Build the collection
+        run: ansible-galaxy collection build --output-path /tmp/build
+
+      - name: Extract the artifact into a collection tree
+        run: |
+          mkdir -p /tmp/tree/ansible_collections/everpure/flashblade
+          tar xzf /tmp/build/*.tar.gz \
+            -C /tmp/tree/ansible_collections/everpure/flashblade
+
+      - name: Fail if non user-facing files were shipped
+        run: |
+          cd /tmp/tree/ansible_collections/everpure/flashblade
+          if ls *.tar.gz *.tgz *.zip .gitignore .git-blame-ignore-revs \
+                .yamllint pytest.ini settings.json README.rst 2>/dev/null; then
+            echo "::error::Non user-facing files were included in the build."
+            echo "Add them to build_ignore in galaxy.yml."
+            exit 1
+          fi
+          if [ -d .github ]; then
+            echo "::error::.github was included in the build."
+            exit 1
+          fi
+          echo "Artifact contains only user-facing content."
+
+      - name: Run sanity against the artifact
+        run: |
+          cd /tmp/tree/ansible_collections/everpure/flashblade
+          ansible-test sanity --python 3.11

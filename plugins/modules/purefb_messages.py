@@ -58,7 +58,7 @@ EXAMPLES = r"""
     history: 4w
     flagged: false
     severity:
-    - critical
+      - critical
     fb_url: 10.10.10.2
     api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
 """

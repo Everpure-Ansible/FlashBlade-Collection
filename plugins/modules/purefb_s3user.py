@@ -677,11 +677,15 @@ def main():
         dict(
             name=dict(required=True, type="str"),
             account=dict(required=True, type="str"),
-            access_key=dict(default="false", type="bool"),
+            # access_key and enable_key are switches, not credentials, but
+            # validate-modules treats any option whose name ends in "key" as a
+            # potential secret. They are marked safe explicitly, as their
+            # neighbours already were.
+            access_key=dict(default="false", type="bool", no_log=False),
             multiple_keys=dict(default="false", type="bool"),
             imported_key=dict(type="str", no_log=False),
             key_name=dict(type="str", no_log=False, aliases=["remove_key"]),
-            enable_key=dict(type="bool", default=True),
+            enable_key=dict(type="bool", default=True, no_log=False),
             imported_secret=dict(type="str", no_log=True),
             policy=dict(type="list", elements="str"),
             state=dict(

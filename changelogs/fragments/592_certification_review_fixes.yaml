@@ -1,0 +1,30 @@
+bugfixes:
+  - purefb_s3user - Added an explicit ``no_log=False`` to the ``access_key`` and ``enable_key``
+    parameters. Both are switches rather than credentials, but ``validate-modules`` treats any
+    option whose name ends in ``key`` as a potential secret and raises ``no-log-needed`` unless it
+    is marked. Their neighbours ``imported_key`` and ``key_name`` were already marked.
+
+minor_changes:
+  - collection - Added ``tests/config.yml`` declaring ``python_requires`` of ``>=3.9``, matching the
+    Python version stated in the README. The 81 entries in ``tests/sanity/ignore-2.16.txt`` existed
+    only to suppress the Python 2.7 compile and import tests one file at a time, so the ignore file
+    is no longer needed and has been removed.
+  - collection - Added a ``build_ignore`` section to ``galaxy.yml`` so that the published tarball
+    holds only user-facing content. ``settings.json``, ``.github``, ``pytest.ini``, ``.yamllint``,
+    ``.gitignore``, ``.git-blame-ignore-revs``, ``changelogs/.plugin-cache.yaml``, ``README.rst``
+    and the empty ``.keep`` placeholders are no longer installed onto customer systems or pulled
+    into execution environment images. ``changelogs/changelog.yaml`` still ships alongside the
+    rendered ``CHANGELOG.rst``.
+  - collection - Completed the rebranding from Pure Storage to Everpure. ``README.rst`` badge URLs,
+    the ``.github/CONTRIBUTING.md`` title and issue link, and a copyright line in the
+    ``purefb_tls_policy`` unit test all still referred to the previous identity.
+  - README - Fixed a typo in the CI badge organisation path, pointed the Release Notes section at
+    the changelog shipped with the collection, dropped the redundant ``ansible-core`` requirement
+    which is already declared by ``requires_ansible`` in ``meta/runtime.yml``, and changed the
+    author line to a ``mailto:`` URL rather than a bare address used as a link target.
+  - README.rst - Replaced the repository-relative license link with a full URL, so that it resolves
+    when the file is rendered outside the repository.
+  - collection - Added an ``.ansible-lint`` file setting the production profile, excluding only
+    non-content directories, and adding ``no-log-password`` to the warning list.
+  - CI - The certification workflow now also builds the collection and runs sanity against the
+    built artifact, not only the source tree, and fails if a non user-facing file is shipped.

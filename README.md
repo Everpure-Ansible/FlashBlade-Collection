@@ -1,9 +1,9 @@
-<a href="https://github.com/Everpure-Ansible/FlashBlade-Collection/releases/latest"><img src="https://img.shields.io/github/v/tag/Everpure-Ansible/FlashBlade-Collection?label=release">
-<a href="https://github.com/Everpure-Ansible/FlashBlade-Collection/blob/master/COPYING.GPLv3"><img src="https://img.shields.io/badge/license-GPL%20v3.0-brightgreen.svg"></a>
-<img src="https://cla-assistant.io/readme/badge/Everpure-Ansible/FlashBlade-Collection">
-<img src="https://github.com/Everpure-Ansible/FlashBlade-Collection/workflows/Everpure%20Ansible%20CI/badge.svg">
-<a href="https://github.com/psf/black"><img src="https://img.shields.io/badge/code%20style-black-000000.svg"></a>
-<img src="https://img.shields.io/badge/tests-passing-brightgreen.svg"></a>
+[![Release](https://img.shields.io/github/v/tag/Everpure-Ansible/FlashBlade-Collection?label=release)](https://github.com/Everpure-Ansible/FlashBlade-Collection/releases/latest)
+[![License](https://img.shields.io/badge/license-GPL%20v3.0-brightgreen.svg)](https://github.com/Everpure-Ansible/FlashBlade-Collection/blob/master/COPYING.GPLv3)
+[![CLA assistant](https://cla-assistant.io/readme/badge/Everpure-Ansible/FlashBlade-Collection)](https://cla-assistant.io/Everpure-Ansible/FlashBlade-Collection)
+[![Everpure Ansible CI](https://github.com/Everpure-Ansible/FlashBlade-Collection/workflows/Everpure%20Ansible%20CI/badge.svg)](https://github.com/Everpure-Ansible/FlashBlade-Collection/actions)
+[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)](https://github.com/Everpure-Ansible/FlashBlade-Collection/actions)
     
 # Everpure FlashBlade Collection
 
@@ -96,6 +96,7 @@ All modules are idempotent with the exception of modules that change or set pass
 ### Available Modules
 
 - purefb_ad - manage Active Directory account on FlashBlade
+- purefb_admin - configure Everpure FlashBlade Global Admin settings
 - purefb_alert - manage alert email settings on a FlashBlade
 - purefb_apiclient - manage API clients for FlashBlade
 - purefb_banner - manage FlashBlade login banner
@@ -155,6 +156,7 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_target - manage remote S3-capable targets for a FlashBlade
 - purefb_timeout - manage FlashBlade GUI timeout
 - purefb_tls_policy - manage FlashBlade TLS policies and their network interface attachments
+- purefb_tz - configure Everpure FlashBlade timezone
 - purefb_user - manage local *pureuser* account password on a FlashBlade
 - purefb_userpolicy - manage FlashBlade Object Store User Access Policies
 - purefb_userquota - manage individual user quotas on FlashBlade filesystems

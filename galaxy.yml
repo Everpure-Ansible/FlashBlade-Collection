@@ -45,8 +45,15 @@ build_ignore:
   - .yamllint
   - .gitignore
   - .git-blame-ignore-revs
-  # Build artifact regenerated at release time
+  # Only changelogs/changelog.yaml is of use to a consumer. .plugin-cache.yaml
+  # is antsibull-changelog state, config.yaml is its configuration, and
+  # fragments are unreleased notes by definition.
   - changelogs/.plugin-cache.yaml
+  - changelogs/config.yaml
+  - changelogs/fragments
+  # tests/unit is excluded above, and tests/README.md documents it in detail -
+  # per-module coverage tables and pytest paths that do not exist in the build
+  - tests/README.md
   # MANIFEST declares README.md as the collection readme; this is a duplicate
   - README.rst
   # Release archives. ansible-galaxy already skips its own

@@ -1,0 +1,12 @@
+minor_changes:
+  - collection - Removed the ``playbooks/roles`` symlink, stopped shipping ``tests/README.md`` which
+    documents the excluded ``tests/unit`` directory, and narrowed the ``changelogs`` exclusion so
+    that only ``changelog.yaml`` ships. A symlink is recorded in ``FILES.json`` as an ordinary
+    directory with a null checksum, so nothing behind it is verified, and content scanners
+    routinely skip symlinks.
+  - README - Converted the badge block from unbalanced raw HTML to markdown image links, and
+    reconciled the Available Modules list against the collection - it listed 64 of 66 modules,
+    omitting ``purefb_admin`` and ``purefb_tz``.
+  - CI - The artifact job now fails on any symlink in the build, on unreleased fragments or test
+    files being shipped, and when ``CHANGELOG.rst`` has no section for the version in
+    ``galaxy.yml``. It also runs ansible-lint against the artifact, not only ansible-test sanity.

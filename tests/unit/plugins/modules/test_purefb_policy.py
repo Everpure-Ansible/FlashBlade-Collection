@@ -47,6 +47,7 @@ sys.modules[
 ] = MagicMock()
 
 from plugins.modules.purefb_policy import (
+    _nfs_rule,
     _share_rule_patch,
     _share_rule_perms,
     copy_policy,
@@ -216,8 +217,11 @@ class TestUpdateNfsPolicyRule:
         module.exit_json.assert_called_once_with(changed=True)
 
     @patch("plugins.modules.purefb_policy.LooseVersion")
-    def test_anon_ids_are_ints_from_rest_2_22(self, mock_loose_version):
-        """From REST 2.22 the SDK model is used and the anon ids are ints."""
+    def test_patch_sends_string_anon_ids_from_rest_2_22(self, mock_loose_version):
+        """From REST 2.22 the array still rejects integer anon ids on PATCH
+        ("invalid value for anonuid", seen on 2.21 and 2.24), so the PATCH
+        body is a plain dict with the ids as strings, never the SDK model
+        (#600)."""
         import plugins.modules.purefb_policy as pol
 
         pol.NfsExportPolicyRule.reset_mock()
@@ -226,44 +230,248 @@ class TestUpdateNfsPolicyRule:
         mock_loose_version.return_value.__le__ = Mock(return_value=True)
         module = _module(access="root-squash")
         module.params["anonuid"] = 1000
-        blade = _blade(_existing_rule(access="root-squash"))
+        existing = _existing_rule(access="root-squash")
+        existing.anonuid = 20000021
+        existing.anongid = 100021
+        blade = _blade(existing)
 
         update_nfs_policy(module, blade)
 
         blade.patch_nfs_export_policies_rules.assert_called_once()
-        assert (
-            blade.patch_nfs_export_policies_rules.call_args[1]["rule"]
-            is pol.NfsExportPolicyRule.return_value
-        )
-        rule_kwargs = pol.NfsExportPolicyRule.call_args[1]
-        assert rule_kwargs["anonuid"] == 1000
-        assert isinstance(rule_kwargs["anonuid"], int)
-        assert rule_kwargs["anongid"] == 100021
+        rule_body = blade.patch_nfs_export_policies_rules.call_args[1]["rule"]
+        assert isinstance(rule_body, dict)
+        assert rule_body["anonuid"] == "1000"
+        assert rule_body["anongid"] == "100021"
+        pol.NfsExportPolicyRule.assert_not_called()
         module.exit_json.assert_called_once_with(changed=True)
 
     @patch("plugins.modules.purefb_policy.LooseVersion")
-    def test_unset_fields_keep_live_values(self, mock_loose_version):
-        """Rule fields the task leaves unset (no argspec defaults any more)
-        must neither trigger a change nor be rewritten."""
+    def test_unrelated_change_keeps_existing_anon_ids_as_strings(
+        self, mock_loose_version
+    ):
+        """The reporter's case in #600: a rule with anon ids, a task that
+        only changes atime. The ids are filled from the current rule and go
+        back as strings, so the array accepts the PATCH."""
+        import plugins.modules.purefb_policy as pol
+
+        pol.NfsExportPolicyRule.reset_mock()
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+        module = _module(access=None)
+        module.params.update(
+            {
+                "permission": None,
+                "anonuid": None,
+                "anongid": None,
+                "fileid_32bit": None,
+                "atime": False,
+                "secure": None,
+                "security": None,
+            }
+        )
+        existing = _existing_rule(access="all-squash")
+        existing.anonuid = 1234
+        existing.anongid = 5678
+        blade = _blade(existing)
+
+        update_nfs_policy(module, blade)
+
+        rule_body = blade.patch_nfs_export_policies_rules.call_args[1]["rule"]
+        assert rule_body["atime"] is False
+        assert rule_body["anonuid"] == "1234"
+        assert rule_body["anongid"] == "5678"
+        assert rule_body["access"] == "all-squash"
+        pol.NfsExportPolicyRule.assert_not_called()
+
+    @patch("plugins.modules.purefb_policy.LooseVersion")
+    def test_security_order_is_kept_when_task_leaves_it_unset(self, mock_loose_version):
+        """The stored sec= order is a client preference: an unrelated update
+        must send it back unchanged, not sorted (#600)."""
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+        module = _module(access="no-squash")
+        module.params["security"] = None
+        existing = _existing_rule(access="root-squash")
+        existing.security = ["sys", "krb5"]
+        blade = _blade(existing)
+
+        update_nfs_policy(module, blade)
+
+        rule_body = blade.patch_nfs_export_policies_rules.call_args[1]["rule"]
+        assert rule_body["security"] == ["sys", "krb5"]
+
+    @patch("plugins.modules.purefb_policy.LooseVersion")
+    def test_security_compares_order_insensitively(self, mock_loose_version):
+        """The same flavours in another order are not a change."""
         mock_loose_version.return_value.__le__ = Mock(return_value=False)
         module = _module(access="root-squash")
-        for key in (
-            "permission",
-            "access",
-            "anonuid",
-            "anongid",
-            "fileid_32bit",
-            "atime",
-            "secure",
-            "security",
-        ):
-            module.params[key] = None
-        blade = _blade(_existing_rule(access="root-squash"))
+        module.params["security"] = ["krb5", "sys"]
+        existing = _existing_rule(access="root-squash")
+        existing.security = ["sys", "krb5"]
+        blade = _blade(existing)
 
         update_nfs_policy(module, blade)
 
         blade.patch_nfs_export_policies_rules.assert_not_called()
         module.exit_json.assert_called_once_with(changed=False)
+
+
+class TestNfsRuleBody:
+    """_nfs_rule: integers on POST from REST 2.22, strings on every PATCH."""
+
+    @patch("plugins.modules.purefb_policy.LooseVersion")
+    def test_post_uses_sdk_model_with_ints_from_rest_2_22(self, mock_loose_version):
+        import plugins.modules.purefb_policy as pol
+
+        pol.NfsExportPolicyRule.reset_mock()
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+
+        body = _nfs_rule("2.24", client="10.0.0.1", anonuid=1234, anongid=None)
+
+        assert body is pol.NfsExportPolicyRule.return_value
+        assert pol.NfsExportPolicyRule.call_args[1] == {
+            "client": "10.0.0.1",
+            "anonuid": 1234,
+        }
+
+    @patch("plugins.modules.purefb_policy.LooseVersion")
+    def test_patch_is_a_dict_with_string_ids_from_rest_2_22(self, mock_loose_version):
+        import plugins.modules.purefb_policy as pol
+
+        pol.NfsExportPolicyRule.reset_mock()
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+
+        body = _nfs_rule(
+            "2.24", patch=True, client="10.0.0.1", anonuid=1234, anongid=5678
+        )
+
+        assert body == {"client": "10.0.0.1", "anonuid": "1234", "anongid": "5678"}
+        pol.NfsExportPolicyRule.assert_not_called()
+
+    @patch("plugins.modules.purefb_policy.LooseVersion")
+    def test_post_below_rest_2_22_is_a_dict_with_string_ids(self, mock_loose_version):
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+
+        body = _nfs_rule("2.21", client="10.0.0.1", anonuid=1234)
+
+        assert body == {"client": "10.0.0.1", "anonuid": "1234"}
+
+
+def _main_network_module(**overrides):
+    """Params for main() on a network policy task, as AnsibleModule would
+    hand them over: context unset, so the fleet default applies."""
+    module = Mock()
+    module.check_mode = False
+    module.params = {
+        "state": "absent",
+        "policy_type": "network",
+        "enabled": True,
+        "name": "default-network-access-policy",
+        "rename": None,
+        "client": "192.0.2.10",
+        "effect": None,
+        "interfaces": ["management-ssh"],
+        "before_rule": None,
+        "context": "",
+        "account": None,
+        "user": None,
+    }
+    module.params.update(overrides)
+    module.fail_json = Mock(side_effect=SystemExit("fail_json called"))
+    module.exit_json = Mock()
+    return module
+
+
+def _fleet_member_blade():
+    """A blade that reports fleet membership, whose network policy lookups
+    reject any keyword other than names, as the SDK does."""
+    blade = Mock()
+    fleet = Mock()
+    fleet.status_code = 200
+    fleet.items = [Mock()]
+    blade.get_fleets.return_value = fleet
+    array = Mock()
+    array.name = "fb-member"
+    blade.get_arrays.return_value.items = [array]
+
+    lookups = []
+
+    def get_policies(names, **kwargs):
+        lookups.append(kwargs)
+        if kwargs:
+            raise TypeError(
+                "Client.get_network_access_policies() got an unexpected "
+                "keyword argument 'context_names'"
+            )
+        resp = Mock()
+        resp.items = [Mock()]
+        return resp
+
+    def get_rules(policy_names, names, **kwargs):
+        lookups.append(kwargs)
+        if kwargs:
+            raise TypeError(
+                "Client.get_network_access_policies_rules() got an unexpected "
+                "keyword argument 'context_names'"
+            )
+        resp = Mock()
+        resp.status_code = 200
+        return resp
+
+    blade.get_network_access_policies.side_effect = get_policies
+    blade.get_network_access_policies_rules.side_effect = get_rules
+    blade.lookups = lookups
+    return blade
+
+
+class TestNetworkPolicyOnFleetMember:
+    """main() defaults context to the array name on a fleet member, but the
+    network-access-policies endpoints take no context (#599)."""
+
+    @patch("plugins.modules.purefb_policy.delete_network_access_policy")
+    @patch("plugins.modules.purefb_policy.get_rest_api_version")
+    @patch("plugins.modules.purefb_policy.get_system")
+    @patch("plugins.modules.purefb_policy.AnsibleModule")
+    @patch("plugins.modules.purefb_policy.LooseVersion", side_effect=lambda v: v)
+    def test_lookup_sends_no_context(
+        self, _lv, mock_ansible_module, mock_get_system, mock_version, mock_delete
+    ):
+        import plugins.modules.purefb_policy as pol
+
+        module = _main_network_module()
+        mock_ansible_module.return_value = module
+        blade = _fleet_member_blade()
+        mock_get_system.return_value = blade
+        mock_version.return_value = "2.24"
+
+        pol.main()
+
+        # The fleet default did run ...
+        assert module.params["context"] == "fb-member"
+        # ... and the lookup was made without it
+        assert blade.lookups == [{}]
+        mock_delete.assert_called_once_with(module, blade)
+        module.fail_json.assert_not_called()
+
+    @patch("plugins.modules.purefb_policy.update_network_access_policy")
+    @patch("plugins.modules.purefb_policy.get_rest_api_version")
+    @patch("plugins.modules.purefb_policy.get_system")
+    @patch("plugins.modules.purefb_policy.AnsibleModule")
+    @patch("plugins.modules.purefb_policy.LooseVersion", side_effect=lambda v: v)
+    def test_before_rule_lookup_sends_no_context(
+        self, _lv, mock_ansible_module, mock_get_system, mock_version, mock_update
+    ):
+        import plugins.modules.purefb_policy as pol
+
+        module = _main_network_module(state="present", before_rule=2)
+        mock_ansible_module.return_value = module
+        blade = _fleet_member_blade()
+        mock_get_system.return_value = blade
+        mock_version.return_value = "2.24"
+
+        pol.main()
+
+        assert module.params["context"] == "fb-member"
+        assert blade.lookups == [{}, {}]
+        mock_update.assert_called_once_with(module, blade)
 
 
 def _snap_rule(every=86400000, keep_for=86400000, at=None, time_zone=None):

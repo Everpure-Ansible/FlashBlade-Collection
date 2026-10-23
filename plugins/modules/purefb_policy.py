@@ -886,25 +886,31 @@ def _share_rule_patch(current, desired):
 def _anon_id(value):
     """Normalise anonuid/anongid for comparison.
 
-    REST 2.21 and older report the ids as strings, newer arrays as integers;
-    None and "" both mean "not set".
+    The array reports the ids as integers, but a PATCH body carries them as
+    strings (see _nfs_rule), so compare them as int. None and "" both mean
+    "not set".
     """
     if value is None or value == "":
         return None
     return int(value)
 
 
-def _nfs_rule(versions, **fields):
+def _nfs_rule(versions, patch=False, **fields):
     """Build the request body of an NFS export policy rule.
 
-    The SDK's ``NfsExportPolicyRule`` follows the newest REST version, where
-    anonuid/anongid are integers, and rejects strings. Arrays below REST 2.22
-    declare the ids as strings and reject integers on PATCH, so for those the
-    body is sent as a plain dict (which the SDK passes through unchanged) with
-    the ids rendered as strings. Fields set to None are left out either way.
+    The array accepts anonuid/anongid as integers on POST and reports them as
+    integers, but rejects integers on PATCH ("invalid value for anonuid") and
+    takes only strings there. This holds on every REST version tested (2.21
+    and 2.24), so a PATCH body is always sent as a plain dict, which the SDK
+    passes through unchanged, with the ids rendered as strings.
+
+    A POST body uses the SDK's ``NfsExportPolicyRule`` from REST 2.22, where
+    the model declares the ids as integers; below that the model still
+    declares strings and rejects integers, so a dict with string ids is sent
+    instead. Fields set to None are left out either way.
     """
     fields = {key: value for key, value in fields.items() if value is not None}
-    if LooseVersion(NFS_ANON_INT_API_VERSION) <= LooseVersion(versions):
+    if not patch and LooseVersion(NFS_ANON_INT_API_VERSION) <= LooseVersion(versions):
         return NfsExportPolicyRule(**fields)
     for key in ("anonuid", "anongid"):
         if key in fields:
@@ -2413,9 +2419,10 @@ def update_nfs_policy(module, blade):
             if not done:
                 old_policy_rule = rules[0]
                 # Fields the task did not set keep their current value. The
-                # anon ids are normalised to int (REST 2.21 reports strings,
-                # the SDK models from 2.22 only accept integers) and security
-                # is compared order-insensitively.
+                # anon ids are compared as int (the PATCH body renders them
+                # as strings, see _nfs_rule) and security is compared
+                # order-insensitively but sent in the order it is stored,
+                # since NFS clients can treat sec= order as a preference.
                 current_rule = {
                     "access": getattr(old_policy_rule, "access", None),
                     "anongid": _anon_id(getattr(old_policy_rule, "anongid", None)),
@@ -2453,7 +2460,11 @@ def update_nfs_policy(module, blade):
                 if current_rule != new_rule:
                     changed = True
                     if not module.check_mode:
-                        rule = _nfs_rule(versions, **new_rule)
+                        if module.params["security"]:
+                            new_rule["security"] = module.params["security"]
+                        else:
+                            new_rule["security"] = old_policy_rule.security
+                        rule = _nfs_rule(versions, patch=True, **new_rule)
                         if (
                             LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
                             and module.params["context"]
@@ -4486,69 +4497,32 @@ def main():
             )
         if not HAS_PYPURECLIENT:
             module.fail_json(msg="py-pure-client sdk is required for this module")
+        # The network-access-policies endpoints take no fleet context in any
+        # REST version (the SDK methods have no context_names argument), so
+        # the context defaulted for fleet members above must not be sent.
         try:
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                and module.params["context"]
-            ):
-                policy = list(
-                    blade.get_network_access_policies(
-                        names=[module.params["name"]],
-                        context_names=[module.params["context"]],
-                    ).items
-                )[0]
-            else:
-                policy = list(
-                    blade.get_network_access_policies(
-                        names=[module.params["name"]]
-                    ).items
-                )[0]
+            policy = list(
+                blade.get_network_access_policies(names=[module.params["name"]]).items
+            )[0]
         except AttributeError:
             policy = None
         if module.params["rename"]:
             try:
-                if (
-                    LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                    and module.params["context"]
-                ):
-                    new_policy = list(
-                        blade.get_network_access_policies(
-                            names=[module.params["rename"]],
-                            context_names=[module.params["context"]],
-                        ).items
-                    )[0]
-                else:
-                    new_policy = list(
-                        blade.get_network_access_policies(
-                            names=[module.params["rename"]]
-                        ).items
-                    )[0]
+                new_policy = list(
+                    blade.get_network_access_policies(
+                        names=[module.params["rename"]]
+                    ).items
+                )[0]
             except AttributeError:
                 new_policy = None
         if policy and state == "present" and not module.params["rename"]:
             if module.params["before_rule"]:
-                if (
-                    LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                    and module.params["context"]
-                ):
-                    res = blade.get_network_access_policies_rules(
-                        policy_names=[module.params["name"]],
-                        names=[
-                            module.params["name"]
-                            + "."
-                            + str(module.params["before_rule"])
-                        ],
-                        context_names=[module.params["context"]],
-                    )
-                else:
-                    res = blade.get_network_access_policies_rules(
-                        policy_names=[module.params["name"]],
-                        names=[
-                            module.params["name"]
-                            + "."
-                            + str(module.params["before_rule"])
-                        ],
-                    )
+                res = blade.get_network_access_policies_rules(
+                    policy_names=[module.params["name"]],
+                    names=[
+                        module.params["name"] + "." + str(module.params["before_rule"])
+                    ],
+                )
                 if res.status_code != 200:
                     module.fail_json(
                         msg="Rule index {0} does not exist.".format(

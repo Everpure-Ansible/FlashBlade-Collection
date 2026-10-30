@@ -1,7 +1,0 @@
-bugfixes:
-  - purefb_info - Fixed a traceback when gathering the ``lags`` or ``subnets`` subsets, or ``all``, on a
-    FlashBlade running in Layer 3 (BGP) mode, where the link aggregation groups endpoint returns an
-    error and the data subnets have no LAG. The ``lag`` subset is now empty and such subnets report
-    a null ``lag``.
-  - purefb_info - The ``drives`` and ``servers`` subsets now apply their API-version check when
-    requested explicitly, not only as part of ``all``.

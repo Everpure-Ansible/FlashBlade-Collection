@@ -1,0 +1,14 @@
+bugfixes:
+  - purefb_policy - ``policy_type=network`` failed on every array that is a
+    member of a fleet with ``TypeError ... unexpected keyword argument
+    'context_names'``, including ``state=absent`` on a policy that does not
+    exist. The network-access-policies endpoints take no fleet context, so
+    the context defaulted for fleet members is no longer sent to them.
+  - purefb_policy - updating an NFS export rule that has ``anonuid`` or
+    ``anongid`` failed with ``invalid value for anonuid``, even for a change
+    that only touched another field such as ``atime``. The array accepts the
+    ids as integers on create but only as strings on update, so an update
+    now sends them as strings on every REST version.
+  - purefb_policy - an update to an NFS export rule that left ``security``
+    unset sent the stored list back sorted, which can reorder a client's
+    ``sec=`` preference. The stored order is now kept.

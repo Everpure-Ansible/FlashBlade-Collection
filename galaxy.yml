@@ -1,6 +1,6 @@
 namespace: everpure
 name: flashblade
-version: 1.28.0
+version: 1.29.0
 readme: README.md
 authors:
   - Everpure Ansible Team <pure-ansible-team@everpuredata.com>

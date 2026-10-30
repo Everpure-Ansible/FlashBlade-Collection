@@ -424,12 +424,16 @@ def _fleet_member_blade():
 
 class TestNetworkPolicyOnFleetMember:
     """main() defaults context to the array name on a fleet member, but the
-    network-access-policies endpoints take no context (#599)."""
+    network-access-policies endpoints take no context (#599).  main() also
+    gates on the optional pytz import, so these tests force HAS_PYTZ the way
+    the other main() tests force HAS_PYPURECLIENT: a unit test must not depend
+    on an optional library being installed."""
 
     @patch("plugins.modules.purefb_policy.delete_network_access_policy")
     @patch("plugins.modules.purefb_policy.get_rest_api_version")
     @patch("plugins.modules.purefb_policy.get_system")
     @patch("plugins.modules.purefb_policy.AnsibleModule")
+    @patch("plugins.modules.purefb_policy.HAS_PYTZ", True)
     @patch("plugins.modules.purefb_policy.LooseVersion", side_effect=lambda v: v)
     def test_lookup_sends_no_context(
         self, _lv, mock_ansible_module, mock_get_system, mock_version, mock_delete
@@ -455,6 +459,7 @@ class TestNetworkPolicyOnFleetMember:
     @patch("plugins.modules.purefb_policy.get_rest_api_version")
     @patch("plugins.modules.purefb_policy.get_system")
     @patch("plugins.modules.purefb_policy.AnsibleModule")
+    @patch("plugins.modules.purefb_policy.HAS_PYTZ", True)
     @patch("plugins.modules.purefb_policy.LooseVersion", side_effect=lambda v: v)
     def test_before_rule_lookup_sends_no_context(
         self, _lv, mock_ansible_module, mock_get_system, mock_version, mock_update
@@ -472,6 +477,7 @@ class TestNetworkPolicyOnFleetMember:
         assert module.params["context"] == "fb-member"
         assert blade.lookups == [{}, {}]
         mock_update.assert_called_once_with(module, blade)
+        module.fail_json.assert_not_called()
 
 
 def _snap_rule(every=86400000, keep_for=86400000, at=None, time_zone=None):

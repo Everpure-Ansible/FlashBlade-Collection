@@ -36,6 +36,7 @@ build_ignore:
   - .vscode
   - .pytest_cache
   - .pre-commit-config.yaml
+  - htmlcov
   # Vendor catalogue metadata, not Ansible configuration
   - settings.json
   # Development tooling with no meaning inside an installed collection.

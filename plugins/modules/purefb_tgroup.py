@@ -83,6 +83,11 @@ options:
     - Name of fleet member on which to perform the operation.
     - This requires the array receiving the request is a member of a fleet
       and the context name to be a member of the same fleet.
+    - Only sent to the array when set. Purity//FB may refuse a context on
+      the topology group endpoints (REST 2.30 answers C(Parameter
+      context_names is not supported in the target version)); the module
+      then fails with that error and a hint to omit I(context). Fleet
+      membership and array lookups are never context-scoped.
     type: str
     default: ""
 extends_documentation_fragment:
@@ -172,17 +177,31 @@ PERMISSION_HINT = (
     "Topology group changes require the API token of a directory-backed "
     "(LDAP or SAML) user; local users and API clients are not permitted."
 )
+CONTEXT_HINT = (
+    "The array does not accept a context for topology groups on this "
+    "Purity//FB version; retry without the context option."
+)
+NOT_FOUND_MARKERS = ("does not exist", "not found")
 
 
 def _context_kwargs(module):
-    """Return context_names kwargs when a context is set.
+    """Return context_names kwargs only when the user set a context.
 
-    Topology groups require REST 2.26, above the 2.17 fleet-context floor,
-    so the array accepts context_names on every call made here.
+    The SDK advertises context_names on every topology group call from
+    REST 2.26, but Purity//FB (REST 2.30 included) refuses the parameter
+    with "Parameter context_names is not supported in the target version",
+    so nothing is sent unless asked for and a refusal is reported with
+    CONTEXT_HINT by fail_on_error.
     """
     if module.params["context"]:
         return {"context_names": [module.params["context"]]}
     return {}
+
+
+def _is_not_found(res):
+    """True when a 400 says the named object is missing, not that it was refused."""
+    error_text = _error_text(res).lower()
+    return any(marker in error_text for marker in NOT_FOUND_MARKERS)
 
 
 def _extract_members(members, resource_type):
@@ -231,8 +250,12 @@ def fail_on_error(res, module, operation):
         msg = "{0}. Error: {1}".format(operation, error_text)
         # FlashArray refuses a local identity with 403; Purity//FB answers
         # 400 "Operation not permitted." for the same reason.
-        if status_code == 403 or "operation not permitted" in error_text.lower():
+        lowered = error_text.lower()
+        if status_code == 403 or "operation not permitted" in lowered:
             msg = "{0} {1}".format(msg, PERMISSION_HINT)
+        # Purity//FB refuses context_names on the topology group endpoints
+        if "context_names" in lowered and "not supported" in lowered:
+            msg = "{0} {1}".format(msg, CONTEXT_HINT)
         module.fail_json(msg=msg, status_code=status_code, changed=False)
 
 
@@ -260,13 +283,14 @@ def get_tgroup(module, blade, name=None):
         if items:
             return items[0]
         return None
-    # Purity//FB 4.8.8 answers an unknown name with 200 and no items; a 400
-    # is treated as not found as well (the FlashArray shape).  A refused read
-    # is never "not found", so it is reported with the identity hint.
-    if res.status_code != 400 or "operation not permitted" in _error_text(res).lower():
-        fail_on_error(
-            res, module, "Failed to read topology group {0}".format(tgroup_name)
-        )
+    # Purity//FB answers an unknown name with 200 and no items; FlashArray
+    # answers 400 "... does not exist".  Every other error (a refused
+    # identity, an unsupported context, a bad query) is a failed read, never
+    # "not found", or state=absent would report ok and state=present would
+    # try to create a group that may already exist.
+    if res.status_code == 400 and _is_not_found(res):
+        return None
+    fail_on_error(res, module, "Failed to read topology group {0}".format(tgroup_name))
     return None
 
 

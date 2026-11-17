@@ -76,13 +76,16 @@ from plugins.modules.purefb_tgroup import (
     _context_kwargs,
     _error_text,
     _extract_members,
+    _is_not_found,
     _missing_names,
     check_fleet_membership,
     fail_on_error,
+    get_tgroup,
 )
 
 LOCAL = "fb-a"
 PEER = "fa-b"
+CONTEXT_REFUSED = "Parameter context_names is not supported in the target version."
 
 
 def _base_params(**overrides):
@@ -267,6 +270,64 @@ class TestPurefbTgroupHelpers:
         assert msg.startswith("Create failed. Error: Operation not permitted.")
         assert "directory-backed" in msg
         assert module.fail_json.call_args[1]["status_code"] == 400
+
+    def test_fail_on_error_adds_context_hint_when_context_refused(self):
+        # Purity//FB refuses context_names on /topology-groups
+        module = Mock()
+        fail_on_error(_resp(400, errors=[_err(CONTEXT_REFUSED)]), module, "Read failed")
+        msg = module.fail_json.call_args[1]["msg"]
+        assert msg.startswith("Read failed. Error: " + CONTEXT_REFUSED)
+        assert "retry without the context option" in msg
+        assert "directory-backed" not in msg
+
+    def test_is_not_found_recognises_missing_object_text(self):
+        assert _is_not_found(
+            _resp(400, errors=[_err("Topology group does not exist.")])
+        )
+        assert _is_not_found(_resp(400, errors=[_err(None, "Group not found")]))
+        assert not _is_not_found(_resp(400, errors=[_err(CONTEXT_REFUSED)]))
+        assert not _is_not_found(_resp(400, errors=[_err("Syntax error in query")]))
+        assert not _is_not_found(_resp(400))
+
+    def test_get_tgroup_returns_none_on_empty_200(self):
+        # Purity//FB shape for an unknown name
+        module = Mock()
+        module.params = _base_params()
+        blade = Mock()
+        blade.get_topology_groups.return_value = _resp(items=[])
+        assert get_tgroup(module, blade) is None
+        blade.get_topology_groups.assert_called_once_with(names=["app-stack"])
+        module.fail_json.assert_not_called()
+
+    def test_get_tgroup_returns_none_on_does_not_exist_400(self):
+        # FlashArray shape for an unknown name
+        module = Mock()
+        module.params = _base_params()
+        blade = Mock()
+        blade.get_topology_groups.return_value = _resp(
+            400, errors=[_err("Topology group does not exist.")]
+        )
+        assert get_tgroup(module, blade, "ghost") is None
+        blade.get_topology_groups.assert_called_once_with(names=["ghost"])
+        module.fail_json.assert_not_called()
+
+    def test_get_tgroup_fails_on_unexpected_400(self):
+        module = Mock()
+        module.params = _base_params()
+        module.fail_json = Mock(side_effect=SystemExit)
+        blade = Mock()
+        blade.get_topology_groups.return_value = _resp(
+            400, errors=[_err("Syntax error in query")]
+        )
+        try:
+            get_tgroup(module, blade)
+        except SystemExit:
+            pass
+        kwargs = module.fail_json.call_args[1]
+        assert kwargs["msg"] == (
+            "Failed to read topology group app-stack. Error: Syntax error in query"
+        )
+        assert kwargs["status_code"] == 400
 
     def test_check_fleet_membership_passes_inside_fleet(self):
         module = Mock()
@@ -990,6 +1051,97 @@ class TestPurefbTgroupMain:
         assert msg.startswith("Failed to read topology group app-stack")
         assert "directory-backed" in msg
         blade.post_topology_groups.assert_not_called()
+
+    @patch("plugins.modules.purefb_tgroup.LooseVersion")
+    @patch("plugins.modules.purefb_tgroup.get_system")
+    @patch("plugins.modules.purefb_tgroup.AnsibleModule")
+    @patch("plugins.modules.purefb_tgroup.HAS_PYPURECLIENT", True)
+    def test_main_absent_with_refused_context_fails_instead_of_ok(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        # The array refuses context_names on /topology-groups: that is a
+        # failed read, not "group already gone"
+        module = _module(state="absent", context="fleet1")
+        blade = _blade(tgroups={"app-stack": _tgroup("app-stack")})
+        blade.get_topology_groups.side_effect = None
+        blade.get_topology_groups.return_value = _resp(
+            400, errors=[_err(CONTEXT_REFUSED)]
+        )
+        _run(module, blade, mock_ansible_module, mock_get_system, mock_loose_version)
+
+        blade.get_topology_groups.assert_called_once_with(
+            names=["app-stack"], context_names=["fleet1"]
+        )
+        msg = module.fail_json.call_args[1]["msg"]
+        assert msg.startswith(
+            "Failed to read topology group app-stack. Error: " + CONTEXT_REFUSED
+        )
+        assert "retry without the context option" in msg
+        blade.delete_topology_groups.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    @patch("plugins.modules.purefb_tgroup.LooseVersion")
+    @patch("plugins.modules.purefb_tgroup.get_system")
+    @patch("plugins.modules.purefb_tgroup.AnsibleModule")
+    @patch("plugins.modules.purefb_tgroup.HAS_PYPURECLIENT", True)
+    def test_main_present_with_refused_context_does_not_create(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        module = _module(parent="root", context="fleet1")
+        blade = _blade(tgroups={"app-stack": _tgroup("app-stack")})
+        blade.get_topology_groups.side_effect = None
+        blade.get_topology_groups.return_value = _resp(
+            400, errors=[_err(CONTEXT_REFUSED)]
+        )
+        _run(module, blade, mock_ansible_module, mock_get_system, mock_loose_version)
+
+        msg = module.fail_json.call_args[1]["msg"]
+        assert msg.startswith("Failed to read topology group app-stack")
+        assert "retry without the context option" in msg
+        # neither a misleading "parent does not exist" nor a create attempt
+        blade.get_topology_groups.assert_called_once()
+        blade.post_topology_groups.assert_not_called()
+        blade.patch_topology_groups.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    @patch("plugins.modules.purefb_tgroup.LooseVersion")
+    @patch("plugins.modules.purefb_tgroup.get_system")
+    @patch("plugins.modules.purefb_tgroup.AnsibleModule")
+    @patch("plugins.modules.purefb_tgroup.HAS_PYPURECLIENT", True)
+    def test_main_read_unexpected_error_does_not_create(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        module = _module()
+        blade = _blade()
+        blade.get_topology_groups.side_effect = None
+        blade.get_topology_groups.return_value = _resp(
+            400, errors=[_err("Syntax error in query")]
+        )
+        _run(module, blade, mock_ansible_module, mock_get_system, mock_loose_version)
+
+        msg = module.fail_json.call_args[1]["msg"]
+        assert msg == (
+            "Failed to read topology group app-stack. Error: Syntax error in query"
+        )
+        blade.post_topology_groups.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    @patch("plugins.modules.purefb_tgroup.LooseVersion")
+    @patch("plugins.modules.purefb_tgroup.get_system")
+    @patch("plugins.modules.purefb_tgroup.AnsibleModule")
+    @patch("plugins.modules.purefb_tgroup.HAS_PYPURECLIENT", True)
+    def test_main_creates_when_read_returns_empty_200(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        # Purity//FB answers an unknown name with 200 and no items
+        module = _module()
+        blade = _blade()
+        blade.get_topology_groups.side_effect = None
+        blade.get_topology_groups.return_value = _resp(items=[])
+        _run(module, blade, mock_ansible_module, mock_get_system, mock_loose_version)
+
+        blade.post_topology_groups.assert_called_once_with(names=["app-stack"])
+        module.exit_json.assert_called_once_with(changed=True)
 
     @patch("plugins.modules.purefb_tgroup.LooseVersion")
     @patch("plugins.modules.purefb_tgroup.get_system")

@@ -241,7 +241,8 @@ class TestPurefbLegalHoldHelpers:
             pass
 
         module.fail_json.assert_called_once()
-        assert "Failed to read held entities" in module.fail_json.call_args[1]["msg"]
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Failed to read held entities for legal hold case-42 at ghost:/" in msg
 
     def test_get_entity_matches_exact_path_only(self):
         module = Mock()
@@ -583,7 +584,7 @@ class TestPurefbLegalHoldMain:
         _run()
 
         blade.post_legal_holds.assert_not_called()
-        blade.get_file_systems.assert_not_called()
+        blade.get_file_systems.assert_called_once_with(names=["evidence"])
         blade.post_legal_holds_held_entities.assert_called_once_with(
             names=["case-42"],
             file_system_names=["evidence"],
@@ -741,9 +742,11 @@ class TestPurefbLegalHoldMain:
 
         _run()
 
+        blade.get_file_systems.assert_called_once_with(names=["ghost"])
         blade.post_legal_holds_held_entities.assert_not_called()
         module.fail_json.assert_called_once()
-        assert "Failed to read held entities" in module.fail_json.call_args[1]["msg"]
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Failed to read held entities for legal hold case-42 at ghost:/" in msg
 
     @patch("plugins.modules.purefb_legal_hold.LooseVersion")
     @patch("plugins.modules.purefb_legal_hold.get_system")
@@ -764,6 +767,56 @@ class TestPurefbLegalHoldMain:
         blade.get_file_systems.assert_called_once_with(names=["ghost"])
         blade.post_legal_holds.assert_not_called()
         blade.post_legal_holds_held_entities.assert_not_called()
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Failed to read file system ghost for legal hold case-42" in msg
+
+    @patch("plugins.modules.purefb_legal_hold.LooseVersion")
+    @patch("plugins.modules.purefb_legal_hold.get_system")
+    @patch("plugins.modules.purefb_legal_hold.AnsibleModule")
+    @patch("plugins.modules.purefb_legal_hold.HAS_PYPURECLIENT", True)
+    def test_apply_entity_existing_hold_missing_file_system(
+        self, mock_ansible_module, mock_get_system, mock_loose
+    ):
+        mock_loose.return_value.__gt__ = Mock(return_value=False)
+        module = _module(_base_params(file_system="ghost", path="/"))
+        mock_ansible_module.return_value = module
+        blade = _blade(hold=_hold())
+        blade.get_file_systems.return_value = _response(400)
+        mock_get_system.return_value = blade
+
+        _run()
+
+        blade.get_file_systems.assert_called_once_with(names=["ghost"])
+        # the file system is validated before any held-entity read or write
+        blade.get_legal_holds_held_entities.assert_not_called()
+        blade.patch_legal_holds.assert_not_called()
+        blade.post_legal_holds_held_entities.assert_not_called()
+        module.exit_json.assert_not_called()
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Failed to read file system ghost for legal hold case-42" in msg
+        assert "held entities" not in msg
+
+    @patch("plugins.modules.purefb_legal_hold.LooseVersion")
+    @patch("plugins.modules.purefb_legal_hold.get_system")
+    @patch("plugins.modules.purefb_legal_hold.AnsibleModule")
+    @patch("plugins.modules.purefb_legal_hold.HAS_PYPURECLIENT", True)
+    def test_apply_entity_existing_hold_missing_file_system_check_mode(
+        self, mock_ansible_module, mock_get_system, mock_loose
+    ):
+        mock_loose.return_value.__gt__ = Mock(return_value=False)
+        module = _module(_base_params(file_system="ghost", path="/"), check_mode=True)
+        mock_ansible_module.return_value = module
+        blade = _blade(hold=_hold())
+        blade.get_file_systems.return_value = _response(400)
+        mock_get_system.return_value = blade
+
+        _run()
+
+        blade.get_file_systems.assert_called_once_with(names=["ghost"])
+        blade.get_legal_holds_held_entities.assert_not_called()
+        module.exit_json.assert_not_called()
         module.fail_json.assert_called_once()
         msg = module.fail_json.call_args[1]["msg"]
         assert "Failed to read file system ghost for legal hold case-42" in msg
@@ -950,6 +1003,54 @@ class TestPurefbLegalHoldMain:
         blade.get_legal_holds_held_entities.assert_not_called()
         blade.patch_legal_holds_held_entities.assert_not_called()
         assert module.exit_json.call_args[1] == {"changed": False}
+
+    @patch("plugins.modules.purefb_legal_hold.LooseVersion")
+    @patch("plugins.modules.purefb_legal_hold.get_system")
+    @patch("plugins.modules.purefb_legal_hold.AnsibleModule")
+    @patch("plugins.modules.purefb_legal_hold.HAS_PYPURECLIENT", True)
+    def test_release_entity_missing_file_system(
+        self, mock_ansible_module, mock_get_system, mock_loose
+    ):
+        mock_loose.return_value.__gt__ = Mock(return_value=False)
+        module = _module(_base_params(file_system="ghost", path="/", release=True))
+        mock_ansible_module.return_value = module
+        blade = _blade(hold=_hold())
+        blade.get_file_systems.return_value = _response(400)
+        mock_get_system.return_value = blade
+
+        _run()
+
+        blade.get_file_systems.assert_called_once_with(names=["ghost"])
+        blade.get_legal_holds_held_entities.assert_not_called()
+        blade.patch_legal_holds_held_entities.assert_not_called()
+        module.exit_json.assert_not_called()
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Failed to read file system ghost for legal hold case-42" in msg
+        assert "held entities" not in msg
+
+    @patch("plugins.modules.purefb_legal_hold.LooseVersion")
+    @patch("plugins.modules.purefb_legal_hold.get_system")
+    @patch("plugins.modules.purefb_legal_hold.AnsibleModule")
+    @patch("plugins.modules.purefb_legal_hold.HAS_PYPURECLIENT", True)
+    def test_release_entity_missing_file_system_without_hold(
+        self, mock_ansible_module, mock_get_system, mock_loose
+    ):
+        mock_loose.return_value.__gt__ = Mock(return_value=False)
+        module = _module(_base_params(file_system="ghost", path="/", state="absent"))
+        mock_ansible_module.return_value = module
+        blade = _blade(hold=None)
+        blade.get_file_systems.return_value = _response(400)
+        mock_get_system.return_value = blade
+
+        _run()
+
+        # the file system is validated even when there is no hold to release
+        blade.get_file_systems.assert_called_once_with(names=["ghost"])
+        module.exit_json.assert_not_called()
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Failed to read file system ghost for legal hold case-42" in msg
 
     @patch("plugins.modules.purefb_legal_hold.LooseVersion")
     @patch("plugins.modules.purefb_legal_hold.get_system")

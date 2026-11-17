@@ -59,9 +59,9 @@ options:
     description:
     - Name of the file system containing I(path).
     - Must be given together with I(path).
-    - When the legal hold does not exist yet the file system must already
-      exist; it is checked before the hold is created so a rejected apply
-      never leaves a new hold behind.
+    - The file system must already exist. It is checked before anything is
+      read or written, so an unknown name fails with a clear message and a
+      rejected apply never leaves a new hold behind.
     type: str
   path:
     description:
@@ -227,8 +227,8 @@ def _get_hold(module, blade):
 def _get_held_entities(module, blade, file_system=None, path=None):
     """Return the held entities of this hold, optionally for one path.
 
-    Fails the module when the array rejects the query (for example an
-    unknown file system) so a refusal is never mistaken for 'not held'.
+    Fails the module when the array rejects the query (for example a path
+    that does not exist) so a refusal is never mistaken for 'not held'.
     """
     kwargs = {"names": [module.params["name"]]}
     if file_system:
@@ -237,9 +237,14 @@ def _get_held_entities(module, blade, file_system=None, path=None):
             kwargs["paths"] = [path]
     res = blade.get_legal_holds_held_entities(**kwargs)
     if res.status_code != 200:
+        target = module.params["name"]
+        if file_system and path:
+            target = "{0} at {1}:{2}".format(target, file_system, path)
+        elif file_system:
+            target = "{0} in file system {1}".format(target, file_system)
         module.fail_json(
             msg="Failed to read held entities for legal hold {0}. Error: {1}".format(
-                module.params["name"], get_error_message(res)
+                target, get_error_message(res)
             )
         )
     return list(res.items)
@@ -259,7 +264,12 @@ def _get_entity(module, blade):
 
 
 def _check_file_system(module, blade):
-    """Fail when the requested file system cannot be read from the array."""
+    """Fail when the requested file system cannot be read from the array.
+
+    Runs for every file_system/path call, whether the hold exists or not,
+    so an unknown file system is reported as such rather than through the
+    held-entities query that would otherwise reject it.
+    """
     file_system = module.params["file_system"]
     res = blade.get_file_systems(names=[file_system])
     if res.status_code != 200:
@@ -369,12 +379,10 @@ def apply_entity(module, blade, hold):
     """Apply the hold to file_system/path, creating the hold when needed.
 
     A path whose previous release is still in progress counts as not held
-    and is applied again; the array decides whether it accepts that. When
-    the hold does not exist yet the file system is checked first so a
-    rejected apply never leaves a freshly created hold behind.
+    and is applied again; the array decides whether it accepts that. The
+    file system has already been validated by main(), so a rejected apply
+    never leaves a freshly created hold behind.
     """
-    if hold is None:
-        _check_file_system(module, blade)
     changed = ensure_hold(module, blade, hold)
     entity = None
     if hold is not None:
@@ -487,6 +495,9 @@ def main():
     state = module.params["state"]
 
     if path:
+        # Validate the file system before any held-entity read or write so
+        # an unknown name fails clearly instead of as a held-entities error.
+        _check_file_system(module, blade)
         if state == "absent" or module.params["release"]:
             release_entity(module, blade, hold)
         else:

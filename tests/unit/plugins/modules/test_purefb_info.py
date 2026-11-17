@@ -95,6 +95,7 @@ from plugins.modules.purefb_info import (
     generate_realms_dict,
     generate_resource_accesses_dict,
     generate_file_repl_dict,
+    generate_fs_repl_transfer_dict,
 )
 
 
@@ -1139,6 +1140,96 @@ class TestPurefbInfo:
         assert result["net2"]["lag"] is None
         assert result["net2"]["vlan"] is None
         assert result["net2"]["interfaces"] == [{"name": "vip1"}]
+
+    @staticmethod
+    def _fs_repl_transfer(name, remote, remote_snapshot):
+        """Build a replica link transfer mock with the SDK model's fields."""
+        transfer = Mock(
+            spec=[
+                "name",
+                "completed",
+                "data_transferred",
+                "progress",
+                "direction",
+                "local_snapshot",
+                "remote",
+                "remote_snapshot",
+                "started",
+                "status",
+            ]
+        )
+        transfer.name = name
+        transfer.completed = 1700000100000
+        transfer.data_transferred = 4096
+        transfer.progress = 1.0
+        transfer.direction = "outbound"
+        transfer.local_snapshot = Mock(spec=[])
+        transfer.remote = remote
+        transfer.remote_snapshot = remote_snapshot
+        transfer.started = 1700000000000
+        transfer.status = "completed"
+        return transfer
+
+    @staticmethod
+    def _ref(name):
+        ref = Mock(spec=["name"])
+        ref.name = name
+        return ref
+
+    def test_generate_fs_repl_transfer_dict_reads_transfers(self):
+        """Replica link transfers are keyed by snapshot name and then by
+        remote array; an empty local_snapshot reference reads as None."""
+        transfer = self._fs_repl_transfer(
+            "fs1.daily-1", self._ref("peer"), self._ref("fs1.daily-1")
+        )
+        response = Mock()
+        response.status_code = 200
+        response.items = [transfer]
+        mock_blade = Mock()
+        mock_blade.get_file_system_replica_links_transfer.return_value = response
+
+        result = generate_fs_repl_transfer_dict(mock_blade)
+
+        assert list(result) == ["fs1.daily-1"]
+        assert list(result["fs1.daily-1"]) == ["peer"]
+        entry = result["fs1.daily-1"]["peer"]
+        assert entry["remote"] == "peer"
+        assert entry["remote_snapshot"] == "fs1.daily-1"
+        assert entry["local_snapshot"] is None
+        assert entry["status"] == "completed"
+        assert entry["data_transferred"] == 4096
+
+    def test_generate_fs_repl_transfer_dict_keeps_fan_out_transfers(self):
+        """The same snapshot transferring to two arrays keeps both entries,
+        and unset remote or remote_snapshot references do not raise."""
+        to_b = self._fs_repl_transfer(
+            "fs1.daily-1", self._ref("arrayB"), self._ref("fs1.daily-1")
+        )
+        to_c = self._fs_repl_transfer("fs1.daily-1", self._ref("arrayC"), None)
+        unset = self._fs_repl_transfer("fs2.daily-1", None, None)
+        response = Mock()
+        response.status_code = 200
+        response.items = [to_b, to_c, unset]
+        mock_blade = Mock()
+        mock_blade.get_file_system_replica_links_transfer.return_value = response
+
+        result = generate_fs_repl_transfer_dict(mock_blade)
+
+        assert sorted(result["fs1.daily-1"]) == ["arrayB", "arrayC"]
+        assert result["fs1.daily-1"]["arrayB"]["remote_snapshot"] == "fs1.daily-1"
+        assert result["fs1.daily-1"]["arrayC"]["remote_snapshot"] is None
+        (orphan,) = result["fs2.daily-1"].values()
+        assert orphan["remote"] is None
+        assert orphan["remote_snapshot"] is None
+        assert orphan["status"] == "completed"
+
+    def test_generate_fs_repl_transfer_dict_returns_empty_on_error(self):
+        response = Mock()
+        response.status_code = 400
+        mock_blade = Mock()
+        mock_blade.get_file_system_replica_links_transfer.return_value = response
+
+        assert generate_fs_repl_transfer_dict(mock_blade) == {}
 
     def test_generate_network_dict_reads_attached_servers_and_subnet(self):
         """server comes from attached_servers[0] and subnet may be a dict.

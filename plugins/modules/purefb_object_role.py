@@ -67,12 +67,15 @@ options:
     - Policies already attached are left in place. Other policies attached
       to the role are only detached when listed in I(remove_access_policies)
       or when I(exclusive=true).
+    - Every listed policy must exist.
     type: list
     elements: str
   remove_access_policies:
     description:
     - Object store access policies to detach from the role.
     - Uses the same naming as I(access_policies).
+    - Every listed policy must exist. A policy that exists but is not
+      attached to the role is left alone.
     type: list
     elements: str
   exclusive:
@@ -331,20 +334,17 @@ def _check_policies_exist(module, blade, policies):
             module.fail_json(msg="Access policy {0} does not exist.".format(policy))
 
 
+def _requested_policies(module, key):
+    """Qualified, de-duplicated policy names from a list parameter."""
+    return _dedupe(
+        [_qualify_policy(module, policy) for policy in (module.params[key] or [])]
+    )
+
+
 def _desired_policy_changes(module, current):
     """Return (to_attach, to_detach) from the parameters and the attached list."""
-    wanted = _dedupe(
-        [
-            _qualify_policy(module, policy)
-            for policy in (module.params["access_policies"] or [])
-        ]
-    )
-    unwanted = _dedupe(
-        [
-            _qualify_policy(module, policy)
-            for policy in (module.params["remove_access_policies"] or [])
-        ]
-    )
+    wanted = _requested_policies(module, "access_policies")
+    unwanted = _requested_policies(module, "remove_access_policies")
     clash = [policy for policy in wanted if policy in unwanted]
     if clash:
         module.fail_json(
@@ -364,6 +364,22 @@ def _desired_policy_changes(module, current):
     to_attach = [policy for policy in wanted if policy not in current]
     to_detach = [policy for policy in unwanted if policy in current]
     return to_attach, to_detach
+
+
+def _policies_to_validate(module, current, to_attach):
+    """Names that must exist before anything is written.
+
+    Policies to attach must exist. So must the names in
+    remove_access_policies that are not attached: an attached policy exists
+    by definition, but a mistyped name would otherwise pass silently as
+    "nothing to detach".
+    """
+    unattached = [
+        policy
+        for policy in _requested_policies(module, "remove_access_policies")
+        if policy not in current
+    ]
+    return to_attach + unattached
 
 
 def _apply_policy_changes(module, blade, to_attach, to_detach):
@@ -416,13 +432,8 @@ def _role_facts(module, role, policies):
 def create_role(module, blade, duration_ms):
     changed = True
     role_name = _full_role_name(module)
-    wanted = _dedupe(
-        [
-            _qualify_policy(module, policy)
-            for policy in (module.params["access_policies"] or [])
-        ]
-    )
-    _check_policies_exist(module, blade, wanted)
+    wanted, _unused = _desired_policy_changes(module, [])
+    _check_policies_exist(module, blade, _policies_to_validate(module, [], wanted))
     if module.check_mode:
         module.exit_json(
             changed=changed,
@@ -461,7 +472,9 @@ def update_role(module, blade, role, duration_ms):
     role_name = _full_role_name(module)
     current_policies = _get_attached_policies(module, blade)
     to_attach, to_detach = _desired_policy_changes(module, current_policies)
-    _check_policies_exist(module, blade, to_attach)
+    _check_policies_exist(
+        module, blade, _policies_to_validate(module, current_policies, to_attach)
+    )
     if duration_ms is not None and duration_ms != getattr(
         role, "max_session_duration", None
     ):

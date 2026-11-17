@@ -78,7 +78,9 @@ from plugins.modules.purefb_object_role import (
     _context_kwargs,
     _desired_policy_changes,
     _duration_to_ms,
+    _policies_to_validate,
     _qualify_policy,
+    _requested_policies,
     _role_facts,
 )
 
@@ -239,6 +241,30 @@ class TestHelpers:
         module = _module()
         assert _qualify_policy(module, "reports") == ACCOUNT + "/reports"
 
+    def test_requested_policies_qualifies_and_dedupes(self):
+        module = _module(
+            remove_access_policies=["reports", READ, "reports", ACCOUNT + "/reports"]
+        )
+        assert _requested_policies(module, "remove_access_policies") == [
+            ACCOUNT + "/reports",
+            READ,
+        ]
+
+    def test_requested_policies_empty_when_unset(self):
+        module = _module()
+        assert _requested_policies(module, "access_policies") == []
+
+    def test_policies_to_validate_adds_unattached_removals_only(self):
+        module = _module(remove_access_policies=[READ, LIST])
+        assert _policies_to_validate(module, [READ], [ACCOUNT + "/new"]) == [
+            ACCOUNT + "/new",
+            LIST,
+        ]
+
+    def test_policies_to_validate_without_removals(self):
+        module = _module(access_policies=[READ])
+        assert _policies_to_validate(module, [], [READ]) == [READ]
+
     def test_desired_policy_changes_additive_by_default(self):
         module = _module(access_policies=[READ, "reports"])
         to_attach, to_detach = _desired_policy_changes(module, [READ, LIST])
@@ -390,6 +416,44 @@ class TestPurefbObjectRole:
             in module.fail_json.call_args[1]["msg"]
         )
 
+    def test_create_unknown_remove_policy_fails_before_post(self):
+        module = _module(remove_access_policies=["pure:policy/no-such"])
+        blade = _blade(role=None, policies_valid=False)
+
+        _run_main(module, blade)
+
+        blade.post_object_store_roles.assert_not_called()
+        assert (
+            "Access policy pure:policy/no-such does not exist"
+            in module.fail_json.call_args[1]["msg"]
+        )
+
+    def test_create_with_known_remove_policy_only_checks_it(self):
+        module = _module(remove_access_policies=[LIST])
+        blade = _blade(role=None)
+        blade.get_object_store_roles.side_effect = [
+            _response(400),
+            _response(200, [_role()]),
+        ]
+
+        _run_main(module, blade)
+
+        blade.get_object_store_access_policies.assert_called_once()
+        assert blade.get_object_store_access_policies.call_args[1]["names"] == [LIST]
+        blade.post_object_store_roles.assert_called_once()
+        blade.delete_object_store_roles_object_store_access_policies.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_create_policy_clash_fails_before_post(self):
+        module = _module(access_policies=[READ], remove_access_policies=[READ])
+        blade = _blade(role=None)
+
+        _run_main(module, blade)
+
+        blade.post_object_store_roles.assert_not_called()
+        blade.get_object_store_access_policies.assert_not_called()
+        assert "both access_policies" in module.fail_json.call_args[1]["msg"]
+
     # ---------------- present on an existing role ----------------
 
     def test_present_idempotent(self):
@@ -530,8 +594,78 @@ class TestPurefbObjectRole:
 
         _run_main(module, blade)
 
+        # the unattached name is validated, then nothing is written
+        blade.get_object_store_access_policies.assert_called_once()
+        assert blade.get_object_store_access_policies.call_args[1]["names"] == [READ]
         blade.delete_object_store_roles_object_store_access_policies.assert_not_called()
         assert module.exit_json.call_args[1]["changed"] is False
+        module.warn.assert_not_called()
+
+    def test_remove_attached_policy_skips_existence_lookup(self):
+        module = _module(remove_access_policies=[READ])
+        blade = _blade(role=_role(), attached=[READ])
+        blade.get_object_store_roles_object_store_access_policies.side_effect = [
+            _response(200, [_link(READ)]),
+            _response(200, []),
+        ]
+
+        _run_main(module, blade)
+
+        blade.get_object_store_access_policies.assert_not_called()
+        blade.delete_object_store_roles_object_store_access_policies.assert_called_once()
+        result = module.exit_json.call_args[1]
+        assert result["changed"] is True
+        assert result["role"]["access_policies"] == []
+
+    def test_remove_unknown_policy_fails_before_any_write(self):
+        module = _module(
+            max_session_duration="2h", remove_access_policies=["pure:policy/no-such"]
+        )
+        blade = _blade(role=_role(3600000), attached=[READ], policies_valid=False)
+
+        _run_main(module, blade)
+
+        blade.patch_object_store_roles.assert_not_called()
+        blade.post_object_store_roles_object_store_access_policies.assert_not_called()
+        blade.delete_object_store_roles_object_store_access_policies.assert_not_called()
+        assert (
+            "Access policy pure:policy/no-such does not exist"
+            in module.fail_json.call_args[1]["msg"]
+        )
+
+    def test_remove_unknown_bare_policy_fails_in_check_mode(self):
+        module = _module(check_mode=True, remove_access_policies=["no-such"])
+        blade = _blade(role=_role(), attached=[READ], policies_valid=False)
+
+        _run_main(module, blade)
+
+        module.exit_json.assert_not_called()
+        assert (
+            "Access policy acme/no-such does not exist"
+            in module.fail_json.call_args[1]["msg"]
+        )
+
+    def test_remove_known_unattached_with_exclusive_detaches_only_extras(self):
+        module = _module(
+            access_policies=[READ], remove_access_policies=["other/x"], exclusive=True
+        )
+        blade = _blade(role=_role(), attached=[READ, LIST])
+        blade.get_object_store_roles_object_store_access_policies.side_effect = [
+            _response(200, [_link(READ), _link(LIST)]),
+            _response(200, [_link(READ)]),
+        ]
+
+        _run_main(module, blade)
+
+        blade.get_object_store_access_policies.assert_called_once()
+        assert blade.get_object_store_access_policies.call_args[1]["names"] == [
+            "other/x"
+        ]
+        calls = (
+            blade.delete_object_store_roles_object_store_access_policies.call_args_list
+        )
+        assert [c[1]["policy_names"] for c in calls] == [[LIST]]
+        assert module.exit_json.call_args[1]["role"]["access_policies"] == [READ]
 
     def test_exclusive_detaches_extras(self):
         module = _module(access_policies=[LIST], exclusive=True)

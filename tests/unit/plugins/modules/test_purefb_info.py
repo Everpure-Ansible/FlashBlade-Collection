@@ -97,6 +97,7 @@ from plugins.modules.purefb_info import (
     generate_realms_dict,
     generate_resource_accesses_dict,
     generate_file_repl_dict,
+    generate_ad_dict,
     _maintenance_window_list,
     generate_admin_dict,
     generate_directory_service_roles_dict,
@@ -2036,3 +2037,46 @@ class TestPurefbInfo:
         call_args = mock_module.exit_json.call_args[1]
         assert call_args["purefb_info"]["fleet"] == {"fleet1": {"members": {}}}
         assert "policies" not in call_args["purefb_info"]
+
+    def test_generate_ad_dict_reports_ca_references(self):
+        """The CA certificate and group names are read back, None when unset."""
+        ca = Mock(spec=["name"])
+        ca.name = "domain_ca"
+        account = Mock(
+            spec=[
+                "name",
+                "computer_name",
+                "domain",
+                "directory_servers",
+                "kerberos_servers",
+                "service_principal_names",
+                "join_ou",
+                "encryption_types",
+                "global_catalog_servers",
+                "server",
+                "ca_certificate",
+                "ca_certificate_group",
+            ]
+        )
+        account.name = "ad1"
+        account.computer_name = "AD1"
+        account.domain = "acme.com"
+        account.directory_servers = ["ldap.acme.com"]
+        account.kerberos_servers = ["kdc.acme.com"]
+        account.service_principal_names = ["nfs/ad1.acme.com"]
+        account.join_ou = "CN=Computers"
+        account.encryption_types = ["aes256-cts-hmac-sha1-96"]
+        account.global_catalog_servers = None
+        account.server = None
+        account.ca_certificate = ca
+        account.ca_certificate_group = None
+
+        mock_blade = Mock()
+        mock_blade.get_active_directory.return_value.total_item_count = 1
+        mock_blade.get_active_directory.return_value.items = [account]
+
+        result = generate_ad_dict(mock_blade)
+
+        assert result["ad1"]["ca_certificate"] == "domain_ca"
+        assert result["ad1"]["ca_certificate_group"] is None
+        assert result["ad1"]["server"] is None

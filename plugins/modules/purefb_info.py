@@ -1136,6 +1136,12 @@ def generate_ad_dict(blade):
             "encryption_types": ad.encryption_types,
             "global_catalog_servers": getattr(ad, "global_catalog_servers", None),
             "server": getattr(getattr(ad, "server", None), "name", None),
+            "ca_certificate": getattr(
+                getattr(ad, "ca_certificate", None), "name", None
+            ),
+            "ca_certificate_group": getattr(
+                getattr(ad, "ca_certificate_group", None), "name", None
+            ),
         }
 
     return ad_info

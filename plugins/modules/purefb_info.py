@@ -45,6 +45,10 @@ options:
         list (and the top-level C(file_system_exports) view under
         C(subset=filesystems)/C(subset=all)) instead. These keys will
         be removed from this module in 2.0.0.
+      - The C(filesystems) subset also returns a top-level C(junctions)
+        dictionary of file system junctions, keyed by junction name with
+        the origin and destination file systems, the junction path and
+        the junction status. Requires REST API 2.25 (Purity//FB 4.8.0+).
     required: false
     type: list
     elements: str
@@ -128,6 +132,7 @@ FLEET_API_VERSION = "2.17"
 TLS_API_VERSION = "2.17"
 REALMS_API_VERSION = "2.19"
 S3_EXPORT_API_VERSION = "2.20"
+JUNCTION_API_VERSION = "2.25"
 
 
 def _bytes_to_human(bytes_number):
@@ -1700,6 +1705,25 @@ def generate_file_system_exports_dict(blade):
     return exports
 
 
+def generate_fs_junctions_dict(blade):
+    junctions_info = {}
+    res = blade.get_file_system_junctions()
+    if res.status_code != 200:
+        return junctions_info
+    for junction in list(res.items):
+        junctions_info[junction.name] = {
+            "origin": getattr(
+                getattr(junction, "origin_file_system", None), "name", None
+            ),
+            "destination": getattr(
+                getattr(junction, "destination_file_system", None), "name", None
+            ),
+            "path": getattr(junction, "junction_origin_path", None),
+            "status": getattr(junction, "status", None),
+        }
+    return junctions_info
+
+
 def generate_fleet_dict(blade):
     fleet_items = list(blade.get_fleets().items)
     if not fleet_items:
@@ -1789,6 +1813,8 @@ def main():
             exports_list = generate_file_system_exports_dict(blade)
             info["file_system_exports"] = exports_list
         info["filesystems"] = generate_fs_dict(blade, exports_list)
+        if LooseVersion(JUNCTION_API_VERSION) <= LooseVersion(api_version):
+            info["junctions"] = generate_fs_junctions_dict(blade)
     if "admins" in subset or "all" in subset:
         info["admins"] = generate_admin_dict(blade)
     if "snapshots" in subset or "all" in subset:

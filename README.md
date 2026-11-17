@@ -114,6 +114,7 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_export - manage filesystem exports on FlashBlade
 - purefb_fleet - manage Fusion fleet members
 - purefb_fs - manage filesystems on a FlashBlade
+- purefb_fs_junction - manage file system junctions on a FlashBlade
 - purefb_fs_replica - manage filesystem replica links on a FlashBlade
 - purefb_groupquota - manage individual group quotas on FlashBlade filesystems
 - purefb_hardware - manage hardware LED identifiers and hardware connectors

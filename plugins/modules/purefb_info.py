@@ -36,6 +36,10 @@ options:
         capacity, network, subnets, lags, filesystems, snapshots, buckets,
         replication, policies, arrays, accounts, admins, ad, kerberos,
         drives, servers, fleet and realms.
+      - The C(accounts) subset also returns C(object_store_roles), the
+        object store roles with their maximum session duration, PRN,
+        trusted entities and attached access policies, on REST API 2.17
+        and later.
       - The C(filesystems) subset surfaces the legacy file system keys
         C(nfs_rules), C(export_policy), C(smb_client_policy) and
         C(smb_share_policy). Purity//FB marks the underlying fields as
@@ -126,6 +130,7 @@ SERVERS_API_VERSION = "2.16"
 PASSWORD_POLICY_API_VERSION = "2.16"
 FLEET_API_VERSION = "2.17"
 TLS_API_VERSION = "2.17"
+OBJECT_ROLES_API_VERSION = "2.17"
 REALMS_API_VERSION = "2.19"
 S3_EXPORT_API_VERSION = "2.20"
 
@@ -1543,6 +1548,32 @@ def generate_object_store_accounts_dict(blade):
     return account_info
 
 
+def generate_object_store_roles_dict(blade):
+    roles_info = {}
+    res = blade.get_object_store_roles()
+    if res.status_code != 200:
+        return roles_info
+    for role in list(res.items):
+        entities = getattr(role, "trusted_entities", None)
+        if not isinstance(entities, list):
+            entities = []
+        roles_info[role.name] = {
+            "account": getattr(getattr(role, "account", None), "name", None),
+            "created": getattr(role, "created", None),
+            "max_session_duration": getattr(role, "max_session_duration", None),
+            "prn": getattr(role, "prn", None),
+            "trusted_entities": [getattr(entity, "name", None) for entity in entities],
+            "access_policies": [],
+        }
+    links = blade.get_object_store_roles_object_store_access_policies()
+    if links.status_code == 200:
+        for link in list(links.items):
+            role_name = getattr(getattr(link, "member", None), "name", None)
+            if role_name in roles_info:
+                roles_info[role_name]["access_policies"].append(link.policy.name)
+    return roles_info
+
+
 def generate_fs_dict(blade, exports=None):
     fs_info = {}
     by_fs = {}
@@ -1815,6 +1846,8 @@ def main():
             info["object_store_account_exports"] = (
                 generate_object_store_account_exports_dict(blade)
             )
+        if LooseVersion(OBJECT_ROLES_API_VERSION) <= LooseVersion(api_version):
+            info["object_store_roles"] = generate_object_store_roles_dict(blade)
     if "ad" in subset or "all" in subset:
         info["active_directory"] = generate_ad_dict(blade)
     if "kerberos" in subset or "all" in subset:

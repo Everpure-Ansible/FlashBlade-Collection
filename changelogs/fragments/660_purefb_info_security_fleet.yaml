@@ -1,0 +1,12 @@
+minor_changes:
+  - "purefb_info - add ``admin_cache`` to the admins subset, ``certificate_uses`` and
+    ``rapid_data_locking`` to the config subset and ``management_access_policies`` (with rules and
+    members), ``management_access_roles`` and ``management_authentication_policies`` to the
+    policies subset."
+  - "purefb_info - add ``presets``, ``workloads``, ``tgroups`` and ``storage_class_members`` to the
+    fleet subset and report each fleet member's operating system, version, model, API versions
+    and topology group."
+  - "purefb_info - add ``realm_connections`` and ``remote_realms`` to the realms subset."
+bugfixes:
+  - "purefb_info - a refused read of the fleet or its members no longer fails the module with a
+    traceback; the ``fleet`` key is returned empty, as on an array that is not in a fleet."

@@ -1,0 +1,10 @@
+bugfixes:
+  - purefb_fs - ``storage_class`` was compared with the storage class object
+    the array returns, so every run that set the option sent a storage class
+    change and reported changed. The module now compares the class name, sends
+    the change only when it differs, honours check mode and fails with the
+    array error when the change is rejected.
+minor_changes:
+  - purefb_info - the ``filesystems`` subset now reports ``storage_class``, the name of the
+    file system's storage class on REST 2.17 and later (null on platforms without storage
+    classes), so the value ``purefb_fs`` compares can be read back.

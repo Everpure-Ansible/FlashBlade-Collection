@@ -79,6 +79,33 @@ options:
     type: str
     default: ""
     version_added: "1.22.0"
+  detach_policies:
+    description:
+    - Names of snapshot policies to detach from the snapshot named by
+      I(name) and I(suffix). Only valid with I(state=present) on an
+      existing snapshot that is not destroyed.
+    - Detaching is one-way. The array has no call to attach a snapshot to
+      a policy again, so a detached snapshot is no longer subject to the
+      policy's retention and stays until it is destroyed.
+    - A policy that is not attached to the snapshot is ignored, so a
+      second run reports no change. An empty list detaches nothing.
+    - Each policy is detached with its own request. The array may refuse
+      one, for example a retention-locked (SafeMode) policy or a
+      replication baseline snapshot; the task then fails naming that
+      policy with the array's message, and the policies detached before
+      it stay detached.
+    - Policies in a realm are matched on their full C(realm::policy) name.
+    type: list
+    elements: str
+    version_added: '1.30.0'
+  detach_all_policies:
+    description:
+    - Detach the snapshot named by I(name) and I(suffix) from every
+      snapshot policy attached to it. Mutually exclusive with
+      I(detach_policies), which describes the behaviour.
+    type: bool
+    default: false
+    version_added: '1.30.0'
 extends_documentation_fragment:
 - everpure.flashblade.everpure.fb
 """
@@ -141,6 +168,25 @@ EXAMPLES = r"""
     fb_url: 10.10.10.2
     api_token: e31060a7-21fc-e277-6240-25983c6c4592
     state: absent
+
+- name: Detach policy snapshot foo.2026_01_01_00_00 from snapshot policy daily
+  everpure.flashblade.purefb_snap:
+    name: foo
+    suffix: 2026_01_01_00_00
+    detach_policies:
+      - daily
+    fb_url: 10.10.10.2
+    api_token: e31060a7-21fc-e277-6240-25983c6c4592
+    state: present
+
+- name: Detach policy snapshot foo.2026_01_01_00_00 from all its snapshot policies
+  everpure.flashblade.purefb_snap:
+    name: foo
+    suffix: 2026_01_01_00_00
+    detach_all_policies: true
+    fb_url: 10.10.10.2
+    api_token: e31060a7-21fc-e277-6240-25983c6c4592
+    state: present
 """
 
 RETURN = r"""
@@ -413,6 +459,89 @@ def update_snapshot(module, blade):
     module.exit_json(changed=changed)
 
 
+def _attached_policy_names(snap):
+    """Return the names of the snapshot policies attached to a snapshot.
+
+    REST 2.12 and later report every attached policy in ``policies``;
+    earlier versions report the single policy in ``policy``.
+    """
+    names = []
+    for policy in getattr(snap, "policies", None) or []:
+        policy_name = getattr(policy, "name", None)
+        if policy_name and policy_name not in names:
+            names.append(policy_name)
+    if not names:
+        policy_name = getattr(getattr(snap, "policy", None), "name", None)
+        if policy_name:
+            names.append(policy_name)
+    return names
+
+
+def detach_snapshot_policies(module, blade, snap):
+    """Detach a snapshot from snapshot policies.
+
+    The snapshot is the one named by ``name`` and ``suffix``. Detaching is
+    one-way (the array has no call to attach a snapshot to a policy again),
+    so only the policies still attached are sent and a rerun is a no-op.
+    Each policy is sent in its own request: a refusal by the array, for
+    example for a retention-locked policy or a replication baseline
+    snapshot, names that policy and leaves the earlier detaches in place.
+    """
+    api_version = get_rest_api_version(blade)
+    # Checked here, not with mutually_exclusive: Ansible counts supplied
+    # keys, which would reject an explicit detach_all_policies=false.
+    if module.params["detach_policies"] and module.params["detach_all_policies"]:
+        module.fail_json(
+            msg="detach_policies and detach_all_policies are mutually exclusive."
+        )
+    if module.params["state"] != "present":
+        module.fail_json(
+            msg="detach_policies and detach_all_policies require state=present."
+        )
+    if not module.params["suffix_given"]:
+        module.fail_json(msg="suffix is required to detach policies from a snapshot.")
+    snapname = module.params["name"] + "." + module.params["suffix"]
+    if snap is None:
+        module.fail_json(
+            msg="Snapshot {0} does not exist, cannot detach policies from it.".format(
+                snapname
+            )
+        )
+    if snap.destroyed:
+        module.fail_json(
+            msg="Snapshot {0} is destroyed. Recover it before detaching policies.".format(
+                snapname
+            )
+        )
+    attached = _attached_policy_names(snap)
+    if module.params["detach_all_policies"]:
+        to_detach = attached
+    else:
+        to_detach = []
+        for policy_name in module.params["detach_policies"]:
+            if policy_name in attached and policy_name not in to_detach:
+                to_detach.append(policy_name)
+    changed = bool(to_detach)
+    if changed and not module.check_mode:
+        kwargs = {"member_names": [snapname]}
+        if (
+            LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
+            and module.params["context"]
+        ):
+            kwargs["context_names"] = [module.params["context"]]
+        for policy_name in to_detach:
+            res = blade.delete_file_system_snapshots_policies(
+                policy_names=[policy_name], **kwargs
+            )
+            if res.status_code != 200:
+                module.fail_json(
+                    msg="Failed to detach policy {0} from snapshot {1}. Error: {2}".format(
+                        policy_name, snapname, get_error_message(res)
+                    )
+                )
+    module.exit_json(changed=changed)
+
+
 def delete_snapshot(module, blade):
     """Delete Snapshot"""
     changed = True
@@ -496,6 +625,8 @@ def main():
             state=dict(default="present", choices=["present", "absent", "restore"]),
             latest_replica=dict(default="false", type="bool"),
             context=dict(type="str", default=""),
+            detach_policies=dict(type="list", elements="str"),
+            detach_all_policies=dict(type="bool", default=False),
         )
     )
 
@@ -536,6 +667,11 @@ def main():
         )
     filesystem = get_filesystem(module, blade)
     snap = get_fssnapshot(module, blade)
+    if (
+        module.params["detach_policies"] is not None
+        or module.params["detach_all_policies"]
+    ):
+        detach_snapshot_policies(module, blade, snap)
     if state == "present" and filesystem and not filesystem.destroyed and not snap:
         create_snapshot(module, blade)
     elif (

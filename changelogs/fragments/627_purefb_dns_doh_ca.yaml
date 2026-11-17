@@ -1,0 +1,7 @@
+minor_changes:
+  - purefb_dns - Added ``ca_certificate`` and ``ca_certificate_group`` to validate DNS over HTTPS
+    nameservers (REST API 2.25, Purity//FB 4.8.0). The module refuses mixed https and IP nameserver
+    lists, https endpoints that use a hostname, and a CA reference with IP nameservers before any
+    write, and sends the reference together with the nameservers in the same request.
+  - purefb_info - The ``config`` subset now reports ``ca_certificate`` and ``ca_certificate_group``
+    for each DNS configuration.

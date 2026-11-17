@@ -10,6 +10,7 @@ __metaclass__ = type
 import sys
 import multiprocessing
 import ctypes
+from datetime import datetime
 from unittest.mock import Mock, patch, MagicMock
 
 # Mock multiprocessing context for Windows
@@ -89,6 +90,7 @@ from plugins.modules.purefb_info import (
     generate_network_access_policies_dict,
     generate_worm_data_policies_dict,
     generate_tls_policies_dict,
+    generate_ssh_ca_policies_dict,
     generate_s3_export_policies_dict,
     generate_object_store_account_exports_dict,
     generate_object_store_virtual_hosts_dict,
@@ -96,7 +98,16 @@ from plugins.modules.purefb_info import (
     generate_resource_accesses_dict,
     generate_file_repl_dict,
     generate_ad_dict,
+    _maintenance_window_list,
+    generate_admin_dict,
+    generate_directory_service_roles_dict,
 )
+
+
+def _reference(name):
+    reference = Mock(spec=["name"])
+    reference.name = name
+    return reference
 
 
 class TestPurefbInfo:
@@ -529,7 +540,13 @@ class TestPurefbInfo:
         mock_support.remote_assist_opened = None
         mock_support.remote_assist_status = "disabled"
         mock_support.remote_assist_duration = 0
+        mock_support.edge_management_enabled = False
+        mock_support.edge_agent_update_enabled = True
         mock_blade.get_support.return_value.items = [mock_support]
+
+        # Mock maintenance window (for MAINTENANCE_API_VERSION) - none open
+        mock_blade.get_maintenance_windows.return_value.status_code = 200
+        mock_blade.get_maintenance_windows.return_value.items = []
 
         # Call function
         result = generate_default_dict(mock_blade)
@@ -551,6 +568,20 @@ class TestPurefbInfo:
         assert "EULA" in result
         assert result["EULA"] == "Signed"
 
+        # Verify support settings read-back with the 2.14 and 2.18 gates open
+        assert result["remote_assist"]["phonehome_enabled"] is True
+        assert result["remote_assist"]["ra_duration"] == 0
+        assert result["remote_assist"]["edge_management_enabled"] is False
+        assert result["remote_assist"]["edge_agent_update_enabled"] is True
+
+        # With the gates closed (below REST 2.18) the edge keys are not reported
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+        ungated = generate_default_dict(mock_blade)
+        assert ungated["remote_assist"]["phonehome_enabled"] is True
+        assert "ra_duration" not in ungated["remote_assist"]
+        assert "edge_management_enabled" not in ungated["remote_assist"]
+        assert "edge_agent_update_enabled" not in ungated["remote_assist"]
+
         # Verify policy counts
         assert "policies" in result
         assert result["policies"] == 8
@@ -570,6 +601,42 @@ class TestPurefbInfo:
         assert result["worm_policies"] == 1
         assert "telemetry_metrics_policies" in result
         assert result["telemetry_metrics_policies"] == 1
+        assert result["maintenance_window"] == []
+
+    def test_maintenance_window_list_with_open_window(self):
+        """An open window is reported with human-readable start and end"""
+        window = Mock()
+        window.name = "array"
+        window.created = 1700000000000
+        window.expires = 1700014400000
+        mock_blade = Mock()
+        mock_blade.get_maintenance_windows.return_value.status_code = 200
+        mock_blade.get_maintenance_windows.return_value.items = [window]
+
+        result = _maintenance_window_list(mock_blade)
+
+        assert result == [
+            {
+                "name": "array",
+                "created": datetime.fromtimestamp(1700000000).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+                "expires": datetime.fromtimestamp(1700014400).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+            }
+        ]
+
+    def test_maintenance_window_list_empty_and_error(self):
+        """No open window, or a failed GET, yields an empty list"""
+        mock_blade = Mock()
+        mock_blade.get_maintenance_windows.return_value.status_code = 200
+        mock_blade.get_maintenance_windows.return_value.items = []
+        assert _maintenance_window_list(mock_blade) == []
+
+        mock_blade.get_maintenance_windows.return_value.status_code = 400
+        mock_blade.get_maintenance_windows.return_value.items = [Mock()]
+        assert _maintenance_window_list(mock_blade) == []
 
     def test_generate_perf_dict(self):
         """Test generate_perf_dict function"""
@@ -682,6 +749,10 @@ class TestPurefbInfo:
         mock_source = Mock(spec=["name"])
         mock_source.name = "vir0"
         mock_dns.sources = [mock_source]
+        # DNS over HTTPS CA references (REST 2.25+); absent on older arrays
+        mock_dns.ca_certificate = Mock(spec=["name"])
+        mock_dns.ca_certificate.name = "doh-ca"
+        mock_dns.ca_certificate_group = None
         mock_blade.get_dns.return_value.items = [mock_dns]
 
         # Mock SMTP
@@ -712,8 +783,28 @@ class TestPurefbInfo:
         mock_ds.uris = ["ldap://dc.example.com"]
         mock_blade.get_directory_services.return_value.items = [mock_ds]
 
-        # Mock directory service roles
-        mock_blade.get_directory_services_roles.return_value.items = []
+        # Mock directory service roles: one legacy mapping and one that
+        # holds two policies, for which the array returns role as null
+        legacy_role = Mock(spec=["name", "group", "group_base", "role"])
+        legacy_role.name = "array_admin"
+        legacy_role.group = "array-admin-users"
+        legacy_role.group_base = "OU=RBAC-Groups"
+        legacy_role.role = _reference("array_admin")
+        policy_role = Mock(
+            spec=["name", "group", "group_base", "role", "management_access_policies"]
+        )
+        policy_role.name = "ops-team"
+        policy_role.group = ""
+        policy_role.group_base = ""
+        policy_role.role = None
+        policy_role.management_access_policies = [
+            _reference("readonly"),
+            _reference("storage_admin"),
+        ]
+        mock_blade.get_directory_services_roles.return_value.items = [
+            legacy_role,
+            policy_role,
+        ]
 
         # Mock arrays for NTP
         mock_array = Mock()
@@ -764,11 +855,191 @@ class TestPurefbInfo:
         assert result["dns"]["management"]["domain"] == "example.com"
         assert result["dns"]["management"]["nameservers"] == ["8.8.8.8", "8.8.4.4"]
         assert result["dns"]["management"]["source"] == "vir0"
+        assert result["dns"]["management"]["ca_certificate"] == "doh-ca"
+        assert result["dns"]["management"]["ca_certificate_group"] is None
         assert "management_directory_service" in result
         assert "array_management" in result
         cert = result["ssl_certs"]["management"]
         assert cert["certificate_type"] == "external"
         assert cert["intermediate_certificate"] == "-----BEGIN CERTIFICATE-----"
+        # the LooseVersion mock keeps the REST 2.19 policy gate off here, so
+        # only the null-safe role read is checked; the policy names are
+        # covered by test_generate_directory_service_roles_dict
+        ds_roles = result["directory_service_roles"]
+        assert ds_roles["array_admin"] == {
+            "group": "array-admin-users",
+            "group_base": "OU=RBAC-Groups",
+            "role": "array_admin",
+        }
+        assert ds_roles["ops-team"] == {
+            "group": "",
+            "group_base": "",
+            "role": None,
+        }
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_directory_service_roles_dict(self, mock_loose_version):
+        """From REST 2.19 the policy names are reported next to the
+        null-safe role for a legacy and for a two-policy mapping"""
+        legacy_role = Mock(
+            spec=["name", "group", "group_base", "role", "management_access_policies"]
+        )
+        legacy_role.name = "array_admin"
+        legacy_role.group = "array-admin-users"
+        legacy_role.group_base = "OU=RBAC-Groups"
+        legacy_role.role = _reference("array_admin")
+        legacy_role.management_access_policies = [_reference("array_admin")]
+        policy_role = Mock(
+            spec=["name", "group", "group_base", "role", "management_access_policies"]
+        )
+        policy_role.name = "ops-team"
+        policy_role.group = ""
+        policy_role.group_base = ""
+        policy_role.role = None
+        policy_role.management_access_policies = [
+            _reference("readonly"),
+            _reference("storage_admin"),
+        ]
+        mock_blade = Mock()
+        mock_blade.get_directory_services_roles.return_value.items = [
+            legacy_role,
+            policy_role,
+        ]
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+
+        result = generate_directory_service_roles_dict(mock_blade, "2.30")
+
+        assert result["array_admin"] == {
+            "group": "array-admin-users",
+            "group_base": "OU=RBAC-Groups",
+            "role": "array_admin",
+            "management_access_policies": ["array_admin"],
+        }
+        assert result["ops-team"] == {
+            "group": "",
+            "group_base": "",
+            "role": None,
+            "management_access_policies": ["readonly", "storage_admin"],
+        }
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_directory_service_roles_dict_before_2_19(
+        self, mock_loose_version
+    ):
+        """An older array has no management_access_policies on a mapping,
+        so the key is left out instead of being read as an empty list"""
+        old_role = Mock(spec=["name", "group", "group_base", "role"])
+        old_role.name = "readonly"
+        old_role.group = "ro-users"
+        old_role.group_base = "OU=Groups"
+        old_role.role = _reference("readonly")
+        mock_blade = Mock()
+        mock_blade.get_directory_services_roles.return_value.items = [old_role]
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+
+        result = generate_directory_service_roles_dict(mock_blade, "2.18")
+
+        assert result == {
+            "readonly": {
+                "group": "ro-users",
+                "group_base": "OU=Groups",
+                "role": "readonly",
+            }
+        }
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_admin_dict_before_2_19(self, mock_loose_version):
+        """An older array has no management_access_policies on an admin,
+        so the key is left out while role is still read null-safe"""
+        old_admin = Mock(
+            spec=["name", "public_key", "is_local", "role", "locked", "api_token"]
+        )
+        old_admin.name = "pureuser"
+        old_admin.public_key = None
+        old_admin.is_local = True
+        old_admin.role = _reference("array_admin")
+        old_admin.locked = False
+        old_admin.api_token = None
+        mock_blade = Mock()
+        mock_blade.get_admins.return_value.items = [old_admin]
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+
+        result = generate_admin_dict(mock_blade)
+
+        assert result == {
+            "pureuser": {
+                "public_key": None,
+                "local": True,
+                "role": "array_admin",
+                "locked": False,
+                "lockout_remaining": None,
+                "token_expires": None,
+                "token_created": None,
+            }
+        }
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_admin_dict_tolerates_null_role(self, mock_loose_version):
+        """An admin with two policies has role null; one with a legacy
+        policy has role set and a token with timestamps"""
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+        legacy = Mock(
+            spec=[
+                "name",
+                "public_key",
+                "is_local",
+                "role",
+                "management_access_policies",
+                "locked",
+                "lockout_remaining",
+                "api_token",
+            ]
+        )
+        legacy.name = "pureuser"
+        legacy.public_key = None
+        legacy.is_local = True
+        legacy.role = _reference("array_admin")
+        legacy.management_access_policies = [_reference("array_admin")]
+        legacy.locked = False
+        legacy.lockout_remaining = None
+        legacy.api_token = Mock(spec=["created_at", "expires_at"])
+        legacy.api_token.created_at = 1700000000000
+        legacy.api_token.expires_at = 1800000000000
+        policy_admin = Mock(
+            spec=["name", "is_local", "role", "management_access_policies", "api_token"]
+        )
+        policy_admin.name = "svc-backup"
+        policy_admin.is_local = True
+        policy_admin.role = None
+        policy_admin.api_token = None
+        policy_admin.management_access_policies = [
+            _reference("storage_admin"),
+            _reference("readonly"),
+        ]
+        mock_blade = Mock()
+        mock_blade.get_admins.return_value.items = [legacy, policy_admin]
+
+        result = generate_admin_dict(mock_blade)
+
+        assert result["pureuser"]["role"] == "array_admin"
+        assert result["pureuser"]["management_access_policies"] == ["array_admin"]
+        assert result["pureuser"]["local"] is True
+        assert result["pureuser"]["token_created"] == datetime.fromtimestamp(
+            1700000000
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        assert result["pureuser"]["token_expires"] == datetime.fromtimestamp(
+            1800000000
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        assert result["svc-backup"] == {
+            "public_key": None,
+            "local": True,
+            "role": None,
+            "management_access_policies": ["storage_admin", "readonly"],
+            "locked": None,
+            "lockout_remaining": None,
+            "token_expires": None,
+            "token_created": None,
+        }
 
     def test_generate_password_policies_dict(self):
         """Test generate_password_policies_dict reports all fields in seconds"""
@@ -1187,6 +1458,9 @@ class TestPurefbInfo:
         assert result["vip1"]["attached_servers"] == ["_array_server"]
         assert result["vip1"]["subnet"] == "data-subnet"
         assert result["vip1"]["address"] == "10.0.0.5"
+        # fields missing from the model on older arrays read back as unset
+        assert result["vip1"]["rdma_enabled"] is None
+        assert result["vip1"]["realms"] == []
 
         # reference-shaped subnet, no attached server
         subnet = Mock(spec=["name"])
@@ -1197,6 +1471,51 @@ class TestPurefbInfo:
         assert result["vip1"]["server"] is None
         assert result["vip1"]["attached_servers"] == []
         assert result["vip1"]["subnet"] == "mgmt"
+
+    def test_generate_network_dict_reports_rdma_and_realms(self):
+        """rdma_enabled (REST 2.28) and realms (REST 2.19) are passed through.
+
+        Realm references arrive as plain dicts on current SDKs and as
+        reference objects on older ones; both shapes reduce to names.
+        """
+        realm_ref = Mock(spec=["name"])
+        realm_ref.name = "realm-2"
+        port = Mock(
+            spec=[
+                "name",
+                "type",
+                "address",
+                "services",
+                "attached_servers",
+                "subnet",
+                "enabled",
+                "rdma_enabled",
+                "realms",
+            ]
+        )
+        port.name = "realm-1::vip1"
+        port.type = "vip"
+        port.address = "10.0.0.6"
+        port.services = ["data"]
+        port.attached_servers = []
+        port.subnet = {"name": "data-subnet"}
+        port.enabled = True
+        port.rdma_enabled = False
+        port.realms = [{"name": "realm-1", "resource_type": "realms"}, realm_ref]
+
+        mock_blade = Mock()
+        mock_blade.get_network_interfaces.return_value.items = [port]
+
+        result = generate_network_dict(mock_blade)
+
+        assert result["realm-1::vip1"]["rdma_enabled"] is False
+        assert result["realm-1::vip1"]["realms"] == ["realm-1", "realm-2"]
+
+        port.rdma_enabled = True
+        port.realms = []
+        result = generate_network_dict(mock_blade)
+        assert result["realm-1::vip1"]["rdma_enabled"] is True
+        assert result["realm-1::vip1"]["realms"] == []
 
     def test_generate_bucket_cross_object_policies_dict_reports_rules(self):
         """The allowed_* lists live on the CORS rules, not on the policy.
@@ -1410,6 +1729,78 @@ class TestPurefbInfo:
         assert result["tls1"]["disabled_tls_ciphers"] == ["RC4"]
         assert result["tls1"]["trusted_client_certificate_authority"] is None
         assert result["tls1"]["network_interfaces"] == ["vip1"]
+
+    def test_generate_ssh_ca_policies_dict(self):
+        """SSH CA policies carry their signer, principals and members."""
+        signer = Mock(spec=["name", "resource_type"])
+        signer.name = "ops-ca-key"
+        signer.resource_type = "public-keys"
+        policy = Mock(
+            spec=[
+                "name",
+                "enabled",
+                "is_local",
+                "signing_authority",
+                "static_authorized_principals",
+            ]
+        )
+        policy.name = "ssh-ca"
+        policy.enabled = True
+        policy.is_local = True
+        policy.signing_authority = signer
+        policy.static_authorized_principals = ["ops"]
+        unset = Mock(
+            spec=[
+                "name",
+                "enabled",
+                "is_local",
+                "signing_authority",
+                "static_authorized_principals",
+            ]
+        )
+        unset.name = "ssh-ca-cert"
+        unset.enabled = False
+        unset.is_local = True
+        unset.signing_authority = Mock(spec=["name", "resource_type"])
+        unset.signing_authority.name = "corp-ca"
+        unset.signing_authority.resource_type = "certificates"
+        unset.static_authorized_principals = None
+        admin_ref = Mock(spec=["name", "resource_type"])
+        admin_ref.name = "alice"
+        admin_ref.resource_type = "admins"
+        array_ref = Mock(spec=["name", "resource_type"])
+        array_ref.name = "myblade"
+        array_ref.resource_type = "arrays"
+        policy_ref = Mock(spec=["name"])
+        policy_ref.name = "ssh-ca"
+        admin_member = Mock(spec=["member", "policy"])
+        admin_member.member = admin_ref
+        admin_member.policy = policy_ref
+        array_member = Mock(spec=["member", "policy"])
+        array_member.member = array_ref
+        array_member.policy = policy_ref
+
+        mock_blade = Mock()
+        mock_blade.get_ssh_certificate_authority_policies.return_value.items = [
+            policy,
+            unset,
+        ]
+        mock_blade.get_ssh_certificate_authority_policies_members.return_value.items = [
+            admin_member,
+            array_member,
+        ]
+
+        result = generate_ssh_ca_policies_dict(mock_blade)
+
+        assert result["ssh-ca"]["enabled"] is True
+        assert result["ssh-ca"]["signing_authority"] == "ops-ca-key"
+        assert result["ssh-ca"]["signing_authority_type"] == "public_key"
+        assert result["ssh-ca"]["static_authorized_principals"] == ["ops"]
+        assert result["ssh-ca"]["admins"] == ["alice"]
+        assert result["ssh-ca"]["arrays"] == ["myblade"]
+        assert result["ssh-ca-cert"]["signing_authority_type"] == "certificate"
+        assert result["ssh-ca-cert"]["static_authorized_principals"] == []
+        assert result["ssh-ca-cert"]["admins"] == []
 
     def test_generate_s3_export_policies_dict(self):
         """S3 export policies are reported with their inline rules."""

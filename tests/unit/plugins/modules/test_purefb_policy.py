@@ -8,6 +8,7 @@ from __future__ import absolute_import, division, print_function
 __metaclass__ = type
 
 import sys
+from collections import defaultdict
 from unittest.mock import Mock, MagicMock, patch
 
 import pytest
@@ -47,10 +48,14 @@ sys.modules[
 ] = MagicMock()
 
 from plugins.modules.purefb_policy import (
+    _OS_ACCESS_ACTIONS_FALLBACK,
+    _check_os_actions,
     _nfs_rule,
     _share_rule_patch,
     _share_rule_perms,
+    _valid_os_actions,
     copy_policy,
+    main,
     create_network_access_policy,
     delete_network_access_policy,
     delete_smb_share_policy,
@@ -62,6 +67,7 @@ from plugins.modules.purefb_policy import (
     update_smb_share_policy,
     update_snap_policy,
 )
+from plugins.module_utils.version import LooseVersion as RealLooseVersion
 
 
 def _existing_rule(access="root-squash"):
@@ -1596,3 +1602,255 @@ class TestCopyPolicy:
 
         blade.post_nfs_export_policies.assert_not_called()
         module.exit_json.assert_called_once_with(changed=True)
+
+
+# A cut-down array catalogue (GET /object-store-access-policy-actions).
+_CATALOGUE = ["s3:*", "s3:GetObject", "s3:PutObjectTagging", "s3:GetBucketPolicy"]
+
+# Actions Purity//FB 4.8.8 publishes that the old static choices list lacked.
+_NEWER_ACTIONS = [
+    "s3:DeleteObjectTagging",
+    "s3:DeleteObjectVersionTagging",
+    "s3:GetBucketCORS",
+    "s3:GetBucketPolicy",
+    "s3:GetBucketPolicyStatus",
+    "s3:GetBucketPublicAccessBlock",
+    "s3:PutObjectTagging",
+    "s3:PutObjectVersionTagging",
+]
+
+
+def _actions_module(actions, context=""):
+    """Build a mock AnsibleModule for an access policy task with the given actions."""
+    module = Mock()
+    module.check_mode = False
+    module.params = defaultdict(
+        lambda: None,
+        {
+            "state": "present",
+            "policy_type": "access",
+            "name": "ospol",
+            "account": "acc",
+            "rule": "rule1",
+            "actions": actions,
+            "object_resources": ["*"],
+            "ignore_enforcement": True,
+            "context": context,
+        },
+    )
+    module.fail_json = Mock(side_effect=SystemExit("fail_json called"))
+    module.exit_json = Mock(side_effect=SystemExit("exit_json called"))
+    return module
+
+
+def _actions_blade(names=None, status=200):
+    """Build a mock blade whose action catalogue holds the given names."""
+    blade = Mock()
+    res = Mock()
+    res.status_code = status
+    items = []
+    for name in names or []:
+        action = Mock()
+        action.name = name
+        items.append(action)
+    res.items = items
+    blade.get_object_store_access_policy_actions.return_value = res
+    return blade
+
+
+@patch("plugins.modules.purefb_policy.LooseVersion", RealLooseVersion)
+class TestOsPolicyActions:
+    """Rule actions are validated against the array's catalogue, not a frozen list."""
+
+    def test_actions_in_the_array_catalogue_are_accepted(self):
+        module = _actions_module(["s3:PutObjectTagging", "s3:GetBucketPolicy"])
+        blade = _actions_blade(_CATALOGUE)
+
+        _check_os_actions(module, blade, "2.30")
+
+        module.fail_json.assert_not_called()
+        module.warn.assert_not_called()
+        blade.get_object_store_access_policy_actions.assert_called_once_with()
+
+    def test_unknown_actions_are_named(self):
+        module = _actions_module(["s3:PutObjectTagging", "s3:Bogus", "s3:Nope"])
+        blade = _actions_blade(_CATALOGUE)
+
+        with pytest.raises(SystemExit):
+            _check_os_actions(module, blade, "2.30")
+
+        msg = module.fail_json.call_args[1]["msg"]
+        assert msg.startswith(
+            "Unknown object store access policy action(s): s3:Bogus, s3:Nope. "
+        )
+        assert "Valid actions: s3:*, s3:GetBucketPolicy, s3:GetObject" in msg
+
+    def test_catalogue_error_falls_back_to_the_built_in_list(self):
+        """The built-in list knows the object tagging and bucket policy actions."""
+        module = _actions_module(["s3:PutObjectTagging", "s3:GetBucketCORS"])
+        blade = _actions_blade(status=400)
+
+        _check_os_actions(module, blade, "2.30")
+
+        module.fail_json.assert_not_called()
+        module.warn.assert_called_once()
+        warning = module.warn.call_args[0][0]
+        assert warning.startswith(
+            "Could not read the array's access policy action list, "
+            "validating against the collection's built-in list. Error: "
+        )
+
+    def test_built_in_list_still_rejects_unknown_actions(self):
+        module = _actions_module(["s3:GetObject", "s3:Bogus"])
+        blade = _actions_blade(status=400)
+
+        with pytest.raises(SystemExit):
+            _check_os_actions(module, blade, "2.30")
+
+        assert "s3:Bogus" in module.fail_json.call_args[1]["msg"]
+
+    def test_empty_catalogue_falls_back_to_the_built_in_list(self):
+        module = _actions_module(["s3:GetObject"])
+        blade = _actions_blade([])
+
+        valid = _valid_os_actions(module, blade, "2.30")
+
+        assert valid == list(_OS_ACCESS_ACTIONS_FALLBACK)
+        module.warn.assert_called_once()
+        assert module.warn.call_args[0][0].endswith(
+            "built-in list. The array returned an empty list."
+        )
+
+    def test_below_rest_2_2_never_asks_the_array(self):
+        module = _actions_module(["s3:GetObject"])
+        blade = _actions_blade(_CATALOGUE)
+
+        _check_os_actions(module, blade, "2.1")
+
+        blade.get_object_store_access_policy_actions.assert_not_called()
+        module.fail_json.assert_not_called()
+        module.warn.assert_not_called()
+
+    def test_no_actions_means_no_lookup(self):
+        module = _actions_module(None)
+        blade = _actions_blade(_CATALOGUE)
+
+        _check_os_actions(module, blade, "2.30")
+
+        blade.get_object_store_access_policy_actions.assert_not_called()
+        module.fail_json.assert_not_called()
+
+    def test_fleet_context_is_sent_with_the_lookup(self):
+        module = _actions_module(["s3:GetObject"], context="array-b")
+        blade = _actions_blade(_CATALOGUE)
+
+        _check_os_actions(module, blade, "2.30")
+
+        blade.get_object_store_access_policy_actions.assert_called_once_with(
+            context_names=["array-b"]
+        )
+
+    def test_context_is_not_sent_below_rest_2_17(self):
+        module = _actions_module(["s3:GetObject"], context="array-b")
+        blade = _actions_blade(_CATALOGUE)
+
+        _check_os_actions(module, blade, "2.16")
+
+        blade.get_object_store_access_policy_actions.assert_called_once_with()
+
+    @pytest.mark.parametrize("action", _NEWER_ACTIONS)
+    def test_built_in_list_knows_the_newer_actions(self, action):
+        assert action in _OS_ACCESS_ACTIONS_FALLBACK
+
+
+@patch("plugins.modules.purefb_policy.LooseVersion", RealLooseVersion)
+@patch("plugins.modules.purefb_policy.HAS_PYTZ", True)
+@patch("plugins.modules.purefb_policy.HAS_PYPURECLIENT", True)
+@patch("plugins.modules.purefb_policy.get_rest_api_version", return_value="2.30")
+@patch("plugins.modules.purefb_policy.purefb_argument_spec", return_value={})
+@patch("plugins.modules.purefb_policy.get_system")
+@patch("plugins.modules.purefb_policy.AnsibleModule")
+class TestOsPolicyMainActions:
+    """main() asks the array about the actions before any rule write."""
+
+    @staticmethod
+    def _blade(policy_exists):
+        blade = _actions_blade(_CATALOGUE)
+        blade.get_fleets.return_value.status_code = 400
+        if policy_exists:
+            blade.get_object_store_access_policies.return_value.items = [Mock()]
+        else:
+            # A missing policy is an ErrorResponse: no ``items`` at all.
+            missing = Mock(spec=["status_code"])
+            missing.status_code = 400
+            blade.get_object_store_access_policies.return_value = missing
+        return blade
+
+    def test_argspec_has_no_static_action_choices(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version
+    ):
+        module = _actions_module(["s3:PutObjectTagging"])
+        mock_ansible_module.return_value = module
+        blade = self._blade(policy_exists=True)
+        blade.get_object_store_access_policies_rules.return_value.status_code = 400
+        blade.post_object_store_access_policies_rules.return_value.status_code = 200
+        mock_get_system.return_value = blade
+
+        with pytest.raises(SystemExit, match="exit_json"):
+            main()
+
+        spec = mock_ansible_module.call_args[0][0]
+        assert spec["actions"] == {"type": "list", "elements": "str"}
+        blade.get_object_store_access_policy_actions.assert_called_once()
+        blade.post_object_store_access_policies_rules.assert_called_once()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_unknown_action_fails_before_any_write_on_update(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version
+    ):
+        module = _actions_module(["s3:Bogus"])
+        mock_ansible_module.return_value = module
+        blade = self._blade(policy_exists=True)
+        mock_get_system.return_value = blade
+
+        with pytest.raises(SystemExit, match="fail_json"):
+            main()
+
+        assert "s3:Bogus" in module.fail_json.call_args[1]["msg"]
+        blade.post_object_store_access_policies_rules.assert_not_called()
+        blade.patch_object_store_access_policies_rules.assert_not_called()
+
+    def test_unknown_action_fails_before_the_policy_is_created(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version
+    ):
+        module = _actions_module(["s3:Bogus"])
+        mock_ansible_module.return_value = module
+        blade = self._blade(policy_exists=False)
+        mock_get_system.return_value = blade
+
+        with pytest.raises(SystemExit, match="fail_json"):
+            main()
+
+        blade.post_object_store_access_policies.assert_not_called()
+        blade.post_object_store_access_policies_rules.assert_not_called()
+
+    def test_delete_does_not_consult_the_catalogue(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version
+    ):
+        module = _actions_module(["s3:Bogus"])
+        module.params["state"] = "absent"
+        module.params["rule"] = None
+        module.params["force_delete"] = False
+        mock_ansible_module.return_value = module
+        blade = self._blade(policy_exists=True)
+        blade.get_object_store_access_policies_object_store_users.return_value.items = (
+            []
+        )
+        blade.delete_object_store_access_policies.return_value.status_code = 200
+        mock_get_system.return_value = blade
+
+        with pytest.raises(SystemExit, match="exit_json"):
+            main()
+
+        blade.get_object_store_access_policy_actions.assert_not_called()
+        blade.delete_object_store_access_policies.assert_called_once()

@@ -165,6 +165,7 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_snap - manage filesystem snapshots on a FlashBlade
 - purefb_snmp_agent - modify the FlashBlade SNMP Agent
 - purefb_snmp_mgr - manage SNMP Managers on a FlashBlade
+- purefb_software - manage Purity//FB software packages and upgrade checks on a FlashBlade
 - purefb_software_patch - install Purity//FB software patches on a FlashBlade
 - purefb_ssh_ca_policy - manage FlashBlade SSH Certificate Authority policies and their members
 - purefb_subnet - manage network subnets on a FlashBlade

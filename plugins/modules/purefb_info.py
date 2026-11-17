@@ -126,6 +126,7 @@ SERVERS_API_VERSION = "2.16"
 PASSWORD_POLICY_API_VERSION = "2.16"
 FLEET_API_VERSION = "2.17"
 TLS_API_VERSION = "2.17"
+OIDC_API_VERSION = "2.17"
 REALMS_API_VERSION = "2.19"
 S3_EXPORT_API_VERSION = "2.20"
 
@@ -529,7 +530,31 @@ def generate_config_dict(blade):
                     "sign_cred": getattr(saml2[0].sp.signing_credential, "name", None),
                 },
             }
+    if LooseVersion(OIDC_API_VERSION) <= LooseVersion(api_version):
+        config_info["oidc_idps"] = generate_oidc_idps_dict(blade)
     return config_info
+
+
+def generate_oidc_idps_dict(blade):
+    """OIDC identity providers keyed by name (an array may hold several)."""
+    idps_info = {}
+    for idp in list(blade.get_sso_oidc_idps().items):
+        idp_cfg = getattr(idp, "idp", None)
+        idps_info[idp.name] = {
+            "enabled": getattr(idp, "enabled", None),
+            "prn": getattr(idp, "prn", None),
+            "services": list(getattr(idp, "services", None) or []),
+            "provider_url": getattr(idp_cfg, "provider_url", None),
+            "ca_certificate": getattr(
+                getattr(idp_cfg, "provider_url_ca_certificate", None), "name", None
+            ),
+            "ca_certificate_group": getattr(
+                getattr(idp_cfg, "provider_url_ca_certificate_group", None),
+                "name",
+                None,
+            ),
+        }
+    return idps_info
 
 
 def generate_subnet_dict(blade):

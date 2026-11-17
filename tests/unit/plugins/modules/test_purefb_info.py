@@ -95,6 +95,7 @@ from plugins.modules.purefb_info import (
     generate_realms_dict,
     generate_resource_accesses_dict,
     generate_file_repl_dict,
+    generate_oidc_idps_dict,
 )
 
 
@@ -768,6 +769,73 @@ class TestPurefbInfo:
         cert = result["ssl_certs"]["management"]
         assert cert["certificate_type"] == "external"
         assert cert["intermediate_certificate"] == "-----BEGIN CERTIFICATE-----"
+        # gated blocks are skipped below their REST version
+        assert "oidc_idps" not in result
+        mock_blade.get_sso_oidc_idps.assert_not_called()
+
+    def test_generate_oidc_idps_dict(self):
+        """OIDC providers are keyed by name with their URL, PRN and CA references."""
+        ca_cert = Mock(spec=["name"])
+        ca_cert.name = "sso-root-ca"
+        okta_cfg = Mock(
+            spec=[
+                "provider_url",
+                "provider_url_ca_certificate",
+                "provider_url_ca_certificate_group",
+            ]
+        )
+        okta_cfg.provider_url = "https://acme.okta.com/oauth2/default"
+        okta_cfg.provider_url_ca_certificate = ca_cert
+        # an unset reference comes back as an empty object
+        okta_cfg.provider_url_ca_certificate_group = {}
+        okta = Mock(spec=["name", "enabled", "prn", "services", "idp"])
+        okta.name = "okta"
+        okta.enabled = True
+        okta.prn = "prn::iam:array-id/local::oidc-provider/okta"
+        okta.services = ["object"]
+        okta.idp = okta_cfg
+
+        keycloak_cfg = Mock(
+            spec=[
+                "provider_url",
+                "provider_url_ca_certificate",
+                "provider_url_ca_certificate_group",
+            ]
+        )
+        keycloak_cfg.provider_url = "https://sso.example.com/realms/storage"
+        keycloak_cfg.provider_url_ca_certificate = {}
+        keycloak_cfg.provider_url_ca_certificate_group = {}
+        keycloak = Mock(spec=["name", "enabled", "prn", "services", "idp"])
+        keycloak.name = "keycloak"
+        keycloak.enabled = False
+        keycloak.prn = "prn::iam:array-id/local::oidc-provider/keycloak"
+        keycloak.services = ["object"]
+        keycloak.idp = keycloak_cfg
+
+        mock_blade = Mock()
+        mock_blade.get_sso_oidc_idps.return_value.items = [okta, keycloak]
+
+        result = generate_oidc_idps_dict(mock_blade)
+
+        assert sorted(result) == ["keycloak", "okta"]
+        assert result["okta"] == {
+            "enabled": True,
+            "prn": "prn::iam:array-id/local::oidc-provider/okta",
+            "services": ["object"],
+            "provider_url": "https://acme.okta.com/oauth2/default",
+            "ca_certificate": "sso-root-ca",
+            "ca_certificate_group": None,
+        }
+        assert result["keycloak"]["enabled"] is False
+        assert result["keycloak"]["ca_certificate"] is None
+        assert result["keycloak"]["ca_certificate_group"] is None
+
+    def test_generate_oidc_idps_dict_empty(self):
+        """No providers configured gives an empty dict, not an error."""
+        mock_blade = Mock()
+        mock_blade.get_sso_oidc_idps.return_value.items = []
+
+        assert generate_oidc_idps_dict(mock_blade) == {}
 
     def test_generate_password_policies_dict(self):
         """Test generate_password_policies_dict reports all fields in seconds"""

@@ -35,10 +35,11 @@ author:
 options:
   state:
     description:
-    - C(check) runs the pre-upgrade checks for I(version). A check task for
-      the same version that already passed is left alone unless I(force) is
-      set, and a task that is still running is waited on rather than
-      duplicated. The module fails when the checks report a failure.
+    - C(check) runs the pre-upgrade checks for I(version). A check task that
+      already exists for the same version, passed or failed, is left alone
+      unless I(force) is set, and a task that is still running is waited on
+      rather than duplicated. The module fails when the checks report a
+      failure, including when the existing task for I(version) failed.
     - The array keeps one check task per target version. A forced re-run
       replaces the previous result for I(version), and a check the array
       refuses to start can still be recorded as a failed task for it.
@@ -81,8 +82,9 @@ options:
   force:
     description:
     - With I(state=check), run the checks again although a task for
-      I(version) already passed. The previous result for I(version) is
-      replaced, as the array keeps one check task per target version.
+      I(version) already passed or failed. The previous result for
+      I(version) is replaced, as the array keeps one check task per target
+      version.
     - With I(state=downloaded), delete a failed download of I(version)
       before downloading it again.
     type: bool
@@ -120,7 +122,7 @@ EXAMPLES = r"""
   debug:
     var: result.software_check.checks
 
-- name: Run the checks again although an earlier run passed
+- name: Run the checks again although an earlier run passed or failed
   everpure.flashblade.purefb_software:
     state: check
     version: 4.8.9
@@ -480,19 +482,23 @@ def _wait(module, fetch, finished, what, changed):
     return item
 
 
-def _fail_on_check_failure(module, task, changed):
-    if getattr(task, "status", None) != "failed":
-        return
+def _failed_checks(task):
+    """The names of the failed checks, or the task details when none is listed."""
     failed = [
         getattr(check, "name", None)
         for check in (getattr(task, "checks", None) or [])
         if getattr(check, "status", None) == "failed"
     ]
+    return ", ".join(failed) or getattr(task, "details", None) or "none reported"
+
+
+def _fail_on_check_failure(module, task, changed):
+    if getattr(task, "status", None) != "failed":
+        return
     module.fail_json(
         changed=changed,
         msg="Software check {0} failed. Failed checks: {1}".format(
-            getattr(task, "name", None),
-            ", ".join(failed) or getattr(task, "details", None) or "none reported",
+            getattr(task, "name", None), _failed_checks(task)
         ),
         software_check=_check_to_dict(task),
     )
@@ -544,7 +550,18 @@ def run_check(module, blade):
         module.exit_json(changed=False, software_check=_check_to_dict(task))
     if task is not None and status == "passed" and not module.params["force"]:
         module.exit_json(changed=False, software_check=_check_to_dict(task))
-    # no task yet, the last one failed, or a re-run was forced
+    if task is not None and status == "failed" and not module.params["force"]:
+        # a failed result stands until a re-run is forced: the array keeps one
+        # task per target version, and a re-run it refuses replaces the record
+        module.fail_json(
+            changed=False,
+            msg=(
+                "Software check {0} failed previously (failed checks: {1}). "
+                "Set force to run the checks again."
+            ).format(getattr(task, "name", None), _failed_checks(task)),
+            software_check=_check_to_dict(task),
+        )
+    # no task yet, or a re-run was forced
     if module.check_mode:
         module.exit_json(changed=True, software_check=_check_to_dict(task))
     kwargs = {"software_names": [name], "software_versions": [version]}

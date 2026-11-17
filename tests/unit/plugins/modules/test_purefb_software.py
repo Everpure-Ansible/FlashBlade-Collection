@@ -321,14 +321,68 @@ class TestCheckState:
         assert module.exit_json.call_args[1]["changed"] is True
         assert module.exit_json.call_args[1]["software_check"]["status"] == "queued"
 
-    def test_failed_check_is_rerun_and_newest_task_wins(
+    def test_failed_check_is_not_rerun_without_force(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        """A failed result stands: a re-run the array refuses would replace it."""
+        module, blade = _setup(
+            mock_ansible_module, mock_get_system, mock_loose_version, _base_params()
+        )
+        older_passed = _check_task("old", status="passed", start_time=10)
+        newer_failed = _check_task(
+            "new",
+            status="failed",
+            start_time=20,
+            checks=[
+                _check_item("Firmware check", "passed"),
+                _check_item("Drive move check", "failed", "reseat"),
+            ],
+        )
+        blade.get_software_check.return_value = _response([older_passed, newer_failed])
+
+        _run()
+
+        blade.post_software_check.assert_not_called()
+        module.fail_json.assert_called_once()
+        kwargs = module.fail_json.call_args[1]
+        assert kwargs["changed"] is False
+        assert "failed previously" in kwargs["msg"]
+        assert "Drive move check" in kwargs["msg"]
+        assert "Firmware check" not in kwargs["msg"]
+        assert "Set force" in kwargs["msg"]
+        assert kwargs["software_check"]["id"] == "new"
+        assert kwargs["software_check"]["status"] == "failed"
+
+    def test_failed_check_in_check_mode_is_not_rerun_either(
         self, mock_ansible_module, mock_get_system, mock_loose_version
     ):
         module, blade = _setup(
             mock_ansible_module,
             mock_get_system,
             mock_loose_version,
-            _base_params(wait=False),
+            _base_params(),
+            check_mode=True,
+        )
+        refused = _check_task(status="failed")
+        refused.details = "Internal error: incompatible upgrade path."
+        blade.get_software_check.return_value = _response([refused])
+
+        _run()
+
+        blade.post_software_check.assert_not_called()
+        module.exit_json.assert_not_called()
+        kwargs = module.fail_json.call_args[1]
+        assert kwargs["changed"] is False
+        assert "incompatible upgrade path" in kwargs["msg"]
+
+    def test_force_reruns_a_failed_check_and_newest_task_wins(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        module, blade = _setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_loose_version,
+            _base_params(force=True, wait=False),
         )
         older_passed = _check_task("old", status="passed", start_time=10)
         newer_failed = _check_task("new", status="failed", start_time=20)
@@ -341,6 +395,7 @@ class TestCheckState:
 
         blade.post_software_check.assert_called_once()
         assert module.exit_json.call_args[1]["changed"] is True
+        assert module.exit_json.call_args[1]["software_check"]["id"] == "t3"
 
     def test_other_version_task_is_ignored(
         self, mock_ansible_module, mock_get_system, mock_loose_version

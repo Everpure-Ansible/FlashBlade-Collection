@@ -111,6 +111,7 @@ def _base_params(**overrides):
         "service": "data",
         "ca_certificate": None,
         "ca_certificate_group": None,
+        "context": "",
     }
     params.update(overrides)
     return params

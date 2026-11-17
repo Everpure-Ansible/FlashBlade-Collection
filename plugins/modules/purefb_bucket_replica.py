@@ -23,6 +23,13 @@ version_added: '1.0.0'
 short_description:  Manage bucket replica links between Everpure FlashBlades
 description:
     - This module manages bucket replica links between Everpure FlashBlades.
+    - An unhealthy link, for example while its target is unreachable, can be
+      paused or deleted, and re-applying its current settings is a no-op.
+      Resuming it, or changing its credential or cascading setting, is
+      refused until the link is healthy again.
+    - The array itself refuses to pause a link whose set-up has not completed,
+      for example when the target bucket has no versioning enabled; the
+      failure message then includes the link's status details.
 author: Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
   name:
@@ -51,6 +58,7 @@ options:
   paused:
     description:
       - State of the bucket replica link
+      - Pausing is allowed while the link is unhealthy.
     type: bool
     default: false
   credential:
@@ -89,7 +97,7 @@ EXAMPLES = """
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
-- name: Pause exisitng bucket replica link
+- name: Pause existing bucket replica link
   everpure.flashblade.purefb_bucket_replica:
     name: foo
     paused: true
@@ -319,11 +327,16 @@ def update_rl_policy(module, blade, local_replica_link):
                 ),
             )
         if res.status_code != 200:
-            module.fail_json(
-                msg="Failed to update bucket replica link {0}. Error: {1}".format(
-                    module.params["name"], get_error_message(res)
-                )
+            msg = "Failed to update bucket replica link {0}. Error: {1}".format(
+                module.params["name"], get_error_message(res)
             )
+            if local_replica_link.status == "unhealthy":
+                # The array answers "Unexpected error." when it cannot act on
+                # an unhealthy link; the status details say why it is unhealthy.
+                msg += " Link is unhealthy: {0}".format(
+                    local_replica_link.status_details
+                )
+            module.fail_json(msg=msg)
     module.exit_json(changed=changed)
 
 
@@ -355,6 +368,25 @@ def delete_rl_policy(module, blade, local_replica_link):
                 )
             )
     module.exit_json(changed=changed)
+
+
+def get_unhealthy_blocked_changes(module, local_replica_link):
+    """Return the requested changes an unhealthy link cannot accept
+
+    Pausing a link does not need its remote side, so an unhealthy link may
+    be paused (it also reports unhealthy for a while after a resume, until
+    the first sync completes). Resuming it, or changing its remote credential
+    or cascading setting, needs a healthy link.
+    """
+    blocked = []
+    if local_replica_link.paused and not module.params["paused"]:
+        blocked.append("resume")
+    new_cred = local_replica_link.remote.name + "/" + module.params["credential"]
+    if local_replica_link.remote_credentials.name != new_cred:
+        blocked.append("credential")
+    if local_replica_link.cascading_enabled != module.params["cascading"]:
+        blocked.append("cascading")
+    return blocked
 
 
 def main():
@@ -443,9 +475,14 @@ def main():
             )
         )
 
-    if local_replica_link:
-        if local_replica_link.status == "unhealthy":
-            module.fail_json(msg="Replica Link unhealthy - please check target")
+    if local_replica_link and local_replica_link.status == "unhealthy":
+        blocked = get_unhealthy_blocked_changes(module, local_replica_link)
+        if blocked:
+            module.fail_json(
+                msg="Replica Link unhealthy - please check target. "
+                "An unhealthy link can only be paused or deleted; "
+                "refused change(s): {0}".format(", ".join(blocked))
+            )
 
     if not local_replica_link:
         create_rl(module, blade, remote_cred)

@@ -95,6 +95,7 @@ from plugins.modules.purefb_info import (
     generate_realms_dict,
     generate_resource_accesses_dict,
     generate_file_repl_dict,
+    _reference_name,
 )
 
 
@@ -745,6 +746,25 @@ class TestPurefbInfo:
         # Mock syslog servers
         mock_blade.get_syslog_servers.return_value.items = []
 
+        # Mock syslog server settings - the SDK returns the references as dicts
+        mock_syslog_settings = Mock(
+            spec=["name", "ca_certificate", "ca_certificate_group"]
+        )
+        mock_syslog_settings.name = "management"
+        mock_syslog_settings.ca_certificate = {
+            "name": "global",
+            "id": "cert-id",
+            "resource_type": "certificates",
+        }
+        mock_syslog_settings.ca_certificate_group = {
+            "name": None,
+            "id": None,
+            "resource_type": None,
+        }
+        mock_blade.get_syslog_servers_settings.return_value.items = [
+            mock_syslog_settings
+        ]
+
         # Mock SNMP agents
         mock_blade.get_snmp_agents.return_value.items = []
 
@@ -768,6 +788,24 @@ class TestPurefbInfo:
         cert = result["ssl_certs"]["management"]
         assert cert["certificate_type"] == "external"
         assert cert["intermediate_certificate"] == "-----BEGIN CERTIFICATE-----"
+        assert result["syslog_settings"] == {
+            "management": {"ca_certificate": "global", "ca_certificate_group": None}
+        }
+
+    def test_reference_name_reads_dict_and_object_references(self):
+        """_reference_name handles dict references, object references and unset values"""
+        obj = Mock(spec=["as_dict", "as_object", "unset", "empty"])
+        obj.as_dict = {"name": "global", "id": "x", "resource_type": "certificates"}
+        ref = Mock(spec=["name"])
+        ref.name = "grp"
+        obj.as_object = ref
+        obj.unset = {"name": None, "id": None, "resource_type": None}
+        obj.empty = None
+        assert _reference_name(obj, "as_dict") == "global"
+        assert _reference_name(obj, "as_object") == "grp"
+        assert _reference_name(obj, "unset") is None
+        assert _reference_name(obj, "empty") is None
+        assert _reference_name(obj, "missing") is None
 
     def test_generate_password_policies_dict(self):
         """Test generate_password_policies_dict reports all fields in seconds"""

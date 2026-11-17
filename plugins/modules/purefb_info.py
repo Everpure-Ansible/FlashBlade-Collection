@@ -143,6 +143,14 @@ def _bytes_to_human(bytes_number):
     return None
 
 
+def _reference_name(obj, field):
+    """Name held by a reference field the SDK returns as a dict or an object."""
+    ref = getattr(obj, field, None)
+    if isinstance(ref, dict):
+        return ref.get("name") or None
+    return getattr(ref, "name", None) or None
+
+
 def generate_default_dict(blade):
     default_info = {}
     # NOTE(latent bug): this previously read list(blade.get_versions().items)[0]
@@ -458,6 +466,12 @@ def generate_config_dict(blade):
         config_info["syslog_servers"][server_name] = {
             "uri": server.uri,
             "services": getattr(server, "services", None),
+        }
+    config_info["syslog_settings"] = {}
+    for settings in list(blade.get_syslog_servers_settings().items):
+        config_info["syslog_settings"][settings.name] = {
+            "ca_certificate": _reference_name(settings, "ca_certificate"),
+            "ca_certificate_group": _reference_name(settings, "ca_certificate_group"),
         }
     snmp_agents = list(blade.get_snmp_agents().items)
     config_info["snmp_agents"] = {}

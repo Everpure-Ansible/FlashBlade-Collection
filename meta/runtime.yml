@@ -60,6 +60,7 @@ action_groups:
     - purefb_snmp_mgr
     - purefb_subnet
     - purefb_syslog
+    - purefb_syslog_settings
     - purefb_target
     - purefb_timeout
     - purefb_tls_policy

@@ -153,6 +153,7 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_snmp_mgr - manage SNMP Managers on a FlashBlade
 - purefb_subnet - manage network subnets on a FlashBlade
 - purefb_syslog - manage FlashBlade syslog server configuration
+- purefb_syslog_settings - manage the CA certificate used to validate FlashBlade syslog servers
 - purefb_target - manage remote S3-capable targets for a FlashBlade
 - purefb_timeout - manage FlashBlade GUI timeout
 - purefb_tls_policy - manage FlashBlade TLS policies and their network interface attachments

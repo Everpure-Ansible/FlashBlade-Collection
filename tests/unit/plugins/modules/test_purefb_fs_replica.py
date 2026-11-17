@@ -293,8 +293,27 @@ class TestCreate:
         )
         blade = _blade(connections=[_connection()])
         _run_main(module, blade)
+        blade.get_array_connections.assert_called_once()
         blade.post_file_system_replica_links.assert_not_called()
         module.exit_json.assert_called_once_with(changed=True)
+
+    def test_create_check_mode_target_not_connected(self):
+        """Check mode must refuse a disconnected target like the real run"""
+        module = _module(_params(target_array="arrayB"), check_mode=True)
+        blade = _blade(connections=[_connection(status="disconnected")])
+        _run_main(module, blade)
+        assert "not connected" in _fail_msg(module)
+        blade.post_file_system_replica_links.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    def test_create_check_mode_unknown_target(self):
+        """Check mode must refuse a target without an array connection"""
+        module = _module(_params(target_array="arrayZ"), check_mode=True)
+        blade = _blade(connections=[_connection("arrayB")])
+        _run_main(module, blade)
+        assert "not connected" in _fail_msg(module)
+        blade.post_file_system_replica_links.assert_not_called()
+        module.exit_json.assert_not_called()
 
     def test_existing_link_ignores_remote_default_exports(self):
         """remote_default_exports is create-only: an existing link is left alone"""

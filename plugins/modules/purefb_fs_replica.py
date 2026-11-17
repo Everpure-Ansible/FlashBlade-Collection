@@ -283,39 +283,38 @@ def create_rl(module, blade):
     changed = True
     if not module.params["target_array"]:
         module.fail_json(msg="target_array is required to create a replica link.")
+    # Validate the target connection before the check-mode exit so that a
+    # check-mode run fails the same way the real run would.
+    remote_array = _check_connected(module, blade)
+    if not remote_array:
+        module.fail_json(
+            msg="Target array {0} is not connected".format(
+                module.params["target_array"]
+            )
+        )
     if not module.check_mode:
-        remote_array = _check_connected(module, blade)
-        if remote_array:
-            if not module.params["target_fs"]:
-                module.params["target_fs"] = module.params["name"]
-            link_body = {}
-            if module.params["link_type"]:
-                link_body["link_type"] = module.params["link_type"]
-            if module.params["policy"]:
-                link_body["policies"] = [
-                    LocationReference(name=module.params["policy"])
-                ]
-            post_kwargs = {
-                "local_file_system_names": [module.params["name"]],
-                "remote_file_system_names": [module.params["target_fs"]],
-                "remote_names": [remote_array.remote.name],
-                "file_system_replica_link": FileSystemReplicaLink(**link_body),
-            }
-            if module.params["remote_default_exports"] is not None:
-                post_kwargs["remote_default_exports"] = _remote_default_exports(
-                    module.params["remote_default_exports"]
-                )
-            res = blade.post_file_system_replica_links(**post_kwargs)
-            if res.status_code != 200:
-                module.fail_json(
-                    msg="Failed to create filesystem replica link for {0}. Error: {1}".format(
-                        module.params["name"], get_error_message(res)
-                    )
-                )
-        else:
+        if not module.params["target_fs"]:
+            module.params["target_fs"] = module.params["name"]
+        link_body = {}
+        if module.params["link_type"]:
+            link_body["link_type"] = module.params["link_type"]
+        if module.params["policy"]:
+            link_body["policies"] = [LocationReference(name=module.params["policy"])]
+        post_kwargs = {
+            "local_file_system_names": [module.params["name"]],
+            "remote_file_system_names": [module.params["target_fs"]],
+            "remote_names": [remote_array.remote.name],
+            "file_system_replica_link": FileSystemReplicaLink(**link_body),
+        }
+        if module.params["remote_default_exports"] is not None:
+            post_kwargs["remote_default_exports"] = _remote_default_exports(
+                module.params["remote_default_exports"]
+            )
+        res = blade.post_file_system_replica_links(**post_kwargs)
+        if res.status_code != 200:
             module.fail_json(
-                msg="Target array {0} is not connected".format(
-                    module.params["target_array"]
+                msg="Failed to create filesystem replica link for {0}. Error: {1}".format(
+                    module.params["name"], get_error_message(res)
                 )
             )
     module.exit_json(changed=changed)

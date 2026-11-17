@@ -8,3 +8,7 @@ minor_changes:
     array, so a fan-out configuration no longer modifies or deletes whichever link the array lists first."
   - "purefb_info - the ``replication`` subset reports filesystem replica link transfers as
     ``fs_replica_transfers``, keyed by snapshot name and remote array."
+bugfixes:
+  - "purefb_fs_replica - check mode now validates that ``target_array`` is connected before reporting a
+    change, so a check-mode run against a disconnected target fails like the real run instead of
+    reporting ``changed``."

@@ -88,43 +88,17 @@ options:
     version_added: "1.9.0"
   actions:
     description:
-    - List of permissions to grant.
+    - List of permissions to grant, for example C(s3:GetObject) or
+      C(s3:PutObjectTagging). C(s3:*) grants every action.
+    - Actions are validated against the list the array publishes
+      (GET /object-store-access-policy-actions, REST 2.2 and later), so an
+      action introduced by a later Purity//FB release is accepted without a
+      collection update. The task fails naming any action the array does
+      not know. The collection's built-in list is used only when the array
+      cannot be asked.
     - System-wide policy rules cannot be deleted or modified
     type: list
     elements: str
-    choices:
-      - s3:*
-      - s3:AbortMultipartUpload
-      - s3:BypassGovernanceRetention
-      - s3:CreateBucket
-      - s3:DeleteBucket
-      - s3:DeleteObject
-      - s3:DeleteObjectVersion
-      - s3:ExtendSafemodeRetentionPeriod
-      - s3:GetBucketAcl
-      - s3:GetBucketLocation
-      - s3:GetBucketVersioning
-      - s3:GetLifecycleConfiguration
-      - s3:GetObject
-      - s3:GetObjectAcl
-      - s3:GetObjectLegalHold
-      - s3:GetObjectLockConfiguration
-      - s3:GetObjectRetention
-      - s3:GetObjectTagging
-      - s3:GetObjectVersion
-      - s3:GetObjectVersionTagging
-      - s3:ListAllMyBuckets
-      - s3:ListBucket
-      - s3:ListBucketMultipartUploads
-      - s3:ListBucketVersions
-      - s3:ListMultipartUploadParts
-      - s3:PutBucketVersioning
-      - s3:PutLifecycleConfiguration
-      - s3:PutObject
-      - s3:PutObjectLegalHold
-      - s3:PutObjectLockConfiguration
-      - s3:PutObjectRetention
-      - s3:ResolveSafemodeConflicts
     version_added: "1.9.0"
   object_resources:
     description:
@@ -490,6 +464,19 @@ EXAMPLES = r"""
     object_resources: "*"
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+- name: Create an object store access policy rule for object tagging
+  everpure.flashblade.purefb_policy:
+    name: test_os_policy_tagging
+    policy_type: access
+    account: test
+    rule: tagging
+    actions:
+      - s3:GetObjectTagging
+      - s3:PutObjectTagging
+      - s3:DeleteObjectTagging
+    object_resources: "*"
+    fb_url: 10.10.10.2
+    api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
 - name: Create an empty SMB client policy
   everpure.flashblade.purefb_policy:
     name: test_smb_client
@@ -691,6 +678,53 @@ CONTEXT_API_VERSION = "2.17"
 # From REST 2.22 the NFS export rule anonuid/anongid are integers on the wire;
 # older arrays declare and accept them only as strings.
 NFS_ANON_INT_API_VERSION = "2.22"
+# GET /object-store-access-policy-actions lists the rule actions the array
+# accepts. It grows with Purity//FB releases, so `actions` is validated
+# against it rather than against a list frozen in the collection.
+OS_ACTIONS_API_VERSION = "2.2"
+# Used only when the array cannot be asked for its own catalogue.
+_OS_ACCESS_ACTIONS_FALLBACK = (
+    "s3:*",
+    "s3:AbortMultipartUpload",
+    "s3:BypassGovernanceRetention",
+    "s3:CreateBucket",
+    "s3:DeleteBucket",
+    "s3:DeleteObject",
+    "s3:DeleteObjectTagging",
+    "s3:DeleteObjectVersion",
+    "s3:DeleteObjectVersionTagging",
+    "s3:ExtendSafemodeRetentionPeriod",
+    "s3:GetBucketAcl",
+    "s3:GetBucketCORS",
+    "s3:GetBucketLocation",
+    "s3:GetBucketPolicy",
+    "s3:GetBucketPolicyStatus",
+    "s3:GetBucketPublicAccessBlock",
+    "s3:GetBucketVersioning",
+    "s3:GetLifecycleConfiguration",
+    "s3:GetObject",
+    "s3:GetObjectAcl",
+    "s3:GetObjectLegalHold",
+    "s3:GetObjectLockConfiguration",
+    "s3:GetObjectRetention",
+    "s3:GetObjectTagging",
+    "s3:GetObjectVersion",
+    "s3:GetObjectVersionTagging",
+    "s3:ListAllMyBuckets",
+    "s3:ListBucket",
+    "s3:ListBucketMultipartUploads",
+    "s3:ListBucketVersions",
+    "s3:ListMultipartUploadParts",
+    "s3:PutBucketVersioning",
+    "s3:PutLifecycleConfiguration",
+    "s3:PutObject",
+    "s3:PutObjectLegalHold",
+    "s3:PutObjectLockConfiguration",
+    "s3:PutObjectRetention",
+    "s3:PutObjectTagging",
+    "s3:PutObjectVersionTagging",
+    "s3:ResolveSafemodeConflicts",
+)
 
 
 def _get_local_tz(module, timezone="UTC"):
@@ -794,6 +828,43 @@ def _blank_to_none(value):
 def _sorted_or_none(values):
     """Sorted copy of a list for order-insensitive comparison; [] is unset."""
     return sorted(values) if values else None
+
+
+def _valid_os_actions(module, blade, versions):
+    """Return the object store access policy rule actions this array accepts.
+
+    The array's catalogue is authoritative; the built-in list is used only
+    when the catalogue cannot be read.
+    """
+    if LooseVersion(OS_ACTIONS_API_VERSION) <= LooseVersion(versions):
+        res = blade.get_object_store_access_policy_actions(
+            **_context_kwargs(module, versions)
+        )
+        if res.status_code == 200:
+            names = [action.name for action in res.items]
+            if names:
+                return names
+            reason = "The array returned an empty list."
+        else:
+            reason = "Error: {0}".format(get_error_message(res))
+        module.warn(
+            "Could not read the array's access policy action list, "
+            "validating against the collection's built-in list. {0}".format(reason)
+        )
+    return list(_OS_ACCESS_ACTIONS_FALLBACK)
+
+
+def _check_os_actions(module, blade, versions):
+    """Fail, naming every unknown action, unless all requested actions are valid."""
+    if not module.params["actions"]:
+        return
+    valid = _valid_os_actions(module, blade, versions)
+    unknown = [action for action in module.params["actions"] if action not in valid]
+    if unknown:
+        module.fail_json(
+            msg="Unknown object store access policy action(s): {0}. "
+            "Valid actions: {1}".format(", ".join(unknown), ", ".join(sorted(valid)))
+        )
 
 
 # SMB share permissions, lowest level first.
@@ -4043,44 +4114,7 @@ def main():
             rule=dict(type="str"),
             user=dict(type="str"),
             effect=dict(type="str", choices=["allow", "deny"]),
-            actions=dict(
-                type="list",
-                elements="str",
-                choices=[
-                    "s3:*",
-                    "s3:AbortMultipartUpload",
-                    "s3:BypassGovernanceRetention",
-                    "s3:CreateBucket",
-                    "s3:DeleteBucket",
-                    "s3:DeleteObject",
-                    "s3:DeleteObjectVersion",
-                    "s3:ExtendSafemodeRetentionPeriod",
-                    "s3:GetBucketAcl",
-                    "s3:GetBucketLocation",
-                    "s3:GetBucketVersioning",
-                    "s3:GetLifecycleConfiguration",
-                    "s3:GetObject",
-                    "s3:GetObjectAcl",
-                    "s3:GetObjectLegalHold",
-                    "s3:GetObjectLockConfiguration",
-                    "s3:GetObjectRetention",
-                    "s3:GetObjectTagging",
-                    "s3:GetObjectVersion",
-                    "s3:GetObjectVersionTagging",
-                    "s3:ListAllMyBuckets",
-                    "s3:ListBucket",
-                    "s3:ListBucketMultipartUploads",
-                    "s3:ListBucketVersions",
-                    "s3:ListMultipartUploadParts",
-                    "s3:PutBucketVersioning",
-                    "s3:PutLifecycleConfiguration",
-                    "s3:PutObject",
-                    "s3:PutObjectLegalHold",
-                    "s3:PutObjectLockConfiguration",
-                    "s3:PutObjectRetention",
-                    "s3:ResolveSafemodeConflicts",
-                ],
-            ),
+            actions=dict(type="list", elements="str"),
             object_resources=dict(type="list", elements="str"),
             source_ips=dict(type="list", elements="str"),
             s3_prefixes=dict(type="list", elements="str"),
@@ -4208,6 +4242,8 @@ def main():
                         get_error_message(res),
                     )
                 )
+        if state == "present":
+            _check_os_actions(module, blade, versions)
         if policy and state == "present":
             update_os_policy(module, blade)
         elif state == "present" and not policy:

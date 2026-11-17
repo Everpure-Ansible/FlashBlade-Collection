@@ -96,6 +96,16 @@ from plugins.modules.purefb_info import (
     generate_resource_accesses_dict,
     generate_file_repl_dict,
 )
+from plugins.modules.purefb_info import (
+    generate_perf_breakdown_dict,
+    generate_clients_dict,
+    CLIENTS_PERF_LIMIT,
+    HTTP_OPS_FIELDS,
+    NFS_OPS_FIELDS,
+    PERF_FIELDS,
+    S3_OPS_FIELDS,
+)
+from plugins.modules import purefb_info as purefb_info_module
 
 
 class TestPurefbInfo:
@@ -1645,3 +1655,341 @@ class TestPurefbInfo:
         call_args = mock_module.exit_json.call_args[1]
         assert call_args["purefb_info"]["fleet"] == {"fleet1": {"members": {}}}
         assert "policies" not in call_args["purefb_info"]
+
+
+class _Row(object):
+    """Attribute holder standing in for an SDK model row.
+
+    Unlike Mock, getattr on a field that was not set yields the default.
+    """
+
+    def __init__(self, **fields):
+        for key, value in fields.items():
+            setattr(self, key, value)
+
+
+class _Version(object):
+    """Minimal LooseVersion stand-in comparing dotted integer versions."""
+
+    def __init__(self, vstring):
+        self.parts = tuple(int(part) for part in str(vstring).split("."))
+
+    def __le__(self, other):
+        return self.parts <= other.parts
+
+    def __gt__(self, other):
+        return self.parts > other.parts
+
+
+def _ok(items):
+    response = Mock()
+    response.status_code = 200
+    response.items = items
+    response.total_item_count = len(items)
+    return response
+
+
+def _failed():
+    response = Mock()
+    response.status_code = 400
+    response.items = None
+    return response
+
+
+def _repl_row(**extra):
+    return _Row(
+        aggregate=_Row(received_bytes_per_sec=10.0, transmitted_bytes_per_sec=20.0),
+        periodic=_Row(received_bytes_per_sec=10.0, transmitted_bytes_per_sec=20.0),
+        continuous=_Row(
+            received_bytes_per_sec=0.0,
+            transmitted_bytes_per_sec=0.0,
+            object_backlog=_Row(
+                bytes_count=0, delete_ops_count=0, other_ops_count=0, put_ops_count=1
+            ),
+        ),
+        time=1700000000000,
+        **extra
+    )
+
+
+class TestPurefbInfoPerformance:
+    """Performance breakdown and opt-in clients subset."""
+
+    def _breakdown_blade(self):
+        blade = Mock()
+
+        def arrays_performance(protocol=None):
+            if protocol == "smb":
+                return _ok([_Row(name="fb", reads_per_sec=5.0, time=1)])
+            return _ok([_Row(name="fb", reads_per_sec=50.0, time=1)])
+
+        blade.get_arrays_performance.side_effect = arrays_performance
+        blade.get_arrays_nfs_specific_performance.return_value = _ok(
+            [_Row(lookups_per_sec=7.0, time=2)]
+        )
+        blade.get_arrays_s3_specific_performance.return_value = _ok(
+            [_Row(read_objects_per_sec=3.0, time=2)]
+        )
+        blade.get_arrays_http_specific_performance.return_value = _ok(
+            [_Row(read_files_per_sec=2.0, time=2)]
+        )
+        blade.get_arrays_performance_replication.return_value = _ok([_repl_row()])
+        # one peer row with no continuous sub-object, one without a remote name
+        blade.get_array_connections_performance_replication.return_value = _ok(
+            [
+                _Row(
+                    remote=_Row(name="peer-fb"),
+                    aggregate=_Row(
+                        received_bytes_per_sec=1.0, transmitted_bytes_per_sec=2.0
+                    ),
+                    periodic=_Row(
+                        received_bytes_per_sec=1.0, transmitted_bytes_per_sec=2.0
+                    ),
+                    time=3,
+                ),
+                _repl_row(id="conn-id"),
+            ]
+        )
+        blade.get_targets_performance_replication.return_value = _ok(
+            [_repl_row(name="s3-target")]
+        )
+        blade.get_file_systems_performance.return_value = _ok(
+            [_Row(name="fs1", reads_per_sec=1.0, time=4)]
+        )
+        blade.get_buckets_performance.return_value = _ok(
+            [_Row(name="b1", writes_per_sec=4.0, time=4)]
+        )
+        blade.get_buckets_s3_specific_performance.return_value = _ok(
+            [
+                _Row(name="b1", write_objects_per_sec=4.0, time=4),
+                _Row(name="b2", write_objects_per_sec=0.0, time=4),
+            ]
+        )
+        return blade
+
+    def test_generate_perf_breakdown_dict_reports_every_key(self):
+        blade = self._breakdown_blade()
+
+        result = generate_perf_breakdown_dict(blade)
+
+        assert set(result) == {
+            "smb",
+            "nfs_ops",
+            "s3_ops",
+            "http_ops",
+            "replication",
+            "filesystems",
+            "buckets",
+        }
+        blade.get_arrays_performance.assert_called_once_with(protocol="smb")
+        assert set(result["smb"]) == set(PERF_FIELDS)
+        assert result["smb"]["reads_per_sec"] == 5.0
+        assert result["smb"]["writes_per_sec"] is None
+        assert set(result["nfs_ops"]) == set(NFS_OPS_FIELDS)
+        assert result["nfs_ops"]["lookups_per_sec"] == 7.0
+        assert set(result["s3_ops"]) == set(S3_OPS_FIELDS)
+        assert result["s3_ops"]["read_objects_per_sec"] == 3.0
+        assert set(result["http_ops"]) == set(HTTP_OPS_FIELDS)
+        assert result["http_ops"]["read_files_per_sec"] == 2.0
+
+        repl = result["replication"]
+        assert repl["aggregate"] == {
+            "received_bytes_per_sec": 10.0,
+            "transmitted_bytes_per_sec": 20.0,
+        }
+        assert repl["periodic"]["received_bytes_per_sec"] == 10.0
+        assert repl["continuous"]["object_backlog"]["put_ops_count"] == 1
+        assert repl["time"] == 1700000000000
+        # array connections are keyed by the remote array name, falling back
+        # to the connection id; a row without continuous data has no backlog
+        assert set(repl["array_connections"]) == {"peer-fb", "conn-id"}
+        assert repl["array_connections"]["peer-fb"]["continuous"] == {}
+        assert repl["array_connections"]["peer-fb"]["periodic"] == {
+            "received_bytes_per_sec": 1.0,
+            "transmitted_bytes_per_sec": 2.0,
+        }
+        assert (
+            repl["array_connections"]["conn-id"]["continuous"]["object_backlog"][
+                "bytes_count"
+            ]
+            == 0
+        )
+        assert (
+            repl["targets"]["s3-target"]["aggregate"]["transmitted_bytes_per_sec"]
+            == 20.0
+        )
+
+        assert set(result["filesystems"]["fs1"]) == set(PERF_FIELDS)
+        assert result["filesystems"]["fs1"]["reads_per_sec"] == 1.0
+        assert set(result["buckets"]["b1"]) == set(PERF_FIELDS) | {"s3"}
+        assert result["buckets"]["b1"]["writes_per_sec"] == 4.0
+        assert result["buckets"]["b1"]["s3"]["write_objects_per_sec"] == 4.0
+        assert set(result["buckets"]["b1"]["s3"]) == set(S3_OPS_FIELDS)
+        # a bucket only present in the S3-specific listing still appears
+        assert set(result["buckets"]["b2"]) == {"s3"}
+
+    def test_generate_perf_breakdown_dict_tolerates_failed_gets(self):
+        blade = Mock()
+        for method in (
+            "get_arrays_performance",
+            "get_arrays_nfs_specific_performance",
+            "get_arrays_s3_specific_performance",
+            "get_arrays_http_specific_performance",
+            "get_arrays_performance_replication",
+            "get_array_connections_performance_replication",
+            "get_targets_performance_replication",
+            "get_file_systems_performance",
+            "get_buckets_performance",
+            "get_buckets_s3_specific_performance",
+        ):
+            getattr(blade, method).return_value = _failed()
+
+        result = generate_perf_breakdown_dict(blade)
+
+        assert result == {
+            "smb": {},
+            "nfs_ops": {},
+            "s3_ops": {},
+            "http_ops": {},
+            "replication": {"array_connections": {}, "targets": {}},
+            "filesystems": {},
+            "buckets": {},
+        }
+
+    @patch("plugins.modules.purefb_info.generate_perf_breakdown_dict")
+    def test_generate_perf_dict_merges_breakdown(self, mock_breakdown):
+        blade = Mock()
+        sample = _Row(
+            bytes_per_op=1,
+            bytes_per_read=2,
+            bytes_per_write=3,
+            read_bytes_per_sec=4,
+            reads_per_sec=5,
+            usec_per_other_op=6,
+            usec_per_read_op=7,
+            usec_per_write_op=8,
+            write_bytes_per_sec=9,
+            writes_per_sec=10,
+        )
+        blade.get_arrays_performance.return_value = _ok([sample])
+        blade.get_array_connections_performance_replication.return_value.total_item_count = (
+            0
+        )
+        mock_breakdown.return_value = {"smb": {"reads_per_sec": 0.0}}
+
+        result = generate_perf_dict(blade)
+
+        mock_breakdown.assert_called_once_with(blade)
+        assert result["aggregate"]["reads_per_sec"] == 5
+        assert result["nfs"]["writes_per_sec"] == 10
+        assert result["smb"] == {"reads_per_sec": 0.0}
+
+    @patch("plugins.modules.purefb_info.LooseVersion", _Version)
+    def test_generate_clients_dict_before_2_18_reports_nfs_only(self):
+        blade = Mock()
+        blade.get_arrays_clients_performance.return_value = _ok(
+            [_Row(name="10.0.0.1:2049", reads_per_sec=9.0, time=5)]
+        )
+
+        result = generate_clients_dict(blade, "2.17")
+
+        blade.get_arrays_clients_performance.assert_called_once_with(
+            limit=CLIENTS_PERF_LIMIT
+        )
+        blade.get_arrays_clients_s3_specific_performance.assert_not_called()
+        assert set(result) == {"nfs", "s3", "s3_ops"}
+        assert set(result["nfs"]["10.0.0.1:2049"]) == set(PERF_FIELDS)
+        assert result["nfs"]["10.0.0.1:2049"]["reads_per_sec"] == 9.0
+        assert result["s3"] == {}
+        assert result["s3_ops"] == {}
+
+    @patch("plugins.modules.purefb_info.LooseVersion", _Version)
+    def test_generate_clients_dict_from_2_18_reports_s3_clients(self):
+        blade = Mock()
+
+        def clients_performance(protocol=None, limit=None):
+            assert limit == CLIENTS_PERF_LIMIT
+            if protocol == "s3":
+                return _ok([_Row(name="10.0.0.2:51000", writes_per_sec=3.0)])
+            return _ok([_Row(name="10.0.0.1:2049", reads_per_sec=9.0)])
+
+        blade.get_arrays_clients_performance.side_effect = clients_performance
+        blade.get_arrays_clients_s3_specific_performance.return_value = _ok(
+            [_Row(name="10.0.0.2:51000", write_objects_per_sec=3.0)]
+        )
+
+        result = generate_clients_dict(blade, "2.18")
+
+        assert blade.get_arrays_clients_performance.call_count == 2
+        blade.get_arrays_clients_performance.assert_any_call(limit=CLIENTS_PERF_LIMIT)
+        blade.get_arrays_clients_performance.assert_any_call(
+            protocol="s3", limit=CLIENTS_PERF_LIMIT
+        )
+        blade.get_arrays_clients_s3_specific_performance.assert_called_once_with(
+            limit=CLIENTS_PERF_LIMIT
+        )
+        assert result["nfs"]["10.0.0.1:2049"]["reads_per_sec"] == 9.0
+        assert result["s3"]["10.0.0.2:51000"]["writes_per_sec"] == 3.0
+        assert set(result["s3_ops"]["10.0.0.2:51000"]) == set(S3_OPS_FIELDS)
+        assert result["s3_ops"]["10.0.0.2:51000"]["write_objects_per_sec"] == 3.0
+
+    @patch("plugins.modules.purefb_info.LooseVersion", _Version)
+    def test_generate_clients_dict_tolerates_failed_gets(self):
+        blade = Mock()
+        blade.get_arrays_clients_performance.return_value = _failed()
+        blade.get_arrays_clients_s3_specific_performance.return_value = _failed()
+
+        result = generate_clients_dict(blade, "2.30")
+
+        assert result == {"nfs": {}, "s3": {}, "s3_ops": {}}
+
+    @patch("plugins.modules.purefb_info.generate_clients_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_clients_subset_is_opt_in(
+        self, mock_ansible_module, mock_get_system, mock_generate_clients
+    ):
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["clients"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        mock_generate_clients.return_value = {"nfs": {}, "s3": {}, "s3_ops": {}}
+
+        main()
+
+        mock_module.fail_json.assert_not_called()
+        mock_generate_clients.assert_called_once()
+        assert mock_generate_clients.call_args[0][0] is mock_blade
+        info = mock_module.exit_json.call_args[1]["purefb_info"]
+        assert info == {"clients": {"nfs": {}, "s3": {}, "s3_ops": {}}}
+
+    def test_main_all_subset_excludes_clients(self):
+        generators = {
+            name: Mock(return_value={})
+            for name in dir(purefb_info_module)
+            if name.startswith("generate_")
+        }
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["all"]}
+        mock_module.check_mode = False
+        mock_blade = Mock()
+
+        with patch.multiple(purefb_info_module, **generators), patch.object(
+            purefb_info_module, "LooseVersion", _Version
+        ), patch.object(
+            purefb_info_module, "get_system", return_value=mock_blade
+        ), patch.object(
+            purefb_info_module, "AnsibleModule", return_value=mock_module
+        ), patch.object(
+            purefb_info_module, "get_rest_api_version", return_value="2.30"
+        ):
+            main()
+
+        mock_module.fail_json.assert_not_called()
+        generators["generate_perf_dict"].assert_called_once_with(mock_blade)
+        generators["generate_clients_dict"].assert_not_called()
+        info = mock_module.exit_json.call_args[1]["purefb_info"]
+        assert "performance" in info
+        assert "clients" not in info

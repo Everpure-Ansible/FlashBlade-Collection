@@ -8,6 +8,7 @@ from __future__ import absolute_import, division, print_function
 __metaclass__ = type
 
 import sys
+import datetime
 import multiprocessing
 import ctypes
 from unittest.mock import Mock, patch, MagicMock
@@ -72,12 +73,14 @@ sys.modules["ansible_collections.everpure.flashblade.plugins.module_utils.versio
 
 from ansible.module_utils.compat.version import LooseVersion
 
+from plugins.modules import purefb_audits as audits_module
 from plugins.modules.purefb_audits import (
     main,
     _build_filter,
     _format_audit,
     _resolve_timezone,
     _to_timestamp,
+    _tzinfo,
     _validate_filter_values,
     AUDIT_CONTEXT_VERSION,
 )
@@ -184,8 +187,6 @@ def _run_main(module, blade, api_version="2.30"):
         MODULE + ".get_system", return_value=blade
     ), patch(MODULE + ".get_rest_api_version", return_value=api_version), patch(
         MODULE + ".LooseVersion", LooseVersion
-    ), patch(
-        MODULE + ".HAS_PYTZ", True
     ):
         try:
             main()
@@ -195,6 +196,21 @@ def _run_main(module, blade, api_version="2.30"):
 
 class TestPurefbAudits:
     """Test cases for purefb_audits module"""
+
+    # ---------------- _tzinfo ----------------
+
+    def test_tzinfo_utc_needs_no_timezone_database(self):
+        """UTC is served by the standard library, not by a zoneinfo lookup"""
+        assert _tzinfo("UTC") is datetime.timezone.utc
+
+    def test_tzinfo_resolves_iana_names(self):
+        """Any other name is resolved through zoneinfo"""
+        assert _tzinfo("America/Los_Angeles").key == "America/Los_Angeles"
+
+    def test_module_does_not_depend_on_pytz(self):
+        """The module never imports pytz, which the test environment lacks"""
+        assert not hasattr(audits_module, "pytz")
+        assert not hasattr(audits_module, "HAS_PYTZ")
 
     # ---------------- _to_timestamp ----------------
 
@@ -332,6 +348,17 @@ class TestPurefbAudits:
             pass
         module.fail_json.assert_called_once_with(
             msg="Timezone Mars/Olympus is not valid"
+        )
+
+    def test_resolve_timezone_rejects_malformed_zone(self):
+        """A name zoneinfo refuses as a key also fails the module"""
+        module = _module(timezone="../Europe/London")
+        try:
+            _resolve_timezone(module, _blade())
+        except SystemExit:
+            pass
+        module.fail_json.assert_called_once_with(
+            msg="Timezone ../Europe/London is not valid"
         )
 
     # ---------------- _format_audit ----------------
@@ -497,21 +524,6 @@ class TestPurefbAudits:
             msg="user value o'brien must not contain a single quote"
         )
         blade.get_arrays.assert_not_called()
-        blade.get_audits.assert_not_called()
-
-    def test_main_requires_pytz(self):
-        """Without pytz the module fails before touching the array"""
-        module = _module()
-        blade = _blade()
-        with patch(MODULE + ".AnsibleModule", return_value=module), patch(
-            MODULE + ".get_system", return_value=blade
-        ), patch(MODULE + ".HAS_PYTZ", False):
-            try:
-                main()
-            except SystemExit:
-                pass
-
-        module.fail_json.assert_called_once_with(msg="pytz is required for this module")
         blade.get_audits.assert_not_called()
 
     def test_main_api_error(self):

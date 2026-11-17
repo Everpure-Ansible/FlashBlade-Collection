@@ -34,6 +34,9 @@ description:
 - The I(user), I(command) and I(correlation_id) values must not contain a
   single quote, which the array query syntax cannot escape. Such a value is
   refused before the array is contacted.
+- Timezone names are resolved with the Python C(zoneinfo) module on the host
+  running the module, which needs the system timezone database or the
+  C(tzdata) Python package. C(UTC) works without either.
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
@@ -250,13 +253,8 @@ purefb_audits:
       correlation_id: null
 """
 
-HAS_PYTZ = True
-try:
-    import pytz
-except ImportError:
-    HAS_PYTZ = False
-
 import datetime
+import zoneinfo
 
 from ansible.module_utils.basic import AnsibleModule
 from ansible_collections.everpure.flashblade.plugins.module_utils.purefb import (
@@ -278,6 +276,19 @@ AUDIT_CONTEXT_VERSION = "2.28"
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
+def _tzinfo(timezone):
+    """Return the tzinfo for the IANA timezone name ``timezone``.
+
+    UTC comes straight from the standard library so it works without a
+    timezone database. Every other name goes through zoneinfo, which raises
+    ZoneInfoNotFoundError for a name it does not know and ValueError for a
+    malformed key.
+    """
+    if timezone == "UTC":
+        return datetime.timezone.utc
+    return zoneinfo.ZoneInfo(timezone)
+
+
 def _resolve_timezone(module, blade):
     """Return the IANA timezone the module interprets and reports times in.
 
@@ -295,7 +306,9 @@ def _resolve_timezone(module, blade):
         if not timezone:
             timezone = get_local_tz(module)
             module.warn("Could not read the array timezone, using {0}".format(timezone))
-    if timezone not in pytz.all_timezones_set:
+    try:
+        _tzinfo(timezone)
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError):
         module.fail_json(msg="Timezone {0} is not valid".format(timezone))
     return timezone
 
@@ -314,7 +327,7 @@ def _to_timestamp(module, name, timezone):
                 name, module.params[name]
             )
         )
-    localized = pytz.timezone(timezone).localize(naive)
+    localized = naive.replace(tzinfo=_tzinfo(timezone))
     return int(localized.timestamp() * 1000)
 
 
@@ -376,7 +389,7 @@ def _format_audit(audit, timezone):
     event_time = getattr(audit, "time", None)
     if event_time is not None:
         event_time = datetime.datetime.fromtimestamp(
-            event_time / 1000, tz=pytz.timezone(timezone)
+            event_time / 1000, tz=_tzinfo(timezone)
         ).strftime(TIME_FORMAT + " %Z")
     system_event = getattr(audit, "system_event", None)
     if system_event is None:
@@ -420,8 +433,6 @@ def main():
 
     module = AnsibleModule(argument_spec, supports_check_mode=True)
 
-    if not HAS_PYTZ:
-        module.fail_json(msg="pytz is required for this module")
     if module.params["limit"] is not None and module.params["limit"] < 1:
         module.fail_json(msg="limit must be at least 1")
     _validate_filter_values(module)

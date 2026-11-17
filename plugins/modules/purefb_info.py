@@ -45,6 +45,13 @@ options:
         list (and the top-level C(file_system_exports) view under
         C(subset=filesystems)/C(subset=all)) instead. These keys will
         be removed from this module in 2.0.0.
+      - On arrays running REST 2.25 or later (Purity//FB 4.8.0) the
+        C(policies) subset adds C(quota_policies), the user-group quota
+        policies with their rules and attached file systems, and the
+        C(filesystems) subset adds C(quota_policy) and C(policy_quotas)
+        to every file system, the attached quota policy and the per-user
+        and per-group usage with the policy rule limiting each. Both are
+        omitted on older arrays.
     required: false
     type: list
     elements: str
@@ -128,6 +135,7 @@ FLEET_API_VERSION = "2.17"
 TLS_API_VERSION = "2.17"
 REALMS_API_VERSION = "2.19"
 S3_EXPORT_API_VERSION = "2.20"
+QUOTA_POLICY_API_VERSION = "2.25"
 
 
 def _bytes_to_human(bytes_number):
@@ -1280,6 +1288,74 @@ def generate_worm_data_policies_dict(blade):
     return policies_info
 
 
+def _subject_dict(subject):
+    return {
+        "id": getattr(subject, "id", None),
+        "name": getattr(subject, "name", None),
+        "sid": getattr(subject, "sid", None),
+    }
+
+
+def generate_quota_policies_dict(blade):
+    """User-group quota policies with their rules and attached file systems.
+
+    Requires REST API 2.25+ (QUOTA_POLICY_API_VERSION); callers gate on it.
+    """
+    policies_info = {}
+
+    for policy in blade.get_user_group_quota_policies().items:
+        policies_info[policy.name] = {
+            "local": getattr(policy, "is_local", None),
+            "enabled": getattr(policy, "enabled", None),
+            "location": getattr(getattr(policy, "location", None), "name", None),
+            "realms": [
+                getattr(realm, "name", None)
+                for realm in (getattr(policy, "realms", None) or [])
+            ],
+            "rules": [],
+            "members": [],
+        }
+
+    for rule in blade.get_user_group_quota_policies_rules().items:
+        policy_name = getattr(getattr(rule, "policy", None), "name", None)
+        if policy_name in policies_info:
+            policies_info[policy_name]["rules"].append(
+                {
+                    "name": rule.name,
+                    "type": getattr(rule, "quota_type", None),
+                    "subject": _subject_dict(getattr(rule, "subject", None)),
+                    "quota_limit": getattr(rule, "quota_limit", None),
+                    "enforced": getattr(rule, "enforced", None),
+                    "notifications": getattr(rule, "notifications", None),
+                    "index": getattr(rule, "index", None),
+                }
+            )
+
+    for member in blade.get_user_group_quota_policies_members().items:
+        policy_name = getattr(getattr(member, "policy", None), "name", None)
+        if policy_name in policies_info:
+            policies_info[policy_name]["members"].append(
+                getattr(getattr(member, "member", None), "name", None)
+            )
+
+    return policies_info
+
+
+def _policy_quota_entry(item, subject_key):
+    """One /file-systems/users or /file-systems/groups item as a dict."""
+    limited_by = getattr(item, "limited_by", None)
+    return {
+        subject_key: _subject_dict(getattr(item, subject_key, None)),
+        "quota_limit": getattr(item, "quota_limit", None),
+        "usage": getattr(item, "usage", None),
+        "percentage_used": getattr(item, "percentage_used", None),
+        "limited_by": {
+            "policy": getattr(getattr(limited_by, "policy", None), "name", None),
+            "rule_name": getattr(limited_by, "rule_name", None),
+        },
+    }
+
+
 def generate_tls_policies_dict(blade):
     policies_info = {}
 
@@ -1543,8 +1619,23 @@ def generate_object_store_accounts_dict(blade):
     return account_info
 
 
-def generate_fs_dict(blade, exports=None):
+def generate_fs_dict(blade, exports=None, api_version=None):
     fs_info = {}
+    # the quota-policy view needs REST 2.25; without an api_version it is skipped
+    quota_view = api_version is not None and LooseVersion(
+        QUOTA_POLICY_API_VERSION
+    ) <= LooseVersion(api_version)
+    attached_policies = {}
+    if quota_view:
+        # one listing of every attachment, looked up per file system below
+        res = blade.get_file_systems_user_group_quota_policies()
+        if res.status_code == 200:
+            for attached in res.items:
+                member_name = getattr(getattr(attached, "member", None), "name", None)
+                if member_name:
+                    attached_policies[member_name] = getattr(
+                        getattr(attached, "policy", None), "name", None
+                    )
     by_fs = {}
     for e in exports or []:
         by_fs.setdefault(e.get("filesystem"), []).append(e)
@@ -1603,6 +1694,23 @@ def generate_fs_dict(blade, exports=None):
         }
         if exports is not None:
             fs_info[share]["file_system_exports"] = by_fs.get(share, [])
+
+        if quota_view:
+            # attached user-group quota policy and the usage it limits
+            fs_info[share]["quota_policy"] = attached_policies.get(share)
+            fs_info[share]["policy_quotas"] = {"users": [], "groups": []}
+            res = blade.get_file_systems_users(file_system_names=[share])
+            if res.status_code == 200:
+                for user in res.items:
+                    fs_info[share]["policy_quotas"]["users"].append(
+                        _policy_quota_entry(user, "user")
+                    )
+            res = blade.get_file_systems_groups(file_system_names=[share])
+            if res.status_code == 200:
+                for group in res.items:
+                    fs_info[share]["policy_quotas"]["groups"].append(
+                        _policy_quota_entry(group, "group")
+                    )
 
         # Group quotas
         for group_quota in blade.get_quotas_groups(file_system_names=[share]).items:
@@ -1788,7 +1896,7 @@ def main():
         if LooseVersion(SERVERS_API_VERSION) <= LooseVersion(api_version):
             exports_list = generate_file_system_exports_dict(blade)
             info["file_system_exports"] = exports_list
-        info["filesystems"] = generate_fs_dict(blade, exports_list)
+        info["filesystems"] = generate_fs_dict(blade, exports_list, api_version)
     if "admins" in subset or "all" in subset:
         info["admins"] = generate_admin_dict(blade)
     if "snapshots" in subset or "all" in subset:
@@ -1847,6 +1955,8 @@ def main():
             info["tls_policies"] = generate_tls_policies_dict(blade)
         if LooseVersion(S3_EXPORT_API_VERSION) <= LooseVersion(api_version):
             info["s3_export_policies"] = generate_s3_export_policies_dict(blade)
+        if LooseVersion(QUOTA_POLICY_API_VERSION) <= LooseVersion(api_version):
+            info["quota_policies"] = generate_quota_policies_dict(blade)
     if ("realms" in subset or "all" in subset) and LooseVersion(
         REALMS_API_VERSION
     ) <= LooseVersion(api_version):

@@ -79,6 +79,7 @@ from plugins.modules.purefb_info import (
     generate_password_policies_dict,
     generate_file_system_exports_dict,
     generate_fs_dict,
+    generate_quota_policies_dict,
     generate_array_conn_dict,
     generate_bucket_access_policies_dict,
     generate_lag_dict,
@@ -1361,6 +1362,207 @@ class TestPurefbInfo:
         assert result["worm1"]["mode"] == "compliance"
         assert result["worm1"]["default_retention"] == 86400000
         assert result["worm1"]["members"] == ["fs1"]
+
+    def test_generate_quota_policies_dict(self):
+        """Quota policies carry their rules and attached file systems."""
+        location = Mock(spec=["name"])
+        location.name = "array1"
+        policy = Mock(spec=["name", "enabled", "is_local", "location", "realms"])
+        policy.name = "qp1"
+        policy.enabled = True
+        policy.is_local = True
+        policy.location = location
+        policy.realms = []
+        policy_ref = Mock(spec=["name"])
+        policy_ref.name = "qp1"
+        subject = Mock(spec=["id", "name", "sid"])
+        subject.id = 1001
+        subject.name = ""
+        subject.sid = None
+        rule = Mock(
+            spec=[
+                "name",
+                "quota_type",
+                "subject",
+                "quota_limit",
+                "enforced",
+                "notifications",
+                "index",
+                "policy",
+            ]
+        )
+        rule.name = "qp1.1"
+        rule.quota_type = "user"
+        rule.subject = subject
+        rule.quota_limit = 10737418240
+        rule.enforced = True
+        rule.notifications = "Account"
+        rule.index = 1
+        rule.policy = policy_ref
+        # a rule of a policy that is not in the listing is ignored
+        other_ref = Mock(spec=["name"])
+        other_ref.name = "other"
+        stray = Mock(spec=["name", "policy"])
+        stray.name = "other.1"
+        stray.policy = other_ref
+        member_ref = Mock(spec=["name"])
+        member_ref.name = "fs1"
+        member = Mock(spec=["member", "policy"])
+        member.member = member_ref
+        member.policy = policy_ref
+
+        mock_blade = Mock()
+        mock_blade.get_user_group_quota_policies.return_value.items = [policy]
+        mock_blade.get_user_group_quota_policies_rules.return_value.items = [
+            rule,
+            stray,
+        ]
+        mock_blade.get_user_group_quota_policies_members.return_value.items = [member]
+
+        result = generate_quota_policies_dict(mock_blade)
+
+        assert result == {
+            "qp1": {
+                "local": True,
+                "enabled": True,
+                "location": "array1",
+                "realms": [],
+                "rules": [
+                    {
+                        "name": "qp1.1",
+                        "type": "user",
+                        "subject": {"id": 1001, "name": "", "sid": None},
+                        "quota_limit": 10737418240,
+                        "enforced": True,
+                        "notifications": "Account",
+                        "index": 1,
+                    }
+                ],
+                "members": ["fs1"],
+            }
+        }
+
+    @staticmethod
+    def _quota_view_filesystem():
+        fs1 = Mock()
+        fs1.name = "fs1"
+        fs1.fast_remove_directory_enabled = False
+        fs1.snapshot_directory_enabled = False
+        fs1.provisioned = 0
+        fs1.destroyed = False
+        fs1.nfs = Mock(
+            rules=None, v3_enabled=True, v4_1_enabled=True, export_policy=None
+        )
+        fs1.smb = Mock(
+            acl_mode=None,
+            client_policy=None,
+            share_policy=None,
+            continuous_availability_enabled=False,
+        )
+        fs1.multi_protocol = Mock(safeguard_acls=True, access_control_style=None)
+        fs1.hard_limit_enabled = False
+        fs1.promotion_status = None
+        fs1.requested_promotion_state = None
+        fs1.writable = True
+        fs1.source = None
+        fs1.location = None
+        fs1.default_group_quota = 0
+        fs1.default_user_quota = 0
+        fs1.http = Mock(enabled=False)
+        return fs1
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_fs_dict_adds_quota_policy_view(self, mock_loose_version):
+        """At REST 2.25 each file system reports its attached quota policy and
+        the per-user / per-group usage limited by it."""
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+        mock_blade = Mock()
+        mock_blade.get_file_systems.return_value.items = [self._quota_view_filesystem()]
+        mock_blade.get_quotas_groups.return_value.items = []
+        mock_blade.get_quotas_users.return_value.items = []
+
+        policy_ref = Mock(spec=["name"])
+        policy_ref.name = "qp1"
+        member_ref = Mock(spec=["name"])
+        member_ref.name = "fs1"
+        attached = Mock(spec=["policy", "member"])
+        attached.policy = policy_ref
+        attached.member = member_ref
+        # another file system's attachment must not be mistaken for fs1's
+        other_policy = Mock(spec=["name"])
+        other_policy.name = "qp2"
+        other_member = Mock(spec=["name"])
+        other_member.name = "fs2"
+        other = Mock(spec=["policy", "member"])
+        other.policy = other_policy
+        other.member = other_member
+        attached_res = Mock()
+        attached_res.status_code = 200
+        attached_res.items = [other, attached]
+        mock_blade.get_file_systems_user_group_quota_policies.return_value = (
+            attached_res
+        )
+
+        user_subject = Mock(spec=["id", "name", "sid"])
+        user_subject.id = 1001
+        user_subject.name = ""
+        user_subject.sid = None
+        limited_by = Mock(spec=["policy", "rule_name"])
+        limited_by.policy = policy_ref
+        limited_by.rule_name = "qp1.1"
+        user = Mock(
+            spec=["user", "quota_limit", "usage", "percentage_used", "limited_by"]
+        )
+        user.user = user_subject
+        user.quota_limit = 10737418240
+        user.usage = 94371840
+        user.percentage_used = 0.0088
+        user.limited_by = limited_by
+        users_res = Mock()
+        users_res.status_code = 200
+        users_res.items = [user]
+        mock_blade.get_file_systems_users.return_value = users_res
+        # an error on the groups view is tolerated (destroyed file systems)
+        groups_res = Mock()
+        groups_res.status_code = 400
+        groups_res.items = []
+        mock_blade.get_file_systems_groups.return_value = groups_res
+
+        result = generate_fs_dict(mock_blade, api_version="2.25")
+
+        assert result["fs1"]["quota_policy"] == "qp1"
+        assert result["fs1"]["policy_quotas"]["users"] == [
+            {
+                "user": {"id": 1001, "name": "", "sid": None},
+                "quota_limit": 10737418240,
+                "usage": 94371840,
+                "percentage_used": 0.0088,
+                "limited_by": {"policy": "qp1", "rule_name": "qp1.1"},
+            }
+        ]
+        assert result["fs1"]["policy_quotas"]["groups"] == []
+        mock_blade.get_file_systems_users.assert_called_once_with(
+            file_system_names=["fs1"]
+        )
+        # the attachment listing is fetched once, not once per file system
+        mock_blade.get_file_systems_user_group_quota_policies.assert_called_once_with()
+        # legacy keys are still present
+        assert result["fs1"]["user_quotas"] == {}
+
+    def test_generate_fs_dict_without_api_version_skips_quota_view(self):
+        """Without an api_version (pre-2.25 callers) the quota-policy GETs are
+        never issued and the new keys are absent."""
+        mock_blade = Mock()
+        mock_blade.get_file_systems.return_value.items = [self._quota_view_filesystem()]
+        mock_blade.get_quotas_groups.return_value.items = []
+        mock_blade.get_quotas_users.return_value.items = []
+
+        result = generate_fs_dict(mock_blade)
+
+        assert "quota_policy" not in result["fs1"]
+        assert "policy_quotas" not in result["fs1"]
+        mock_blade.get_file_systems_users.assert_not_called()
+        mock_blade.get_file_systems_user_group_quota_policies.assert_not_called()
 
     def test_generate_tls_policies_dict(self):
         """TLS policies carry their settings and attached interfaces."""

@@ -115,6 +115,7 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_export - manage filesystem exports on FlashBlade
 - purefb_fleet - manage Fusion fleet members
 - purefb_fs - manage filesystems on a FlashBlade
+- purefb_fs_lock - list and clear file locks, file sessions and SMB open files on a FlashBlade
 - purefb_fs_replica - manage filesystem replica links on a FlashBlade
 - purefb_groupquota - manage individual group quotas on FlashBlade filesystems
 - purefb_hardware - manage hardware LED identifiers and hardware connectors
@@ -134,11 +135,13 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_mgmt_role - manage FlashBlade custom management roles, permissions, and policy attachment
 - purefb_network - manage the network settings for a FlashBlade
 - purefb_ntp - manage the NTP settings for a FlashBlade
+- purefb_oidc - manage FlashBlade OIDC identity providers
 - purefb_password_policy - manage the FlashBlade management password policy
 - purefb_phonehome - manage the phone home settings for a FlashBlade
 - purefb_pingtrace - perform FlashBlade network diagnostics
 - purefb_policy - manage the filesystem snapshot policies for a FlashBlade
 - purefb_proxy - manage the phone home HTTP proxy settings for a FlashBlade
+- purefb_quota_settings - manage FlashBlade user and group quota notification settings
 - purefb_ra - manage the Remote Assist connections on a FlashBlade
 - purefb_realm - manage the Realms for a FlashBlade
 - purefb_remote_cred - manage the Object Store Remote Credentials on a FlashBlade
@@ -157,6 +160,7 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_software_patch - install Purity//FB software patches on a FlashBlade
 - purefb_ssh_ca_policy - manage FlashBlade SSH Certificate Authority policies and their members
 - purefb_subnet - manage network subnets on a FlashBlade
+- purefb_support_diagnostics - run FlashBlade self-diagnostics and report the results
 - purefb_syslog - manage FlashBlade syslog server configuration
 - purefb_syslog_settings - manage the CA certificate used to validate FlashBlade syslog servers
 - purefb_target - manage remote S3-capable targets for a FlashBlade

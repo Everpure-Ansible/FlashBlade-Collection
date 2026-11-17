@@ -1,0 +1,5 @@
+minor_changes:
+  - purefb_ad - add ``ca_certificate`` and ``ca_certificate_group`` to pin the CA that validates the
+    directory, global catalog and Kerberos servers (REST 2.27, Purity//FB 4.8.3). ``state=test`` with
+    either option runs the connectivity tests with that CA without applying it.
+  - purefb_info - report ``ca_certificate`` and ``ca_certificate_group`` in the ``active_directory`` subset.

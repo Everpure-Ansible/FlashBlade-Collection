@@ -81,6 +81,7 @@ from plugins.modules.purefb_info import (
     generate_file_system_exports_dict,
     generate_fs_dict,
     generate_array_conn_dict,
+    generate_all_policies_dict,
     generate_bucket_access_policies_dict,
     generate_lag_dict,
     generate_subnet_dict,
@@ -97,11 +98,26 @@ from plugins.modules.purefb_info import (
     generate_realms_dict,
     generate_resource_accesses_dict,
     generate_file_repl_dict,
+    generate_ad_dict,
     _maintenance_window_list,
     _reference_name,
     generate_admin_dict,
     generate_directory_service_roles_dict,
+    generate_oidc_idps_dict,
+    generate_quota_settings_dict,
+    generate_support_dict,
 )
+from plugins.module_utils.version import LooseVersion as RealLooseVersion
+from plugins.modules.purefb_info import (
+    generate_perf_breakdown_dict,
+    generate_clients_dict,
+    CLIENTS_PERF_LIMIT,
+    HTTP_OPS_FIELDS,
+    NFS_OPS_FIELDS,
+    PERF_FIELDS,
+    S3_OPS_FIELDS,
+)
+from plugins.modules import purefb_info as purefb_info_module
 
 
 def _reference(name):
@@ -602,6 +618,9 @@ class TestPurefbInfo:
         assert "telemetry_metrics_policies" in result
         assert result["telemetry_metrics_policies"] == 1
         assert result["maintenance_window"] == []
+        # the misspelt key is kept alongside the correct one
+        assert result["network_access_protocol"] == "default"
+        assert result["network_access_policy"] == "default"
 
     def test_maintenance_window_list_with_open_window(self):
         """An open window is reported with human-readable start and end"""
@@ -898,6 +917,9 @@ class TestPurefbInfo:
         assert result["syslog_settings"] == {
             "management": {"ca_certificate": "global", "ca_certificate_group": None}
         }
+        # gated blocks are skipped below their REST version
+        assert "oidc_idps" not in result
+        mock_blade.get_sso_oidc_idps.assert_not_called()
 
     @patch("plugins.modules.purefb_info.LooseVersion")
     def test_generate_directory_service_roles_dict(self, mock_loose_version):
@@ -1077,6 +1099,100 @@ class TestPurefbInfo:
         assert _reference_name(obj, "unset") is None
         assert _reference_name(obj, "empty") is None
         assert _reference_name(obj, "missing") is None
+
+    def test_generate_oidc_idps_dict(self):
+        """OIDC providers are keyed by name with their URL, PRN and CA references."""
+        ca_cert = Mock(spec=["name"])
+        ca_cert.name = "sso-root-ca"
+        okta_cfg = Mock(
+            spec=[
+                "provider_url",
+                "provider_url_ca_certificate",
+                "provider_url_ca_certificate_group",
+            ]
+        )
+        okta_cfg.provider_url = "https://acme.okta.com/oauth2/default"
+        okta_cfg.provider_url_ca_certificate = ca_cert
+        # an unset reference comes back as an empty object
+        okta_cfg.provider_url_ca_certificate_group = {}
+        okta = Mock(spec=["name", "enabled", "prn", "services", "idp"])
+        okta.name = "okta"
+        okta.enabled = True
+        okta.prn = "prn::iam:array-id/local::oidc-provider/okta"
+        okta.services = ["object"]
+        okta.idp = okta_cfg
+
+        keycloak_cfg = Mock(
+            spec=[
+                "provider_url",
+                "provider_url_ca_certificate",
+                "provider_url_ca_certificate_group",
+            ]
+        )
+        keycloak_cfg.provider_url = "https://sso.example.com/realms/storage"
+        keycloak_cfg.provider_url_ca_certificate = {}
+        keycloak_cfg.provider_url_ca_certificate_group = {}
+        keycloak = Mock(spec=["name", "enabled", "prn", "services", "idp"])
+        keycloak.name = "keycloak"
+        keycloak.enabled = False
+        keycloak.prn = "prn::iam:array-id/local::oidc-provider/keycloak"
+        keycloak.services = ["object"]
+        keycloak.idp = keycloak_cfg
+
+        mock_blade = Mock()
+        mock_blade.get_sso_oidc_idps.return_value.items = [okta, keycloak]
+
+        result = generate_oidc_idps_dict(mock_blade)
+
+        assert sorted(result) == ["keycloak", "okta"]
+        assert result["okta"] == {
+            "enabled": True,
+            "prn": "prn::iam:array-id/local::oidc-provider/okta",
+            "services": ["object"],
+            "provider_url": "https://acme.okta.com/oauth2/default",
+            "ca_certificate": "sso-root-ca",
+            "ca_certificate_group": None,
+        }
+        assert result["keycloak"]["enabled"] is False
+        assert result["keycloak"]["ca_certificate"] is None
+        assert result["keycloak"]["ca_certificate_group"] is None
+
+    def test_generate_oidc_idps_dict_empty(self):
+        """No providers configured gives an empty dict, not an error."""
+        mock_blade = Mock()
+        mock_blade.get_sso_oidc_idps.return_value.items = []
+
+        assert generate_oidc_idps_dict(mock_blade) == {}
+
+    def test_generate_quota_settings_dict_without_contact(self):
+        """generate_quota_settings_dict reads the singleton; contact is absent when unset"""
+        mock_blade = Mock()
+        settings = Mock(spec=["name", "direct_notifications_enabled"])
+        settings.name = "management"
+        settings.direct_notifications_enabled = False
+        mock_blade.get_quotas_settings.return_value.status_code = 200
+        mock_blade.get_quotas_settings.return_value.items = [settings]
+        assert generate_quota_settings_dict(mock_blade) == {
+            "management": {"contact": None, "direct_notifications_enabled": False}
+        }
+
+    def test_generate_quota_settings_dict_with_contact_and_api_error(self):
+        """generate_quota_settings_dict reports a set contact and returns {} on an API error"""
+        mock_blade = Mock()
+        settings = Mock(spec=["name", "contact", "direct_notifications_enabled"])
+        settings.name = "management"
+        settings.contact = "storage-admins@example.com"
+        settings.direct_notifications_enabled = True
+        mock_blade.get_quotas_settings.return_value.status_code = 200
+        mock_blade.get_quotas_settings.return_value.items = [settings]
+        assert generate_quota_settings_dict(mock_blade) == {
+            "management": {
+                "contact": "storage-admins@example.com",
+                "direct_notifications_enabled": True,
+            }
+        }
+        mock_blade.get_quotas_settings.return_value.status_code = 400
+        assert generate_quota_settings_dict(mock_blade) == {}
 
     def test_generate_password_policies_dict(self):
         """Test generate_password_policies_dict reports all fields in seconds"""
@@ -1336,11 +1452,13 @@ class TestPurefbInfo:
 
         mock_blade = Mock()
         mock_blade.get_array_connections.return_value.items = [conn]
+        mock_blade.get_array_connections_path.return_value.items = []
 
         result = generate_array_conn_dict(mock_blade)
 
         assert list(result) == ["remote-array"]
         entry = result["remote-array"]
+        assert entry["connection_paths"] == []
         assert entry["encrypted"] is False
         assert entry["status"] == "connected"
         assert entry["version"] == "4.3.3"
@@ -1755,9 +1873,17 @@ class TestPurefbInfo:
         member.member = iface_ref
         member.policy = policy_ref
 
+        array_ref = Mock(spec=["name", "resource_type"])
+        array_ref.name = "array1"
+        array_ref.resource_type = "arrays"
+        array_member = Mock(spec=["member", "policy"])
+        array_member.member = array_ref
+        array_member.policy = policy_ref
+
         mock_blade = Mock()
         mock_blade.get_tls_policies.return_value.items = [policy]
         mock_blade.get_tls_policies_network_interfaces.return_value.items = [member]
+        mock_blade.get_tls_policies_members.return_value.items = [array_member]
 
         result = generate_tls_policies_dict(mock_blade)
 
@@ -1765,6 +1891,14 @@ class TestPurefbInfo:
         assert result["tls1"]["min_tls_version"] == "1.2"
         assert result["tls1"]["disabled_tls_ciphers"] == ["RC4"]
         assert result["tls1"]["trusted_client_certificate_authority"] is None
+        assert result["tls1"]["network_interfaces"] == ["vip1"]
+        # tls-policies/members lists the policy applied to the whole array
+        assert result["tls1"]["array_wide"] is True
+
+        # a policy attached only to interfaces is not array-wide
+        mock_blade.get_tls_policies_members.return_value.items = []
+        result = generate_tls_policies_dict(mock_blade)
+        assert result["tls1"]["array_wide"] is False
         assert result["tls1"]["network_interfaces"] == ["vip1"]
 
     def test_generate_ssh_ca_policies_dict(self):
@@ -1924,43 +2058,77 @@ class TestPurefbInfo:
             "attached_servers": [],
         }
 
-    def test_generate_realms_and_resource_accesses(self):
-        """Realms report their space and TLS policy; resource accesses map a
-        scope to a resource by name and type."""
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_realms_and_resource_accesses(self, mock_loose_version):
+        """Realms report their space, TLS policy and default object store
+        server; resource accesses map a scope to a resource by name and type."""
+        # REST 2.20+: the realms/defaults endpoint exists
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
         space = Mock(spec=["total_physical", "virtual"])
         space.total_physical = 1024
         space.virtual = 2048
         tls = Mock(spec=["name"])
         tls.name = "tls1"
-        realm = Mock(
-            spec=[
-                "name",
-                "created",
-                "destroyed",
-                "time_remaining",
-                "default_inbound_tls_policy",
-                "space",
-            ]
-        )
+        realm_spec = [
+            "name",
+            "created",
+            "destroyed",
+            "time_remaining",
+            "default_inbound_tls_policy",
+            "space",
+        ]
+        realm = Mock(spec=realm_spec)
         realm.name = "realm1"
         realm.created = 1700000000000
         realm.destroyed = False
         realm.time_remaining = None
         realm.default_inbound_tls_policy = tls
         realm.space = space
+        realm2 = Mock(spec=realm_spec)
+        realm2.name = "realm2"
+        realm2.created = None
+        realm2.destroyed = False
+        realm2.time_remaining = None
+        realm2.default_inbound_tls_policy = None
+        realm2.space = space
+
+        # realm1 has a default server, realm2 an empty object_store list
+        server = Mock(spec=["name"])
+        server.name = "realm1::s3srv"
+        store_default = Mock(spec=["server"])
+        store_default.server = server
+        realm1_ref = Mock(spec=["name"])
+        realm1_ref.name = "realm1"
+        realm1_defaults = Mock(spec=["realm", "object_store"])
+        realm1_defaults.realm = realm1_ref
+        realm1_defaults.object_store = [store_default]
+        realm2_ref = Mock(spec=["name"])
+        realm2_ref.name = "realm2"
+        realm2_defaults = Mock(spec=["realm", "object_store"])
+        realm2_defaults.realm = realm2_ref
+        realm2_defaults.object_store = []
 
         mock_blade = Mock()
-        mock_blade.get_realms.return_value.items = [realm]
+        mock_blade.get_realms.return_value.items = [realm, realm2]
+        mock_blade.get_realms_defaults.return_value.status_code = 200
+        mock_blade.get_realms_defaults.return_value.items = [
+            realm1_defaults,
+            realm2_defaults,
+        ]
 
         result = generate_realms_dict(mock_blade)
 
+        mock_blade.get_realms_defaults.assert_called_once_with()
         assert result["realm1"]["destroyed"] is False
         assert result["realm1"]["created"] is not None
         assert result["realm1"]["default_inbound_tls_policy"] == "tls1"
+        assert result["realm1"]["default_object_server"] == "realm1::s3srv"
         assert result["realm1"]["space"]["total_physical"] == 1024
         assert result["realm1"]["space"]["virtual"] == 2048
         # fields absent from this Space version are reported as null
         assert result["realm1"]["space"]["total_used"] is None
+        assert result["realm2"]["created"] is None
+        assert result["realm2"]["default_object_server"] is None
 
         resource = Mock(spec=["name", "resource_type"])
         resource.name = "data-subnet"
@@ -1985,6 +2153,37 @@ class TestPurefbInfo:
                 "scope_type": "realms",
             }
         ]
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_realms_dict_before_realm_defaults_api(self, mock_loose_version):
+        """Before REST 2.20 there is no realms/defaults endpoint: it is not
+        queried and the default object store server is reported as null."""
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+        realm = Mock(
+            spec=[
+                "name",
+                "created",
+                "destroyed",
+                "time_remaining",
+                "default_inbound_tls_policy",
+                "space",
+            ]
+        )
+        realm.name = "realm1"
+        realm.created = None
+        realm.destroyed = False
+        realm.time_remaining = None
+        realm.default_inbound_tls_policy = None
+        realm.space = None
+
+        mock_blade = Mock()
+        mock_blade.get_realms.return_value.items = [realm]
+
+        result = generate_realms_dict(mock_blade)
+
+        mock_blade.get_realms_defaults.assert_not_called()
+        assert result["realm1"]["default_object_server"] is None
+        assert result["realm1"]["default_inbound_tls_policy"] is None
 
     def test_generate_file_repl_dict_reads_status_details(self):
         """The SDK replica link model has status_details, not status_detail.
@@ -2074,3 +2273,890 @@ class TestPurefbInfo:
         call_args = mock_module.exit_json.call_args[1]
         assert call_args["purefb_info"]["fleet"] == {"fleet1": {"members": {}}}
         assert "policies" not in call_args["purefb_info"]
+
+    # ---------------- support subset (self-diagnostics) ----------------
+
+    @staticmethod
+    def _diagnostics_run(index, task_id, status, counts):
+        run = Mock(
+            spec=[
+                "index",
+                "task_id",
+                "status",
+                "version",
+                "start_time",
+                "analysis_period",
+                "severity_count",
+            ]
+        )
+        run.index = index
+        run.task_id = task_id
+        run.status = status
+        run.version = "default"
+        run.start_time = 1700003600
+        period = Mock(spec=["start_time", "end_time"])
+        period.start_time = 1700000000
+        period.end_time = 1700003600
+        run.analysis_period = period
+        run.severity_count = []
+        for severity, count in counts:
+            entry = Mock(spec=["severity", "count"])
+            entry.severity = severity
+            entry.count = count
+            run.severity_count.append(entry)
+        return run
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.get_rest_api_version", return_value="2.30")
+    def test_generate_support_dict_reports_runs_and_settings(
+        self, mock_api_version, mock_loose_version
+    ):
+        """Retained runs are keyed by index; the tool version is read on 2.24+."""
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+        mock_blade = Mock()
+        runs = Mock()
+        runs.status_code = 200
+        runs.items = [
+            self._diagnostics_run(1, "task-1", "completed", [("info", 200)]),
+            self._diagnostics_run(
+                2, "task-2", "running", [("info", 5), ("warning", 1)]
+            ),
+        ]
+        mock_blade.get_support_diagnostics.return_value = runs
+        settings = Mock()
+        settings.status_code = 200
+        item = Mock(spec=["version", "last_updated"])
+        item.version = "default"
+        item.last_updated = None
+        settings.items = [item]
+        mock_blade.get_support_diagnostics_settings.return_value = settings
+
+        result = generate_support_dict(mock_blade)
+
+        assert sorted(result["diagnostics"]) == ["1", "2"]
+        assert result["diagnostics"]["1"]["severity_count"] == {
+            "info": 200,
+            "warning": 0,
+            "critical": 0,
+        }
+        assert result["diagnostics"]["2"] == {
+            "task_id": "task-2",
+            "status": "running",
+            "version": "default",
+            "start_time": 1700003600,
+            "analysis_period_start": 1700000000,
+            "analysis_period_end": 1700003600,
+            "severity_count": {"info": 5, "warning": 1, "critical": 0},
+        }
+        assert result["diagnostics_settings"] == {
+            "version": "default",
+            "last_updated": None,
+        }
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.get_rest_api_version", return_value="2.17")
+    def test_generate_support_dict_skips_settings_before_2_24(
+        self, mock_api_version, mock_loose_version
+    ):
+        """No runs and an old array: both sections come back empty, no settings call."""
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+        mock_blade = Mock()
+        runs = Mock()
+        runs.status_code = 200
+        runs.items = []
+        mock_blade.get_support_diagnostics.return_value = runs
+
+        result = generate_support_dict(mock_blade)
+
+        assert result == {"diagnostics": {}, "diagnostics_settings": {}}
+        mock_blade.get_support_diagnostics_settings.assert_not_called()
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_support_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_support_subset(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_support,
+        mock_loose_version,
+    ):
+        """gather_subset=support returns the support section on its own."""
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["support"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        mock_blade = Mock()
+        mock_version = Mock()
+        mock_version.version = "2.30"
+        mock_blade.get_versions.return_value.items = [mock_version]
+        mock_get_system.return_value = mock_blade
+        # version gates ON
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+
+        mock_generate_support.return_value = {
+            "diagnostics": {},
+            "diagnostics_settings": {},
+        }
+
+        main()
+
+        mock_generate_support.assert_called_once_with(mock_blade)
+        call_args = mock_module.exit_json.call_args[1]
+        assert call_args["purefb_info"]["support"] == {
+            "diagnostics": {},
+            "diagnostics_settings": {},
+        }
+        assert "default" not in call_args["purefb_info"]
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_file_locks_dict(self, mock_loose_version):
+        """The locks subset returns locks, lock clients, sessions and SMB open files."""
+        # Imported here so the shared import block above stays untouched.
+        from plugins.modules.purefb_info import generate_file_locks_dict
+
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+
+        def ref(name):
+            item = Mock()
+            item.name = name
+            return item
+
+        lock = ref("lock1")
+        lock.access_type = "exclusive"
+        lock.client = ref("10.0.0.1")
+        lock.created_at = 1700000000000
+        lock.inode = 42
+        lock.path = "/build/output.db"
+        lock.protocol = "NLM"
+        lock.range = Mock(length=0, offset=0)
+        lock.source = ref("fs1")
+        session = ref("sess1")
+        session.authentication = "NTLMv2"
+        session.client = ref("10.0.0.1")
+        session.connection_time = 1700000000000
+        session.idle_time = 5000
+        session.opens = 2
+        session.port = 51234
+        session.protocol = "smb"
+        session.user = ref("alice")
+        open_file = Mock()
+        open_file.id = "of1"
+        open_file.client = ref("10.0.0.1")
+        open_file.lock_count = 1
+        open_file.mode = "rw"
+        open_file.path = "/build/output.db"
+        open_file.session = ref("sess1")
+        open_file.source = ref("fs1")
+        open_file.user = ref("alice")
+
+        blade = Mock()
+        blade.get_file_systems_locks.return_value = Mock(status_code=200, items=[lock])
+        blade.get_file_systems_locks_clients.return_value = Mock(
+            status_code=200, items=[ref("10.0.0.1")]
+        )
+        blade.get_file_systems_sessions.return_value = Mock(
+            status_code=200, items=[session]
+        )
+        blade.get_file_systems_open_files.return_value = Mock(
+            status_code=200, items=[open_file]
+        )
+
+        result = generate_file_locks_dict(blade)
+
+        assert result["file_locks"]["lock1"]["client"] == "10.0.0.1"
+        assert result["file_locks"]["lock1"]["file_system"] == "fs1"
+        assert result["file_locks"]["lock1"]["range"] == {"length": 0, "offset": 0}
+        assert result["file_lock_clients"] == ["10.0.0.1"]
+        assert result["file_sessions"]["sess1"]["user"] == "alice"
+        assert result["file_sessions"]["sess1"]["protocol"] == "smb"
+        assert result["open_files"]["of1"]["session"] == "sess1"
+        assert result["open_files"]["of1"]["mode"] == "rw"
+        blade.get_file_systems_open_files.assert_called_once_with(protocols=["smb"])
+
+    def test_generate_ad_dict_reports_ca_references(self):
+        """The CA certificate and group names are read back, None when unset."""
+        ca = Mock(spec=["name"])
+        ca.name = "domain_ca"
+        account = Mock(
+            spec=[
+                "name",
+                "computer_name",
+                "domain",
+                "directory_servers",
+                "kerberos_servers",
+                "service_principal_names",
+                "join_ou",
+                "encryption_types",
+                "global_catalog_servers",
+                "server",
+                "ca_certificate",
+                "ca_certificate_group",
+            ]
+        )
+        account.name = "ad1"
+        account.computer_name = "AD1"
+        account.domain = "acme.com"
+        account.directory_servers = ["ldap.acme.com"]
+        account.kerberos_servers = ["kdc.acme.com"]
+        account.service_principal_names = ["nfs/ad1.acme.com"]
+        account.join_ou = "CN=Computers"
+        account.encryption_types = ["aes256-cts-hmac-sha1-96"]
+        account.global_catalog_servers = None
+        account.server = None
+        account.ca_certificate = ca
+        account.ca_certificate_group = None
+
+        mock_blade = Mock()
+        mock_blade.get_active_directory.return_value.total_item_count = 1
+        mock_blade.get_active_directory.return_value.items = [account]
+
+        result = generate_ad_dict(mock_blade)
+
+        assert result["ad1"]["ca_certificate"] == "domain_ca"
+        assert result["ad1"]["ca_certificate_group"] is None
+        assert result["ad1"]["server"] is None
+
+    @staticmethod
+    def _connection(remote_name):
+        """An array connection mock shaped like the real model."""
+        window = Mock(spec=["start", "end"])
+        window.start = None
+        window.end = None
+        throttle = Mock(spec=["default_limit", "window_limit", "window"])
+        throttle.default_limit = None
+        throttle.window_limit = None
+        throttle.window = window
+        remote = Mock(spec=["name"])
+        remote.name = remote_name
+        conn = Mock(
+            spec=[
+                "remote",
+                "encrypted",
+                "replication_addresses",
+                "management_address",
+                "status",
+                "version",
+                "ca_certificate_group",
+                "throttle",
+            ]
+        )
+        conn.remote = remote
+        conn.encrypted = False
+        conn.replication_addresses = ["10.0.0.1"]
+        conn.management_address = "10.0.0.2"
+        conn.status = "connected"
+        conn.version = "4.5.6"
+        conn.ca_certificate_group = None
+        conn.throttle = throttle
+        return conn
+
+    @staticmethod
+    def _path(remote_name, destination, status, **extra):
+        """An array-connections/path row; extra adds optional fields."""
+        remote = Mock(spec=["name"])
+        remote.name = remote_name
+        fields = {
+            "remote": remote,
+            "source": "10.0.0.2",
+            "destination": destination,
+            "status": status,
+            "type": "async-replication",
+        }
+        fields.update(extra)
+        path = Mock(spec=list(fields))
+        for key, value in fields.items():
+            setattr(path, key, value)
+        return path
+
+    def test_generate_array_conn_dict_connection_paths(self):
+        """Each connection lists its network paths from array-connections/path.
+
+        A connected path comes back with status_details empty or without
+        the field at all; both are reported as None. Rows for a remote that
+        is not a connection are ignored.
+        """
+        mock_blade = Mock()
+        mock_blade.get_array_connections.return_value.items = [
+            self._connection("remote-array")
+        ]
+        mock_blade.get_array_connections_path.return_value.items = [
+            self._path("remote-array", "10.0.0.1:80", "connected"),
+            self._path("remote-array", "10.0.0.1:8117", "connected", status_details=""),
+            self._path(
+                "remote-array",
+                "10.0.0.3:8117",
+                "connecting",
+                status_details="Connection refused",
+                type="fleet-management",
+            ),
+            self._path("other-array", "10.0.0.9:80", "connected"),
+        ]
+
+        result = generate_array_conn_dict(mock_blade)
+
+        assert list(result) == ["remote-array"]
+        assert result["remote-array"]["connection_paths"] == [
+            {
+                "source": "10.0.0.2",
+                "destination": "10.0.0.1:80",
+                "status": "connected",
+                "status_details": None,
+                "type": "async-replication",
+            },
+            {
+                "source": "10.0.0.2",
+                "destination": "10.0.0.1:8117",
+                "status": "connected",
+                "status_details": None,
+                "type": "async-replication",
+            },
+            {
+                "source": "10.0.0.2",
+                "destination": "10.0.0.3:8117",
+                "status": "connecting",
+                "status_details": "Connection refused",
+                "type": "fleet-management",
+            },
+        ]
+        mock_blade.get_array_connections_path.assert_called_once_with()
+
+    def test_generate_array_conn_dict_without_connections_skips_paths(self):
+        """No connections means no array-connections/path call."""
+        mock_blade = Mock()
+        mock_blade.get_array_connections.return_value.items = []
+
+        assert generate_array_conn_dict(mock_blade) == {}
+        mock_blade.get_array_connections_path.assert_not_called()
+
+    @staticmethod
+    def _policy(name, policy_id, policy_type):
+        """A policies-all row."""
+        policy = Mock(
+            spec=["name", "id", "enabled", "is_local", "location", "policy_type"]
+        )
+        policy.name = name
+        policy.id = policy_id
+        policy.enabled = True
+        policy.is_local = True
+        policy.location = None
+        policy.policy_type = policy_type
+        return policy
+
+    @staticmethod
+    def _ref(name, ref_id=None, resource_type=None):
+        """A FixedReference."""
+        ref = Mock(spec=["name", "id", "resource_type"])
+        ref.name = name
+        ref.id = ref_id
+        ref.resource_type = resource_type
+        return ref
+
+    @staticmethod
+    def _member_row(policy_ref, member_ref, link=None):
+        """A policies-all/members row."""
+        row = Mock(spec=["policy", "member", "link"])
+        row.policy = policy_ref
+        row.member = member_ref
+        row.link = link
+        return row
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_all_policies_dict_members(self, mock_loose_version):
+        """Every policy carries its members from one policies-all/members call.
+
+        Rows are attributed by policy id, so a realm policy that shares its
+        name with an array-level policy keeps its own members; replica-link
+        members carry the link's file systems; a policy without members
+        reports an empty list.
+        """
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+        link = Mock(spec=["local_file_system", "remote", "remote_file_system"])
+        link.local_file_system = self._ref("fs1")
+        link.remote = self._ref("peer")
+        link.remote_file_system = self._ref("fs1-dr")
+
+        mock_blade = Mock()
+        mock_blade.get_policies_all.return_value.items = [
+            self._policy("daily", "p1", "snapshot"),
+            self._policy("realm1::daily", "p2", "snapshot"),
+            self._policy("device_perf_metrics", "p3", "telemetry-metrics"),
+            self._policy("unused", "p4", "nfs"),
+        ]
+        mock_blade.get_policies_all_members.return_value.items = [
+            self._member_row(
+                self._ref("daily", "p1", "policies"),
+                self._ref("fs1", "f1", "file-systems"),
+            ),
+            self._member_row(
+                self._ref("daily", "p1", "policies"),
+                self._ref("fs1-link", "l1", "file-system-replica-links"),
+                link,
+            ),
+            # the realm policy is reported under its own name but with its id
+            self._member_row(
+                self._ref("daily", "p2", "policies"),
+                self._ref("realm1::fs9", "f9", "file-systems"),
+            ),
+            self._member_row(
+                self._ref("device_perf_metrics", "p3", "telemetry-metrics-policies"),
+                self._ref("array1", "a1", "arrays"),
+            ),
+        ]
+
+        result = generate_all_policies_dict(mock_blade)
+
+        assert result["daily"]["policy_type"] == "snapshot"
+        assert result["daily"]["members"] == [
+            {"name": "fs1", "resource_type": "file-systems"},
+            {
+                "name": "fs1-link",
+                "resource_type": "file-system-replica-links",
+                "link": {
+                    "local_file_system": "fs1",
+                    "remote": "peer",
+                    "remote_file_system": "fs1-dr",
+                },
+            },
+        ]
+        assert result["realm1::daily"]["members"] == [
+            {"name": "realm1::fs9", "resource_type": "file-systems"}
+        ]
+        assert result["device_perf_metrics"]["members"] == [
+            {"name": "array1", "resource_type": "arrays"}
+        ]
+        assert result["unused"]["members"] == []
+        mock_blade.get_policies_all_members.assert_called_once_with()
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_all_policies_dict_members_need_rest_2_2(self, mock_loose_version):
+        """Below REST 2.2 the members call is not made and no key is added."""
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+        mock_blade = Mock()
+        mock_blade.get_policies_all.return_value.items = [
+            self._policy("daily", "p1", "snapshot")
+        ]
+
+        result = generate_all_policies_dict(mock_blade)
+
+        assert result["daily"]["policy_type"] == "snapshot"
+        assert "members" not in result["daily"]
+        mock_blade.get_policies_all_members.assert_not_called()
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_nfs_export_policies_dict")
+    @patch("plugins.modules.purefb_info.generate_object_store_access_policies_dict")
+    @patch("plugins.modules.purefb_info.generate_policies_dict")
+    @patch("plugins.modules.purefb_info.generate_all_policies_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_policies_subset_copies_members_to_snapshot_policies(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_all_policies,
+        mock_generate_policies,
+        mock_generate_access,
+        mock_generate_nfs_export,
+        mock_loose_version,
+    ):
+        """snapshot_policies reuse the members gathered by the policies view.
+
+        No second members call is made; a snapshot policy missing from the
+        policies view, or one gathered below REST 2.2, has no members key.
+        """
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["policies"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        # the other version gates in the policies subset stay off
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+
+        members = [{"name": "fs1", "resource_type": "file-systems"}]
+        mock_generate_all_policies.return_value = {
+            "daily": {"policy_type": "snapshot", "members": members},
+            "nfs1": {"policy_type": "nfs", "members": []},
+        }
+        mock_generate_policies.return_value = {
+            "daily": {"enabled": True},
+            "weekly": {"enabled": True},
+        }
+        mock_generate_access.return_value = {}
+        mock_generate_nfs_export.return_value = {}
+
+        main()
+
+        info = mock_module.exit_json.call_args[1]["purefb_info"]
+        assert info["snapshot_policies"]["daily"]["members"] == members
+        assert "members" not in info["snapshot_policies"]["weekly"]
+        assert info["policies"]["nfs1"]["members"] == []
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    @patch("plugins.modules.purefb_info.get_rest_api_version")
+    def test_generate_all_policies_dict_members_gate_compares_real_versions(
+        self, mock_get_rest_api_version
+    ):
+        """The REST 2.2 gate holds against real version strings.
+
+        2.1 is below the gate, 2.2 meets it and 2.10 is above it (a numeric,
+        not a string, comparison).
+        """
+        mock_blade = Mock()
+        mock_blade.get_policies_all.return_value.items = [
+            self._policy("daily", "p1", "snapshot")
+        ]
+        mock_blade.get_policies_all_members.return_value.items = []
+
+        mock_get_rest_api_version.return_value = "2.1"
+        assert "members" not in generate_all_policies_dict(mock_blade)["daily"]
+        mock_blade.get_policies_all_members.assert_not_called()
+
+        mock_get_rest_api_version.return_value = "2.2"
+        assert generate_all_policies_dict(mock_blade)["daily"]["members"] == []
+        mock_blade.get_policies_all_members.assert_called_once_with()
+
+        mock_get_rest_api_version.return_value = "2.10"
+        assert generate_all_policies_dict(mock_blade)["daily"]["members"] == []
+        assert mock_blade.get_policies_all_members.call_count == 2
+
+
+class _Row(object):
+    """Attribute holder standing in for an SDK model row.
+
+    Unlike Mock, getattr on a field that was not set yields the default.
+    """
+
+    def __init__(self, **fields):
+        for key, value in fields.items():
+            setattr(self, key, value)
+
+
+class _Version(object):
+    """Minimal LooseVersion stand-in comparing dotted integer versions."""
+
+    def __init__(self, vstring):
+        self.parts = tuple(int(part) for part in str(vstring).split("."))
+
+    def __le__(self, other):
+        return self.parts <= other.parts
+
+    def __gt__(self, other):
+        return self.parts > other.parts
+
+
+def _ok(items):
+    response = Mock()
+    response.status_code = 200
+    response.items = items
+    response.total_item_count = len(items)
+    return response
+
+
+def _failed():
+    response = Mock()
+    response.status_code = 400
+    response.items = None
+    return response
+
+
+def _repl_row(**extra):
+    return _Row(
+        aggregate=_Row(received_bytes_per_sec=10.0, transmitted_bytes_per_sec=20.0),
+        periodic=_Row(received_bytes_per_sec=10.0, transmitted_bytes_per_sec=20.0),
+        continuous=_Row(
+            received_bytes_per_sec=0.0,
+            transmitted_bytes_per_sec=0.0,
+            object_backlog=_Row(
+                bytes_count=0, delete_ops_count=0, other_ops_count=0, put_ops_count=1
+            ),
+        ),
+        time=1700000000000,
+        **extra
+    )
+
+
+class TestPurefbInfoPerformance:
+    """Performance breakdown and opt-in clients subset."""
+
+    def _breakdown_blade(self):
+        blade = Mock()
+
+        def arrays_performance(protocol=None):
+            if protocol == "smb":
+                return _ok([_Row(name="fb", reads_per_sec=5.0, time=1)])
+            return _ok([_Row(name="fb", reads_per_sec=50.0, time=1)])
+
+        blade.get_arrays_performance.side_effect = arrays_performance
+        blade.get_arrays_nfs_specific_performance.return_value = _ok(
+            [_Row(lookups_per_sec=7.0, time=2)]
+        )
+        blade.get_arrays_s3_specific_performance.return_value = _ok(
+            [_Row(read_objects_per_sec=3.0, time=2)]
+        )
+        blade.get_arrays_http_specific_performance.return_value = _ok(
+            [_Row(read_files_per_sec=2.0, time=2)]
+        )
+        blade.get_arrays_performance_replication.return_value = _ok([_repl_row()])
+        # one peer row with no continuous sub-object, one without a remote name
+        blade.get_array_connections_performance_replication.return_value = _ok(
+            [
+                _Row(
+                    remote=_Row(name="peer-fb"),
+                    aggregate=_Row(
+                        received_bytes_per_sec=1.0, transmitted_bytes_per_sec=2.0
+                    ),
+                    periodic=_Row(
+                        received_bytes_per_sec=1.0, transmitted_bytes_per_sec=2.0
+                    ),
+                    time=3,
+                ),
+                _repl_row(id="conn-id"),
+            ]
+        )
+        blade.get_targets_performance_replication.return_value = _ok(
+            [_repl_row(name="s3-target")]
+        )
+        blade.get_file_systems_performance.return_value = _ok(
+            [_Row(name="fs1", reads_per_sec=1.0, time=4)]
+        )
+        blade.get_buckets_performance.return_value = _ok(
+            [_Row(name="b1", writes_per_sec=4.0, time=4)]
+        )
+        blade.get_buckets_s3_specific_performance.return_value = _ok(
+            [
+                _Row(name="b1", write_objects_per_sec=4.0, time=4),
+                _Row(name="b2", write_objects_per_sec=0.0, time=4),
+            ]
+        )
+        return blade
+
+    def test_generate_perf_breakdown_dict_reports_every_key(self):
+        blade = self._breakdown_blade()
+
+        result = generate_perf_breakdown_dict(blade)
+
+        assert set(result) == {
+            "smb",
+            "nfs_ops",
+            "s3_ops",
+            "http_ops",
+            "replication",
+            "filesystems",
+            "buckets",
+        }
+        blade.get_arrays_performance.assert_called_once_with(protocol="smb")
+        assert set(result["smb"]) == set(PERF_FIELDS)
+        assert result["smb"]["reads_per_sec"] == 5.0
+        assert result["smb"]["writes_per_sec"] is None
+        assert set(result["nfs_ops"]) == set(NFS_OPS_FIELDS)
+        assert result["nfs_ops"]["lookups_per_sec"] == 7.0
+        assert set(result["s3_ops"]) == set(S3_OPS_FIELDS)
+        assert result["s3_ops"]["read_objects_per_sec"] == 3.0
+        assert set(result["http_ops"]) == set(HTTP_OPS_FIELDS)
+        assert result["http_ops"]["read_files_per_sec"] == 2.0
+
+        repl = result["replication"]
+        assert repl["aggregate"] == {
+            "received_bytes_per_sec": 10.0,
+            "transmitted_bytes_per_sec": 20.0,
+        }
+        assert repl["periodic"]["received_bytes_per_sec"] == 10.0
+        assert repl["continuous"]["object_backlog"]["put_ops_count"] == 1
+        assert repl["time"] == 1700000000000
+        # array connections are keyed by the remote array name, falling back
+        # to the connection id; a row without continuous data has no backlog
+        assert set(repl["array_connections"]) == {"peer-fb", "conn-id"}
+        assert repl["array_connections"]["peer-fb"]["continuous"] == {}
+        assert repl["array_connections"]["peer-fb"]["periodic"] == {
+            "received_bytes_per_sec": 1.0,
+            "transmitted_bytes_per_sec": 2.0,
+        }
+        assert (
+            repl["array_connections"]["conn-id"]["continuous"]["object_backlog"][
+                "bytes_count"
+            ]
+            == 0
+        )
+        assert (
+            repl["targets"]["s3-target"]["aggregate"]["transmitted_bytes_per_sec"]
+            == 20.0
+        )
+
+        assert set(result["filesystems"]["fs1"]) == set(PERF_FIELDS)
+        assert result["filesystems"]["fs1"]["reads_per_sec"] == 1.0
+        assert set(result["buckets"]["b1"]) == set(PERF_FIELDS) | {"s3"}
+        assert result["buckets"]["b1"]["writes_per_sec"] == 4.0
+        assert result["buckets"]["b1"]["s3"]["write_objects_per_sec"] == 4.0
+        assert set(result["buckets"]["b1"]["s3"]) == set(S3_OPS_FIELDS)
+        # a bucket only present in the S3-specific listing still appears
+        assert set(result["buckets"]["b2"]) == {"s3"}
+
+    def test_generate_perf_breakdown_dict_tolerates_failed_gets(self):
+        blade = Mock()
+        for method in (
+            "get_arrays_performance",
+            "get_arrays_nfs_specific_performance",
+            "get_arrays_s3_specific_performance",
+            "get_arrays_http_specific_performance",
+            "get_arrays_performance_replication",
+            "get_array_connections_performance_replication",
+            "get_targets_performance_replication",
+            "get_file_systems_performance",
+            "get_buckets_performance",
+            "get_buckets_s3_specific_performance",
+        ):
+            getattr(blade, method).return_value = _failed()
+
+        result = generate_perf_breakdown_dict(blade)
+
+        assert result == {
+            "smb": {},
+            "nfs_ops": {},
+            "s3_ops": {},
+            "http_ops": {},
+            "replication": {"array_connections": {}, "targets": {}},
+            "filesystems": {},
+            "buckets": {},
+        }
+
+    @patch("plugins.modules.purefb_info.generate_perf_breakdown_dict")
+    def test_generate_perf_dict_merges_breakdown(self, mock_breakdown):
+        blade = Mock()
+        sample = _Row(
+            bytes_per_op=1,
+            bytes_per_read=2,
+            bytes_per_write=3,
+            read_bytes_per_sec=4,
+            reads_per_sec=5,
+            usec_per_other_op=6,
+            usec_per_read_op=7,
+            usec_per_write_op=8,
+            write_bytes_per_sec=9,
+            writes_per_sec=10,
+        )
+        blade.get_arrays_performance.return_value = _ok([sample])
+        blade.get_array_connections_performance_replication.return_value.total_item_count = (
+            0
+        )
+        mock_breakdown.return_value = {"smb": {"reads_per_sec": 0.0}}
+
+        result = generate_perf_dict(blade)
+
+        mock_breakdown.assert_called_once_with(blade)
+        assert result["aggregate"]["reads_per_sec"] == 5
+        assert result["nfs"]["writes_per_sec"] == 10
+        assert result["smb"] == {"reads_per_sec": 0.0}
+
+    @patch("plugins.modules.purefb_info.LooseVersion", _Version)
+    def test_generate_clients_dict_before_2_18_reports_nfs_only(self):
+        blade = Mock()
+        blade.get_arrays_clients_performance.return_value = _ok(
+            [_Row(name="10.0.0.1:2049", reads_per_sec=9.0, time=5)]
+        )
+
+        result = generate_clients_dict(blade, "2.17")
+
+        blade.get_arrays_clients_performance.assert_called_once_with(
+            limit=CLIENTS_PERF_LIMIT
+        )
+        blade.get_arrays_clients_s3_specific_performance.assert_not_called()
+        assert set(result) == {"nfs", "s3", "s3_ops"}
+        assert set(result["nfs"]["10.0.0.1:2049"]) == set(PERF_FIELDS)
+        assert result["nfs"]["10.0.0.1:2049"]["reads_per_sec"] == 9.0
+        assert result["s3"] == {}
+        assert result["s3_ops"] == {}
+
+    @patch("plugins.modules.purefb_info.LooseVersion", _Version)
+    def test_generate_clients_dict_from_2_18_reports_s3_clients(self):
+        blade = Mock()
+
+        def clients_performance(protocol=None, limit=None):
+            assert limit == CLIENTS_PERF_LIMIT
+            if protocol == "s3":
+                return _ok([_Row(name="10.0.0.2:51000", writes_per_sec=3.0)])
+            return _ok([_Row(name="10.0.0.1:2049", reads_per_sec=9.0)])
+
+        blade.get_arrays_clients_performance.side_effect = clients_performance
+        blade.get_arrays_clients_s3_specific_performance.return_value = _ok(
+            [_Row(name="10.0.0.2:51000", write_objects_per_sec=3.0)]
+        )
+
+        result = generate_clients_dict(blade, "2.18")
+
+        assert blade.get_arrays_clients_performance.call_count == 2
+        blade.get_arrays_clients_performance.assert_any_call(limit=CLIENTS_PERF_LIMIT)
+        blade.get_arrays_clients_performance.assert_any_call(
+            protocol="s3", limit=CLIENTS_PERF_LIMIT
+        )
+        blade.get_arrays_clients_s3_specific_performance.assert_called_once_with(
+            limit=CLIENTS_PERF_LIMIT
+        )
+        assert result["nfs"]["10.0.0.1:2049"]["reads_per_sec"] == 9.0
+        assert result["s3"]["10.0.0.2:51000"]["writes_per_sec"] == 3.0
+        assert set(result["s3_ops"]["10.0.0.2:51000"]) == set(S3_OPS_FIELDS)
+        assert result["s3_ops"]["10.0.0.2:51000"]["write_objects_per_sec"] == 3.0
+
+    @patch("plugins.modules.purefb_info.LooseVersion", _Version)
+    def test_generate_clients_dict_tolerates_failed_gets(self):
+        blade = Mock()
+        blade.get_arrays_clients_performance.return_value = _failed()
+        blade.get_arrays_clients_s3_specific_performance.return_value = _failed()
+
+        result = generate_clients_dict(blade, "2.30")
+
+        assert result == {"nfs": {}, "s3": {}, "s3_ops": {}}
+
+    @patch("plugins.modules.purefb_info.generate_clients_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_clients_subset_is_opt_in(
+        self, mock_ansible_module, mock_get_system, mock_generate_clients
+    ):
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["clients"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        mock_generate_clients.return_value = {"nfs": {}, "s3": {}, "s3_ops": {}}
+
+        main()
+
+        mock_module.fail_json.assert_not_called()
+        mock_generate_clients.assert_called_once()
+        assert mock_generate_clients.call_args[0][0] is mock_blade
+        info = mock_module.exit_json.call_args[1]["purefb_info"]
+        assert info == {"clients": {"nfs": {}, "s3": {}, "s3_ops": {}}}
+
+    def test_main_all_subset_excludes_clients(self):
+        generators = {
+            name: Mock(return_value={})
+            for name in dir(purefb_info_module)
+            if name.startswith("generate_")
+        }
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["all"]}
+        mock_module.check_mode = False
+        mock_blade = Mock()
+
+        with patch.multiple(purefb_info_module, **generators), patch.object(
+            purefb_info_module, "LooseVersion", _Version
+        ), patch.object(
+            purefb_info_module, "get_system", return_value=mock_blade
+        ), patch.object(
+            purefb_info_module, "AnsibleModule", return_value=mock_module
+        ), patch.object(
+            purefb_info_module, "get_rest_api_version", return_value="2.30"
+        ):
+            main()
+
+        mock_module.fail_json.assert_not_called()
+        generators["generate_perf_dict"].assert_called_once_with(mock_blade)
+        generators["generate_clients_dict"].assert_not_called()
+        info = mock_module.exit_json.call_args[1]["purefb_info"]
+        assert "performance" in info
+        assert "clients" not in info

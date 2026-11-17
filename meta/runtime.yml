@@ -22,6 +22,7 @@ action_groups:
     - purefb_export
     - purefb_fleet
     - purefb_fs
+    - purefb_fs_lock
     - purefb_fs_replica
     - purefb_groupquota
     - purefb_hardware
@@ -41,11 +42,13 @@ action_groups:
     - purefb_mgmt_role
     - purefb_network
     - purefb_ntp
+    - purefb_oidc
     - purefb_password_policy
     - purefb_phonehome
     - purefb_pingtrace
     - purefb_policy
     - purefb_proxy
+    - purefb_quota_settings
     - purefb_ra
     - purefb_realm
     - purefb_remote_cred
@@ -64,6 +67,7 @@ action_groups:
     - purefb_software_patch
     - purefb_ssh_ca_policy
     - purefb_subnet
+    - purefb_support_diagnostics
     - purefb_syslog
     - purefb_syslog_settings
     - purefb_target

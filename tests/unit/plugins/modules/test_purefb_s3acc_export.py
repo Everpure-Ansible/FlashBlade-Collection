@@ -1,4 +1,4 @@
-# Copyright: (c) 2026, Pure Storage Ansible Team <pure-ansible-team@everpuredata.com>
+# Copyright: (c) 2026, Everpure Ansible Team <pure-ansible-team@everpuredata.com>
 # GNU General Public License v3.0+ (see COPYING.GPLv3 or https://www.gnu.org/licenses/gpl-3.0.txt)
 
 """Unit tests for purefb_s3acc_export module."""
@@ -8,6 +8,7 @@ from __future__ import absolute_import, division, print_function
 __metaclass__ = type
 
 import sys
+import importlib
 import multiprocessing
 import ctypes
 from unittest.mock import Mock, patch, MagicMock
@@ -74,6 +75,7 @@ from plugins.modules.purefb_s3acc_export import (
     main,
     _get_export,
 )
+import plugins.modules.purefb_s3acc_export as s3acc_export_module
 
 
 class TestPurefbS3accExport:
@@ -131,9 +133,14 @@ class TestPurefbS3accExport:
             context_names=["fleet1"],
         )
 
-    def test_get_export_returns_none_on_error(self):
-        """Test _get_export returns None when the SDK reports an error"""
+    @patch(
+        "plugins.modules.purefb_s3acc_export.get_error_message",
+        return_value="Unknown attribute.",
+    )
+    def test_get_export_fails_on_api_error(self, mock_get_error_message):
+        """A failed lookup is reported, not treated as 'no export'"""
         mock_module = Mock()
+        mock_module.fail_json = Mock(side_effect=SystemExit)
         mock_module.params = {
             "account": "acme",
             "server": "fb-01",
@@ -146,9 +153,15 @@ class TestPurefbS3accExport:
         mock_response.items = []
         mock_blade.get_object_store_account_exports.return_value = mock_response
 
-        out = _get_export(mock_module, mock_blade)
+        try:
+            _get_export(mock_module, mock_blade)
+        except SystemExit:
+            pass
 
-        assert out is None
+        mock_module.fail_json.assert_called_once()
+        msg = mock_module.fail_json.call_args[1]["msg"]
+        assert "Failed to get account export for account acme on server fb-01" in msg
+        assert "Unknown attribute." in msg
 
     def test_get_export_returns_none_when_no_items(self):
         """Test _get_export returns None when no export matches the filter"""
@@ -823,6 +836,175 @@ class TestPurefbS3accExport:
             in mock_module.fail_json.call_args[1]["msg"]
         )
 
+    @patch("plugins.modules.purefb_s3acc_export.LooseVersion")
+    @patch("plugins.modules.purefb_s3acc_export.get_system")
+    @patch("plugins.modules.purefb_s3acc_export.AnsibleModule")
+    @patch("plugins.modules.purefb_s3acc_export.HAS_PYPURECLIENT", True)
+    def test_main_delete_uses_array_name_and_context(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        """Delete sends the name the array reports (server::account) and the
+        fleet context when the array is a fleet member"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = Mock()
+        mock_module.exit_json = Mock(side_effect=SystemExit)
+        mock_module.fail_json = Mock(side_effect=SystemExit)
+        mock_module.params = {
+            "account": "acme",
+            "server": "fb-01",
+            "policy": None,
+            "enabled": None,
+            "state": "absent",
+            "context": "",
+        }
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        mock_blade = Mock()
+        mock_blade.get_versions.return_value.items = ["2.30"]
+        mock_blade.get_fleets.return_value.status_code = 200
+        mock_blade.get_fleets.return_value.items = [Mock()]
+        local_array = Mock()
+        local_array.name = "fb-a"
+        mock_blade.get_arrays.return_value.items = [local_array]
+        mock_get_system.return_value = mock_blade
+
+        existing_export = Mock()
+        existing_export.name = "fb-01::acme"
+
+        get_response = Mock()
+        get_response.status_code = 200
+        get_response.items = [existing_export]
+        mock_blade.get_object_store_account_exports.return_value = get_response
+
+        delete_response = Mock()
+        delete_response.status_code = 200
+        mock_blade.delete_object_store_account_exports.return_value = delete_response
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        mock_blade.delete_object_store_account_exports.assert_called_once_with(
+            names=["fb-01::acme"], context_names=["fb-a"]
+        )
+        mock_module.fail_json.assert_not_called()
+        assert mock_module.exit_json.call_args[1]["changed"] is True
+
+    @patch(
+        "plugins.modules.purefb_s3acc_export.get_error_message",
+        return_value="Unknown attribute.",
+    )
+    @patch("plugins.modules.purefb_s3acc_export.LooseVersion")
+    @patch("plugins.modules.purefb_s3acc_export.get_system")
+    @patch("plugins.modules.purefb_s3acc_export.AnsibleModule")
+    @patch("plugins.modules.purefb_s3acc_export.HAS_PYPURECLIENT", True)
+    def test_main_delete_fails_when_lookup_fails(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_error_message,
+    ):
+        """state=absent must not report ok when the export lookup itself failed"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = Mock()
+        mock_module.exit_json = Mock(side_effect=SystemExit)
+        mock_module.fail_json = Mock(side_effect=SystemExit)
+        mock_module.params = {
+            "account": "acme",
+            "server": "fb-01",
+            "policy": None,
+            "enabled": None,
+            "state": "absent",
+            "context": "",
+        }
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        mock_blade = Mock()
+        mock_blade.get_versions.return_value.items = ["2.30"]
+        mock_blade.get_fleets.return_value.status_code = 200
+        mock_blade.get_fleets.return_value.items = []
+        mock_get_system.return_value = mock_blade
+
+        get_response = Mock()
+        get_response.status_code = 400
+        get_response.items = []
+        mock_blade.get_object_store_account_exports.return_value = get_response
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        mock_blade.delete_object_store_account_exports.assert_not_called()
+        mock_module.exit_json.assert_not_called()
+        mock_module.fail_json.assert_called_once()
+        msg = mock_module.fail_json.call_args[1]["msg"]
+        assert "Failed to get account export" in msg
+        assert "Unknown attribute." in msg
+
+    @patch(
+        "plugins.modules.purefb_s3acc_export.get_error_message",
+        return_value="Export does not exist.",
+    )
+    @patch("plugins.modules.purefb_s3acc_export.LooseVersion")
+    @patch("plugins.modules.purefb_s3acc_export.get_system")
+    @patch("plugins.modules.purefb_s3acc_export.AnsibleModule")
+    @patch("plugins.modules.purefb_s3acc_export.HAS_PYPURECLIENT", True)
+    def test_main_delete_failure_includes_array_error(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_error_message,
+    ):
+        """The array's own error text is part of the delete failure message"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = Mock()
+        mock_module.exit_json = Mock(side_effect=SystemExit)
+        mock_module.fail_json = Mock(side_effect=SystemExit)
+        mock_module.params = {
+            "account": "acme",
+            "server": "fb-01",
+            "policy": None,
+            "enabled": None,
+            "state": "absent",
+            "context": "",
+        }
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        mock_blade = Mock()
+        mock_blade.get_versions.return_value.items = ["2.30"]
+        mock_blade.get_fleets.return_value.status_code = 200
+        mock_blade.get_fleets.return_value.items = []
+        mock_get_system.return_value = mock_blade
+
+        existing_export = Mock()
+        existing_export.name = "fb-01::acme"
+
+        get_response = Mock()
+        get_response.status_code = 200
+        get_response.items = [existing_export]
+        mock_blade.get_object_store_account_exports.return_value = get_response
+
+        delete_response = Mock()
+        delete_response.status_code = 400
+        mock_blade.delete_object_store_account_exports.return_value = delete_response
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        mock_module.fail_json.assert_called_once()
+        msg = mock_module.fail_json.call_args[1]["msg"]
+        assert "Failed to delete account export for account acme on server fb-01" in msg
+        assert "Export does not exist." in msg
+
     # ---------------- main() context defaulting ----------------
 
     @patch("plugins.modules.purefb_s3acc_export.LooseVersion")
@@ -960,10 +1142,17 @@ class TestPurefbS3accExport:
             in mock_module.fail_json.call_args[1]["msg"]
         )
 
+    @patch("plugins.modules.purefb_s3acc_export.get_system")
     @patch("plugins.modules.purefb_s3acc_export.AnsibleModule")
+    @patch(
+        "plugins.modules.purefb_s3acc_export.PYPURECLIENT_IMPORT_ERROR",
+        "Traceback (most recent call last):\n  ...\n"
+        "ModuleNotFoundError: No module named 'pypureclient.flashblade'\n",
+    )
     @patch("plugins.modules.purefb_s3acc_export.HAS_PYPURECLIENT", False)
-    def test_main_fails_when_sdk_missing(self, mock_ansible_module):
-        """Test failure when py-pure-client is not installed"""
+    def test_main_fails_when_sdk_missing(self, mock_ansible_module, mock_get_system):
+        """A missing or broken SDK fails before any array contact and the
+        failure carries the import traceback"""
         mock_module = Mock()
         mock_module.exit_json = Mock(side_effect=SystemExit)
         mock_module.fail_json = Mock(side_effect=SystemExit)
@@ -972,7 +1161,7 @@ class TestPurefbS3accExport:
             "server": "fb-01",
             "policy": None,
             "enabled": None,
-            "state": "present",
+            "state": "absent",
             "context": "",
         }
         mock_module.check_mode = False
@@ -983,8 +1172,26 @@ class TestPurefbS3accExport:
         except SystemExit:
             pass
 
+        mock_get_system.assert_not_called()
         mock_module.fail_json.assert_called_once()
-        assert (
-            "py-pure-client sdk is required"
-            in mock_module.fail_json.call_args[1]["msg"]
-        )
+        kwargs = mock_module.fail_json.call_args[1]
+        assert "py-pure-client sdk is required" in kwargs["msg"]
+        assert "No module named 'pypureclient.flashblade'" in kwargs["exception"]
+
+    def test_import_guard_records_the_import_error(self):
+        """When pypureclient.flashblade cannot be imported the module records
+        the traceback instead of discarding it, and recovers once it can"""
+        saved = sys.modules["pypureclient.flashblade"]
+        # None in sys.modules makes the import raise ImportError
+        sys.modules["pypureclient.flashblade"] = None
+        try:
+            importlib.reload(s3acc_export_module)
+            assert s3acc_export_module.HAS_PYPURECLIENT is False
+            err = s3acc_export_module.PYPURECLIENT_IMPORT_ERROR
+            assert err.startswith("Traceback")
+            assert "pypureclient.flashblade" in err
+        finally:
+            sys.modules["pypureclient.flashblade"] = saved
+            importlib.reload(s3acc_export_module)
+        assert s3acc_export_module.HAS_PYPURECLIENT is True
+        assert s3acc_export_module.PYPURECLIENT_IMPORT_ERROR is None

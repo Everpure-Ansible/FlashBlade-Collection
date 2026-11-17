@@ -1,7 +1,7 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
 
-# (c) 2026
+# (c) 2026, Simon Dodsley (simon@everpuredata.com)
 # GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
 from __future__ import absolute_import, division, print_function
@@ -26,8 +26,13 @@ description:
   that server.
 - The account export is uniquely identified by the (I(account), I(server))
   pair.
+- A new object store account is created by the array with a default export
+  on its default object store server (normally C(_array_server)) bound to
+  the built-in C(_s3_export_allow_everything) policy. On that server this
+  module modifies the default export rather than creating a second one, and
+  I(state=absent) removes it.
 author:
-- Pure Storage Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
+- Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
   state:
     description:
@@ -105,7 +110,10 @@ EXAMPLES = r"""
 RETURN = r"""
 """
 
+import traceback
+
 HAS_PYPURECLIENT = True
+PYPURECLIENT_IMPORT_ERROR = None
 try:
     from pypureclient.flashblade import (
         ObjectStoreAccountExportPost,
@@ -114,6 +122,7 @@ try:
     )
 except ImportError:
     HAS_PYPURECLIENT = False
+    PYPURECLIENT_IMPORT_ERROR = traceback.format_exc()
 
 from ansible.module_utils.basic import AnsibleModule
 from ansible_collections.everpure.flashblade.plugins.module_utils.purefb import (
@@ -139,7 +148,12 @@ def _context_kwargs(module):
 
 
 def _get_export(module, blade):
-    """Return the existing account export object or None."""
+    """Return the existing account export object, or None when there is none.
+
+    A failed lookup is reported, never treated as "no export": doing so would
+    turn an API error into a silent no-op for state=absent or into a POST that
+    then fails with a misleading message for state=present.
+    """
     filter_string = "member.name='{0}' and server.name='{1}'".format(
         module.params["account"], module.params["server"]
     )
@@ -147,7 +161,13 @@ def _get_export(module, blade):
         filter=filter_string, **_context_kwargs(module)
     )
     if res.status_code != 200:
-        return None
+        module.fail_json(
+            msg="Failed to get account export for account {0} on server {1}. Error: {2}".format(
+                module.params["account"],
+                module.params["server"],
+                get_error_message(res),
+            )
+        )
     items = list(res.items)
     return items[0] if items else None
 
@@ -249,7 +269,13 @@ def main():
     module = AnsibleModule(argument_spec, supports_check_mode=True)
 
     if not HAS_PYPURECLIENT:
-        module.fail_json(msg="py-pure-client sdk is required for this module")
+        # Keep the import failure itself: a half-installed or broken SDK gives
+        # exactly the same symptom as a missing one, and only the traceback
+        # tells them apart.
+        module.fail_json(
+            msg="py-pure-client sdk is required for this module",
+            exception=PYPURECLIENT_IMPORT_ERROR,
+        )
 
     blade = get_system(module)
     api_version = get_rest_api_version(blade)

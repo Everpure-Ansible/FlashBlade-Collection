@@ -106,6 +106,7 @@ from plugins.modules.purefb_info import (
     generate_realms_dict,
     generate_resource_accesses_dict,
     generate_file_repl_dict,
+    generate_object_store_roles_dict,
     generate_public_keys_dict,
     generate_admin_cache_dict,
     generate_management_access_policies_dict,
@@ -3171,6 +3172,110 @@ class TestPurefbInfo:
         call_args = mock_module.exit_json.call_args[1]
         assert call_args["purefb_info"]["fleet"] == {"fleet1": {"members": {}}}
         assert "policies" not in call_args["purefb_info"]
+
+    def test_generate_object_store_roles_dict(self):
+        """Roles are keyed by full name with their attached access policies."""
+        account = Mock(spec=["name"])
+        account.name = "acme"
+        entity = Mock(spec=["name"])
+        entity.name = "idp1"
+        role = Mock(
+            spec=[
+                "name",
+                "account",
+                "created",
+                "max_session_duration",
+                "prn",
+                "trusted_entities",
+            ]
+        )
+        role.name = "acme/analytics"
+        role.account = account
+        role.created = 1700000000000
+        role.max_session_duration = 7200000
+        role.prn = "prn:pure:fb:test:role/acme/analytics"
+        role.trusted_entities = [entity]
+
+        link = Mock(spec=["member", "policy"])
+        link.member = Mock(spec=["name"])
+        link.member.name = "acme/analytics"
+        link.policy = Mock(spec=["name"])
+        link.policy.name = "pure:policy/object-read"
+        stray = Mock(spec=["member", "policy"])
+        stray.member = Mock(spec=["name"])
+        stray.member.name = "other/role"
+        stray.policy = Mock(spec=["name"])
+        stray.policy.name = "pure:policy/object-list"
+
+        mock_blade = Mock()
+        mock_blade.get_object_store_roles.return_value.status_code = 200
+        mock_blade.get_object_store_roles.return_value.items = [role]
+        links = mock_blade.get_object_store_roles_object_store_access_policies
+        links.return_value.status_code = 200
+        links.return_value.items = [link, stray]
+
+        result = generate_object_store_roles_dict(mock_blade)
+
+        assert result == {
+            "acme/analytics": {
+                "account": "acme",
+                "created": 1700000000000,
+                "max_session_duration": 7200000,
+                "prn": "prn:pure:fb:test:role/acme/analytics",
+                "trusted_entities": ["idp1"],
+                "access_policies": ["pure:policy/object-read"],
+            }
+        }
+
+    def test_generate_object_store_roles_dict_empty_on_error(self):
+        """A failed roles GET yields an empty dict instead of raising."""
+        mock_blade = Mock()
+        mock_blade.get_object_store_roles.return_value.status_code = 400
+
+        assert generate_object_store_roles_dict(mock_blade) == {}
+        mock_blade.get_object_store_roles_object_store_access_policies.assert_not_called()
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_object_store_roles_dict")
+    @patch("plugins.modules.purefb_info.generate_object_store_account_exports_dict")
+    @patch("plugins.modules.purefb_info.generate_object_store_accounts_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_accounts_subset_includes_object_store_roles(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_accounts,
+        mock_generate_exports,
+        mock_generate_roles,
+        mock_loose_version,
+    ):
+        """gather_subset=accounts adds object_store_roles on REST 2.17+."""
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["accounts"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        mock_blade = Mock()
+        mock_version = Mock()
+        mock_version.version = "2.30"
+        mock_blade.get_versions.return_value.items = [mock_version]
+        mock_get_system.return_value = mock_blade
+        # version gates ON
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+
+        mock_generate_accounts.return_value = {"acme": {}}
+        mock_generate_exports.return_value = {}
+        mock_generate_roles.return_value = {"acme/analytics": {"account": "acme"}}
+
+        main()
+
+        mock_generate_roles.assert_called_once_with(mock_blade)
+        call_args = mock_module.exit_json.call_args[1]
+        assert call_args["purefb_info"]["accounts"] == {"acme": {}}
+        assert call_args["purefb_info"]["object_store_roles"] == {
+            "acme/analytics": {"account": "acme"}
+        }
 
     # ------------------------------------------------------------------
     # security and identity read-back

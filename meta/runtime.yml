@@ -45,6 +45,7 @@ action_groups:
     - purefb_mgmt_role
     - purefb_network
     - purefb_ntp
+    - purefb_object_role
     - purefb_oidc
     - purefb_password_policy
     - purefb_phonehome

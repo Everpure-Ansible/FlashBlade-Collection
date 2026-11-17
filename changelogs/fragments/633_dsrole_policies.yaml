@@ -1,0 +1,13 @@
+minor_changes:
+  - purefb_dsrole - Add ``name`` and ``policies`` so custom directory service role mappings can be
+    created with a list of management access policies (REST 2.19) and deleted. The policy set is
+    reconciled through the policy membership endpoints because the array does not accept
+    ``management_access_policies`` in a PATCH.
+  - purefb_dsrole - ``role`` now ensures the management access policy of the same name is attached
+    to the mapping and leaves other attached policies in place.
+bugfixes:
+  - purefb_dsrole - ``state=present`` now creates a built-in mapping that is missing from the array
+    instead of failing.
+  - purefb_dsrole - ``group`` and ``group_base`` are compared case-insensitively because the array
+    normalises them, so an unchanged mapping no longer reports a change. An error reading the
+    mapping now fails the module instead of being treated as a missing mapping.

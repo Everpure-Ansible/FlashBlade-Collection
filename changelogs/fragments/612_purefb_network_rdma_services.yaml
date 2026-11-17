@@ -1,0 +1,7 @@
+minor_changes:
+  - purefb_network - add ``rdma_enabled`` option to control RDMA on data interfaces (requires REST 2.28).
+  - purefb_network - add ``egress-only`` (REST 2.19) and ``sts`` (REST 2.17) to the ``services`` choices.
+  - purefb_network - apply ``services`` changes to an existing interface, which were previously ignored, and disable RDMA in the same request when leaving the data service.
+  - 'purefb_network - detach an interface from its server with ``attached_server: ""``.'
+  - purefb_network - ``services`` no longer defaults to ``data`` on an existing interface; an omitted value leaves the current service unchanged (creation still defaults to ``data``).
+  - purefb_info - network subset now reports ``rdma_enabled`` and ``realms``.

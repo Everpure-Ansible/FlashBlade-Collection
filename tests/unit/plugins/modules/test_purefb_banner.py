@@ -102,13 +102,15 @@ def _module(**overrides):
     return module
 
 
-def _blade(current_banner, get_status=200, patch_status=200):
+def _blade(current_banner, get_status=200, patch_status=200, items=None):
     blade = Mock()
-    item = Mock()
-    item.banner = current_banner
+    if items is None:
+        item = Mock()
+        item.banner = current_banner
+        items = [item]
     get_response = Mock()
     get_response.status_code = get_status
-    get_response.items = [item]
+    get_response.items = items
     blade.get_arrays.return_value = get_response
     patch_response = Mock()
     patch_response.status_code = patch_status
@@ -524,6 +526,87 @@ class TestPurefbBanner:
             in module.fail_json.call_args[1]["msg"]
         )
         blade.patch_arrays.assert_not_called()
+
+    @patch(MODULE + ".LooseVersion", RealLooseVersion)
+    @patch(MODULE + ".get_rest_api_version", return_value="2.30")
+    @patch(MODULE + ".get_system")
+    @patch(MODULE + ".AnsibleModule")
+    @patch(MODULE + ".HAS_PYPURECLIENT", True)
+    def test_main_get_arrays_no_items(
+        self, mock_ansible_module, mock_get_system, mock_version
+    ):
+        """A 200 that carries no array fails cleanly instead of IndexError"""
+        module = _module(banner="new text", context=CONTEXT)
+        mock_ansible_module.return_value = module
+        blade = _blade("old", items=[])
+        mock_get_system.return_value = blade
+
+        _run_main()
+
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Failed to get current MOTD banner text" in msg
+        assert "No array returned" in msg
+        blade.patch_arrays.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    @patch(MODULE + ".LooseVersion", RealLooseVersion)
+    @patch(MODULE + ".get_rest_api_version", return_value="2.30")
+    @patch(MODULE + ".get_system")
+    @patch(MODULE + ".AnsibleModule")
+    @patch(MODULE + ".HAS_PYPURECLIENT", True)
+    def test_main_context_fleet_name_refused(
+        self, mock_ansible_module, mock_get_system, mock_version
+    ):
+        """A context resolving to several arrays (the fleet name) is refused.
+
+        The first member already carries the wanted banner, so the old
+        unchecked [0] read would have reported changed=False for the fleet.
+        """
+        module = _module(banner="new text", context=CONTEXT)
+        mock_ansible_module.return_value = module
+        first = Mock()
+        first.banner = "new text"
+        second = Mock()
+        second.banner = "other"
+        blade = _blade("old", items=[first, second])
+        mock_get_system.return_value = blade
+
+        _run_main()
+
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert CONTEXT in msg
+        assert "2 arrays" in msg
+        assert "single fleet member" in msg
+        blade.patch_arrays.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    @patch(MODULE + ".LooseVersion", RealLooseVersion)
+    @patch(MODULE + ".get_rest_api_version", return_value="2.30")
+    @patch(MODULE + ".get_system")
+    @patch(MODULE + ".AnsibleModule")
+    @patch(MODULE + ".HAS_PYPURECLIENT", True)
+    def test_main_context_fleet_name_refused_in_check_mode(
+        self, mock_ansible_module, mock_get_system, mock_version
+    ):
+        """The item-count guard applies to state=absent in check mode too"""
+        module = _module(state="absent", context=CONTEXT)
+        module.check_mode = True
+        mock_ansible_module.return_value = module
+        first = Mock()
+        first.banner = ""
+        second = Mock()
+        second.banner = "other"
+        blade = _blade("old", items=[first, second])
+        mock_get_system.return_value = blade
+
+        _run_main()
+
+        module.fail_json.assert_called_once()
+        assert "2 arrays" in module.fail_json.call_args[1]["msg"]
+        blade.patch_arrays.assert_not_called()
+        module.exit_json.assert_not_called()
 
     @patch(MODULE + ".get_rest_api_version", return_value="2.30")
     @patch(MODULE + ".get_system")

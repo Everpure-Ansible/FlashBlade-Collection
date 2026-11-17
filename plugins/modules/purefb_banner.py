@@ -188,7 +188,21 @@ def main():
                 get_error_message(res)
             )
         )
-    current_banner = list(res.items)[0].banner
+    # GET /arrays also accepts the fleet name as a context and then returns
+    # every member; the banner must be read from, and written to, one array.
+    arrays = list(res.items)
+    if not arrays:
+        module.fail_json(
+            msg="Failed to get current MOTD banner text. No array returned."
+        )
+    if len(arrays) > 1:
+        module.fail_json(
+            msg=(
+                "Context {0} resolves to {1} arrays. The context must name a "
+                "single fleet member, not the fleet."
+            ).format(module.params["context"], len(arrays))
+        )
+    current_banner = arrays[0].banner
     patch_ctx = _context_kwargs(module, api_version, CONTEXT_PATCH_API_VERSION)
 
     # set banner if empty value or value differs

@@ -77,6 +77,7 @@ action_groups:
     - purefb_syslog
     - purefb_syslog_settings
     - purefb_target
+    - purefb_telemetry_target
     - purefb_tgroup
     - purefb_timeout
     - purefb_tls_policy

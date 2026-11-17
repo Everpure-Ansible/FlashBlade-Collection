@@ -36,7 +36,7 @@ options:
         capacity, network, subnets, lags, filesystems, snapshots, buckets,
         replication, policies, arrays, accounts, admins, ad, kerberos,
         drives, servers, fleet, realms, clients, locks, support,
-        legal_holds and connections.
+        legal_holds, connections and telemetry.
       - The C(accounts) subset also returns C(object_store_roles), the
         object store roles with their maximum session duration, PRN,
         trusted entities and attached access policies, on REST API 2.17
@@ -68,6 +68,8 @@ options:
         the array as C(connections) on Purity//FB with REST API version
         2.18 or higher. The table changes with every call and can be large,
         so it is not included in C(all) and has to be requested explicitly.
+      - The C(telemetry) subset reports the telemetry metrics targets
+        (C(telemetry_targets)) and requires REST API 2.29 or later.
       - The C(filesystems) subset surfaces the legacy file system keys
         C(nfs_rules), C(export_policy), C(smb_client_policy) and
         C(smb_share_policy). Purity//FB marks the underlying fields as
@@ -338,6 +340,7 @@ TGROUP_API_VERSION = "2.26"
 STORAGE_CLASS_API_VERSION = "2.27"
 WORKLOAD_METRICS_API_VERSION = "2.30"
 JUNCTION_API_VERSION = "2.25"
+TELEMETRY_API_VERSION = "2.29"
 
 
 def _bytes_to_human(bytes_number):
@@ -2832,6 +2835,37 @@ def generate_legal_holds_dict(blade):
     return holds_info
 
 
+def generate_telemetry_targets_dict(blade):
+    targets_info = {}
+    for target in list(blade.get_telemetry_targets().items):
+        targets_info[target.name] = {
+            "enabled": getattr(target, "enabled", None),
+            "endpoint": getattr(target, "endpoint", None),
+            "transport": getattr(target, "transport", None),
+            "vendor": getattr(target, "vendor", None),
+            "source": getattr(getattr(target, "source", None), "name", None),
+            "ca_certificate": getattr(
+                getattr(target, "ca_certificate", None), "name", None
+            ),
+            "ca_certificate_group": getattr(
+                getattr(target, "ca_certificate_group", None), "name", None
+            ),
+            "client_certificate": getattr(
+                getattr(target, "client_certificate", None), "name", None
+            ),
+            # The array only ever returns "***" for a configured token.
+            "api_token_configured": bool(getattr(target, "api_token", None)),
+            "resource_attributes": [
+                {
+                    "key": getattr(attr, "key", None),
+                    "value": getattr(attr, "value", None),
+                }
+                for attr in (getattr(target, "resource_attributes", None) or [])
+            ],
+        }
+    return targets_info
+
+
 def generate_fleet_dict(blade):
     """Return the fleet the array belongs to, keyed by name, with its members
 
@@ -3490,6 +3524,7 @@ def main():
         "support",
         "legal_holds",
         "connections",
+        "telemetry",
     )
     subset_test = (test in valid_subsets for test in subset)
     if not all(subset_test):
@@ -3637,6 +3672,10 @@ def main():
         SERVERS_API_VERSION
     ) <= LooseVersion(api_version):
         info["servers"] = generate_servers_dict(blade)
+    if ("telemetry" in subset or "all" in subset) and LooseVersion(
+        TELEMETRY_API_VERSION
+    ) <= LooseVersion(api_version):
+        info["telemetry_targets"] = generate_telemetry_targets_dict(blade)
     # `clients` samples the array for several seconds per protocol and lists
     # S3 clients per connection, so it is opt-in and not part of `all`.
     if "clients" in subset:

@@ -179,6 +179,7 @@ STORAGE_CLASS_API_VERSION = "2.17"
 REALMS_API_VERSION = "2.19"
 MAP_API_VERSION = "2.19"
 S3_EXPORT_API_VERSION = "2.20"
+ADMIN_TYPE_API_VERSION = "2.24"
 # From REST 2.29 (Purity//FB 4.8.6) a WORM data policy carries commit_mode and
 # the autocommit configuration.
 WORM_AUTOCOMMIT_API_VERSION = "2.29"
@@ -1021,12 +1022,14 @@ def generate_admin_dict(blade):
     ``role`` is set only when the admin holds exactly one management access
     policy that corresponds to a legacy role of the same name; it is null for
     an admin with no, several, or a custom policy, so it is read through
-    getattr. The policy names are reported from REST 2.19, where the array
-    exposes them.
+    getattr. The policy names are reported from REST 2.19, the account type
+    (local user, remote user or service account) and the authorization model
+    of a remote user from REST 2.24, where the array exposes them.
     """
     admin_info = {}
     api_version = get_rest_api_version(blade)
     report_policies = LooseVersion(MAP_API_VERSION) <= LooseVersion(api_version)
+    report_type = LooseVersion(ADMIN_TYPE_API_VERSION) <= LooseVersion(api_version)
     admins = list(blade.get_admins().items)
     for admin in admins:
         admin_name = admin.name
@@ -1041,20 +1044,24 @@ def generate_admin_dict(blade):
             admin_info[admin_name]["management_access_policies"] = _reference_names(
                 getattr(admin, "management_access_policies", None)
             )
-        if hasattr(admin.api_token, "expires_at"):
-            if admin.api_token.expires_at:
-                admin_info[admin_name]["token_expires"] = datetime.fromtimestamp(
-                    admin.api_token.expires_at / 1000
-                ).strftime("%Y-%m-%d %H:%M:%S")
-        else:
-            admin_info[admin_name]["token_expires"] = None
-        if hasattr(admin.api_token, "created_at"):
-            if admin.api_token.created_at:
-                admin_info[admin_name]["token_created"] = datetime.fromtimestamp(
-                    admin.api_token.created_at / 1000
-                ).strftime("%Y-%m-%d %H:%M:%S")
-        else:
-            admin_info[admin_name]["token_created"] = None
+        if report_type:
+            admin_info[admin_name]["admin_type"] = getattr(admin, "admin_type", None)
+            admin_info[admin_name]["authorization_model"] = getattr(
+                admin, "authorization_model", None
+            )
+        # an admin without a token has api_token null or an object whose
+        # timestamps are null; both read as None
+        token = getattr(admin, "api_token", None)
+        for key, field in (
+            ("token_expires", "expires_at"),
+            ("token_created", "created_at"),
+        ):
+            stamp = getattr(token, field, None)
+            admin_info[admin_name][key] = (
+                datetime.fromtimestamp(stamp / 1000).strftime("%Y-%m-%d %H:%M:%S")
+                if stamp
+                else None
+            )
     return admin_info
 
 

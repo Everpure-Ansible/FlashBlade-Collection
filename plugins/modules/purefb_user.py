@@ -20,7 +20,8 @@ module: purefb_user
 version_added: '1.0.0'
 short_description: Create, modify or delete FlashBlade user accounts
 description:
-- Modify user on a Pure Stoage FlashBlade.
+- Create, modify or delete local users and service accounts on a FlashBlade,
+  and manage the API token, SSH key and authorization model of remote users.
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
@@ -39,8 +40,10 @@ options:
   role:
     description:
     - Sets the local user's access level to the system
-    - A new local user is created with I(readonly) when no role is given.
+    - A new local user is created with C(readonly) when neither I(role) nor
+      I(management_access_policies) is given.
     - When omitted for an existing user the current role is left unchanged.
+    - Mutually exclusive with I(management_access_policies).
     - A user that holds several management access policies, or a custom one,
       has no legacy role. The requested role is then satisfied when it is one
       of the user's policies; the policy set is left alone and a warning names
@@ -53,6 +56,10 @@ options:
   password:
     description:
     - Password for the local user.
+    - Changing the password of an existing account also needs
+      I(old_password). Without it the task returns unchanged and no other
+      option is applied either.
+    - Not allowed for a service account.
     type: str
   old_password:
     description:
@@ -102,6 +109,61 @@ options:
     type: bool
     default: false
     version_added: "1.21.0"
+  admin_type:
+    description:
+    - The type of account to create. A C(local-user) is a regular local
+      account. A C(service-account) is a local account intended only for
+      REST API access, for automation.
+    - A service account has no password and cannot hold an SSH public key,
+      so I(password), I(old_password) and I(public_key) are refused for it.
+      It cannot log in to the GUI or CLI, and password policy and lockout do
+      not apply to it. Its API token is not created automatically; request
+      one with I(api).
+    - A service account cannot be a member of an SSH certificate authority
+      policy or a management authentication policy and, like every local
+      account, cannot run remote operations on other fleet members.
+    - Set when the account is created and never changed. The module fails
+      when an existing account has a different type. A new account is a
+      C(local-user) when omitted.
+    - C(service-account) requires Purity//FB 4.8.1 or higher (REST 2.26).
+    type: str
+    choices: [ local-user, service-account ]
+    version_added: '1.30.0'
+  management_access_policies:
+    description:
+    - Names of the management access policies that give the account its
+      permissions, instead of a legacy I(role).
+    - A local user or service account becomes a member of exactly these
+      policies. Missing policies are added before surplus ones are removed,
+      so the account is never left without one. Names are compared without
+      regard to case. The policies of C(pureuser) cannot be changed. The
+      list is not compared when I(password) is given without
+      I(old_password) for an existing account (see I(password)).
+    - For a remote user (I(ad_user=true)) the list is applied only together
+      with I(authorization_model=static) and may be empty. A remote user
+      addressed without I(ad_user) is refused.
+    - Mutually exclusive with I(role).
+    - Requires Purity//FB 4.6.1 or higher (REST 2.19).
+    type: list
+    elements: str
+    version_added: '1.30.0'
+  authorization_model:
+    description:
+    - Where the management access policies of a remote user (I(ad_user=true))
+      are decided. With C(dynamic), the array default, they come from the
+      directory service or identity provider at every login. With C(static)
+      they are fixed on the array to I(management_access_policies).
+    - C(static) requires I(management_access_policies). The array does not
+      convert a remote user that holds an API token or SSH public key, and a
+      static user cannot be given either afterwards, so the module fails
+      before the call when the user holds one or when I(api) or
+      I(public_key) is requested in the same task. For a user that is already
+      static the policy set is converged as for a local user.
+    - C(dynamic) returns a static user to directory-service authorization.
+    - Requires Purity//FB 4.6.8 or higher (REST 2.24).
+    type: str
+    choices: [ static, dynamic ]
+    version_added: '1.30.0'
 extends_documentation_fragment:
 - everpure.flashblade.everpure.fb
 """
@@ -138,9 +200,58 @@ EXAMPLES = r"""
     timeout: 2d
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+
+- name: Create a service account for automation with an API token
+  everpure.flashblade.purefb_user:
+    name: svc-backup
+    admin_type: service-account
+    management_access_policies:
+      - storage_admin
+    api: true
+    fb_url: 10.10.10.2
+    api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+  register: result
+  no_log: true
+
+- name: Create a local user that holds two management access policies
+  everpure.flashblade.purefb_user:
+    name: ops
+    password: apassword
+    management_access_policies:
+      - ops_admin
+      - readonly
+    fb_url: 10.10.10.2
+    api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+
+- name: Fix the policies of a remote user on the array
+  everpure.flashblade.purefb_user:
+    name: ad-ops
+    ad_user: true
+    authorization_model: static
+    management_access_policies:
+      - ops_admin
+    fb_url: 10.10.10.2
+    api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+
+- name: Return a remote user to directory-service authorization
+  everpure.flashblade.purefb_user:
+    name: ad-ops
+    ad_user: true
+    authorization_model: dynamic
+    fb_url: 10.10.10.2
+    api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
 """
 
 RETURN = r"""
+user_info:
+  description:
+  - The new API token when I(api) is true, otherwise
+    C(No API token created).
+  - The token is a secret; register the result with C(no_log) and never
+    print it.
+  returned: when I(state) is C(present)
+  type: str
+  sample: "No API token created"
 """
 
 HAS_PYPURECLIENT = True
@@ -174,7 +285,13 @@ import time
 
 MIN_LOCAL_USER = "2.15"
 MIN_EXPOSE_API = "2.18"
+MIN_POLICIES = "2.19"
+MIN_AUTH_MODEL = "2.24"
+MIN_SERVICE_ACCOUNT = "2.26"
 DEFAULT_ROLE = "readonly"
+SERVICE_ACCOUNT = "service-account"
+STATIC = "static"
+DYNAMIC = "dynamic"
 # Value the array reports for a stored public key when it masks it.
 PUBLIC_KEY_MASK = "****"
 MAX_PUBLIC_KEYS = 2
@@ -262,13 +379,24 @@ def set_public_key(module, blade, action="change"):
 
 
 def get_user(module, blade):
-    """Return Local User Account or None"""
-    user = None
+    """Return the admin as GET admins reports it, or None when it does not exist.
+
+    The array answers a GET for a missing name with a 400 "Admin does not
+    exist.", so only that error reads as None. Any other failure (an expired
+    token, a busy or restarting array) fails the task with the array's message
+    rather than reading as "absent", which would drive a POST that fails with
+    "already exists" or let ``state=absent`` report ok.
+    """
     res = blade.get_admins(names=[module.params["name"]])
-    if res.status_code != 200:
+    if res.status_code == 200:
+        items = list(res.items)
+        return items[0] if items else None
+    error = get_error_message(res)
+    if error and "does not exist" in str(error).lower():
         return None
-    else:
-        return list(res.items)[0]
+    module.fail_json(
+        msg="Failed to read admin {0}. Error: {1}".format(module.params["name"], error)
+    )
 
 
 def get_role_name(user):
@@ -321,6 +449,267 @@ def role_change(module, user):
         ).format(module.params["name"], policies, requested)
     )
     return False
+
+
+def requested_policy_names(module):
+    """Return the requested policy names, duplicates removed without regard to case"""
+    names = {}
+    for name in module.params["management_access_policies"] or []:
+        names.setdefault(name.lower(), name)
+    return list(names.values())
+
+
+def policy_references(module):
+    """Return the requested policies as references for a POST or PATCH body"""
+    return [ReferenceWritable(name=name) for name in requested_policy_names(module)]
+
+
+def policy_change(module, user):
+    """Return the policies to attach to and to detach from the admin.
+
+    Names are compared without regard to case; detaching uses the array's
+    spelling. Both lists are sorted and empty when the sets already match.
+    """
+    current = {name.lower(): name for name in get_policy_names(user)}
+    desired = {name.lower(): name for name in requested_policy_names(module)}
+    to_add = sorted(name for key, name in desired.items() if key not in current)
+    to_remove = sorted(name for key, name in current.items() if key not in desired)
+    return to_add, to_remove
+
+
+def set_policies(module, blade, to_add, to_remove):
+    """Attach, then detach, management access policies of the admin.
+
+    Attaching first means the admin is never left without a policy.
+    """
+    name = module.params["name"]
+    if to_add:
+        res = blade.post_management_access_policies_admins(
+            member_names=[name], policy_names=to_add
+        )
+        if res.status_code != 200:
+            module.fail_json(
+                msg="Failed to attach management access policies {0} to {1}. "
+                "Error: {2}".format(to_add, name, get_error_message(res))
+            )
+    if to_remove:
+        res = blade.delete_management_access_policies_admins(
+            member_names=[name], policy_names=to_remove
+        )
+        if res.status_code != 200:
+            module.fail_json(
+                msg="Failed to detach management access policies {0} from {1}. "
+                "Error: {2}".format(to_remove, name, get_error_message(res))
+            )
+
+
+def converge_policies(module, blade, user):
+    """Make the admin a member of exactly the requested policies.
+
+    Returns True when the policy set differs; the attach and detach calls
+    are skipped in check mode. A remote user is refused: its policies are
+    managed with ``ad_user`` and ``authorization_model``.
+    """
+    if module.params["management_access_policies"] is None:
+        return False
+    if not getattr(user, "is_local", False):
+        module.fail_json(
+            msg="User {0} is a remote user; use ad_user true with "
+            "authorization_model static to manage its policies".format(
+                module.params["name"]
+            )
+        )
+    to_add, to_remove = policy_change(module, user)
+    if not to_add and not to_remove:
+        return False
+    if not module.check_mode:
+        set_policies(module, blade, to_add, to_remove)
+    return True
+
+
+def validate_account_params(module):
+    """Fail early on option combinations the array refuses.
+
+    A service account has no password or SSH key. A remote user takes a
+    policy list only when it is made statically authorized, and a static
+    remote user may hold neither an API token nor a public key.
+    """
+    params = module.params
+    policies = params["management_access_policies"]
+    model = params["authorization_model"]
+    if params["admin_type"] == SERVICE_ACCOUNT:
+        if params["ad_user"]:
+            module.fail_json(
+                msg="A service account is a local account and cannot be a "
+                "remote (ad_user) user"
+            )
+        if (
+            params["password"]
+            or params["old_password"]
+            or params["public_key"] is not None
+        ):
+            module.fail_json(
+                msg="A service account is REST-only: password, old_password and "
+                "public_key cannot be set on it"
+            )
+    if params["ad_user"]:
+        if policies is not None and model != STATIC:
+            module.fail_json(
+                msg="management_access_policies of a remote user are only applied "
+                "with authorization_model static"
+            )
+        if model == STATIC:
+            if policies is None:
+                module.fail_json(
+                    msg="authorization_model static requires "
+                    "management_access_policies (an empty list is allowed)"
+                )
+            if params["api"] or (params["public_key"] and params["public_key"].strip()):
+                module.fail_json(
+                    msg="A statically authorized remote user cannot hold an API "
+                    "token or public key; do not request api or public_key "
+                    "with authorization_model static"
+                )
+    else:
+        if model:
+            module.fail_json(
+                msg="authorization_model applies only to remote users (ad_user: true)"
+            )
+        if policies is not None and not requested_policy_names(module):
+            module.fail_json(
+                msg="management_access_policies must name at least one policy for "
+                "a local user or service account"
+            )
+
+
+def check_version_gates(module, api_version):
+    """Fail before any write when an option needs a newer REST version"""
+    if LooseVersion(MIN_LOCAL_USER) > LooseVersion(api_version):
+        module.fail_json(
+            msg="Purity//FB must be upgraded to support managing local users."
+        )
+    gates = [
+        (
+            module.params["management_access_policies"] is not None,
+            MIN_POLICIES,
+            "management_access_policies",
+        ),
+        (
+            module.params["authorization_model"] is not None,
+            MIN_AUTH_MODEL,
+            "authorization_model",
+        ),
+        (
+            module.params["admin_type"] == SERVICE_ACCOUNT,
+            MIN_SERVICE_ACCOUNT,
+            "admin_type service-account",
+        ),
+    ]
+    for requested, minimum, option in gates:
+        if requested and LooseVersion(minimum) > LooseVersion(api_version):
+            module.fail_json(
+                msg="{0} requires Purity//FB REST {1} or higher; the array "
+                "supports {2}".format(option, minimum, api_version)
+            )
+
+
+def check_admin_type(module, user):
+    """Fail when the request contradicts the type of an existing account.
+
+    ``admin_type`` is fixed when the account is created. A service account
+    is REST-only, so a password or public key can never be set on it.
+    """
+    current = getattr(user, "admin_type", None)
+    requested = module.params["admin_type"]
+    if requested and current and requested != current:
+        module.fail_json(
+            msg="User {0} is a {1}; admin_type is set when the account is created "
+            "and cannot be changed".format(module.params["name"], current)
+        )
+    if current == SERVICE_ACCOUNT and (
+        module.params["password"]
+        or module.params["old_password"]
+        or module.params["public_key"] is not None
+    ):
+        module.fail_json(
+            msg="Service account {0} is REST-only: password, old_password and "
+            "public_key cannot be set on it".format(module.params["name"])
+        )
+
+
+def new_admin_post(module):
+    """Return the POST body for a new local user or service account.
+
+    The account gets the requested management access policies, or else the
+    requested legacy role (readonly by default). A service account is sent
+    with its type and no password; the type is left out for a local user,
+    which older arrays create without the field.
+    """
+    body = {}
+    if module.params["management_access_policies"] is not None:
+        body["management_access_policies"] = policy_references(module)
+    else:
+        body["role"] = ReferenceWritable(name=module.params["role"] or DEFAULT_ROLE)
+    if module.params["admin_type"] == SERVICE_ACCOUNT:
+        body["admin_type"] = SERVICE_ACCOUNT
+    else:
+        body["password"] = module.params["password"]
+    return AdminPost(**body)
+
+
+def set_authorization_model(module, blade, user):
+    """Converge a remote user's authorization model; return True when changed.
+
+    ``static`` sends the model with the full policy list in one PATCH; on a
+    user that is already static only the policy set is converged, through
+    the policy membership endpoints. ``dynamic`` sends the model alone and
+    is a no-op on a user the array does not report as static.
+    """
+    requested = module.params["authorization_model"]
+    current = getattr(user, "authorization_model", None) if user else None
+    name = module.params["name"]
+    if requested == DYNAMIC:
+        if current != STATIC:
+            return False
+        if not module.check_mode:
+            res = blade.patch_admins(
+                names=[name], admin=AdminPatch(authorization_model=DYNAMIC)
+            )
+            if res.status_code != 200:
+                module.fail_json(
+                    msg="Failed to return remote user {0} to dynamic authorization. "
+                    "Error: {1}".format(name, get_error_message(res))
+                )
+        return True
+    if current == STATIC:
+        to_add, to_remove = policy_change(module, user)
+        if not to_add and not to_remove:
+            return False
+        if not module.check_mode:
+            set_policies(module, blade, to_add, to_remove)
+        return True
+    if user is not None and (
+        has_api_token(user) or (getattr(user, "public_key", None) or "").strip()
+    ):
+        module.fail_json(
+            msg="Remote user {0} holds an API token or public key, which the array "
+            "does not allow on a statically authorized user. Remove them first "
+            "(state absent clears both).".format(name)
+        )
+    if not module.check_mode:
+        res = blade.patch_admins(
+            names=[name],
+            admin=AdminPatch(
+                authorization_model=STATIC,
+                management_access_policies=policy_references(module),
+            ),
+        )
+        if res.status_code != 200:
+            module.fail_json(
+                msg="Failed to make remote user {0} statically authorized. "
+                "Error: {1}".format(name, get_error_message(res))
+            )
+    return True
 
 
 def has_api_token(user):
@@ -381,20 +770,15 @@ def create_api_token(module, blade):
 
 
 def create_local_user(module, blade, user):
-    """Create or Update Local User Account"""
+    """Create or Update Local User Account or Service Account"""
     changed = key_changed = api_changed = role_changed = passwd_changed = False
-    lock_changed = False
-    role = module.params["role"] or DEFAULT_ROLE
+    lock_changed = policy_changed = False
     api_token = "No API token created"
     if not user:
         changed = True
         if not module.check_mode:
             res = blade.post_admins(
-                names=[module.params["name"]],
-                admin=AdminPost(
-                    role=ReferenceWritable(name=role),
-                    password=module.params["password"],
-                ),
+                names=[module.params["name"]], admin=new_admin_post(module)
             )
             if res.status_code != 200:
                 module.fail_json(
@@ -407,8 +791,9 @@ def create_local_user(module, blade, user):
             if module.params["public_key"] and module.params["public_key"].strip():
                 set_public_key(module, blade, action="add")
     else:
+        check_admin_type(module, user)
         if module.params["password"] and not module.params["old_password"]:
-            module.exit_json(changed=changed)
+            module.exit_json(changed=changed, user_info=api_token)
         if (
             module.params["password"]
             and module.params["old_password"]
@@ -437,10 +822,17 @@ def create_local_user(module, blade, user):
                     delete_api_token(module, blade)
                 api_token = create_api_token(module, blade)
         if module.params["name"] == "pureuser":
-            # the role of pureuser is fixed, whether it is a legacy role or
-            # the account is managed by management access policies
+            # the role and policies of pureuser are fixed, whether it is a
+            # legacy role or the account is managed by management access
+            # policies
             if module.params["role"] and module.params["role"] != get_role_name(user):
                 module.warn("Role for 'pureuser' cannot be modified.")
+            if module.params["management_access_policies"] is not None and any(
+                policy_change(module, user)
+            ):
+                module.warn(
+                    "Management access policies for 'pureuser' cannot be modified."
+                )
         elif role_change(module, user):
             role_changed = True
             if not module.check_mode:
@@ -456,6 +848,8 @@ def create_local_user(module, blade, user):
                             module.params["name"], get_error_message(res)
                         )
                     )
+        elif converge_policies(module, blade, user):
+            policy_changed = True
         if public_key_changed(module, user):
             key_changed = True
             if not module.check_mode:
@@ -474,15 +868,22 @@ def create_local_user(module, blade, user):
                         )
                     )
         changed = bool(
-            passwd_changed or role_changed or api_changed or key_changed or lock_changed
+            passwd_changed
+            or role_changed
+            or policy_changed
+            or api_changed
+            or key_changed
+            or lock_changed
         )
     module.exit_json(changed=changed, user_info=api_token)
 
 
 def update_ad_user(module, blade, user):
-    """Update AD user API token and/or SSH key"""
+    """Update AD user authorization model, API token and/or SSH key"""
     api_token = "No API token created"
-    api_changed = ssh_changed = False
+    api_changed = ssh_changed = model_changed = False
+    if module.params["authorization_model"]:
+        model_changed = set_authorization_model(module, blade, user)
     if module.params["api"]:
         api_changed = True
         if not module.check_mode:
@@ -498,7 +899,7 @@ def update_ad_user(module, blade, user):
             ssh_changed = public_key_changed(module, user)
         if ssh_changed and not module.check_mode:
             set_public_key(module, blade, action="add")
-    changed = bool(api_changed or ssh_changed)
+    changed = bool(model_changed or api_changed or ssh_changed)
     module.exit_json(changed=changed, user_info=api_token)
 
 
@@ -570,21 +971,23 @@ def main():
             api=dict(type="bool", default=False),
             ad_user=dict(type="bool", default=False),
             timeout=dict(type="str", default="0"),
+            admin_type=dict(type="str", choices=["local-user", SERVICE_ACCOUNT]),
+            management_access_policies=dict(type="list", elements="str"),
+            authorization_model=dict(type="str", choices=[STATIC, DYNAMIC]),
         )
     )
 
     module = AnsibleModule(
         argument_spec,
         supports_check_mode=True,
+        mutually_exclusive=[["role", "management_access_policies"]],
     )
 
     validate_public_key(module)
+    validate_account_params(module)
     blade = get_system(module)
     api_version = get_rest_api_version(blade)
-    if LooseVersion(MIN_LOCAL_USER) > LooseVersion(api_version):
-        module.fail_json(
-            msg="Purity//FB must be upgraded to support managing local users."
-        )
+    check_version_gates(module, api_version)
 
     state = module.params["state"]
     pattern = re.compile("^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$")

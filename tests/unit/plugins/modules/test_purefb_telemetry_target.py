@@ -336,7 +336,8 @@ class TestPurefbTelemetryTargetMain:
         body = mock_post_model.call_args[1]
         assert body["transport"] == "otlp-http-protobuf"
         assert body["vendor"] == "generic-otlp"
-        assert body["enabled"] is False
+        # an omitted enabled is not sent; the array default (disabled) applies
+        assert "enabled" not in body
         # an empty certificate reference is not sent on create
         assert "ca_certificate" not in body
         mock_ref.assert_called_once_with(name="data-vip")
@@ -364,6 +365,18 @@ class TestPurefbTelemetryTargetMain:
         blade.post_telemetry_targets.assert_not_called()
         module.fail_json.assert_called_once()
         assert "endpoint is required" in module.fail_json.call_args[1]["msg"]
+
+    def test_create_requires_source(self, mock_am, mock_gs, mock_lv):
+        module, blade = self._setup(
+            mock_am, mock_gs, mock_lv, _base_params(source=None)
+        )
+        blade.get_telemetry_targets.return_value = _response(400)
+
+        _run()
+
+        blade.post_telemetry_targets.assert_not_called()
+        module.fail_json.assert_called_once()
+        assert "source is required" in module.fail_json.call_args[1]["msg"]
 
     def test_create_fails_on_api_error(self, mock_am, mock_gs, mock_lv):
         module, blade = self._setup(mock_am, mock_gs, mock_lv, _base_params())
@@ -872,6 +885,65 @@ class TestPurefbTelemetryTargetMain:
         mock_gs.assert_not_called()
         module.fail_json.assert_called_once()
         assert "at most 10 resource attributes" in module.fail_json.call_args[1]["msg"]
+
+    def test_attribute_value_with_hyphen_rejected(self, mock_am, mock_gs, mock_lv):
+        # the array only answers "Unexpected error" to a hyphen
+        attrs = [{"key": "env", "value": "lab-1"}]
+        module, blade = self._setup(
+            mock_am, mock_gs, mock_lv, _base_params(resource_attributes=attrs)
+        )
+
+        _run()
+
+        mock_gs.assert_not_called()
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Invalid resource attribute value 'lab-1'" in msg
+        assert "alphanumeric" in msg
+
+    def test_attribute_key_with_hyphen_rejected(self, mock_am, mock_gs, mock_lv):
+        attrs = [{"key": "deployment-env", "value": "prod"}]
+        module, blade = self._setup(
+            mock_am, mock_gs, mock_lv, _base_params(resource_attributes=attrs)
+        )
+
+        _run()
+
+        mock_gs.assert_not_called()
+        module.fail_json.assert_called_once()
+        assert (
+            "Invalid resource attribute key 'deployment-env'"
+            in module.fail_json.call_args[1]["msg"]
+        )
+
+    @patch(MODULE + ".TelemetryTargetResourceAttributes")
+    @patch(MODULE + ".TelemetryTargetPatch")
+    def test_attribute_underscore_and_dot_accepted(
+        self, mock_patch_model, mock_attr_model, mock_am, mock_gs, mock_lv
+    ):
+        attrs = [{"key": "deployment.environment", "value": "prod_1"}]
+        module, blade = self._setup(
+            mock_am, mock_gs, mock_lv, _base_params(resource_attributes=attrs)
+        )
+        blade.get_telemetry_targets.return_value = _response(200, [_existing()])
+        blade.patch_telemetry_targets.return_value = _response(200)
+
+        _run()
+
+        mock_attr_model.assert_called_once_with(
+            key="deployment.environment", value="prod_1"
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_empty_source_rejected(self, mock_am, mock_gs, mock_lv):
+        module, blade = self._setup(mock_am, mock_gs, mock_lv, _base_params(source=""))
+
+        _run()
+
+        mock_gs.assert_not_called()
+        blade.patch_telemetry_targets.assert_not_called()
+        module.fail_json.assert_called_once()
+        assert "source cannot be removed" in module.fail_json.call_args[1]["msg"]
 
     def test_endpoint_with_scheme_rejected(self, mock_am, mock_gs, mock_lv):
         module, blade = self._setup(

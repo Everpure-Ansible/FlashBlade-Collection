@@ -86,6 +86,8 @@ options:
   source:
     description:
     - Name of the network interface (data VIP) the metrics are exported from.
+    - Required when creating a target. Every target needs a source, so it can
+      be changed but not removed; the module rejects an empty string.
     type: str
   enabled:
     description:
@@ -133,7 +135,8 @@ options:
     description:
     - Resource attributes added to every metric exported to the target.
     - A target supports at most 10 attributes. Keys and values must be
-      alphanumeric and may include C(_) and C(.).
+      alphanumeric and may include C(_) and C(.); the module rejects any
+      other character before contacting the array.
     - The list given replaces the whole list on the array. Order is not
       significant; an empty list removes all attributes.
     type: list
@@ -280,6 +283,7 @@ except ImportError:
     HAS_PYPURECLIENT = False
 
 
+import re
 from ansible.module_utils.basic import AnsibleModule
 from ansible_collections.everpure.flashblade.plugins.module_utils.purefb import (
     get_system,
@@ -297,6 +301,9 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.version import
 # although the REST path itself is older.
 MIN_REQUIRED_API_VERSION = "2.29"
 MAX_RESOURCE_ATTRIBUTES = 10
+# The array answers a bare "Unexpected error" to any other character in an
+# attribute key or value, so the module checks them first.
+ATTRIBUTE_PATTERN = re.compile(r"^[A-Za-z0-9_.]+$")
 # Array defaults applied on create when the play omits the option. On an
 # existing target an omitted option leaves the current value alone.
 DEFAULT_TRANSPORT = "otlp-http-protobuf"
@@ -381,14 +388,20 @@ def delete_target(module, blade):
 
 def create_target(module, blade):
     """Create the target with the fields given in the play."""
-    if not module.params["endpoint"]:
-        module.fail_json(msg="endpoint is required to create a new telemetry target")
+    for param in ("endpoint", "source"):
+        if not module.params[param]:
+            module.fail_json(
+                msg="{0} is required to create a new telemetry target".format(param)
+            )
     body = {
         "endpoint": module.params["endpoint"],
         "transport": module.params["transport"] or DEFAULT_TRANSPORT,
         "vendor": module.params["vendor"] or DEFAULT_VENDOR,
-        "enabled": bool(module.params["enabled"]),
     }
+    # Sent only when given: an omitted enabled leaves the array default
+    # (disabled) in force instead of asserting false explicitly.
+    if module.params["enabled"] is not None:
+        body["enabled"] = module.params["enabled"]
     if module.params["target_api_token"]:
         body["api_token"] = module.params["target_api_token"]
     for param in REFERENCE_PARAMS:
@@ -423,6 +436,8 @@ def update_target(module, blade, target):
         wanted = module.params[param]
         if wanted is not None and wanted != getattr(target, param, None):
             patch[param] = wanted
+    # A target always has a source; "" is refused in main(), so only a new
+    # name is ever sent.
     source = module.params["source"]
     if source and source != _reference_name(target, "source"):
         patch["source"] = ReferenceWritable(name=source)
@@ -541,6 +556,20 @@ def main():
             msg="A telemetry target supports at most {0} resource attributes".format(
                 MAX_RESOURCE_ATTRIBUTES
             )
+        )
+    for attribute in attributes or []:
+        for field in ("key", "value"):
+            if not ATTRIBUTE_PATTERN.match(attribute[field]):
+                module.fail_json(
+                    msg=(
+                        "Invalid resource attribute {0} '{1}': keys and values "
+                        "must be alphanumeric and may include '_' and '.'"
+                    ).format(field, attribute[field])
+                )
+    if module.params["source"] == "":
+        module.fail_json(
+            msg="source cannot be removed; every telemetry target exports from "
+            "a network interface, give a different one instead"
         )
 
     blade = get_system(module)

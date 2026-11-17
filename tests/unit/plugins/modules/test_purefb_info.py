@@ -1495,43 +1495,77 @@ class TestPurefbInfo:
             "attached_servers": [],
         }
 
-    def test_generate_realms_and_resource_accesses(self):
-        """Realms report their space and TLS policy; resource accesses map a
-        scope to a resource by name and type."""
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_realms_and_resource_accesses(self, mock_loose_version):
+        """Realms report their space, TLS policy and default object store
+        server; resource accesses map a scope to a resource by name and type."""
+        # REST 2.20+: the realms/defaults endpoint exists
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
         space = Mock(spec=["total_physical", "virtual"])
         space.total_physical = 1024
         space.virtual = 2048
         tls = Mock(spec=["name"])
         tls.name = "tls1"
-        realm = Mock(
-            spec=[
-                "name",
-                "created",
-                "destroyed",
-                "time_remaining",
-                "default_inbound_tls_policy",
-                "space",
-            ]
-        )
+        realm_spec = [
+            "name",
+            "created",
+            "destroyed",
+            "time_remaining",
+            "default_inbound_tls_policy",
+            "space",
+        ]
+        realm = Mock(spec=realm_spec)
         realm.name = "realm1"
         realm.created = 1700000000000
         realm.destroyed = False
         realm.time_remaining = None
         realm.default_inbound_tls_policy = tls
         realm.space = space
+        realm2 = Mock(spec=realm_spec)
+        realm2.name = "realm2"
+        realm2.created = None
+        realm2.destroyed = False
+        realm2.time_remaining = None
+        realm2.default_inbound_tls_policy = None
+        realm2.space = space
+
+        # realm1 has a default server, realm2 an empty object_store list
+        server = Mock(spec=["name"])
+        server.name = "realm1::s3srv"
+        store_default = Mock(spec=["server"])
+        store_default.server = server
+        realm1_ref = Mock(spec=["name"])
+        realm1_ref.name = "realm1"
+        realm1_defaults = Mock(spec=["realm", "object_store"])
+        realm1_defaults.realm = realm1_ref
+        realm1_defaults.object_store = [store_default]
+        realm2_ref = Mock(spec=["name"])
+        realm2_ref.name = "realm2"
+        realm2_defaults = Mock(spec=["realm", "object_store"])
+        realm2_defaults.realm = realm2_ref
+        realm2_defaults.object_store = []
 
         mock_blade = Mock()
-        mock_blade.get_realms.return_value.items = [realm]
+        mock_blade.get_realms.return_value.items = [realm, realm2]
+        mock_blade.get_realms_defaults.return_value.status_code = 200
+        mock_blade.get_realms_defaults.return_value.items = [
+            realm1_defaults,
+            realm2_defaults,
+        ]
 
         result = generate_realms_dict(mock_blade)
 
+        mock_blade.get_realms_defaults.assert_called_once_with()
         assert result["realm1"]["destroyed"] is False
         assert result["realm1"]["created"] is not None
         assert result["realm1"]["default_inbound_tls_policy"] == "tls1"
+        assert result["realm1"]["default_object_server"] == "realm1::s3srv"
         assert result["realm1"]["space"]["total_physical"] == 1024
         assert result["realm1"]["space"]["virtual"] == 2048
         # fields absent from this Space version are reported as null
         assert result["realm1"]["space"]["total_used"] is None
+        assert result["realm2"]["created"] is None
+        assert result["realm2"]["default_object_server"] is None
 
         resource = Mock(spec=["name", "resource_type"])
         resource.name = "data-subnet"
@@ -1556,6 +1590,37 @@ class TestPurefbInfo:
                 "scope_type": "realms",
             }
         ]
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_realms_dict_before_realm_defaults_api(self, mock_loose_version):
+        """Before REST 2.20 there is no realms/defaults endpoint: it is not
+        queried and the default object store server is reported as null."""
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+        realm = Mock(
+            spec=[
+                "name",
+                "created",
+                "destroyed",
+                "time_remaining",
+                "default_inbound_tls_policy",
+                "space",
+            ]
+        )
+        realm.name = "realm1"
+        realm.created = None
+        realm.destroyed = False
+        realm.time_remaining = None
+        realm.default_inbound_tls_policy = None
+        realm.space = None
+
+        mock_blade = Mock()
+        mock_blade.get_realms.return_value.items = [realm]
+
+        result = generate_realms_dict(mock_blade)
+
+        mock_blade.get_realms_defaults.assert_not_called()
+        assert result["realm1"]["default_object_server"] is None
+        assert result["realm1"]["default_inbound_tls_policy"] is None
 
     def test_generate_file_repl_dict_reads_status_details(self):
         """The SDK replica link model has status_details, not status_detail.

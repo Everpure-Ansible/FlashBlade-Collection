@@ -2108,8 +2108,10 @@ def generate_fs_dict(blade, exports=None):
         nfs = getattr(fsystem, "nfs", None)
         smb = getattr(fsystem, "smb", None)
         multi = getattr(fsystem, "multi_protocol", None)
+        # A filesystem copy reports its source filesystem here; a plain
+        # filesystem has a source with no name.
         source = getattr(fsystem, "source", None)
-        location = getattr(fsystem, "location", None)
+        source_location = getattr(source, "location", None)
 
         fs_info[share] = {
             "fast_remove": fsystem.fast_remove_directory_enabled,
@@ -2136,7 +2138,9 @@ def generate_fs_dict(blade, exports=None):
             "source": {
                 "is_local": getattr(source, "is_local", None),
                 "name": getattr(source, "name", None),
-                "location": getattr(location, "name", None),
+                "resource_type": getattr(source, "resource_type", None),
+                "display_name": getattr(source, "display_name", None),
+                "location": getattr(source_location, "name", None),
             },
             "default_group_quota": fsystem.default_group_quota,
             "default_user_quota": fsystem.default_user_quota,

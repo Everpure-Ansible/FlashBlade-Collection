@@ -421,6 +421,12 @@ def generate_config_dict(blade):
             "nameservers": config.nameservers,
             "domain": config.domain,
             "services": getattr(config, "services", None),
+            "ca_certificate": getattr(
+                getattr(config, "ca_certificate", None), "name", None
+            ),
+            "ca_certificate_group": getattr(
+                getattr(config, "ca_certificate_group", None), "name", None
+            ),
         }
         if hasattr(config, "sources"):
             # sources is a list of references (at most one), not a reference

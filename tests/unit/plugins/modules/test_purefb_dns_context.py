@@ -109,6 +109,8 @@ def _base_params(**overrides):
         "nameservers": ["9.9.9.9"],
         "service": "data",
         "context": "",
+        "ca_certificate": None,
+        "ca_certificate_group": None,
     }
     params.update(overrides)
     return params

@@ -747,6 +747,10 @@ class TestPurefbInfo:
         mock_source = Mock(spec=["name"])
         mock_source.name = "vir0"
         mock_dns.sources = [mock_source]
+        # DNS over HTTPS CA references (REST 2.25+); absent on older arrays
+        mock_dns.ca_certificate = Mock(spec=["name"])
+        mock_dns.ca_certificate.name = "doh-ca"
+        mock_dns.ca_certificate_group = None
         mock_blade.get_dns.return_value.items = [mock_dns]
 
         # Mock SMTP
@@ -849,6 +853,8 @@ class TestPurefbInfo:
         assert result["dns"]["management"]["domain"] == "example.com"
         assert result["dns"]["management"]["nameservers"] == ["8.8.8.8", "8.8.4.4"]
         assert result["dns"]["management"]["source"] == "vir0"
+        assert result["dns"]["management"]["ca_certificate"] == "doh-ca"
+        assert result["dns"]["management"]["ca_certificate_group"] is None
         assert "management_directory_service" in result
         assert "array_management" in result
         cert = result["ssl_certs"]["management"]

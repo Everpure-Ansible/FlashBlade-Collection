@@ -107,8 +107,7 @@ EXAMPLES = r"""
     - name: Attach LDS to server (see purefb_server for details)
       everpure.flashblade.purefb_server:
         name: myserver
-        directory_service:
-          - myserver_local
+        local_directory_service: myserver_local
         fb_url: 10.10.10.2
         api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
     - name: Create primary group for alice

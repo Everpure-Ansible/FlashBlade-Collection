@@ -35,16 +35,54 @@ options:
         Possible values for this include all, minimum, config, performance,
         capacity, network, subnets, lags, filesystems, snapshots, buckets,
         replication, policies, arrays, accounts, admins, ad, kerberos,
-        drives, servers, fleet, realms, software and support.
+        drives, servers, fleet, realms, clients, locks, support,
+        legal_holds, connections, telemetry and software.
+      - The C(accounts) subset also returns C(object_store_roles), the
+        object store roles with their maximum session duration, PRN,
+        trusted entities and attached access policies, on REST API 2.17
+        and later.
+      - The C(performance) subset reports array-wide performance per protocol
+        (C(aggregate), C(http), C(s3), C(nfs), C(smb)), the protocol-specific
+        operation breakdowns (C(nfs_ops), C(s3_ops), C(http_ops)), replication
+        performance (array-wide, per array connection and per target under
+        C(replication)) and point-in-time per-object samples keyed by name
+        under C(filesystems) and C(buckets).
+      - The C(clients) subset lists per-client NFS and S3 performance from
+        the array's client sample. Clients are reported as C(IP:PORT) and
+        each list is capped at the first 100 entries the array returns.
+        Sampling takes several seconds per protocol and S3 clients are
+        listed per connection, so this subset is not part of C(all) and
+        must be requested explicitly. S3 client performance requires
+        REST 2.18 (Purity//FB 4.6.0) and is reported empty on older arrays.
+      - The C(legal_holds) subset lists every file legal hold with its
+        description, realms and the paths it is currently applied to.
+        Requires REST API 2.17 or later and is skipped on older arrays.
+      - The C(network) subset also reports the physical network connectors
+        as C(network_connectors), their latest performance sample (including
+        the blade network interfaces) as C(network_connector_performance)
+        and the RoCE congestion control settings as
+        C(network_connector_settings) on Purity//FB with REST API version
+        2.17 or higher, and the LLDP neighbours of the ports as
+        C(lldp_neighbors) with REST API version 2.20 or higher.
+      - The C(connections) subset returns the current TCP connections of
+        the array as C(connections) on Purity//FB with REST API version
+        2.18 or higher. The table changes with every call and can be large,
+        so it is not included in C(all) and has to be requested explicitly.
+      - The C(telemetry) subset (REST 2.29+) reports telemetry targets,
+        telemetry metrics policies with their rules, targets and member
+        arrays, and the metrics collections with their default and
+        supported resolutions.
       - The C(software) subset reports the Purity//FB versions the array can
         upgrade to, the software packages and bundles on the array, the
         upgrade check tasks, software patches, and the software installations
         with their steps. Checks, installations and steps are keyed by ID
         because their names repeat. Times are reported as the array returns
         them.
-      - The C(support) subset reports the support diagnostics runs, their
-        test results and the diagnostics tool settings, and a summary of the
-        system manifest.
+      - The C(support) subset reports the retained support diagnostics runs
+        and the diagnostics tool settings on REST API 2.16 or later, and a
+        summary of the system manifest on REST API 2.26 or later. The
+        per-test results of a run are returned by the
+        purefb_support_diagnostics module.
       - The C(filesystems) subset surfaces the legacy file system keys
         C(nfs_rules), C(export_policy), C(smb_client_policy) and
         C(smb_share_policy). Purity//FB marks the underlying fields as
@@ -54,6 +92,57 @@ options:
         list (and the top-level C(file_system_exports) view under
         C(subset=filesystems)/C(subset=all)) instead. These keys will
         be removed from this module in 2.0.0.
+      - The C(admins) subset also returns the array's public keys under
+        C(public_keys) (name, algorithm, key size, key text and the SSH
+        certificate authority policies that use each key) on
+        Purity//FB 4.4.2 / REST API 2.14 or later.
+      - The C(filesystems) subset also returns a top-level C(junctions)
+        dictionary of file system junctions, keyed by junction name with
+        the origin and destination file systems, the junction path and
+        the junction status. Requires REST API 2.25 (Purity//FB 4.8.0+).
+      - On arrays running REST 2.25 or later (Purity//FB 4.8.0) the
+        C(policies) subset adds C(quota_policies), the user-group quota
+        policies with their rules and attached file systems, and the
+        C(filesystems) subset adds C(quota_policy) and C(policy_quotas)
+        to every file system, the attached quota policy and the per-user
+        and per-group usage with the policy rule limiting each. Both are
+        omitted on older arrays.
+      - The C(arrays) subset reports C(connection_paths) for every array
+        connection, one entry per network path with its C(source),
+        C(destination), C(status), C(status_details) and C(type).
+      - The C(policies) subset reports C(members) for every policy
+        (Purity//FB REST 2.2 or later), each with the member C(name) and
+        C(resource_type); replica link members also carry a C(link) with
+        the local and remote file systems. Snapshot policies in
+        C(snapshot_policies) carry the same C(members). TLS policies
+        report C(array_wide), true when the policy applies to the array
+        as a whole.
+      - The C(minimum) subset key C(network_access_protocol) holds the
+        name of the array network access policy and is misspelt. Use
+        C(network_access_policy) instead; the misspelt key is kept for
+        backwards compatibility and will be removed in 2.0.0.
+      - The C(admins) subset also returns the cached remote administrators
+        under C(admin_cache). The C(config) subset also returns
+        C(certificate_uses) and, on Purity//FB 3.2.3 / REST API 2.1 or
+        later, C(rapid_data_locking).
+      - The C(policies) subset also returns C(management_access_policies)
+        with their rules and members on Purity//FB 4.6.1 / REST API 2.19
+        or later, C(management_authentication_policies) on 4.6.5 / 2.22
+        or later and C(management_access_roles) on 4.8.1 / 2.26 or later.
+      - The C(fleet) subset adds the operating system, version, model,
+        API versions and topology group of each fleet member and also
+        returns C(presets) and C(workloads) on Purity//FB 4.6.7 / REST
+        API 2.23 or later (workload space and performance from 4.8.8 /
+        2.30), C(tgroups) on 4.8.1 / 2.26 or later and
+        C(storage_class_members) on 4.8.3 / 2.27 or later. The C(realms)
+        subset also returns C(realm_connections) and C(remote_realms) on
+        4.8.0 / 2.25 or later. All of these are read from the local array
+        only. C(fleet), its member detail, C(presets), C(workloads) and
+        C(tgroups) are empty on an array that is not in a fleet and when
+        the credentials used lack the fleet rights those endpoints require;
+        C(storage_class_members) lists the local array itself when it is
+        not in a fleet; C(realm_connections) and C(remote_realms) are
+        empty when no realm is connected.
     required: false
     type: list
     elements: str
@@ -93,6 +182,29 @@ EXAMPLES = r"""
 - name: show all information
   debug:
     msg: "{{ blade_info['purefb_info'] }}"
+
+- name: collect per-client performance (opt-in, not part of all)
+  everpure.flashblade.purefb_info:
+    gather_subset:
+      - clients
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+  register: blade_info
+- name: show NFS client performance
+  debug:
+    msg: "{{ blade_info['purefb_info']['clients']['nfs'] }}"
+
+- name: collect network connectors, LLDP neighbours and TCP connections
+  everpure.flashblade.purefb_info:
+    gather_subset:
+      - network
+      - connections
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+  register: blade_info
+- name: show which switch port each uplink is cabled to
+  debug:
+    msg: "{{ blade_info['purefb_info']['lldp_neighbors'] }}"
 """
 
 RETURN = r"""
@@ -100,6 +212,49 @@ purefb_info:
   description: Returns the information collected from the FlashBlade
   returned: always
   type: dict
+  contains:
+    network_connectors:
+      description:
+        - Physical network connectors keyed by connector name, with the
+          connector type, lane speed, lanes per port, port count, port
+          speed and transceiver type.
+      returned: network subset on Purity//FB with REST API 2.17 or higher
+      type: dict
+      version_added: '1.30.0'
+    network_connector_performance:
+      description:
+        - Latest performance sample of every network connector and blade
+          network interface keyed by name, with the link aggregation group,
+          throughput, error, flow control and RDMA counters.
+      returned: network subset on Purity//FB with REST API 2.17 or higher
+      type: dict
+      version_added: '1.30.0'
+    network_connector_settings:
+      description:
+        - RoCE congestion control settings of the network connectors keyed
+          by settings name. Empty until RoCE congestion control has been
+          enabled on the array.
+      returned: network subset on Purity//FB with REST API 2.17 or higher
+      type: dict
+      version_added: '1.30.0'
+    lldp_neighbors:
+      description:
+        - LLDP neighbours keyed by local port name. A port can see more
+          than one neighbour, so each port holds a list of its neighbours
+          in the order the array reports them, each with the neighbour
+          chassis identity, management addresses, capabilities and the
+          neighbour port.
+      returned: network subset on Purity//FB with REST API 2.20 or higher
+      type: dict
+      version_added: '1.30.0'
+    connections:
+      description:
+        - Current TCP connections of the array with state, local and remote
+          address and port, and sample time. Not part of the C(all) subset.
+      returned: connections subset on Purity//FB with REST API 2.18 or higher
+      type: list
+      elements: dict
+      version_added: '1.30.0'
 """
 
 
@@ -122,6 +277,7 @@ import json
 import time
 
 KMIP_API_VERSION = "2.1"
+POLICY_MEMBERS_API_VERSION = "2.2"
 DRIVES_API_VERSION = "2.5"
 SECURITY_API_VERSION = "2.7"
 BUCKET_API_VERSION = "2.8"
@@ -130,19 +286,86 @@ SPACE_API_VERSION = "2.11"
 PUBLIC_API_VERSION = "2.12"
 NAP_API_VERSION = "2.13"
 RA_DURATION_API_VERSION = "2.14"
+PUBLIC_KEYS_API_VERSION = "2.14"
+SSH_CA_API_VERSION = "2.14"
 SMTP_ENCRYPT_API_VERSION = "2.15"
 WORM_API_VERSION = "2.15"
 SERVERS_API_VERSION = "2.16"
 PASSWORD_POLICY_API_VERSION = "2.16"
+MAINTENANCE_API_VERSION = "2.16"
 FLEET_API_VERSION = "2.17"
 TLS_API_VERSION = "2.17"
+LEGAL_HOLD_API_VERSION = "2.17"
+EDGE_API_VERSION = "2.18"
+OIDC_API_VERSION = "2.17"
+CLIENTS_S3_API_VERSION = "2.18"
+FS_STORAGE_CLASS_API_VERSION = "2.17"
+OBJECT_ROLES_API_VERSION = "2.17"
 REALMS_API_VERSION = "2.19"
+MAP_API_VERSION = "2.19"
 S3_EXPORT_API_VERSION = "2.20"
+ADMIN_TYPE_API_VERSION = "2.24"
+# From REST 2.29 (Purity//FB 4.8.6) a WORM data policy carries commit_mode and
+# the autocommit configuration.
+WORM_AUTOCOMMIT_API_VERSION = "2.29"
+REALM_DEFAULTS_API_VERSION = "2.20"
+SUPPORT_DIAGNOSTICS_API_VERSION = "2.16"
+SUPPORT_DIAGNOSTICS_SETTINGS_API_VERSION = "2.24"
+EVICTION_API_VERSION = "2.21"
+# /network-interfaces/connectors, its performance and settings views
+CONNECTORS_API_VERSION = "2.17"
+# /network-interfaces/network-connection-statistics
+NETSTAT_API_VERSION = "2.18"
+# /network-interfaces/neighbors (LLDP)
+NEIGHBOR_API_VERSION = "2.20"
+# Counters of every /network-interfaces/connectors/performance row. The flow
+# control and RDMA counters have been part of the model since REST 2.17.
+CONNECTOR_PERFORMANCE_FIELDS = (
+    "received_bytes_per_sec",
+    "received_packets_per_sec",
+    "transmitted_bytes_per_sec",
+    "transmitted_packets_per_sec",
+    "other_errors_per_sec",
+    "total_errors_per_sec",
+    "received_crc_errors_per_sec",
+    "received_frame_errors_per_sec",
+    "transmitted_carrier_errors_per_sec",
+    "transmitted_dropped_errors_per_sec",
+    "flow_control_received_congestion_packets_per_sec",
+    "flow_control_received_discarded_packets_per_sec",
+    "flow_control_received_lossless_bytes_per_sec",
+    "flow_control_received_pause_frames_per_sec",
+    "flow_control_transmitted_congestion_packets_per_sec",
+    "flow_control_transmitted_discarded_packets_per_sec",
+    "flow_control_transmitted_lossless_bytes_per_sec",
+    "flow_control_transmitted_pause_frames_per_sec",
+    "rdma_received_req_cqe_errors_per_sec",
+    "rdma_received_sequence_errors_per_sec",
+    "rdma_transmitted_local_ack_timeout_errors_per_sec",
+    "time",
+)
+NEIGHBOR_CAPABILITIES = (
+    "bridge",
+    "router",
+    "repeater",
+    "station_only",
+    "telephone",
+    "wlan_access_point",
+    "docsis_cable_device",
+)
+MGMT_AUTH_API_VERSION = "2.22"
+WORKLOAD_API_VERSION = "2.23"
+REALM_CONNECTION_API_VERSION = "2.25"
+MAP_ROLES_API_VERSION = "2.26"
+TGROUP_API_VERSION = "2.26"
+STORAGE_CLASS_API_VERSION = "2.27"
+WORKLOAD_METRICS_API_VERSION = "2.30"
+JUNCTION_API_VERSION = "2.25"
+TELEMETRY_API_VERSION = "2.29"
+QUOTA_POLICY_API_VERSION = "2.25"
 SOFTWARE_CHECK_API_VERSION = "2.16"
 SOFTWARE_BUNDLE_API_VERSION = "2.24"
 SOFTWARE_API_VERSION = "2.30"
-SUPPORT_DIAGS_API_VERSION = "2.16"
-DIAGS_SETTINGS_API_VERSION = "2.24"
 MANIFEST_API_VERSION = "2.26"
 
 
@@ -157,6 +380,65 @@ def _bytes_to_human(bytes_number):
             bytes_number = bytes_number / 1024
         return str(round(double_bytes, 2)) + " " + labels[i]
     return None
+
+
+def _reference_names(references):
+    """Return the names in a list of references (None or empty gives [])"""
+    return [
+        reference.name
+        for reference in (references or [])
+        if getattr(reference, "name", None)
+    ]
+
+
+def generate_directory_service_roles_dict(blade, api_version):
+    """Return the directory service role mappings
+
+    ``role`` is null for a mapping with no, several, or a custom management
+    access policy, so it is read through getattr. The policy names are
+    reported from REST 2.19, where the array exposes them.
+    """
+    roles_info = {}
+    report_policies = LooseVersion(MAP_API_VERSION) <= LooseVersion(api_version)
+    for ds_role in list(blade.get_directory_services_roles().items):
+        roles_info[ds_role.name] = {
+            "group": getattr(ds_role, "group", None),
+            "group_base": getattr(ds_role, "group_base", None),
+            "role": getattr(getattr(ds_role, "role", None), "name", None),
+        }
+        if report_policies:
+            roles_info[ds_role.name]["management_access_policies"] = _reference_names(
+                getattr(ds_role, "management_access_policies", None)
+            )
+    return roles_info
+
+
+def _maintenance_window_list(blade):
+    """Return the open maintenance window as a one-item list, or []"""
+    windows = []
+    res = blade.get_maintenance_windows()
+    if res.status_code == 200:
+        for window in list(res.items):
+            windows.append(
+                {
+                    "name": window.name,
+                    "created": datetime.fromtimestamp(
+                        int(window.created) / 1000
+                    ).strftime("%Y-%m-%d %H:%M:%S"),
+                    "expires": datetime.fromtimestamp(
+                        int(window.expires) / 1000
+                    ).strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+    return windows
+
+
+def _reference_name(obj, field):
+    """Name held by a reference field the SDK returns as a dict or an object."""
+    ref = getattr(obj, field, None)
+    if isinstance(ref, dict):
+        return ref.get("name") or None
+    return getattr(ref, "name", None) or None
 
 
 def generate_default_dict(blade):
@@ -256,6 +538,8 @@ def generate_default_dict(blade):
         default_info["network_access_protocol"] = getattr(
             defaults.network_access_policy, "name", "None"
         )
+        # the key above is misspelt; it is kept for backwards compatibility
+        default_info["network_access_policy"] = default_info["network_access_protocol"]
     ra_info = list(blade.get_support().items)[0]
     if ra_info.remote_assist_active:
         ra_expires = datetime.fromtimestamp(
@@ -276,7 +560,244 @@ def generate_default_dict(blade):
     }
     if LooseVersion(RA_DURATION_API_VERSION) <= LooseVersion(api_version):
         default_info["remote_assist"]["ra_duration"] = ra_info.remote_assist_duration
+    if LooseVersion(MAINTENANCE_API_VERSION) <= LooseVersion(api_version):
+        default_info["maintenance_window"] = _maintenance_window_list(blade)
+    if LooseVersion(EDGE_API_VERSION) <= LooseVersion(api_version):
+        # Pure1 Edge Services opt-ins, set by purefb_phonehome
+        default_info["remote_assist"]["edge_management_enabled"] = getattr(
+            ra_info, "edge_management_enabled", None
+        )
+        default_info["remote_assist"]["edge_agent_update_enabled"] = getattr(
+            ra_info, "edge_agent_update_enabled", None
+        )
     return default_info
+
+
+# Performance samples (array, file system, bucket and client rows) share one
+# metric layout; the protocol-specific endpoints each have their own.
+PERF_FIELDS = (
+    "bytes_per_op",
+    "bytes_per_read",
+    "bytes_per_write",
+    "others_per_sec",
+    "read_bytes_per_sec",
+    "reads_per_sec",
+    "time",
+    "usec_per_other_op",
+    "usec_per_read_op",
+    "usec_per_write_op",
+    "write_bytes_per_sec",
+    "writes_per_sec",
+)
+NFS_OPS_FIELDS = (
+    "accesses_per_sec",
+    "aggregate_file_metadata_creates_per_sec",
+    "aggregate_file_metadata_modifies_per_sec",
+    "aggregate_file_metadata_reads_per_sec",
+    "aggregate_other_per_sec",
+    "aggregate_share_metadata_reads_per_sec",
+    "aggregate_usec_per_file_metadata_create_op",
+    "aggregate_usec_per_file_metadata_modify_op",
+    "aggregate_usec_per_file_metadata_read_op",
+    "aggregate_usec_per_other_op",
+    "aggregate_usec_per_share_metadata_read_op",
+    "creates_per_sec",
+    "fsinfos_per_sec",
+    "fsstats_per_sec",
+    "getattrs_per_sec",
+    "links_per_sec",
+    "lookups_per_sec",
+    "mkdirs_per_sec",
+    "pathconfs_per_sec",
+    "readdirpluses_per_sec",
+    "readdirs_per_sec",
+    "readlinks_per_sec",
+    "reads_per_sec",
+    "removes_per_sec",
+    "renames_per_sec",
+    "rmdirs_per_sec",
+    "setattrs_per_sec",
+    "symlinks_per_sec",
+    "time",
+    "usec_per_access_op",
+    "usec_per_create_op",
+    "usec_per_fsinfo_op",
+    "usec_per_fsstat_op",
+    "usec_per_getattr_op",
+    "usec_per_link_op",
+    "usec_per_lookup_op",
+    "usec_per_mkdir_op",
+    "usec_per_pathconf_op",
+    "usec_per_read_op",
+    "usec_per_readdir_op",
+    "usec_per_readdirplus_op",
+    "usec_per_readlink_op",
+    "usec_per_remove_op",
+    "usec_per_rename_op",
+    "usec_per_rmdir_op",
+    "usec_per_setattr_op",
+    "usec_per_symlink_op",
+    "usec_per_write_op",
+    "writes_per_sec",
+)
+S3_OPS_FIELDS = (
+    "others_per_sec",
+    "read_buckets_per_sec",
+    "read_objects_per_sec",
+    "time",
+    "usec_per_other_op",
+    "usec_per_read_bucket_op",
+    "usec_per_read_object_op",
+    "usec_per_write_bucket_op",
+    "usec_per_write_object_op",
+    "write_buckets_per_sec",
+    "write_objects_per_sec",
+)
+HTTP_OPS_FIELDS = (
+    "others_per_sec",
+    "read_dirs_per_sec",
+    "read_files_per_sec",
+    "time",
+    "usec_per_other_op",
+    "usec_per_read_dir_op",
+    "usec_per_read_file_op",
+    "usec_per_write_dir_op",
+    "usec_per_write_file_op",
+    "write_dirs_per_sec",
+    "write_files_per_sec",
+)
+REPL_PERF_FIELDS = ("received_bytes_per_sec", "transmitted_bytes_per_sec")
+OBJECT_BACKLOG_FIELDS = (
+    "bytes_count",
+    "delete_ops_count",
+    "other_ops_count",
+    "put_ops_count",
+)
+# The array samples clients for several seconds per request and lists S3
+# clients per connection, so the listings are capped like the CLI does.
+CLIENTS_PERF_LIMIT = 100
+
+
+def _perf_fields(sample, fields):
+    """Return the requested metric fields of a performance sample as a dict.
+
+    Fields the array did not report come back as None; a missing sample
+    gives an empty dict so callers can store the result as-is.
+    """
+    if sample is None:
+        return {}
+    return {field: getattr(sample, field, None) for field in fields}
+
+
+def _perf_items(response):
+    """Return the items of a successful list response, or an empty list."""
+    if getattr(response, "status_code", None) != 200:
+        return []
+    return list(response.items)
+
+
+def _perf_first(response):
+    """Return the first item of a successful list response, or None."""
+    items = _perf_items(response)
+    return items[0] if items else None
+
+
+def _replication_perf(sample):
+    """Flatten a ResourcePerformanceReplication sample.
+
+    ``aggregate`` and ``periodic`` carry bytes received/transmitted per
+    second; ``continuous`` adds the object replication backlog. The array
+    omits sub-objects it has no data for, so every level is optional.
+    """
+    if sample is None:
+        return {}
+    continuous = getattr(sample, "continuous", None)
+    repl_info = {
+        "aggregate": _perf_fields(getattr(sample, "aggregate", None), REPL_PERF_FIELDS),
+        "periodic": _perf_fields(getattr(sample, "periodic", None), REPL_PERF_FIELDS),
+        "continuous": _perf_fields(continuous, REPL_PERF_FIELDS),
+        "time": getattr(sample, "time", None),
+    }
+    if continuous is not None:
+        repl_info["continuous"]["object_backlog"] = _perf_fields(
+            getattr(continuous, "object_backlog", None), OBJECT_BACKLOG_FIELDS
+        )
+    return repl_info
+
+
+def generate_perf_breakdown_dict(blade):
+    """Protocol, replication and per-object performance for the performance subset.
+
+    Every endpoint used here exists since REST 2.0, so there is no version
+    gate. A failed GET leaves its key empty instead of failing the gather.
+    """
+    breakdown = {
+        "smb": _perf_fields(
+            _perf_first(blade.get_arrays_performance(protocol="smb")), PERF_FIELDS
+        ),
+        "nfs_ops": _perf_fields(
+            _perf_first(blade.get_arrays_nfs_specific_performance()), NFS_OPS_FIELDS
+        ),
+        "s3_ops": _perf_fields(
+            _perf_first(blade.get_arrays_s3_specific_performance()), S3_OPS_FIELDS
+        ),
+        "http_ops": _perf_fields(
+            _perf_first(blade.get_arrays_http_specific_performance()),
+            HTTP_OPS_FIELDS,
+        ),
+        "replication": _replication_perf(
+            _perf_first(blade.get_arrays_performance_replication())
+        ),
+        "filesystems": {},
+        "buckets": {},
+    }
+    breakdown["replication"]["array_connections"] = {}
+    breakdown["replication"]["targets"] = {}
+    for conn in _perf_items(blade.get_array_connections_performance_replication()):
+        remote = getattr(getattr(conn, "remote", None), "name", None) or getattr(
+            conn, "id", None
+        )
+        if remote:
+            breakdown["replication"]["array_connections"][remote] = _replication_perf(
+                conn
+            )
+    for target in _perf_items(blade.get_targets_performance_replication()):
+        breakdown["replication"]["targets"][target.name] = _replication_perf(target)
+    for fsys in _perf_items(blade.get_file_systems_performance()):
+        breakdown["filesystems"][fsys.name] = _perf_fields(fsys, PERF_FIELDS)
+    for bucket in _perf_items(blade.get_buckets_performance()):
+        breakdown["buckets"][bucket.name] = _perf_fields(bucket, PERF_FIELDS)
+    for bucket in _perf_items(blade.get_buckets_s3_specific_performance()):
+        breakdown["buckets"].setdefault(bucket.name, {})["s3"] = _perf_fields(
+            bucket, S3_OPS_FIELDS
+        )
+    return breakdown
+
+
+def generate_clients_dict(blade, api_version):
+    """Per-client performance for the opt-in clients subset.
+
+    Clients are reported as IP:PORT and each listing is capped at
+    CLIENTS_PERF_LIMIT entries. The protocol selector and the S3-specific
+    listing need REST 2.18; older arrays get the S3 keys back empty.
+    """
+    clients_info = {"nfs": {}, "s3": {}, "s3_ops": {}}
+    for client in _perf_items(
+        blade.get_arrays_clients_performance(limit=CLIENTS_PERF_LIMIT)
+    ):
+        clients_info["nfs"][client.name] = _perf_fields(client, PERF_FIELDS)
+    if LooseVersion(CLIENTS_S3_API_VERSION) <= LooseVersion(api_version):
+        for client in _perf_items(
+            blade.get_arrays_clients_performance(
+                protocol="s3", limit=CLIENTS_PERF_LIMIT
+            )
+        ):
+            clients_info["s3"][client.name] = _perf_fields(client, PERF_FIELDS)
+        for client in _perf_items(
+            blade.get_arrays_clients_s3_specific_performance(limit=CLIENTS_PERF_LIMIT)
+        ):
+            clients_info["s3_ops"][client.name] = _perf_fields(client, S3_OPS_FIELDS)
+    return clients_info
 
 
 def generate_perf_dict(blade):
@@ -360,7 +881,28 @@ def generate_perf_dict(blade):
                 obj_repl_perf.periodic, "transmitted_bytes_per_sec", None
             ),
         }
+    perf_info.update(generate_perf_breakdown_dict(blade))
     return perf_info
+
+
+def generate_quota_settings_dict(blade):
+    """Legacy user and group quota notification settings (/quotas/settings).
+
+    Keyed by the settings object name (a single object named management).
+    The array omits contact from the response while it is unset.
+    """
+    quota_settings = {}
+    res = blade.get_quotas_settings()
+    if res.status_code != 200:
+        return quota_settings
+    for settings in list(res.items):
+        quota_settings[settings.name] = {
+            "contact": getattr(settings, "contact", None),
+            "direct_notifications_enabled": getattr(
+                settings, "direct_notifications_enabled", None
+            ),
+        }
+    return quota_settings
 
 
 def generate_config_dict(blade):
@@ -373,6 +915,12 @@ def generate_config_dict(blade):
             "nameservers": config.nameservers,
             "domain": config.domain,
             "services": getattr(config, "services", None),
+            "ca_certificate": getattr(
+                getattr(config, "ca_certificate", None), "name", None
+            ),
+            "ca_certificate_group": getattr(
+                getattr(config, "ca_certificate_group", None), "name", None
+            ),
         }
         if hasattr(config, "sources"):
             # sources is a list of references (at most one), not a reference
@@ -390,6 +938,7 @@ def generate_config_dict(blade):
             "sender_domain": getattr(config, "sender_domain", None),
             "encryption_mode": getattr(config, "encryption_mode", None),
         }
+    config_info["quota_settings"] = generate_quota_settings_dict(blade)
     alert_config = list(blade.get_alert_watchers().items)
     config_info["alert_watchers"] = {}
     for config in alert_config:
@@ -420,15 +969,9 @@ def generate_config_dict(blade):
     # Forward backwards compatability
     config_info["array_management"] = config_info["management_directory_service"]
 
-    config_info["directory_service_roles"] = {}
-    roles = list(blade.get_directory_services_roles().items)
-    for ds_role in roles:
-        role_name = ds_role.name
-        config_info["directory_service_roles"][role_name] = {
-            "group": ds_role.group,
-            "group_base": ds_role.group_base,
-            "role": ds_role.role.name,
-        }
+    config_info["directory_service_roles"] = generate_directory_service_roles_dict(
+        blade, api_version
+    )
     config_info["ntp"] = list(blade.get_arrays().items)[0].ntp_servers
     certs = list(blade.get_certificates().items)
     config_info["ssl_certs"] = {}
@@ -474,6 +1017,12 @@ def generate_config_dict(blade):
         config_info["syslog_servers"][server_name] = {
             "uri": server.uri,
             "services": getattr(server, "services", None),
+        }
+    config_info["syslog_settings"] = {}
+    for settings in list(blade.get_syslog_servers_settings().items):
+        config_info["syslog_settings"][settings.name] = {
+            "ca_certificate": _reference_name(settings, "ca_certificate"),
+            "ca_certificate_group": _reference_name(settings, "ca_certificate_group"),
         }
     snmp_agents = list(blade.get_snmp_agents().items)
     config_info["snmp_agents"] = {}
@@ -532,20 +1081,75 @@ def generate_config_dict(blade):
                 "enabled": saml2[0].enabled,
                 "array_url": saml2[0].array_url,
                 "name": saml2[0].name,
+                "prn": getattr(saml2[0], "prn", None),
+                "services": getattr(saml2[0], "services", None),
+                "binding": getattr(saml2[0], "binding", None),
+                "trust_other_saml_sps_in_fleet": getattr(
+                    getattr(saml2[0], "management", None),
+                    "trust_other_saml_sps_in_fleet",
+                    None,
+                ),
                 "idp": {
                     "url": getattr(saml2[0].idp, "url", None),
+                    "entity_id": getattr(saml2[0].idp, "entity_id", None),
                     "encrypt_enabled": saml2[0].idp.encrypt_assertion_enabled,
                     "sign_enabled": saml2[0].idp.sign_request_enabled,
                     "metadata_url": saml2[0].idp.metadata_url,
+                    "metadata_url_ca_certificate": getattr(
+                        getattr(saml2[0].idp, "metadata_url_ca_certificate", None),
+                        "name",
+                        None,
+                    ),
+                    "metadata_url_ca_certificate_group": getattr(
+                        getattr(
+                            saml2[0].idp, "metadata_url_ca_certificate_group", None
+                        ),
+                        "name",
+                        None,
+                    ),
+                    "verification_certificate": getattr(
+                        getattr(saml2[0].idp, "verification_certificate", None),
+                        "name",
+                        None,
+                    ),
                 },
                 "sp": {
+                    "entity_id": getattr(saml2[0].sp, "entity_id", None),
+                    "assertion_consumer_url": getattr(
+                        saml2[0].sp, "assertion_consumer_url", None
+                    ),
+                    "metadata_url": getattr(saml2[0].sp, "metadata_url", None),
                     "decrypt_cred": getattr(
                         saml2[0].sp.decryption_credential, "name", None
                     ),
                     "sign_cred": getattr(saml2[0].sp.signing_credential, "name", None),
                 },
             }
+    if LooseVersion(OIDC_API_VERSION) <= LooseVersion(api_version):
+        config_info["oidc_idps"] = generate_oidc_idps_dict(blade)
     return config_info
+
+
+def generate_oidc_idps_dict(blade):
+    """OIDC identity providers keyed by name (an array may hold several)."""
+    idps_info = {}
+    for idp in list(blade.get_sso_oidc_idps().items):
+        idp_cfg = getattr(idp, "idp", None)
+        idps_info[idp.name] = {
+            "enabled": getattr(idp, "enabled", None),
+            "prn": getattr(idp, "prn", None),
+            "services": list(getattr(idp, "services", None) or []),
+            "provider_url": getattr(idp_cfg, "provider_url", None),
+            "ca_certificate": getattr(
+                getattr(idp_cfg, "provider_url_ca_certificate", None), "name", None
+            ),
+            "ca_certificate_group": getattr(
+                getattr(idp_cfg, "provider_url_ca_certificate_group", None),
+                "name",
+                None,
+            ),
+        }
+    return idps_info
 
 
 def generate_subnet_dict(blade):
@@ -593,32 +1197,79 @@ def generate_lag_dict(blade):
 
 
 def generate_admin_dict(blade):
+    """Return the array's administrators
+
+    ``role`` is set only when the admin holds exactly one management access
+    policy that corresponds to a legacy role of the same name; it is null for
+    an admin with no, several, or a custom policy, so it is read through
+    getattr. The policy names are reported from REST 2.19, the account type
+    (local user, remote user or service account) and the authorization model
+    of a remote user from REST 2.24, where the array exposes them.
+    """
     admin_info = {}
+    api_version = get_rest_api_version(blade)
+    report_policies = LooseVersion(MAP_API_VERSION) <= LooseVersion(api_version)
+    report_type = LooseVersion(ADMIN_TYPE_API_VERSION) <= LooseVersion(api_version)
     admins = list(blade.get_admins().items)
     for admin in admins:
         admin_name = admin.name
         admin_info[admin_name] = {
-            "public_key": admin.public_key,
-            "local": admin.is_local,
-            "role": admin.role.name,
-            "locked": admin.locked,
+            "public_key": getattr(admin, "public_key", None),
+            "local": getattr(admin, "is_local", None),
+            "role": getattr(getattr(admin, "role", None), "name", None),
+            "locked": getattr(admin, "locked", None),
             "lockout_remaining": getattr(admin, "lockout_remaining", None),
         }
-        if hasattr(admin.api_token, "expires_at"):
-            if admin.api_token.expires_at:
-                admin_info[admin_name]["token_expires"] = datetime.fromtimestamp(
-                    admin.api_token.expires_at / 1000
-                ).strftime("%Y-%m-%d %H:%M:%S")
-        else:
-            admin_info[admin_name]["token_expires"] = None
-        if hasattr(admin.api_token, "created_at"):
-            if admin.api_token.created_at:
-                admin_info[admin_name]["token_created"] = datetime.fromtimestamp(
-                    admin.api_token.created_at / 1000
-                ).strftime("%Y-%m-%d %H:%M:%S")
-        else:
-            admin_info[admin_name]["token_created"] = None
+        if report_policies:
+            admin_info[admin_name]["management_access_policies"] = _reference_names(
+                getattr(admin, "management_access_policies", None)
+            )
+        if report_type:
+            admin_info[admin_name]["admin_type"] = getattr(admin, "admin_type", None)
+            admin_info[admin_name]["authorization_model"] = getattr(
+                admin, "authorization_model", None
+            )
+        # an admin without a token has api_token null or an object whose
+        # timestamps are null; both read as None
+        token = getattr(admin, "api_token", None)
+        for key, field in (
+            ("token_expires", "expires_at"),
+            ("token_created", "created_at"),
+        ):
+            stamp = getattr(token, field, None)
+            admin_info[admin_name][key] = (
+                datetime.fromtimestamp(stamp / 1000).strftime("%Y-%m-%d %H:%M:%S")
+                if stamp
+                else None
+            )
     return admin_info
+
+
+def generate_public_keys_dict(blade):
+    """Return the array's public keys keyed by name, each with its uses"""
+    keys_info = {}
+    res = blade.get_public_keys()
+    if res.status_code != 200:
+        return keys_info
+    uses = {}
+    uses_res = blade.get_public_keys_uses()
+    if uses_res.status_code == 200:
+        for item in list(uses_res.items):
+            ref = getattr(item, "use", None)
+            uses.setdefault(item.name, []).append(
+                {
+                    "name": getattr(ref, "name", None),
+                    "resource_type": getattr(ref, "resource_type", None),
+                }
+            )
+    for key in list(res.items):
+        keys_info[key.name] = {
+            "algorithm": getattr(key, "algorithm", None),
+            "key_size": getattr(key, "key_size", None),
+            "public_key": getattr(key, "public_key", None),
+            "uses": uses.get(key.name, []),
+        }
+    return keys_info
 
 
 def generate_targets_dict(blade):
@@ -717,6 +1368,19 @@ def generate_network_dict(blade):
             subnet_name = subnet.get("name")
         else:
             subnet_name = getattr(subnet, "name", None)
+        # realms (REST 2.19) and rdma_enabled (REST 2.28) are absent from
+        # the interface model on older arrays
+        realms = getattr(port, "realms", None) or []
+        if not isinstance(realms, list):
+            realms = []
+        realm_names = [
+            (
+                realm.get("name")
+                if isinstance(realm, dict)
+                else getattr(realm, "name", None)
+            )
+            for realm in realms
+        ]
         net_info[int_name] = {
             "type": getattr(port, "type", None),
             "mtu": getattr(port, "mtu", None),
@@ -729,8 +1393,179 @@ def generate_network_dict(blade):
             "attached_servers": attached_names,
             "subnet": subnet_name,
             "enabled": port.enabled,
+            "rdma_enabled": getattr(port, "rdma_enabled", None),
+            "realms": realm_names,
         }
     return net_info
+
+
+def _ref_name(reference):
+    """Name of an SDK reference that may be an object, a plain dict or None."""
+    if isinstance(reference, dict):
+        return reference.get("name")
+    return getattr(reference, "name", None)
+
+
+def generate_network_connectors_dict(blade):
+    """Physical network connectors keyed by connector name (REST 2.17+).
+
+    An unpopulated connector is reported as the array describes it, with a
+    connector type of "-" and zero speeds.
+    """
+    connectors_info = {}
+    res = blade.get_network_interfaces_connectors()
+    if res.status_code != 200:
+        return connectors_info
+    for connector in list(res.items):
+        connectors_info[connector.name] = {
+            "connector_type": getattr(connector, "connector_type", None),
+            "lane_speed": getattr(connector, "lane_speed", None),
+            "lanes_per_port": getattr(connector, "lanes_per_port", None),
+            "port_count": getattr(connector, "port_count", None),
+            "port_speed": getattr(connector, "port_speed", None),
+            "transceiver_type": getattr(connector, "transceiver_type", None),
+        }
+    return connectors_info
+
+
+def generate_network_connector_performance_dict(blade):
+    """Latest performance sample of every connector and blade NIC (REST 2.17+).
+
+    The rows include the blade network interfaces (CHx.FBn), which are not
+    connectors, so the dictionary is keyed independently of the connectors
+    dictionary. Only the items are read; the aggregate total row is not.
+    """
+    perf_info = {}
+    res = blade.get_network_interfaces_connectors_performance()
+    if res.status_code != 200:
+        return perf_info
+    for perf in list(res.items):
+        perf_info[perf.name] = {
+            "link_aggregation_group": _ref_name(
+                getattr(perf, "link_aggregation_group", None)
+            )
+        }
+        for field in CONNECTOR_PERFORMANCE_FIELDS:
+            perf_info[perf.name][field] = getattr(perf, field, None)
+    return perf_info
+
+
+def generate_network_connector_settings_dict(blade):
+    """RoCE congestion control settings of the connectors (REST 2.17+).
+
+    The array answers 400 "Congestion control is not enabled." until RoCE
+    congestion control has been set up, so an error response yields an
+    empty dictionary rather than a failure.
+    """
+    settings_info = {}
+    res = blade.get_network_interfaces_connectors_settings()
+    if res.status_code != 200:
+        return settings_info
+    for setting in list(res.items):
+        roce = getattr(setting, "roce", None)
+        ecn = getattr(roce, "default_ecn", None)
+        pfc = getattr(roce, "default_pfc", None)
+        settings_info[getattr(setting, "name", None) or "default"] = {
+            "roce": {
+                "enabled": getattr(roce, "enabled", None),
+                "network_congestion_mode": getattr(
+                    roce, "network_congestion_mode", None
+                ),
+                "trust_mode": getattr(roce, "trust_mode", None),
+                "default_ecn": {
+                    "marking_probability": getattr(ecn, "marking_probability", None),
+                    "max_ecn_marked_threshold": getattr(
+                        ecn, "max_ecn_marked_threshold", None
+                    ),
+                    "min_ecn_marked_threshold": getattr(
+                        ecn, "min_ecn_marked_threshold", None
+                    ),
+                },
+                "default_pfc": {
+                    "port_buffer": getattr(pfc, "port_buffer", None),
+                    "xoff_threshold": getattr(pfc, "xoff_threshold", None),
+                    "xon_threshold": getattr(pfc, "xon_threshold", None),
+                },
+            }
+        }
+    return settings_info
+
+
+def generate_lldp_neighbors_dict(blade):
+    """LLDP neighbours keyed by local port name (REST 2.20+).
+
+    Neighbours hang off the physical ports (CHx.FMy.ETHz), never off the
+    VIP names that key the network dictionary, so they are kept apart.
+    The array returns one row per neighbour and a port can see more than
+    one (for example through an unmanaged switch), so every port maps to
+    the list of its neighbours in the order the array reports them.
+    """
+    neighbors_info = {}
+    res = blade.get_network_interfaces_neighbors()
+    if res.status_code != 200:
+        return neighbors_info
+    for neighbor in list(res.items):
+        chassis = getattr(neighbor, "neighbor_chassis", None)
+        chassis_id = getattr(chassis, "id", None)
+        port = getattr(neighbor, "neighbor_port", None)
+        port_id = getattr(port, "id", None)
+        capabilities = {}
+        for capability in NEIGHBOR_CAPABILITIES:
+            value = getattr(chassis, capability, None)
+            capabilities[capability] = {
+                "supported": getattr(value, "supported", None),
+                "enabled": getattr(value, "enabled", None),
+            }
+        local_port = _ref_name(getattr(neighbor, "local_port", None))
+        neighbors_info.setdefault(local_port, []).append(
+            {
+                "initial_ttl_in_sec": getattr(neighbor, "initial_ttl_in_sec", None),
+                "neighbor_chassis": {
+                    "id": {
+                        "type": getattr(chassis_id, "type", None),
+                        "value": getattr(chassis_id, "value", None),
+                    },
+                    "name": getattr(chassis, "name", None),
+                    "description": getattr(chassis, "description", None),
+                    "addresses": getattr(chassis, "addresses", None) or [],
+                    "capabilities": capabilities,
+                },
+                "neighbor_port": {
+                    "id": {
+                        "type": getattr(port_id, "type", None),
+                        "value": getattr(port_id, "value", None),
+                    },
+                    "description": getattr(port, "description", None),
+                },
+            }
+        )
+    return neighbors_info
+
+
+def generate_connections_list(blade):
+    """Current TCP connections of the array (REST 2.18+).
+
+    The table changes with every call and is unbounded on a busy array,
+    which is why the connections subset is not part of all.
+    """
+    connections = []
+    res = blade.get_network_interfaces_network_connection_statistics()
+    if res.status_code != 200:
+        return connections
+    for conn in list(res.items):
+        local = getattr(conn, "local", None)
+        remote = getattr(conn, "remote", None)
+        connections.append(
+            {
+                "state": getattr(conn, "current_state", None),
+                "local_address": getattr(local, "address", None),
+                "local_port": getattr(local, "port", None),
+                "remote_address": getattr(remote, "address", None),
+                "remote_port": getattr(remote, "port", None),
+                "time": getattr(conn, "time", None),
+            }
+        )
+    return connections
 
 
 def generate_capacity_dict(blade):
@@ -835,6 +1670,59 @@ def generate_snap_transfer_dict(blade):
     return snap_transfer_info
 
 
+def generate_fs_repl_transfer_dict(blade):
+    """Transfer status of file system replica links.
+
+    Keyed by snapshot name and then by remote array, so a snapshot that
+    replicates to several arrays (fan-out) keeps one entry per transfer.
+    """
+    fs_transfer_info = {}
+    res = blade.get_file_system_replica_links_transfer()
+    if res.status_code != 200:
+        return fs_transfer_info
+    for transfer in list(res.items):
+        remote = getattr(getattr(transfer, "remote", None), "name", None)
+        fs_transfer_info.setdefault(transfer.name, {})[remote] = {
+            "completed": transfer.completed,
+            "data_transferred": transfer.data_transferred,
+            "progress": transfer.progress,
+            "direction": transfer.direction,
+            "local_snapshot": getattr(
+                getattr(transfer, "local_snapshot", None), "name", None
+            ),
+            "remote": remote,
+            "remote_snapshot": getattr(
+                getattr(transfer, "remote_snapshot", None), "name", None
+            ),
+            "started": transfer.started,
+            "status": transfer.status,
+        }
+    return fs_transfer_info
+
+
+def _connection_paths_by_remote(blade):
+    """Group the GET array-connections/path rows by remote array name.
+
+    One connection has several paths (one per replication address and
+    port). ``status_details`` is only meaningful when a path is not
+    connected; the array returns it empty or omits it otherwise, so both
+    shapes are normalised to None.
+    """
+    paths = {}
+    for path in blade.get_array_connections_path().items:
+        remote_name = getattr(getattr(path, "remote", None), "name", None)
+        paths.setdefault(remote_name, []).append(
+            {
+                "source": getattr(path, "source", None),
+                "destination": getattr(path, "destination", None),
+                "status": getattr(path, "status", None),
+                "status_details": getattr(path, "status_details", None) or None,
+                "type": getattr(path, "type", None),
+            }
+        )
+    return paths
+
+
 def generate_array_conn_dict(blade):
     array_conn_info = {}
     arrays = list(blade.get_array_connections().items)
@@ -870,6 +1758,14 @@ def generate_array_conn_dict(blade):
                 ),
             },
         }
+    # Per-path status of each connection (REST 2.0), the first thing to
+    # check when replication or fleet management misbehaves.
+    if array_conn_info:
+        paths = _connection_paths_by_remote(blade)
+        for remote_name in array_conn_info:
+            array_conn_info[remote_name]["connection_paths"] = paths.get(
+                remote_name, []
+            )
     return array_conn_info
 
 
@@ -895,6 +1791,42 @@ def generate_policies_dict(blade):
     return policies_info
 
 
+def _policy_members_by_name(blade, policies):
+    """Map policy name -> members from one GET policies-all/members call.
+
+    The endpoint covers every policy type (snapshot, access, telemetry,
+    network, TLS ...) in a single response. Rows are attributed by policy
+    id first, so a realm-scoped policy that shares its name with an
+    array-level one keeps its own members. The server refuses responses
+    over 150,000 rows, which an info read does not approach.
+    """
+    names_by_id = {policy.id: policy.name for policy in policies}
+    members = {}
+    for row in blade.get_policies_all_members().items:
+        policy_ref = getattr(row, "policy", None)
+        policy_name = names_by_id.get(
+            getattr(policy_ref, "id", None), getattr(policy_ref, "name", None)
+        )
+        member_ref = getattr(row, "member", None)
+        member = {
+            "name": getattr(member_ref, "name", None),
+            "resource_type": getattr(member_ref, "resource_type", None),
+        }
+        if member["resource_type"] == "file-system-replica-links":
+            link = getattr(row, "link", None)
+            member["link"] = {
+                "local_file_system": getattr(
+                    getattr(link, "local_file_system", None), "name", None
+                ),
+                "remote": getattr(getattr(link, "remote", None), "name", None),
+                "remote_file_system": getattr(
+                    getattr(link, "remote_file_system", None), "name", None
+                ),
+            }
+        members.setdefault(policy_name, []).append(member)
+    return members
+
+
 def generate_all_policies_dict(blade):
     policies_info = {}
     policies = list(blade.get_policies_all().items)
@@ -907,6 +1839,12 @@ def generate_all_policies_dict(blade):
             "location": getattr(getattr(policy, "location", None), "name", None),
             "policy_type": policy.policy_type,
         }
+    if LooseVersion(POLICY_MEMBERS_API_VERSION) <= LooseVersion(
+        get_rest_api_version(blade)
+    ):
+        members = _policy_members_by_name(blade, policies)
+        for policy_name in policies_info:
+            policies_info[policy_name]["members"] = members.get(policy_name, [])
     return policies_info
 
 
@@ -1000,7 +1938,7 @@ def generate_bucket_dict(blade):
                     abort_incomplete_multipart_uploads_after = None
                 if rule.keep_current_version_until:
                     keep_current_version_until = datetime.fromtimestamp(
-                        rule.keep_current_version_until / 1000
+                        rule.keep_current_version_until / 1000, tz=timezone.utc
                     ).strftime("%Y-%m-%d")
                 else:
                     keep_current_version_until = None
@@ -1012,6 +1950,13 @@ def generate_bucket_dict(blade):
                     "enabled": rule.enabled,
                     "abort_incomplete_multipart_uploads_after (days)": abort_incomplete_multipart_uploads_after,
                     "cleanup_expired_object_delete_marker": rule.cleanup_expired_object_delete_marker,
+                    "keep_previous_versions_count": getattr(
+                        rule, "keep_previous_versions_count", None
+                    ),
+                    "tags": [
+                        {"key": tag.key, "value": tag.value}
+                        for tag in (getattr(rule, "tags", None) or [])
+                    ],
                 }
 
     return bucket_info
@@ -1058,6 +2003,12 @@ def generate_ad_dict(blade):
             "encryption_types": ad.encryption_types,
             "global_catalog_servers": getattr(ad, "global_catalog_servers", None),
             "server": getattr(getattr(ad, "server", None), "name", None),
+            "ca_certificate": getattr(
+                getattr(ad, "ca_certificate", None), "name", None
+            ),
+            "ca_certificate_group": getattr(
+                getattr(ad, "ca_certificate_group", None), "name", None
+            ),
         }
 
     return ad_info
@@ -1273,6 +2224,10 @@ def generate_network_access_policies_dict(blade):
 
 def generate_worm_data_policies_dict(blade):
     policies_info = {}
+    api_version = get_rest_api_version(blade)
+    has_autocommit = LooseVersion(WORM_AUTOCOMMIT_API_VERSION) <= LooseVersion(
+        api_version
+    )
 
     for policy in blade.get_worm_data_policies().items:
         policies_info[policy.name] = {
@@ -1285,6 +2240,17 @@ def generate_worm_data_policies_dict(blade):
             "max_retention": getattr(policy, "max_retention", None),
             "members": [],
         }
+        if has_autocommit:
+            # commit_mode and the autocommit configuration exist from REST
+            # 2.29; delay_period is in milliseconds like the retentions.
+            autocommit = getattr(policy, "autocommit_config", None)
+            policies_info[policy.name]["commit_mode"] = getattr(
+                policy, "commit_mode", None
+            )
+            policies_info[policy.name]["autocommit_config"] = {
+                "delay_on": getattr(autocommit, "delay_on", None),
+                "delay_period": getattr(autocommit, "delay_period", None),
+            }
 
     for member in blade.get_worm_data_policies_members().items:
         policy_name = getattr(getattr(member, "policy", None), "name", None)
@@ -1294,6 +2260,74 @@ def generate_worm_data_policies_dict(blade):
             )
 
     return policies_info
+
+
+def _subject_dict(subject):
+    return {
+        "id": getattr(subject, "id", None),
+        "name": getattr(subject, "name", None),
+        "sid": getattr(subject, "sid", None),
+    }
+
+
+def generate_quota_policies_dict(blade):
+    """User-group quota policies with their rules and attached file systems.
+
+    Requires REST API 2.25+ (QUOTA_POLICY_API_VERSION); callers gate on it.
+    """
+    policies_info = {}
+
+    for policy in blade.get_user_group_quota_policies().items:
+        policies_info[policy.name] = {
+            "local": getattr(policy, "is_local", None),
+            "enabled": getattr(policy, "enabled", None),
+            "location": getattr(getattr(policy, "location", None), "name", None),
+            "realms": [
+                getattr(realm, "name", None)
+                for realm in (getattr(policy, "realms", None) or [])
+            ],
+            "rules": [],
+            "members": [],
+        }
+
+    for rule in blade.get_user_group_quota_policies_rules().items:
+        policy_name = getattr(getattr(rule, "policy", None), "name", None)
+        if policy_name in policies_info:
+            policies_info[policy_name]["rules"].append(
+                {
+                    "name": rule.name,
+                    "type": getattr(rule, "quota_type", None),
+                    "subject": _subject_dict(getattr(rule, "subject", None)),
+                    "quota_limit": getattr(rule, "quota_limit", None),
+                    "enforced": getattr(rule, "enforced", None),
+                    "notifications": getattr(rule, "notifications", None),
+                    "index": getattr(rule, "index", None),
+                }
+            )
+
+    for member in blade.get_user_group_quota_policies_members().items:
+        policy_name = getattr(getattr(member, "policy", None), "name", None)
+        if policy_name in policies_info:
+            policies_info[policy_name]["members"].append(
+                getattr(getattr(member, "member", None), "name", None)
+            )
+
+    return policies_info
+
+
+def _policy_quota_entry(item, subject_key):
+    """One /file-systems/users or /file-systems/groups item as a dict."""
+    limited_by = getattr(item, "limited_by", None)
+    return {
+        subject_key: _subject_dict(getattr(item, subject_key, None)),
+        "quota_limit": getattr(item, "quota_limit", None),
+        "usage": getattr(item, "usage", None),
+        "percentage_used": getattr(item, "percentage_used", None),
+        "limited_by": {
+            "policy": getattr(getattr(limited_by, "policy", None), "name", None),
+            "rule_name": getattr(limited_by, "rule_name", None),
+        },
+    }
 
 
 def generate_tls_policies_dict(blade):
@@ -1329,6 +2363,50 @@ def generate_tls_policies_dict(blade):
             policies_info[policy_name]["network_interfaces"].append(
                 getattr(getattr(member, "member", None), "name", None)
             )
+
+    # tls-policies/members also lists the policy applied to the array as a
+    # whole (member resource_type "arrays"); interface members are above.
+    for policy_name in policies_info:
+        policies_info[policy_name]["array_wide"] = False
+    for member in blade.get_tls_policies_members().items:
+        policy_name = getattr(getattr(member, "policy", None), "name", None)
+        member_type = getattr(getattr(member, "member", None), "resource_type", None)
+        if member_type == "arrays" and policy_name in policies_info:
+            policies_info[policy_name]["array_wide"] = True
+
+    return policies_info
+
+
+def generate_ssh_ca_policies_dict(blade):
+    policies_info = {}
+    signer_types = {"public-keys": "public_key", "certificates": "certificate"}
+
+    for policy in blade.get_ssh_certificate_authority_policies().items:
+        signer = getattr(policy, "signing_authority", None)
+        signer_type = getattr(signer, "resource_type", None)
+        policies_info[policy.name] = {
+            "local": getattr(policy, "is_local", None),
+            "enabled": getattr(policy, "enabled", None),
+            "signing_authority": getattr(signer, "name", None),
+            "signing_authority_type": signer_types.get(signer_type, signer_type),
+            "static_authorized_principals": getattr(
+                policy, "static_authorized_principals", None
+            )
+            or [],
+            "admins": [],
+            "arrays": [],
+        }
+
+    for member in blade.get_ssh_certificate_authority_policies_members().items:
+        policy_name = getattr(getattr(member, "policy", None), "name", None)
+        if policy_name in policies_info:
+            ref = getattr(member, "member", None)
+            key = (
+                "arrays"
+                if getattr(ref, "resource_type", None) == "arrays"
+                else "admins"
+            )
+            policies_info[policy_name][key].append(getattr(ref, "name", None))
 
     return policies_info
 
@@ -1389,6 +2467,23 @@ def generate_object_store_virtual_hosts_dict(blade):
 
 def generate_realms_dict(blade):
     realms_info = {}
+    api_version = get_rest_api_version(blade)
+
+    # Default object store server per realm (REST 2.20+). A realm without a
+    # default has an empty object_store list or no defaults entry at all.
+    default_servers = {}
+    if LooseVersion(REALM_DEFAULTS_API_VERSION) <= LooseVersion(api_version):
+        res = blade.get_realms_defaults()
+        if res.status_code == 200:
+            for defaults in res.items:
+                realm_name = getattr(getattr(defaults, "realm", None), "name", None)
+                object_store = getattr(defaults, "object_store", None) or []
+                server = None
+                if object_store:
+                    server = getattr(
+                        getattr(object_store[0], "server", None), "name", None
+                    )
+                default_servers[realm_name] = server
 
     for realm in blade.get_realms().items:
         space = getattr(realm, "space", None)
@@ -1404,6 +2499,7 @@ def generate_realms_dict(blade):
             "default_inbound_tls_policy": getattr(
                 getattr(realm, "default_inbound_tls_policy", None), "name", None
             ),
+            "default_object_server": default_servers.get(realm.name),
             "space": {
                 "data_reduction": getattr(space, "data_reduction", None),
                 "snapshots": getattr(space, "snapshots", None),
@@ -1559,9 +2655,61 @@ def generate_object_store_accounts_dict(blade):
     return account_info
 
 
-def generate_fs_dict(blade, exports=None):
+def generate_object_store_roles_dict(blade):
+    roles_info = {}
+    res = blade.get_object_store_roles()
+    if res.status_code != 200:
+        return roles_info
+    for role in list(res.items):
+        entities = getattr(role, "trusted_entities", None)
+        if not isinstance(entities, list):
+            entities = []
+        roles_info[role.name] = {
+            "account": getattr(getattr(role, "account", None), "name", None),
+            "created": getattr(role, "created", None),
+            "max_session_duration": getattr(role, "max_session_duration", None),
+            "prn": getattr(role, "prn", None),
+            "trusted_entities": [getattr(entity, "name", None) for entity in entities],
+            "access_policies": [],
+        }
+    links = blade.get_object_store_roles_object_store_access_policies()
+    if links.status_code == 200:
+        for link in list(links.items):
+            role_name = getattr(getattr(link, "member", None), "name", None)
+            if role_name in roles_info:
+                roles_info[role_name]["access_policies"].append(link.policy.name)
+    return roles_info
+
+
+def generate_fs_dict(blade, exports=None, api_version=None, worm_policies=None):
+    """Return the per-filesystem dict.
+
+    ``exports`` is the array-wide File System Exports list (REST 2.16+),
+    ``api_version`` enables the quota-policy view (REST 2.25+) and
+    ``worm_policies`` maps filesystem name to its WORM data policy (REST
+    2.15+, from generate_fs_worm_policies_dict). main() passes None for any
+    of them when the array is too old and the matching keys are left out.
+    """
     fs_info = {}
+    # the quota-policy view needs REST 2.25; without an api_version it is skipped
+    quota_view = api_version is not None and LooseVersion(
+        QUOTA_POLICY_API_VERSION
+    ) <= LooseVersion(api_version)
+    attached_policies = {}
+    if quota_view:
+        # one listing of every attachment, looked up per file system below
+        res = blade.get_file_systems_user_group_quota_policies()
+        if res.status_code == 200:
+            for attached in res.items:
+                member_name = getattr(getattr(attached, "member", None), "name", None)
+                if member_name:
+                    attached_policies[member_name] = getattr(
+                        getattr(attached, "policy", None), "name", None
+                    )
     by_fs = {}
+    # the storage class is reported whenever the array supports it, whether
+    # or not the caller passed api_version for the quota-policy view
+    array_api_version = get_rest_api_version(blade)
     for e in exports or []:
         by_fs.setdefault(e.get("filesystem"), []).append(e)
     for fsystem in blade.get_file_systems().items:
@@ -1570,8 +2718,10 @@ def generate_fs_dict(blade, exports=None):
         nfs = getattr(fsystem, "nfs", None)
         smb = getattr(fsystem, "smb", None)
         multi = getattr(fsystem, "multi_protocol", None)
+        # A filesystem copy reports its source filesystem here; a plain
+        # filesystem has a source with no name.
         source = getattr(fsystem, "source", None)
-        location = getattr(fsystem, "location", None)
+        source_location = getattr(source, "location", None)
 
         fs_info[share] = {
             "fast_remove": fsystem.fast_remove_directory_enabled,
@@ -1598,7 +2748,9 @@ def generate_fs_dict(blade, exports=None):
             "source": {
                 "is_local": getattr(source, "is_local", None),
                 "name": getattr(source, "name", None),
-                "location": getattr(location, "name", None),
+                "resource_type": getattr(source, "resource_type", None),
+                "display_name": getattr(source, "display_name", None),
+                "location": getattr(source_location, "name", None),
             },
             "default_group_quota": fsystem.default_group_quota,
             "default_user_quota": fsystem.default_user_quota,
@@ -1617,8 +2769,42 @@ def generate_fs_dict(blade, exports=None):
             ),
             "multi_protocol_safeguard_acls": getattr(multi, "safeguard_acls", None),
         }
+        if LooseVersion(FS_STORAGE_CLASS_API_VERSION) <= LooseVersion(
+            array_api_version
+        ):
+            # The array returns storage_class as an object; platforms without
+            # storage classes return it with no name, so the name is null there.
+            fs_info[share]["storage_class"] = getattr(
+                getattr(fsystem, "storage_class", None), "name", None
+            )
         if exports is not None:
             fs_info[share]["file_system_exports"] = by_fs.get(share, [])
+        if worm_policies is not None:
+            # eradication_config is on the filesystem from REST 2.15; the WORM
+            # data policy only shows through GET file-systems/worm-data-policies
+            fs_info[share]["eradication_mode"] = getattr(
+                getattr(fsystem, "eradication_config", None),
+                "eradication_mode",
+                None,
+            )
+            fs_info[share]["worm_policy"] = worm_policies.get(share)
+
+        if quota_view:
+            # attached user-group quota policy and the usage it limits
+            fs_info[share]["quota_policy"] = attached_policies.get(share)
+            fs_info[share]["policy_quotas"] = {"users": [], "groups": []}
+            res = blade.get_file_systems_users(file_system_names=[share])
+            if res.status_code == 200:
+                for user in res.items:
+                    fs_info[share]["policy_quotas"]["users"].append(
+                        _policy_quota_entry(user, "user")
+                    )
+            res = blade.get_file_systems_groups(file_system_names=[share])
+            if res.status_code == 200:
+                for group in res.items:
+                    fs_info[share]["policy_quotas"]["groups"].append(
+                        _policy_quota_entry(group, "group")
+                    )
 
         # Group quotas
         for group_quota in blade.get_quotas_groups(file_system_names=[share]).items:
@@ -1641,6 +2827,22 @@ def generate_fs_dict(blade, exports=None):
             }
 
     return fs_info
+
+
+def generate_fs_worm_policies_dict(blade):
+    """Map each filesystem name to the WORM data policy attached to it.
+
+    Requires REST API 2.15+ (WORM_API_VERSION); callers gate on the version
+    before invoking. Filesystems without a WORM data policy are absent.
+    """
+    worm_policies = {}
+    for member in blade.get_file_systems_worm_data_policies().items:
+        fs_name = getattr(getattr(member, "member", None), "name", None)
+        if fs_name and fs_name not in worm_policies:
+            worm_policies[fs_name] = getattr(
+                getattr(member, "policy", None), "name", None
+            )
+    return worm_policies
 
 
 def generate_drives_dict(blade):
@@ -1679,6 +2881,12 @@ def generate_servers_dict(blade):
             ),
             "dns": [dns.name for dns in server.dns],
             "directory_services": [ds.name for ds in server.directory_services],
+            # local_directory_service arrived in REST 2.24 and realms in 2.19;
+            # older arrays return servers without either field
+            "local_directory_service": getattr(
+                getattr(server, "local_directory_service", None), "name", None
+            ),
+            "realms": [realm.name for realm in (getattr(server, "realms", None) or [])],
         }
     return servers_info
 
@@ -1716,26 +2924,798 @@ def generate_file_system_exports_dict(blade):
     return exports
 
 
+def generate_fs_junctions_dict(blade):
+    junctions_info = {}
+    res = blade.get_file_system_junctions()
+    if res.status_code != 200:
+        return junctions_info
+    for junction in list(res.items):
+        junctions_info[junction.name] = {
+            "origin": getattr(
+                getattr(junction, "origin_file_system", None), "name", None
+            ),
+            "destination": getattr(
+                getattr(junction, "destination_file_system", None), "name", None
+            ),
+            "path": getattr(junction, "junction_origin_path", None),
+            "status": getattr(junction, "status", None),
+        }
+    return junctions_info
+
+
+def generate_legal_holds_dict(blade):
+    """File legal holds keyed by name, each with the paths it is applied to.
+
+    Requires REST API 2.17+ (LEGAL_HOLD_API_VERSION). Callers gate on it.
+    """
+    holds_info = {}
+    for hold in blade.get_legal_holds().items:
+        holds_info[hold.name] = {
+            "description": getattr(hold, "description", None),
+            "realms": [
+                getattr(realm, "name", None)
+                for realm in (getattr(hold, "realms", None) or [])
+            ],
+            "held_entities": [],
+        }
+    for entity in blade.get_legal_holds_held_entities().items:
+        hold_name = getattr(getattr(entity, "legal_hold", None), "name", None)
+        if hold_name in holds_info:
+            holds_info[hold_name]["held_entities"].append(
+                {
+                    "file_system": getattr(
+                        getattr(entity, "file_system", None), "name", None
+                    ),
+                    "path": getattr(entity, "path", None),
+                    "status": getattr(entity, "status", None),
+                }
+            )
+    return holds_info
+
+
+def generate_telemetry_targets_dict(blade):
+    targets_info = {}
+    for target in list(blade.get_telemetry_targets().items):
+        targets_info[target.name] = {
+            "enabled": getattr(target, "enabled", None),
+            "endpoint": getattr(target, "endpoint", None),
+            "transport": getattr(target, "transport", None),
+            "vendor": getattr(target, "vendor", None),
+            "source": getattr(getattr(target, "source", None), "name", None),
+            "ca_certificate": getattr(
+                getattr(target, "ca_certificate", None), "name", None
+            ),
+            "ca_certificate_group": getattr(
+                getattr(target, "ca_certificate_group", None), "name", None
+            ),
+            "client_certificate": getattr(
+                getattr(target, "client_certificate", None), "name", None
+            ),
+            # The array only ever returns "***" for a configured token.
+            "api_token_configured": bool(getattr(target, "api_token", None)),
+            "resource_attributes": [
+                {
+                    "key": getattr(attr, "key", None),
+                    "value": getattr(attr, "value", None),
+                }
+                for attr in (getattr(target, "resource_attributes", None) or [])
+            ],
+        }
+    return targets_info
+
+
 def generate_fleet_dict(blade):
-    fleet_items = list(blade.get_fleets().items)
+    """Return the fleet the array belongs to, keyed by name, with its members
+
+    An array that is not in a fleet answers both reads with no items, and
+    credentials without fleet rights are refused; a refused read gives the
+    same empty structure instead of an error (an error response carries no
+    ``items`` at all).
+    """
+    fleet_info = {}
+    res = blade.get_fleets()
+    if res.status_code != 200:
+        return fleet_info
+    fleet_items = list(res.items)
     if not fleet_items:
-        return {}
+        return fleet_info
 
     fleet_name = fleet_items[0].name
-    members = blade.get_fleets_members().items
-
-    fleet_info = {
-        fleet_name: {
-            "members": {
-                member.member.name: {
-                    "status": member.status,
-                    "status_details": member.status_details,
-                }
-                for member in members
-            }
+    fleet_info[fleet_name] = {"members": {}}
+    res = blade.get_fleets_members()
+    if res.status_code != 200:
+        return fleet_info
+    for member in list(res.items):
+        fleet_info[fleet_name]["members"][member.member.name] = {
+            "status": member.status,
+            "status_details": member.status_details,
         }
-    }
     return fleet_info
+
+
+def _ref_dict(reference):
+    """Return the name and resource type of a reference"""
+    return {
+        "name": getattr(reference, "name", None),
+        "resource_type": getattr(reference, "resource_type", None),
+    }
+
+
+def _epoch_to_string(stamp):
+    """Format a millisecond UNIX timestamp the way the module does elsewhere"""
+    if not stamp:
+        return None
+    return datetime.fromtimestamp(stamp / 1000).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _to_plain(value):
+    """Recursively convert SDK objects into JSON-safe primitives"""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        return [_to_plain(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _to_plain(item) for key, item in value.items()}
+    if hasattr(value, "__dict__"):
+        return {
+            key: _to_plain(item)
+            for key, item in vars(value).items()
+            if not key.startswith("_")
+        }
+    return str(value)
+
+
+def _collate_by_name(items):
+    """Key a list of named SDK objects by their name"""
+    collated = {}
+    for item in items or []:
+        plain = _to_plain(item)
+        name = plain.get("name") if isinstance(plain, dict) else None
+        if name:
+            collated[name] = plain
+    return collated
+
+
+def generate_admin_cache_dict(blade):
+    """Return the cached remote administrators keyed by name
+
+    The cache is reported as it stands; ``refresh`` is never passed because
+    it makes the array look every entry up in the directory service again.
+    ``role`` is null unless the entry holds exactly one management access
+    policy named after a legacy role.
+    """
+    cache_info = {}
+    res = blade.get_admins_cache()
+    if res.status_code != 200:
+        return cache_info
+    for entry in list(res.items):
+        cache_info[entry.name] = {
+            "authorization_model": getattr(entry, "authorization_model", None),
+            "management_access_policies": [
+                _ref_name(policy)
+                for policy in (getattr(entry, "management_access_policies", None) or [])
+            ],
+            "role": _ref_name(getattr(entry, "role", None)),
+            "time": _epoch_to_string(getattr(entry, "time", None)),
+        }
+    return cache_info
+
+
+def generate_management_access_policies_dict(blade):
+    """Return the management access policies with their rules and members
+
+    Rules are reported in evaluation order. Members are the administrators
+    and directory service role mappings the policy applies to.
+    """
+    policies_info = {}
+    res = blade.get_management_access_policies()
+    if res.status_code != 200:
+        return policies_info
+    for policy in list(res.items):
+        policies_info[policy.name] = {
+            "enabled": getattr(policy, "enabled", None),
+            "is_local": getattr(policy, "is_local", None),
+            "location": _ref_name(getattr(policy, "location", None)),
+            "aggregation_strategy": getattr(policy, "aggregation_strategy", None),
+            "realms": [
+                _ref_name(realm) for realm in (getattr(policy, "realms", None) or [])
+            ],
+            "rules": [
+                {
+                    "name": getattr(rule, "name", None),
+                    "index": getattr(rule, "index", None),
+                    "role": _ref_name(getattr(rule, "role", None)),
+                    "scope": _ref_name(getattr(rule, "scope", None)),
+                    "scope_type": getattr(
+                        getattr(rule, "scope", None), "resource_type", None
+                    ),
+                }
+                for rule in (getattr(policy, "rules", None) or [])
+            ],
+            "members": [],
+        }
+    members_res = blade.get_management_access_policies_members()
+    if members_res.status_code == 200:
+        for member in list(members_res.items):
+            policy_name = _ref_name(getattr(member, "policy", None))
+            if policy_name in policies_info:
+                policies_info[policy_name]["members"].append(
+                    _ref_dict(getattr(member, "member", None))
+                )
+    return policies_info
+
+
+def generate_management_access_roles_dict(blade):
+    """Return the roles a management access policy rule can grant"""
+    roles_info = {}
+    res = blade.get_management_access_policies_roles()
+    if res.status_code != 200:
+        return roles_info
+    for role in list(res.items):
+        roles_info[role.name] = {
+            "description": getattr(role, "description", None),
+            "pure_defined": getattr(role, "pure_defined", None),
+        }
+    return roles_info
+
+
+def generate_management_authentication_policies_dict(blade):
+    """Return the management authentication policies with their members"""
+    policies_info = {}
+    res = blade.get_management_authentication_policies()
+    if res.status_code != 200:
+        return policies_info
+    for policy in list(res.items):
+        ssh = getattr(policy, "ssh", None)
+        policies_info[policy.name] = {
+            "enabled": getattr(policy, "enabled", None),
+            "is_local": getattr(policy, "is_local", None),
+            "location": _ref_name(getattr(policy, "location", None)),
+            "realms": [
+                _ref_name(realm) for realm in (getattr(policy, "realms", None) or [])
+            ],
+            "ssh": {
+                "allowed_methods": list(getattr(ssh, "allowed_methods", None) or []),
+                "required_methods": list(getattr(ssh, "required_methods", None) or []),
+            },
+            "members": [],
+        }
+    members_res = blade.get_management_authentication_policies_members()
+    if members_res.status_code == 200:
+        for member in list(members_res.items):
+            policy_name = _ref_name(getattr(member, "policy", None))
+            if policy_name in policies_info:
+                policies_info[policy_name]["members"].append(
+                    _ref_dict(getattr(member, "member", None))
+                )
+    return policies_info
+
+
+def generate_rapid_data_locking_dict(blade):
+    """Return the Rapid Data Locking state and its KMIP server"""
+    res = blade.get_rapid_data_locking()
+    if res.status_code != 200:
+        return {}
+    settings = list(res.items)
+    if not settings:
+        return {}
+    return {
+        "enabled": getattr(settings[0], "enabled", None),
+        "kmip_server": _ref_name(getattr(settings[0], "kmip_server", None)),
+    }
+
+
+def generate_certificate_uses_dict(blade):
+    """Return, per certificate, the objects that use it
+
+    A certificate used through a certificate group reports the group; a
+    certificate nothing uses is absent.
+    """
+    uses_info = {}
+    res = blade.get_certificates_uses()
+    if res.status_code != 200:
+        return uses_info
+    for item in list(res.items):
+        use = getattr(item, "use", None)
+        uses_info.setdefault(item.name, []).append(
+            {
+                "name": _ref_name(use),
+                "resource_type": getattr(use, "resource_type", None),
+                "remote": _ref_name(getattr(use, "remote", None)),
+                "group": _ref_name(getattr(item, "group", None)),
+            }
+        )
+    return uses_info
+
+
+def generate_remote_arrays_dict(blade):
+    """Return the arrays in the current fleet keyed by name
+
+    ``current_fleet_only`` is mandatory: the array answers 400 without it.
+    An array that is not in a fleet returns nothing.
+    """
+    arrays_info = {}
+    res = blade.get_remote_arrays(current_fleet_only=True)
+    if res.status_code != 200:
+        return arrays_info
+    for array in list(res.items):
+        arrays_info[array.name] = {
+            "os": getattr(array, "os", None),
+            "version": getattr(array, "version", None),
+            "model": getattr(array, "model", None),
+            "api_versions": list(getattr(array, "api_versions", None) or []),
+            "is_local": getattr(array, "is_local", None),
+            "topology_group": _ref_name(getattr(array, "topology_group", None)),
+        }
+    return arrays_info
+
+
+def generate_tgroups_dict(blade):
+    """Return the topology groups with their array and group members
+
+    Members come from the members endpoint; the arrays endpoint is not used
+    because it refuses a request without topology group names.
+    """
+    tgroups_info = {}
+    res = blade.get_topology_groups()
+    if res.status_code != 200:
+        return tgroups_info
+    for tgroup in list(res.items):
+        tgroups_info[tgroup.name] = {
+            "context": _ref_name(getattr(tgroup, "context", None)),
+            "parent_topology_group": _ref_name(
+                getattr(tgroup, "parent_topology_group", None)
+            ),
+            "arrays": [],
+            "tgroups": [],
+        }
+    if not tgroups_info:
+        return tgroups_info
+    members_res = blade.get_topology_groups_members()
+    if members_res.status_code != 200:
+        return tgroups_info
+    for member in list(members_res.items):
+        group_name = _ref_name(getattr(member, "topology_group", None))
+        member_ref = getattr(member, "member", None)
+        member_name = _ref_name(member_ref)
+        if group_name not in tgroups_info or not member_name:
+            continue
+        member_info = {
+            "name": member_name,
+            "status": getattr(member, "status", None),
+            "status_details": getattr(member, "status_details", None),
+        }
+        member_type = getattr(member_ref, "resource_type", None)
+        if member_type == "remote-arrays":
+            tgroups_info[group_name]["arrays"].append(member_info)
+        elif member_type == "topology-groups":
+            tgroups_info[group_name]["tgroups"].append(member_info)
+    return tgroups_info
+
+
+def generate_presets_dict(blade):
+    """Return the workload presets keyed by name
+
+    Each configuration list is collated by configuration name; parameters
+    carry their type, metadata and the constraints for that type.
+    """
+    presets_info = {}
+    res = blade.get_presets_workload()
+    if res.status_code != 200:
+        return presets_info
+    for preset in list(res.items):
+        preset_name = getattr(preset, "name", None)
+        if not preset_name:
+            continue
+        parameters = {}
+        for param in getattr(preset, "parameters", None) or []:
+            param_name = getattr(param, "name", None)
+            if not param_name:
+                continue
+            param_type = getattr(param, "type", None)
+            metadata = getattr(param, "metadata", None)
+            constraints = getattr(param, "constraints", None)
+            typed_constraints = None
+            if constraints is not None and param_type:
+                typed_constraints = getattr(constraints, param_type, None)
+            parameters[param_name] = {
+                "type": param_type,
+                "description": getattr(metadata, "description", None),
+                "display_name": getattr(metadata, "display_name", None),
+                "subtype": getattr(metadata, "subtype", None),
+                "constraints": _to_plain(typed_constraints) or {},
+            }
+        exports = getattr(preset, "export_configurations", None)
+        presets_info[preset_name] = {
+            "description": getattr(preset, "description", None),
+            "workload_type": getattr(preset, "workload_type", None),
+            "revision": getattr(preset, "revision", None),
+            "context": _ref_name(getattr(preset, "context", None)),
+            "platform_features": list(getattr(preset, "platform_features", None) or []),
+            "parameters": parameters,
+            "export_configurations": {
+                "nfs": _collate_by_name(getattr(exports, "nfs", None)),
+                "smb": _collate_by_name(getattr(exports, "smb", None)),
+                "smb_share": _collate_by_name(getattr(exports, "smb_share", None)),
+            },
+            "workload_tags": _to_plain(getattr(preset, "workload_tags", None) or []),
+        }
+        for section in (
+            "bucket_configurations",
+            "directory_configurations",
+            "volume_configurations",
+            "placement_configurations",
+            "qos_configurations",
+            "quota_configurations",
+            "snapshot_configurations",
+            "lifecycle_configurations",
+            "periodic_replication_configurations",
+        ):
+            presets_info[preset_name][section] = _collate_by_name(
+                getattr(preset, section, None)
+            )
+    return presets_info
+
+
+def generate_workloads_dict(blade, api_version):
+    """Return the workloads keyed by name with their tags, space and performance
+
+    Space arrives with the workload and performance from its own endpoint,
+    both from REST 2.30; older arrays report neither. Performance is only
+    requested for workloads that are not destroyed.
+    """
+    workloads_info = {}
+    res = blade.get_workloads()
+    if res.status_code != 200:
+        return workloads_info
+    workloads = list(res.items)
+    if not workloads:
+        return workloads_info
+    for workload in workloads:
+        preset = getattr(workload, "preset", None)
+        space = getattr(workload, "space", None)
+        workloads_info[workload.name] = {
+            "context": _ref_name(getattr(workload, "context", None)),
+            "preset": _ref_name(preset),
+            "preset_revision": getattr(preset, "revision", None),
+            "status": getattr(workload, "status", None),
+            "status_details": list(getattr(workload, "status_details", None) or []),
+            "created": _epoch_to_string(getattr(workload, "created", None)),
+            "destroyed": getattr(workload, "destroyed", None),
+            "time_remaining": getattr(workload, "time_remaining", None),
+            "tags": [],
+            "space": _to_plain(space) if space is not None else None,
+            "performance": None,
+        }
+    tags_res = blade.get_workloads_tags()
+    if tags_res.status_code == 200:
+        for tag in list(tags_res.items):
+            resource_name = _ref_name(getattr(tag, "resource", None))
+            if resource_name in workloads_info:
+                workloads_info[resource_name]["tags"].append(
+                    {
+                        "key": getattr(tag, "key", None),
+                        "value": getattr(tag, "value", None),
+                        "namespace": getattr(tag, "namespace", None),
+                        "copyable": getattr(tag, "copyable", None),
+                    }
+                )
+    live_names = [
+        name for name, detail in workloads_info.items() if not detail["destroyed"]
+    ]
+    if live_names and LooseVersion(WORKLOAD_METRICS_API_VERSION) <= LooseVersion(
+        api_version
+    ):
+        perf_res = blade.get_workloads_performance(names=live_names)
+        if perf_res.status_code == 200:
+            for perf in list(perf_res.items):
+                if perf.name in workloads_info:
+                    workloads_info[perf.name]["performance"] = {
+                        field: getattr(perf, field, None)
+                        for field in (
+                            "bytes_per_op",
+                            "bytes_per_read",
+                            "bytes_per_write",
+                            "others_per_sec",
+                            "read_bytes_per_sec",
+                            "reads_per_sec",
+                            "usec_per_other_op",
+                            "usec_per_read_op",
+                            "usec_per_write_op",
+                            "write_bytes_per_sec",
+                            "writes_per_sec",
+                            "time",
+                        )
+                    }
+    return workloads_info
+
+
+def generate_storage_class_members_dict(blade):
+    """Return the storage class of each fleet member array"""
+    members_info = {}
+    res = blade.get_storage_classes_members()
+    if res.status_code != 200:
+        return members_info
+    for item in list(res.items):
+        member_name = _ref_name(getattr(item, "member", None))
+        if member_name:
+            members_info[member_name] = _ref_name(getattr(item, "storage_class", None))
+    return members_info
+
+
+def generate_realm_connections_dict(blade):
+    """Return the realm connections keyed by local realm, then remote realm"""
+    connections_info = {}
+    res = blade.get_realm_connections()
+    if res.status_code != 200:
+        return connections_info
+    for connection in list(res.items):
+        local_realm = _ref_name(getattr(connection, "local_realm", None))
+        remote_realm = _ref_name(getattr(connection, "remote_realm", None))
+        if not local_realm or not remote_realm:
+            continue
+        connections_info.setdefault(local_realm, {})[remote_realm] = {
+            "status": getattr(connection, "status", None),
+        }
+    return connections_info
+
+
+def generate_remote_realms_dict(blade):
+    """Return the realms on connected arrays and the arrays that hold them"""
+    realms_info = {}
+    res = blade.get_remote_realms()
+    if res.status_code != 200:
+        return realms_info
+    for realm in list(res.items):
+        realms_info[realm.name] = {
+            "arrays": [
+                _ref_name(array) for array in (getattr(realm, "arrays", None) or [])
+            ],
+        }
+    return realms_info
+
+
+# File locks, lock clients, file sessions and SMB open files (the read-back
+# for purefb_fs_lock). Locks need REST 2.8, sessions 2.10, open files 2.17.
+FILE_LOCKS_API_VERSION = "2.8"
+FILE_SESSIONS_API_VERSION = "2.10"
+OPEN_FILES_API_VERSION = "2.17"
+
+
+def generate_file_locks_dict(blade):
+    """Return the active file locks, lock clients, file sessions and open files.
+
+    Point-in-time data that changes as clients work. Open files are only
+    tracked for SMB, so they are queried with protocols=smb.
+    """
+    api_version = get_rest_api_version(blade)
+    info = {
+        "file_locks": {},
+        "file_lock_clients": [],
+        "file_sessions": {},
+        "open_files": {},
+    }
+    res = blade.get_file_systems_locks()
+    if res.status_code == 200:
+        for lock in list(res.items):
+            lock_range = getattr(lock, "range", None)
+            info["file_locks"][lock.name] = {
+                "access_type": getattr(lock, "access_type", None),
+                "client": _ref_name(getattr(lock, "client", None)),
+                "created_at": getattr(lock, "created_at", None),
+                "file_system": _ref_name(getattr(lock, "source", None)),
+                "inode": getattr(lock, "inode", None),
+                "path": getattr(lock, "path", None),
+                "protocol": getattr(lock, "protocol", None),
+                "range": (
+                    None
+                    if lock_range is None
+                    else {
+                        "length": getattr(lock_range, "length", None),
+                        "offset": getattr(lock_range, "offset", None),
+                    }
+                ),
+            }
+    res = blade.get_file_systems_locks_clients()
+    if res.status_code == 200:
+        names = [_ref_name(client) for client in list(res.items)]
+        info["file_lock_clients"] = sorted(name for name in names if name)
+    if LooseVersion(FILE_SESSIONS_API_VERSION) <= LooseVersion(api_version):
+        res = blade.get_file_systems_sessions()
+        if res.status_code == 200:
+            for session in list(res.items):
+                info["file_sessions"][session.name] = {
+                    "authentication": getattr(session, "authentication", None),
+                    "client": _ref_name(getattr(session, "client", None)),
+                    "connection_time": getattr(session, "connection_time", None),
+                    "idle_time": getattr(session, "idle_time", None),
+                    "opens": getattr(session, "opens", None),
+                    "port": getattr(session, "port", None),
+                    "protocol": getattr(session, "protocol", None),
+                    "user": _ref_name(getattr(session, "user", None)),
+                }
+    if LooseVersion(OPEN_FILES_API_VERSION) <= LooseVersion(api_version):
+        res = blade.get_file_systems_open_files(protocols=["smb"])
+        if res.status_code == 200:
+            for open_file in list(res.items):
+                info["open_files"][open_file.id] = {
+                    "client": _ref_name(getattr(open_file, "client", None)),
+                    "file_system": _ref_name(getattr(open_file, "source", None)),
+                    "lock_count": getattr(open_file, "lock_count", None),
+                    "mode": getattr(open_file, "mode", None),
+                    "path": getattr(open_file, "path", None),
+                    "session": _ref_name(getattr(open_file, "session", None)),
+                    "user": _ref_name(getattr(open_file, "user", None)),
+                }
+    return info
+
+
+def generate_support_dict(blade):
+    """Return the retained self-diagnostics runs, the diagnostics tool version
+    and a summary of the system manifest.
+
+    Requires REST API 2.16+ (SUPPORT_DIAGNOSTICS_API_VERSION); callers gate
+    on the API version. The array keeps the last 10 runs only, keyed here by
+    run index. Per-test results are not included - they belong to
+    purefb_support_diagnostics state=report. The tool version read-back needs
+    REST API 2.24+ and the system manifest REST API 2.26+; both are empty on
+    older arrays. The manifest is one JSON document of tens of kilobytes, most
+    of it the hardware component tree, so the header fields and the space
+    summary are reported and the components are counted rather than listed.
+    """
+    api_version = get_rest_api_version(blade)
+    support_info = {"diagnostics": {}, "diagnostics_settings": {}, "manifest": {}}
+    res = blade.get_support_diagnostics()
+    if res.status_code == 200:
+        for run in list(res.items):
+            period = getattr(run, "analysis_period", None)
+            counts = {"info": 0, "warning": 0, "critical": 0}
+            for entry in getattr(run, "severity_count", None) or []:
+                severity = getattr(entry, "severity", None)
+                if severity:
+                    counts[severity] = getattr(entry, "count", None) or 0
+            support_info["diagnostics"][str(getattr(run, "index", ""))] = {
+                "task_id": getattr(run, "task_id", None),
+                "status": getattr(run, "status", None),
+                "version": getattr(run, "version", None),
+                "start_time": getattr(run, "start_time", None),
+                "analysis_period_start": getattr(period, "start_time", None),
+                "analysis_period_end": getattr(period, "end_time", None),
+                "severity_count": counts,
+            }
+    if LooseVersion(SUPPORT_DIAGNOSTICS_SETTINGS_API_VERSION) <= LooseVersion(
+        api_version
+    ):
+        res = blade.get_support_diagnostics_settings()
+        if res.status_code == 200:
+            settings = next(iter(list(res.items)), None)
+            if settings is not None:
+                support_info["diagnostics_settings"] = {
+                    "version": getattr(settings, "version", None),
+                    "last_updated": getattr(settings, "last_updated", None),
+                }
+    if LooseVersion(MANIFEST_API_VERSION) <= LooseVersion(api_version):
+        res = blade.get_support_system_manifest()
+        if res.status_code == 200:
+            item = next(iter(list(res.items)), None)
+            raw = getattr(item, "system_manifest", None) if item else None
+            manifest = {}
+            if isinstance(raw, str):
+                try:
+                    manifest = json.loads(raw)
+                except ValueError:
+                    manifest = {}
+            elif isinstance(raw, dict):
+                manifest = raw
+            for field in (
+                "manifest_version",
+                "manifest_source",
+                "product_family",
+                "product_model",
+                "purity_version",
+                "array_name",
+                "appliance_id",
+                "domain",
+                "time_zone",
+                "timestamp",
+                "space",
+            ):
+                support_info["manifest"][field] = manifest.get(field)
+            components = manifest.get("components")
+            support_info["manifest"]["component_count"] = (
+                len(components) if isinstance(components, (list, dict)) else None
+            )
+    return support_info
+
+
+def generate_eviction_policies_dict(blade):
+    """Data eviction policies (REST 2.21) with their attached file systems."""
+    policies_info = {}
+
+    res = blade.get_data_eviction_policies()
+    if res.status_code != 200:
+        return policies_info
+    for policy in list(res.items):
+        policies_info[policy.name] = {
+            "local": getattr(policy, "is_local", None),
+            "enabled": getattr(policy, "enabled", None),
+            "keep_size": getattr(policy, "keep_size", None),
+            "file_systems": [],
+        }
+
+    res = blade.get_data_eviction_policies_file_systems()
+    if res.status_code == 200:
+        for member in list(res.items):
+            policy_name = getattr(getattr(member, "policy", None), "name", None)
+            if policy_name in policies_info:
+                policies_info[policy_name]["file_systems"].append(
+                    getattr(getattr(member, "member", None), "name", None)
+                )
+
+    return policies_info
+
+
+def generate_telemetry_policies_dict(blade):
+    policies_info = {}
+
+    for policy in blade.get_telemetry_metrics_policies().items:
+        policies_info[policy.name] = {
+            "enabled": getattr(policy, "enabled", None),
+            "is_local": getattr(policy, "is_local", None),
+            "location": getattr(getattr(policy, "location", None), "name", None),
+            "realms": [
+                getattr(realm, "name", None)
+                for realm in getattr(policy, "realms", None) or []
+            ],
+            "version": getattr(policy, "version", None),
+            "targets": [
+                getattr(target, "name", None)
+                for target in getattr(policy, "targets", None) or []
+            ],
+            "rules": [
+                {
+                    "name": getattr(rule, "name", None),
+                    "collection": getattr(
+                        getattr(rule, "collection", None), "name", None
+                    ),
+                    "resolution": getattr(rule, "resolution", None),
+                    "index": getattr(rule, "index", None),
+                }
+                for rule in getattr(policy, "rules", None) or []
+            ],
+            "arrays": [],
+        }
+
+    for member in blade.get_telemetry_metrics_policies_arrays().items:
+        policy_name = getattr(getattr(member, "policy", None), "name", None)
+        if policy_name in policies_info:
+            policies_info[policy_name]["arrays"].append(
+                getattr(getattr(member, "member", None), "name", None)
+            )
+
+    return policies_info
+
+
+def generate_telemetry_collections_dict(blade):
+    collections_info = {}
+
+    for collection in blade.get_telemetry_metrics_collections().items:
+        collections_info[collection.name] = {
+            "default_resolution": getattr(collection, "default_resolution", None),
+            "supported_resolutions": list(
+                getattr(collection, "supported_resolutions", None) or []
+            ),
+            "metrics": [],
+        }
+
+    for membership in blade.get_telemetry_metrics_collections_metrics().items:
+        group = getattr(getattr(membership, "group", None), "name", None)
+        if group in collections_info:
+            collections_info[group]["metrics"].append(
+                getattr(getattr(membership, "member", None), "name", None)
+            )
+
+    return collections_info
 
 
 def generate_software_dict(blade, api_version):
@@ -1882,93 +3862,6 @@ def generate_software_dict(blade, api_version):
     return software_info
 
 
-def generate_support_dict(blade, api_version):
-    """Support diagnostics and a summary of the system manifest
-
-    The manifest is one JSON document of tens of kilobytes, most of it the
-    hardware component tree, so the header fields and the space summary are
-    reported and the components are counted rather than listed.
-    """
-    support_info = {
-        "diagnostics": {"settings": {}, "runs": {}, "details": {}},
-        "manifest": {},
-    }
-    if LooseVersion(SUPPORT_DIAGS_API_VERSION) <= LooseVersion(api_version):
-        res = blade.get_support_diagnostics()
-        if res.status_code == 200:
-            for run in list(res.items):
-                period = getattr(run, "analysis_period", None)
-                support_info["diagnostics"]["runs"][run.id] = {
-                    "name": getattr(run, "name", None),
-                    "index": getattr(run, "index", None),
-                    "status": getattr(run, "status", None),
-                    "version": getattr(run, "version", None),
-                    "task_id": getattr(run, "task_id", None),
-                    "start_time": getattr(run, "start_time", None),
-                    "analysis_period": {
-                        "start_time": getattr(period, "start_time", None),
-                        "end_time": getattr(period, "end_time", None),
-                    },
-                    "severity_count": {
-                        getattr(count, "severity", None): getattr(count, "count", None)
-                        for count in (getattr(run, "severity_count", None) or [])
-                    },
-                }
-        res = blade.get_support_diagnostics_details()
-        if res.status_code == 200:
-            for detail in list(res.items):
-                support_info["diagnostics"]["details"][detail.id] = {
-                    "name": getattr(detail, "name", None),
-                    "index": getattr(detail, "index", None),
-                    "task_id": getattr(detail, "task_id", None),
-                    "test_name": getattr(detail, "test_name", None),
-                    "test_type": getattr(detail, "test_type", None),
-                    "severity": getattr(detail, "severity", None),
-                    "result_details": getattr(detail, "result_details", None),
-                }
-    if LooseVersion(DIAGS_SETTINGS_API_VERSION) <= LooseVersion(api_version):
-        res = blade.get_support_diagnostics_settings()
-        if res.status_code == 200:
-            settings = next(iter(list(res.items)), None)
-            if settings is not None:
-                support_info["diagnostics"]["settings"] = {
-                    "version": getattr(settings, "version", None),
-                    "last_updated": getattr(settings, "last_updated", None),
-                }
-    if LooseVersion(MANIFEST_API_VERSION) <= LooseVersion(api_version):
-        res = blade.get_support_system_manifest()
-        if res.status_code == 200:
-            item = next(iter(list(res.items)), None)
-            raw = getattr(item, "system_manifest", None) if item else None
-            manifest = {}
-            if isinstance(raw, str):
-                try:
-                    manifest = json.loads(raw)
-                except ValueError:
-                    manifest = {}
-            elif isinstance(raw, dict):
-                manifest = raw
-            for field in (
-                "manifest_version",
-                "manifest_source",
-                "product_family",
-                "product_model",
-                "purity_version",
-                "array_name",
-                "appliance_id",
-                "domain",
-                "time_zone",
-                "timestamp",
-                "space",
-            ):
-                support_info["manifest"][field] = manifest.get(field)
-            components = manifest.get("components")
-            support_info["manifest"]["component_count"] = (
-                len(components) if isinstance(components, (list, dict)) else None
-            )
-    return support_info
-
-
 def main():
     argument_spec = purefb_argument_spec()
     argument_spec.update(
@@ -2006,8 +3899,13 @@ def main():
         "servers",
         "fleet",
         "realms",
-        "software",
+        "clients",
+        "locks",
         "support",
+        "legal_holds",
+        "connections",
+        "telemetry",
+        "software",
     )
     subset_test = (test in valid_subsets for test in subset)
     if not all(subset_test):
@@ -2030,6 +3928,27 @@ def main():
         info["lag"] = generate_lag_dict(blade)
     if "network" in subset or "all" in subset:
         info["network"] = generate_network_dict(blade)
+    # Connectors, their counters, the RoCE settings and the LLDP neighbours
+    # are keyed by port name, which never matches a VIP name, so they sit
+    # beside `network` rather than inside it.
+    if ("network" in subset or "all" in subset) and LooseVersion(
+        CONNECTORS_API_VERSION
+    ) <= LooseVersion(api_version):
+        info["network_connectors"] = generate_network_connectors_dict(blade)
+        info["network_connector_performance"] = (
+            generate_network_connector_performance_dict(blade)
+        )
+        info["network_connector_settings"] = generate_network_connector_settings_dict(
+            blade
+        )
+        if LooseVersion(NEIGHBOR_API_VERSION) <= LooseVersion(api_version):
+            info["lldp_neighbors"] = generate_lldp_neighbors_dict(blade)
+    # `connections` is a volatile, potentially large table: gathered only
+    # when asked for by name, never as part of `all`.
+    if "connections" in subset and LooseVersion(NETSTAT_API_VERSION) <= LooseVersion(
+        api_version
+    ):
+        info["connections"] = generate_connections_list(blade)
     if "subnets" in subset or "all" in subset:
         info["subnet"] = generate_subnet_dict(blade)
     if "filesystems" in subset or "all" in subset:
@@ -2037,9 +3956,18 @@ def main():
         if LooseVersion(SERVERS_API_VERSION) <= LooseVersion(api_version):
             exports_list = generate_file_system_exports_dict(blade)
             info["file_system_exports"] = exports_list
-        info["filesystems"] = generate_fs_dict(blade, exports_list)
+        worm_policies = None
+        if LooseVersion(WORM_API_VERSION) <= LooseVersion(api_version):
+            worm_policies = generate_fs_worm_policies_dict(blade)
+        info["filesystems"] = generate_fs_dict(
+            blade, exports_list, api_version, worm_policies
+        )
+        if LooseVersion(JUNCTION_API_VERSION) <= LooseVersion(api_version):
+            info["junctions"] = generate_fs_junctions_dict(blade)
     if "admins" in subset or "all" in subset:
         info["admins"] = generate_admin_dict(blade)
+        if LooseVersion(PUBLIC_KEYS_API_VERSION) <= LooseVersion(api_version):
+            info["public_keys"] = generate_public_keys_dict(blade)
     if "snapshots" in subset or "all" in subset:
         info["snapshots"] = generate_snap_dict(blade)
     if "buckets" in subset or "all" in subset:
@@ -2050,12 +3978,18 @@ def main():
     if "policies" in subset or "all" in subset:
         info["policies"] = generate_all_policies_dict(blade)
         info["snapshot_policies"] = generate_policies_dict(blade)
+        # snapshot policies share the membership gathered by the policies
+        # view, so no second members call is made
+        for name, snap_policy in info["snapshot_policies"].items():
+            if "members" in info["policies"].get(name, {}):
+                snap_policy["members"] = info["policies"][name]["members"]
     if "arrays" in subset or "all" in subset:
         info["arrays"] = generate_array_conn_dict(blade)
     if "replication" in subset or "all" in subset:
         info["file_replication"] = generate_file_repl_dict(blade)
         info["bucket_replication"] = generate_bucket_repl_dict(blade)
         info["snap_transfers"] = generate_snap_transfer_dict(blade)
+        info["fs_replica_transfers"] = generate_fs_repl_transfer_dict(blade)
         info["remote_credentials"] = generate_remote_creds_dict(blade)
         info["targets"] = generate_targets_dict(blade)
     if "accounts" in subset or "all" in subset:
@@ -2064,6 +3998,8 @@ def main():
             info["object_store_account_exports"] = (
                 generate_object_store_account_exports_dict(blade)
             )
+        if LooseVersion(OBJECT_ROLES_API_VERSION) <= LooseVersion(api_version):
+            info["object_store_roles"] = generate_object_store_roles_dict(blade)
     if "ad" in subset or "all" in subset:
         info["active_directory"] = generate_ad_dict(blade)
     if "kerberos" in subset or "all" in subset:
@@ -2094,8 +4030,14 @@ def main():
             info["fleet"] = generate_fleet_dict(blade)
         if LooseVersion(TLS_API_VERSION) <= LooseVersion(api_version):
             info["tls_policies"] = generate_tls_policies_dict(blade)
+        if LooseVersion(SSH_CA_API_VERSION) <= LooseVersion(api_version):
+            info["ssh_ca_policies"] = generate_ssh_ca_policies_dict(blade)
         if LooseVersion(S3_EXPORT_API_VERSION) <= LooseVersion(api_version):
             info["s3_export_policies"] = generate_s3_export_policies_dict(blade)
+        if LooseVersion(QUOTA_POLICY_API_VERSION) <= LooseVersion(api_version):
+            info["quota_policies"] = generate_quota_policies_dict(blade)
+        if LooseVersion(EVICTION_API_VERSION) <= LooseVersion(api_version):
+            info["eviction_policies"] = generate_eviction_policies_dict(blade)
     if ("realms" in subset or "all" in subset) and LooseVersion(
         REALMS_API_VERSION
     ) <= LooseVersion(api_version):
@@ -2115,10 +4057,76 @@ def main():
         SERVERS_API_VERSION
     ) <= LooseVersion(api_version):
         info["servers"] = generate_servers_dict(blade)
+    if ("telemetry" in subset or "all" in subset) and LooseVersion(
+        TELEMETRY_API_VERSION
+    ) <= LooseVersion(api_version):
+        info["telemetry_targets"] = generate_telemetry_targets_dict(blade)
+        info["telemetry_policies"] = generate_telemetry_policies_dict(blade)
+        info["telemetry_collections"] = generate_telemetry_collections_dict(blade)
+    # `clients` samples the array for several seconds per protocol and lists
+    # S3 clients per connection, so it is opt-in and not part of `all`.
+    if "clients" in subset:
+        info["clients"] = generate_clients_dict(blade, api_version)
+    if ("locks" in subset or "all" in subset) and LooseVersion(
+        FILE_LOCKS_API_VERSION
+    ) <= LooseVersion(api_version):
+        info.update(generate_file_locks_dict(blade))
     if "software" in subset or "all" in subset:
         info["software"] = generate_software_dict(blade, api_version)
-    if "support" in subset or "all" in subset:
-        info["support"] = generate_support_dict(blade, api_version)
+    if ("support" in subset or "all" in subset) and LooseVersion(
+        SUPPORT_DIAGNOSTICS_API_VERSION
+    ) <= LooseVersion(api_version):
+        info["support"] = generate_support_dict(blade)
+    if ("legal_holds" in subset or "all" in subset) and LooseVersion(
+        LEGAL_HOLD_API_VERSION
+    ) <= LooseVersion(api_version):
+        info["legal_holds"] = generate_legal_holds_dict(blade)
+    # Security, identity and fleet read-back. This runs after the base
+    # subsets so that the config and fleet sections it adds to exist.
+    if "admins" in subset or "all" in subset:
+        info["admin_cache"] = generate_admin_cache_dict(blade)
+    if "config" in subset or "all" in subset:
+        info["config"]["certificate_uses"] = generate_certificate_uses_dict(blade)
+        if LooseVersion(KMIP_API_VERSION) <= LooseVersion(api_version):
+            info["config"]["rapid_data_locking"] = generate_rapid_data_locking_dict(
+                blade
+            )
+    if "policies" in subset or "all" in subset:
+        if LooseVersion(MAP_API_VERSION) <= LooseVersion(api_version):
+            info["management_access_policies"] = (
+                generate_management_access_policies_dict(blade)
+            )
+        if LooseVersion(MGMT_AUTH_API_VERSION) <= LooseVersion(api_version):
+            info["management_authentication_policies"] = (
+                generate_management_authentication_policies_dict(blade)
+            )
+        if LooseVersion(MAP_ROLES_API_VERSION) <= LooseVersion(api_version):
+            info["management_access_roles"] = generate_management_access_roles_dict(
+                blade
+            )
+    # Fleet members gain the detail the array reports for them whichever
+    # subset produced the fleet key; an array that is not in a fleet is
+    # not asked about remote arrays at all.
+    if info.get("fleet"):
+        remote_arrays = generate_remote_arrays_dict(blade)
+        for fleet in info["fleet"].values():
+            for member_name, member in fleet.get("members", {}).items():
+                member.update(remote_arrays.get(member_name, {}))
+    if ("fleet" in subset or "all" in subset) and LooseVersion(
+        FLEET_API_VERSION
+    ) <= LooseVersion(api_version):
+        if LooseVersion(WORKLOAD_API_VERSION) <= LooseVersion(api_version):
+            info["presets"] = generate_presets_dict(blade)
+            info["workloads"] = generate_workloads_dict(blade, api_version)
+        if LooseVersion(TGROUP_API_VERSION) <= LooseVersion(api_version):
+            info["tgroups"] = generate_tgroups_dict(blade)
+        if LooseVersion(STORAGE_CLASS_API_VERSION) <= LooseVersion(api_version):
+            info["storage_class_members"] = generate_storage_class_members_dict(blade)
+    if ("realms" in subset or "all" in subset) and LooseVersion(
+        REALM_CONNECTION_API_VERSION
+    ) <= LooseVersion(api_version):
+        info["realm_connections"] = generate_realm_connections_dict(blade)
+        info["remote_realms"] = generate_remote_realms_dict(blade)
     module.exit_json(changed=False, purefb_info=info)
 
 

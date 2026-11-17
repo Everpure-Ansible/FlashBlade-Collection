@@ -89,6 +89,7 @@ from plugins.modules.purefb_info import (
     generate_network_access_policies_dict,
     generate_worm_data_policies_dict,
     generate_tls_policies_dict,
+    generate_ssh_ca_policies_dict,
     generate_s3_export_policies_dict,
     generate_object_store_account_exports_dict,
     generate_object_store_virtual_hosts_dict,
@@ -1409,6 +1410,78 @@ class TestPurefbInfo:
         assert result["tls1"]["disabled_tls_ciphers"] == ["RC4"]
         assert result["tls1"]["trusted_client_certificate_authority"] is None
         assert result["tls1"]["network_interfaces"] == ["vip1"]
+
+    def test_generate_ssh_ca_policies_dict(self):
+        """SSH CA policies carry their signer, principals and members."""
+        signer = Mock(spec=["name", "resource_type"])
+        signer.name = "ops-ca-key"
+        signer.resource_type = "public-keys"
+        policy = Mock(
+            spec=[
+                "name",
+                "enabled",
+                "is_local",
+                "signing_authority",
+                "static_authorized_principals",
+            ]
+        )
+        policy.name = "ssh-ca"
+        policy.enabled = True
+        policy.is_local = True
+        policy.signing_authority = signer
+        policy.static_authorized_principals = ["ops"]
+        unset = Mock(
+            spec=[
+                "name",
+                "enabled",
+                "is_local",
+                "signing_authority",
+                "static_authorized_principals",
+            ]
+        )
+        unset.name = "ssh-ca-cert"
+        unset.enabled = False
+        unset.is_local = True
+        unset.signing_authority = Mock(spec=["name", "resource_type"])
+        unset.signing_authority.name = "corp-ca"
+        unset.signing_authority.resource_type = "certificates"
+        unset.static_authorized_principals = None
+        admin_ref = Mock(spec=["name", "resource_type"])
+        admin_ref.name = "alice"
+        admin_ref.resource_type = "admins"
+        array_ref = Mock(spec=["name", "resource_type"])
+        array_ref.name = "myblade"
+        array_ref.resource_type = "arrays"
+        policy_ref = Mock(spec=["name"])
+        policy_ref.name = "ssh-ca"
+        admin_member = Mock(spec=["member", "policy"])
+        admin_member.member = admin_ref
+        admin_member.policy = policy_ref
+        array_member = Mock(spec=["member", "policy"])
+        array_member.member = array_ref
+        array_member.policy = policy_ref
+
+        mock_blade = Mock()
+        mock_blade.get_ssh_certificate_authority_policies.return_value.items = [
+            policy,
+            unset,
+        ]
+        mock_blade.get_ssh_certificate_authority_policies_members.return_value.items = [
+            admin_member,
+            array_member,
+        ]
+
+        result = generate_ssh_ca_policies_dict(mock_blade)
+
+        assert result["ssh-ca"]["enabled"] is True
+        assert result["ssh-ca"]["signing_authority"] == "ops-ca-key"
+        assert result["ssh-ca"]["signing_authority_type"] == "public_key"
+        assert result["ssh-ca"]["static_authorized_principals"] == ["ops"]
+        assert result["ssh-ca"]["admins"] == ["alice"]
+        assert result["ssh-ca"]["arrays"] == ["myblade"]
+        assert result["ssh-ca-cert"]["signing_authority_type"] == "certificate"
+        assert result["ssh-ca-cert"]["static_authorized_principals"] == []
+        assert result["ssh-ca-cert"]["admins"] == []
 
     def test_generate_s3_export_policies_dict(self):
         """S3 export policies are reported with their inline rules."""

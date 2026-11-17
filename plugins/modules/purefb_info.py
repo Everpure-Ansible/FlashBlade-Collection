@@ -120,6 +120,7 @@ SPACE_API_VERSION = "2.11"
 PUBLIC_API_VERSION = "2.12"
 NAP_API_VERSION = "2.13"
 RA_DURATION_API_VERSION = "2.14"
+SSH_CA_API_VERSION = "2.14"
 SMTP_ENCRYPT_API_VERSION = "2.15"
 WORM_API_VERSION = "2.15"
 SERVERS_API_VERSION = "2.16"
@@ -1317,6 +1318,40 @@ def generate_tls_policies_dict(blade):
     return policies_info
 
 
+def generate_ssh_ca_policies_dict(blade):
+    policies_info = {}
+    signer_types = {"public-keys": "public_key", "certificates": "certificate"}
+
+    for policy in blade.get_ssh_certificate_authority_policies().items:
+        signer = getattr(policy, "signing_authority", None)
+        signer_type = getattr(signer, "resource_type", None)
+        policies_info[policy.name] = {
+            "local": getattr(policy, "is_local", None),
+            "enabled": getattr(policy, "enabled", None),
+            "signing_authority": getattr(signer, "name", None),
+            "signing_authority_type": signer_types.get(signer_type, signer_type),
+            "static_authorized_principals": getattr(
+                policy, "static_authorized_principals", None
+            )
+            or [],
+            "admins": [],
+            "arrays": [],
+        }
+
+    for member in blade.get_ssh_certificate_authority_policies_members().items:
+        policy_name = getattr(getattr(member, "policy", None), "name", None)
+        if policy_name in policies_info:
+            ref = getattr(member, "member", None)
+            key = (
+                "arrays"
+                if getattr(ref, "resource_type", None) == "arrays"
+                else "admins"
+            )
+            policies_info[policy_name][key].append(getattr(ref, "name", None))
+
+    return policies_info
+
+
 def generate_s3_export_policies_dict(blade):
     policies_info = {}
 
@@ -1845,6 +1880,8 @@ def main():
             info["fleet"] = generate_fleet_dict(blade)
         if LooseVersion(TLS_API_VERSION) <= LooseVersion(api_version):
             info["tls_policies"] = generate_tls_policies_dict(blade)
+        if LooseVersion(SSH_CA_API_VERSION) <= LooseVersion(api_version):
+            info["ssh_ca_policies"] = generate_ssh_ca_policies_dict(blade)
         if LooseVersion(S3_EXPORT_API_VERSION) <= LooseVersion(api_version):
             info["s3_export_policies"] = generate_s3_export_policies_dict(blade)
     if ("realms" in subset or "all" in subset) and LooseVersion(

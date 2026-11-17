@@ -1,0 +1,2 @@
+minor_changes:
+  - purefb_virtualhost - add ``hostname``, ``servers`` and ``rename`` options (REST 2.20, Purity//FB 4.6.3). ``servers`` is the exact set of attached object store servers and is reconciled with an add/remove delta; the built-in ``s3.amazonaws.com`` host is never modified.

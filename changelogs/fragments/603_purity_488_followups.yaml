@@ -1,0 +1,3 @@
+bugfixes:
+  - purefb_policy - renaming a snapshot policy on Purity//FB 4.8.8 failed with only the array's error; the module now reports that snapshot policies cannot be renamed on any Purity//FB release and quotes the array.
+  - purefb_user - an API token create that the array still answered with "already created" right after the previous token was deleted is retried once.

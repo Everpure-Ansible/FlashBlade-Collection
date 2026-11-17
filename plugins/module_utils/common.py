@@ -14,6 +14,7 @@ This module adds shared functions for the FlashArray modules
 import platform
 import os
 import re
+import time
 
 from ansible.module_utils.common.process import get_bin_path
 from ansible.module_utils.facts.utils import get_file_content
@@ -295,3 +296,82 @@ def get_local_tz(module, timezone="UTC"):
     else:
         module.warn("Could not find /etc/timezone. Assuming UTC")
     return timezone
+
+
+def wait_for(
+    module,
+    probe,
+    is_done,
+    timeout,
+    description,
+    is_failed=None,
+    detail=None,
+    interval=5,
+    max_interval=30,
+    skip_in_check_mode=True,
+):
+    """Poll an array operation until it completes, or fail the module.
+
+    Args:
+        module: AnsibleModule instance
+        probe: Callable taking no arguments that reads the current state of
+            the resource and returns it. Returning None means the resource is
+            absent, which is how waiting for a deletion is expressed.
+        is_done: Callable taking the probed value, returning True when the
+            operation has finished
+        timeout: Maximum number of seconds to wait
+        description: What is being waited for, phrased to follow "waiting
+            for", e.g. "diagnostics run 3 to complete". Used in the timeout
+            message
+        is_failed: Optional callable taking the probed value and returning an
+            error message when the operation has terminally failed, or a
+            falsy value otherwise
+        detail: Optional callable taking the probed value and returning extra
+            diagnostics to append to the timeout message
+        interval: Seconds to wait before the second probe
+        max_interval: Ceiling for the interval as it backs off
+        skip_in_check_mode: By default polls are skipped in check mode, on
+            the basis that nothing was asked of the array so there is nothing
+            to wait for. Set this to False to poll in check mode anyway.
+
+    Returns:
+        The value from the final probe, or None when the poll was skipped in
+        check mode.
+
+    Raises:
+        Fails the module on a terminal failure or on timeout. Never returns a
+        value that does not satisfy is_done.
+    """
+    if module.check_mode and skip_in_check_mode:
+        return None
+
+    deadline = time.monotonic() + timeout
+    current_interval = interval
+    while True:
+        value = probe()
+        if is_failed is not None:
+            failure = is_failed(value)
+            if failure:
+                module.fail_json(
+                    msg="Failed while waiting for {0}. Error: {1}".format(
+                        description, failure
+                    )
+                )
+                return value
+        if is_done(value):
+            return value
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(current_interval, remaining))
+        current_interval = min(current_interval * 1.5, max_interval)
+
+    message = "Timed out after {0} seconds waiting for {1}.".format(
+        timeout, description
+    )
+    if detail is not None:
+        extra = detail(value)
+        if extra:
+            message = "{0} Last reported: {1}".format(message, extra)
+    module.fail_json(msg=message)
+    return value

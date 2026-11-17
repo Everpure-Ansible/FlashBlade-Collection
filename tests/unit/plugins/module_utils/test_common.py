@@ -7,13 +7,14 @@ from __future__ import absolute_import, division, print_function
 
 __metaclass__ = type
 
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from plugins.module_utils.common import (
     _findstr,
     remove_duplicates,
     get_error_message,
     human_to_bytes,
     human_to_real,
+    wait_for,
 )
 
 
@@ -202,3 +203,118 @@ class TestHumanToReal:
         assert human_to_real("5K") == 5000
         assert human_to_real("2m") == 2000000
         assert human_to_real("2M") == 2000000
+
+
+class TestWaitFor:
+    """Tests for the wait_for polling helper."""
+
+    @staticmethod
+    def _module(check_mode=False):
+        module = Mock()
+        module.check_mode = check_mode
+        module.fail_json = Mock(side_effect=SystemExit)
+        return module
+
+    @patch("plugins.module_utils.common.time")
+    def test_returns_when_done_on_first_probe(self, mock_time):
+        mock_time.monotonic.return_value = 0
+        module = self._module()
+        result = wait_for(module, lambda: "done", lambda v: v == "done", 60, "x")
+        assert result == "done"
+        mock_time.sleep.assert_not_called()
+        module.fail_json.assert_not_called()
+
+    @patch("plugins.module_utils.common.time")
+    def test_polls_with_backoff_until_done(self, mock_time):
+        mock_time.monotonic.side_effect = [0, 1, 2]
+        module = self._module()
+        probe = Mock(side_effect=["queued", "running", "completed"])
+        result = wait_for(
+            module, probe, lambda v: v == "completed", 600, "run 3 to complete"
+        )
+        assert result == "completed"
+        assert probe.call_count == 3
+        # 5 s then 7.5 s: interval backs off by half each time
+        assert [c[0][0] for c in mock_time.sleep.call_args_list] == [5, 7.5]
+
+    @patch("plugins.module_utils.common.time")
+    def test_sleep_never_overshoots_deadline(self, mock_time):
+        mock_time.monotonic.side_effect = [0, 58, 70]
+        module = self._module()
+        probe = Mock(side_effect=["running", "completed"])
+        wait_for(module, probe, lambda v: v == "completed", 60, "x")
+        assert mock_time.sleep.call_args_list[0][0][0] == 2
+
+    @patch("plugins.module_utils.common.time")
+    def test_fails_on_terminal_failure(self, mock_time):
+        mock_time.monotonic.return_value = 0
+        module = self._module()
+        try:
+            wait_for(
+                module,
+                lambda: "failed",
+                lambda v: v == "completed",
+                60,
+                "run 3 to complete",
+                is_failed=lambda v: "status failed" if v == "failed" else None,
+            )
+        except SystemExit:
+            pass
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert msg == "Failed while waiting for run 3 to complete. Error: status failed"
+        mock_time.sleep.assert_not_called()
+
+    @patch("plugins.module_utils.common.time")
+    def test_times_out_with_detail(self, mock_time):
+        mock_time.monotonic.side_effect = [0, 100]
+        module = self._module()
+        try:
+            wait_for(
+                module,
+                lambda: "running",
+                lambda v: v == "completed",
+                50,
+                "run 3 to complete",
+                detail="status {0}".format,
+            )
+        except SystemExit:
+            pass
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert msg == (
+            "Timed out after 50 seconds waiting for run 3 to complete. "
+            "Last reported: status running"
+        )
+        mock_time.sleep.assert_not_called()
+
+    @patch("plugins.module_utils.common.time")
+    def test_times_out_without_detail(self, mock_time):
+        mock_time.monotonic.side_effect = [0, 100]
+        module = self._module()
+        try:
+            wait_for(module, lambda: None, lambda v: v is not None, 50, "x")
+        except SystemExit:
+            pass
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Timed out after 50 seconds waiting for x."
+        )
+
+    @patch("plugins.module_utils.common.time")
+    def test_skipped_in_check_mode(self, mock_time):
+        module = self._module(check_mode=True)
+        probe = Mock()
+        assert wait_for(module, probe, lambda v: True, 60, "x") is None
+        probe.assert_not_called()
+        mock_time.monotonic.assert_not_called()
+
+    @patch("plugins.module_utils.common.time")
+    def test_polls_in_check_mode_when_asked(self, mock_time):
+        mock_time.monotonic.return_value = 0
+        module = self._module(check_mode=True)
+        probe = Mock(return_value="done")
+        result = wait_for(
+            module, probe, lambda v: True, 60, "x", skip_in_check_mode=False
+        )
+        assert result == "done"
+        probe.assert_called_once()

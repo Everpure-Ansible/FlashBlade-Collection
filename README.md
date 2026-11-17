@@ -152,6 +152,7 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_snmp_agent - modify the FlashBlade SNMP Agent
 - purefb_snmp_mgr - manage SNMP Managers on a FlashBlade
 - purefb_subnet - manage network subnets on a FlashBlade
+- purefb_support_diagnostics - run FlashBlade self-diagnostics and report the results
 - purefb_syslog - manage FlashBlade syslog server configuration
 - purefb_target - manage remote S3-capable targets for a FlashBlade
 - purefb_timeout - manage FlashBlade GUI timeout

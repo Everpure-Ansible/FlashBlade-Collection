@@ -59,6 +59,7 @@ action_groups:
     - purefb_snmp_agent
     - purefb_snmp_mgr
     - purefb_subnet
+    - purefb_support_diagnostics
     - purefb_syslog
     - purefb_target
     - purefb_timeout

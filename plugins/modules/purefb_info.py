@@ -35,7 +35,7 @@ options:
         Possible values for this include all, minimum, config, performance,
         capacity, network, subnets, lags, filesystems, snapshots, buckets,
         replication, policies, arrays, accounts, admins, ad, kerberos,
-        drives, servers, fleet and realms.
+        drives, servers, fleet, realms and support.
       - The C(filesystems) subset surfaces the legacy file system keys
         C(nfs_rules), C(export_policy), C(smb_client_policy) and
         C(smb_share_policy). Purity//FB marks the underlying fields as
@@ -128,6 +128,8 @@ FLEET_API_VERSION = "2.17"
 TLS_API_VERSION = "2.17"
 REALMS_API_VERSION = "2.19"
 S3_EXPORT_API_VERSION = "2.20"
+SUPPORT_DIAGNOSTICS_API_VERSION = "2.16"
+SUPPORT_DIAGNOSTICS_SETTINGS_API_VERSION = "2.24"
 
 
 def _bytes_to_human(bytes_number):
@@ -1722,6 +1724,49 @@ def generate_fleet_dict(blade):
     return fleet_info
 
 
+def generate_support_dict(blade):
+    """Return the retained self-diagnostics runs and the diagnostics tool version.
+
+    Requires REST API 2.16+ (SUPPORT_DIAGNOSTICS_API_VERSION); callers gate
+    on the API version. The array keeps the last 10 runs only, keyed here by
+    run index. Per-test results are not included - they belong to
+    purefb_support_diagnostics state=report. The tool version read-back needs
+    REST API 2.24+ and is empty on older arrays.
+    """
+    api_version = get_rest_api_version(blade)
+    support_info = {"diagnostics": {}, "diagnostics_settings": {}}
+    res = blade.get_support_diagnostics()
+    if res.status_code == 200:
+        for run in list(res.items):
+            period = getattr(run, "analysis_period", None)
+            counts = {"info": 0, "warning": 0, "critical": 0}
+            for entry in getattr(run, "severity_count", None) or []:
+                severity = getattr(entry, "severity", None)
+                if severity:
+                    counts[severity] = getattr(entry, "count", None) or 0
+            support_info["diagnostics"][str(getattr(run, "index", ""))] = {
+                "task_id": getattr(run, "task_id", None),
+                "status": getattr(run, "status", None),
+                "version": getattr(run, "version", None),
+                "start_time": getattr(run, "start_time", None),
+                "analysis_period_start": getattr(period, "start_time", None),
+                "analysis_period_end": getattr(period, "end_time", None),
+                "severity_count": counts,
+            }
+    if LooseVersion(SUPPORT_DIAGNOSTICS_SETTINGS_API_VERSION) <= LooseVersion(
+        api_version
+    ):
+        res = blade.get_support_diagnostics_settings()
+        if res.status_code == 200:
+            settings = next(iter(list(res.items)), None)
+            if settings is not None:
+                support_info["diagnostics_settings"] = {
+                    "version": getattr(settings, "version", None),
+                    "last_updated": getattr(settings, "last_updated", None),
+                }
+    return support_info
+
+
 def main():
     argument_spec = purefb_argument_spec()
     argument_spec.update(
@@ -1759,6 +1804,7 @@ def main():
         "servers",
         "fleet",
         "realms",
+        "support",
     )
     subset_test = (test in valid_subsets for test in subset)
     if not all(subset_test):
@@ -1866,6 +1912,10 @@ def main():
         SERVERS_API_VERSION
     ) <= LooseVersion(api_version):
         info["servers"] = generate_servers_dict(blade)
+    if ("support" in subset or "all" in subset) and LooseVersion(
+        SUPPORT_DIAGNOSTICS_API_VERSION
+    ) <= LooseVersion(api_version):
+        info["support"] = generate_support_dict(blade)
     module.exit_json(changed=False, purefb_info=info)
 
 

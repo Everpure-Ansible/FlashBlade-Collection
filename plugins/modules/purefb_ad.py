@@ -41,6 +41,9 @@ options:
     - Define whether the AD sccount is deleted or not
     - Test state will perform a test against the suppied account name
     - Rotate will force a keytab rotation for the specified account
+    - With I(ca_certificate) or I(ca_certificate_group), C(test) runs the tests
+      using that CA in place of the configured one and leaves the stored
+      configuration unchanged
     default: present
     choices: [ absent, present, test, rotate ]
     type: str
@@ -133,6 +136,41 @@ options:
     - Do a local-only delete of an active directory account
     type: bool
     default: false
+  ca_certificate:
+    description:
+    - Name of an existing certificate on the array for the Certificate Authority
+      that signed the certificates of the configured directory, global catalog
+      and Kerberos servers. The array uses it to validate those servers when it
+      connects over LDAPS and Kerberos.
+    - Use the M(everpure.flashblade.purefb_certs) module to create certificates.
+    - Mutually exclusive with I(ca_certificate_group).
+    - When omitted the array's current setting is left unchanged. If neither a
+      CA certificate nor a certificate group is configured the array does not
+      validate server certificates. The module does not clear a configured CA.
+    - Switching from a configured I(ca_certificate_group) to a certificate sends
+      only the new reference. Check the result with M(everpure.flashblade.purefb_info)
+      and clear the old reference on the array if it is still reported.
+    - Requires REST API 2.27 or later (Purity//FB 4.8.3) and a py-pure-client
+      release that includes FlashBlade REST 2.27 support.
+    type: str
+    version_added: '1.30.0'
+  ca_certificate_group:
+    description:
+    - Name of an existing certificate group on the array containing CA
+      certificates that can validate the configured directory, global catalog
+      and Kerberos servers.
+    - Use the M(everpure.flashblade.purefb_certgrp) module to create
+      certificate groups.
+    - Mutually exclusive with I(ca_certificate).
+    - When omitted the array's current setting is left unchanged. The module
+      does not clear a configured CA.
+    - Switching from a configured I(ca_certificate) to a certificate group sends
+      only the new reference. Check the result with M(everpure.flashblade.purefb_info)
+      and clear the old reference on the array if it is still reported.
+    - Requires REST API 2.27 or later (Purity//FB 4.8.3) and a py-pure-client
+      release that includes FlashBlade REST 2.27 support.
+    type: str
+    version_added: '1.30.0'
 extends_documentation_fragment:
 - everpure.flashblade.everpure.fb
 """
@@ -218,9 +256,76 @@ EXAMPLES = r"""
     state: rotate
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Create new AD account validating the domain controllers with a CA group
+  everpure.flashblade.purefb_ad:
+    name: ad_account
+    computer: FLASHBLADE
+    domain: acme.com
+    username: Administrator
+    password: Password
+    ca_certificate_group: domain_ca_group
+    kerberos_servers:
+      - kdc.acme.com
+    directory_servers:
+      - ldap.acme.com
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Test an existing AD account against a candidate CA without applying it
+  everpure.flashblade.purefb_ad:
+    name: ad_account
+    state: test
+    ca_certificate: new_domain_ca
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Apply the CA certificate to an existing AD account
+  everpure.flashblade.purefb_ad:
+    name: ad_account
+    ca_certificate: new_domain_ca
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 """
 
 RETURN = r"""
+test_response:
+  description:
+  - Result of each test the array ran against the servers of the account.
+  - With I(ca_certificate) or I(ca_certificate_group) the tests used that CA
+    in place of the configured one.
+  returned: when C(state=test) and the account exists
+  type: list
+  elements: dict
+  contains:
+    component_name:
+      description: Name of the array component that ran the test.
+      type: str
+      sample: CH1.FM1
+    description:
+      description: What the test checked.
+      type: str
+      sample: Validating connectivity to the directory server
+    destination:
+      description: URI of the server the test connected to.
+      type: str
+      sample: ldaps://ldap.acme.com:636
+    enabled:
+      description: Whether the tested service is enabled, as C(true) or C(false).
+      type: str
+      sample: "true"
+    success:
+      description: Whether the test passed, as C(true) or C(false).
+      type: str
+      sample: "true"
+    test_type:
+      description: Type of test the array ran.
+      type: str
+      sample: connectivity
+    resource_name:
+      description: Name of the Active Directory account that was tested.
+      type: str
+      sample: ad_account
 """
 
 HAS_PYPURECLIENT = True
@@ -233,6 +338,19 @@ try:
     )
 except ImportError:
     HAS_PYPURECLIENT = False
+
+# ActiveDirectoryTestPatch entered py-pure-client with the FlashBlade REST
+# 2.27 models, so when it is present ActiveDirectoryPost and
+# ActiveDirectoryPatch also carry the CA reference fields. Older releases
+# (py-pure-client 1.88.0, the collection's floor, stops at REST 2.26) lack
+# it and their models would silently drop the references, so the CA options
+# are refused when this import fails while the rest of the module keeps
+# working.
+HAS_AD_TEST_PATCH = True
+try:
+    from pypureclient.flashblade import ActiveDirectoryTestPatch
+except ImportError:
+    HAS_AD_TEST_PATCH = False
 
 from ansible.module_utils.basic import AnsibleModule
 from ansible_collections.everpure.flashblade.plugins.module_utils.purefb import (
@@ -249,6 +367,48 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
 
 GC_SERVERS_API_VERSION = "2.12"
 SERVERS_API_VERSION = "2.16"
+CA_CERT_API_VERSION = "2.27"
+
+# Module option -> Active Directory field. Both name a certificate object that
+# must already exist on the array, so the module sends Reference(name=...)
+# and compares against the name held by the current configuration.
+REFERENCE_PARAMS = {
+    "ca_certificate": "ca_certificate",
+    "ca_certificate_group": "ca_certificate_group",
+}
+
+
+def _reference_name(obj, field):
+    """Name held by a reference field on an AD configuration, or None."""
+    return getattr(getattr(obj, field, None), "name", None)
+
+
+def _check_certificate(module, blade, param):
+    """Fail unless the named certificate or certificate group exists."""
+    name = module.params[param]
+    if not name:
+        return
+    if param == "ca_certificate_group":
+        res = blade.get_certificate_groups(names=[name])
+        kind = "Certificate group"
+    else:
+        res = blade.get_certificates(names=[name])
+        kind = "Certificate"
+    if res.status_code != 200:
+        module.fail_json(
+            msg="{0} {1} does not exist. Error: {2}".format(
+                kind, name, get_error_message(res)
+            )
+        )
+
+
+def _ca_reference_kwargs(module):
+    """Reference kwargs for the CA option that was given, if any."""
+    kwargs = {}
+    for param, field in REFERENCE_PARAMS.items():
+        if module.params[param]:
+            kwargs[field] = Reference(name=module.params[param])
+    return kwargs
 
 
 def delete_account(module, blade):
@@ -269,6 +429,9 @@ def create_account(module, blade):
     """Create Active Directory Account"""
     changed = True
     api_version = get_rest_api_version(blade)
+    # CA references need REST 2.27; main() has already rejected them on
+    # older arrays, so they only ever reach the >= 2.12 constructors below.
+    ca_kwargs = _ca_reference_kwargs(module)
     if not module.params["existing"]:
         if LooseVersion(GC_SERVERS_API_VERSION) <= LooseVersion(api_version):
             ad_config = ActiveDirectoryPost(
@@ -282,6 +445,7 @@ def create_account(module, blade):
                 user=module.params["username"],
                 password=module.params["password"],
                 global_catalog_servers=module.params["global_catalog_servers"],
+                **ca_kwargs
             )
         else:
             ad_config = ActiveDirectoryPost(
@@ -316,6 +480,7 @@ def create_account(module, blade):
                 user=module.params["username"],
                 password=module.params["password"],
                 global_catalog_servers=module.params["global_catalog_servers"],
+                **ca_kwargs
             )
         else:
             ad_config = ActiveDirectoryPost(
@@ -404,6 +569,14 @@ def update_account(module, blade):
                         "global_catalog_servers"
                     ]
                     mod_ad = True
+    # CA references: main() has already gated them on REST 2.27 and checked
+    # that the named object exists. Only the given option is sent; an
+    # omitted option never clears what the array holds.
+    for param, field in REFERENCE_PARAMS.items():
+        wanted = module.params[param]
+        if wanted and wanted != _reference_name(current_ad, field):
+            attr[field] = Reference(name=wanted)
+            mod_ad = True
     if mod_ad:
         changed = True
         if not module.check_mode:
@@ -421,11 +594,28 @@ def update_account(module, blade):
 
 
 def test_account(module, blade):
-    """Test AD account configuration"""
+    """Test AD account configuration
+
+    With a CA certificate or certificate group the array runs the tests
+    using that reference in place of the configured one (PATCH
+    /active-directory/test); the stored configuration is never changed.
+    """
     test_response = []
-    response = list(
-        blade.get_active_directory_test(names=[module.params["name"]]).items
-    )
+    ca_kwargs = _ca_reference_kwargs(module)
+    if ca_kwargs:
+        res = blade.patch_active_directory_test(
+            names=[module.params["name"]],
+            active_directory=ActiveDirectoryTestPatch(**ca_kwargs),
+        )
+    else:
+        res = blade.get_active_directory_test(names=[module.params["name"]])
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to test Active Directory Account {0}. Error: {1}".format(
+                module.params["name"], get_error_message(res)
+            )
+        )
+    response = list(res.items)
     for component in response:
         if component.enabled:
             enabled = "true"
@@ -492,6 +682,8 @@ def main():
             kerberos_servers=dict(type="list", elements="str"),
             service_principals=dict(type="list", elements="str"),
             global_catalog_servers=dict(type="list", elements="str"),
+            ca_certificate=dict(type="str"),
+            ca_certificate_group=dict(type="str"),
             encryption=dict(
                 type="list",
                 elements="str",
@@ -507,10 +699,25 @@ def main():
         )
     )
 
-    module = AnsibleModule(argument_spec, supports_check_mode=True)
+    module = AnsibleModule(
+        argument_spec,
+        supports_check_mode=True,
+        mutually_exclusive=[["ca_certificate", "ca_certificate_group"]],
+    )
 
     if not HAS_PYPURECLIENT:
         module.fail_json(msg="py-pure-client sdk is required for this module")
+    # The CA options need the REST 2.27 models; an older SDK would drop the
+    # references silently, so refuse them before the array is contacted.
+    ca_params = [param for param in REFERENCE_PARAMS if module.params[param]]
+    if ca_params and not HAS_AD_TEST_PATCH:
+        module.fail_json(
+            msg=(
+                "{0} requires a py-pure-client release with FlashBlade REST "
+                "{1} support (ActiveDirectoryTestPatch is missing from the "
+                "installed SDK)"
+            ).format(", ".join(ca_params), CA_CERT_API_VERSION)
+        )
 
     blade = get_system(module)
     module.params["encryption"] = [
@@ -542,6 +749,19 @@ def main():
         module.params["kerberos_servers"] = module.params["kerberos_servers"][0:5]
     if module.params["directory_servers"]:
         module.params["directory_servers"] = module.params["directory_servers"][0:5]
+
+    # CA references: gate on the array's REST 2.27 and confirm the named
+    # object exists before any POST, PATCH or test is issued.
+    if ca_params and LooseVersion(CA_CERT_API_VERSION) > LooseVersion(api_version):
+        module.fail_json(
+            msg=(
+                "{0} requires FlashBlade REST version {1} or later "
+                "(Purity//FB 4.8.3+)"
+            ).format(", ".join(ca_params), CA_CERT_API_VERSION)
+        )
+    if state in ("present", "test"):
+        for param in ca_params:
+            _check_certificate(module, blade, param)
 
     if not exists and state == "present":
         create_account(module, blade)

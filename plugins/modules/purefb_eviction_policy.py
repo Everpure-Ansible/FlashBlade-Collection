@@ -223,12 +223,24 @@ def _keep_size_bytes(module):
 
 
 def _get_policy(module, blade, name):
-    """Return the data eviction policy called C(name), or None."""
+    """Return the data eviction policy called C(name), or None.
+
+    A missing policy is itself a 400 here ("Data eviction policy does not
+    exist."), so only that answer reads as None. Any other failure fails
+    the task rather than masquerading as "absent", which would let
+    state=absent report ok, or state=present attempt a create, on a
+    transient API error.
+    """
     res = blade.get_data_eviction_policies(names=[name], **_context_kwargs(module))
-    if res.status_code != 200:
+    if res.status_code == 200:
+        items = list(res.items)
+        return items[0] if items else None
+    error = get_error_message(res)
+    if error and "policy does not exist" in str(error).lower():
         return None
-    items = list(res.items)
-    return items[0] if items else None
+    module.fail_json(
+        msg="Failed to read data eviction policy {0}. Error: {1}".format(name, error)
+    )
 
 
 def _get_members(module, blade):

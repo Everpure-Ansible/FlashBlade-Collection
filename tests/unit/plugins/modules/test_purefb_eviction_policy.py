@@ -171,9 +171,12 @@ def _blade(existing=None, members=None):
     return blade
 
 
-def _run_main(params, blade, check_mode=False, old_api=False, sdk=True):
+def _run_main(
+    params, blade, check_mode=False, old_api=False, sdk=True, error="array says no"
+):
     """Run main() against a prepared blade mock.
 
+    C(error) is what get_error_message returns for any failed response.
     Returns (module, DataEvictionPolicyPost mock, DataEvictionPolicy mock).
     """
     module = _module(params, check_mode)
@@ -188,7 +191,7 @@ def _run_main(params, blade, check_mode=False, old_api=False, sdk=True):
     ) as mock_patch_model, patch(
         MOD + ".human_to_bytes", side_effect=_fake_human_to_bytes
     ), patch(
-        MOD + ".get_error_message", return_value="array says no"
+        MOD + ".get_error_message", return_value=error
     ):
         mock_loose_version.return_value.__gt__ = Mock(return_value=old_api)
         try:
@@ -260,13 +263,32 @@ class TestPurefbEvictionPolicy:
         module.params = {"context": ""}
         assert _get_policy(module, _blade([]), "edge_cache") is None
 
-    def test_get_policy_returns_none_on_error(self):
-        """_get_policy returns None on a non-200 response"""
-        module = Mock()
-        module.params = {"context": ""}
+    def test_get_policy_returns_none_when_array_says_missing(self):
+        """_get_policy reads the array's not-found answer as None"""
+        module = _module(_base_params())
         blade = Mock()
         blade.get_data_eviction_policies.return_value = _response(status_code=400)
-        assert _get_policy(module, blade, "edge_cache") is None
+        with patch(
+            MOD + ".get_error_message",
+            return_value="Data eviction policy does not exist.",
+        ):
+            assert _get_policy(module, blade, "edge_cache") is None
+        module.fail_json.assert_not_called()
+
+    def test_get_policy_fails_on_other_error(self):
+        """_get_policy fails on any error other than the not-found answer"""
+        module = _module(_base_params())
+        blade = Mock()
+        blade.get_data_eviction_policies.return_value = _response(status_code=500)
+        with patch(MOD + ".get_error_message", return_value="Internal error"):
+            try:
+                _get_policy(module, blade, "edge_cache")
+            except SystemExit:
+                pass
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Failed to read data eviction policy edge_cache" in msg
+        assert "Internal error" in msg
 
     def test_get_policy_passes_context(self):
         """_get_policy passes context_names when a context is set"""
@@ -646,6 +668,69 @@ class TestPurefbEvictionPolicy:
         assert "Failed to delete data eviction policy edge_cache" in msg
         assert "array says no" in msg
         assert "already been detached" in msg
+
+    # ---------------- policy read errors ----------------
+
+    def test_main_absent_fails_on_read_error(self):
+        """A failed policy read with state=absent fails instead of reporting ok"""
+        blade = _blade([])
+        blade.get_data_eviction_policies.side_effect = None
+        blade.get_data_eviction_policies.return_value = _response(status_code=500)
+        module, _post_model, _patch_model = _run_main(
+            _base_params(state="absent"), blade
+        )
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Failed to read data eviction policy edge_cache" in msg
+        assert "array says no" in msg
+        module.exit_json.assert_not_called()
+        blade.delete_data_eviction_policies.assert_not_called()
+
+    def test_main_present_fails_on_read_error_before_create(self):
+        """A failed policy read with state=present fails without a POST"""
+        blade = _blade([])
+        blade.get_data_eviction_policies.side_effect = None
+        blade.get_data_eviction_policies.return_value = _response(status_code=500)
+        module, post_model, _patch_model = _run_main(
+            _base_params(keep_size="100G"), blade
+        )
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Failed to read data eviction policy edge_cache" in msg
+        blade.post_data_eviction_policies.assert_not_called()
+        post_model.assert_not_called()
+
+    def test_main_not_found_answer_creates_policy(self):
+        """The array's 400 not-found answer reads as absent and leads to a create"""
+        created = _policy()
+        blade = _blade([])
+        blade.get_data_eviction_policies.side_effect = None
+        blade.get_data_eviction_policies.return_value = _response(status_code=400)
+        blade.post_data_eviction_policies.side_effect = _swap_policies(blade, [created])
+        module, _post_model, _patch_model = _run_main(
+            _base_params(keep_size="100G"),
+            blade,
+            error="Data eviction policy does not exist.",
+        )
+        module.fail_json.assert_not_called()
+        blade.post_data_eviction_policies.assert_called_once()
+        result = module.exit_json.call_args[1]
+        assert result["changed"] is True
+        assert result["policy"]["name"] == "edge_cache"
+
+    def test_main_absent_not_found_answer_is_idempotent(self):
+        """The array's 400 not-found answer with state=absent reports no change"""
+        blade = _blade([])
+        blade.get_data_eviction_policies.side_effect = None
+        blade.get_data_eviction_policies.return_value = _response(status_code=400)
+        module, _post_model, _patch_model = _run_main(
+            _base_params(state="absent"),
+            blade,
+            error="Data eviction policy does not exist.",
+        )
+        module.fail_json.assert_not_called()
+        blade.delete_data_eviction_policies.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
 
     # ---------------- gates and context ----------------
 

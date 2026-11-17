@@ -143,6 +143,7 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_pingtrace - perform FlashBlade network diagnostics
 - purefb_policy - manage the filesystem snapshot policies for a FlashBlade
 - purefb_proxy - manage the phone home HTTP proxy settings for a FlashBlade
+- purefb_public_key - manage FlashBlade public keys for SSH certificate authority policies
 - purefb_quota_settings - manage FlashBlade user and group quota notification settings
 - purefb_ra - manage the Remote Assist connections on a FlashBlade
 - purefb_realm - manage the Realms for a FlashBlade

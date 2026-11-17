@@ -50,6 +50,7 @@ action_groups:
     - purefb_pingtrace
     - purefb_policy
     - purefb_proxy
+    - purefb_public_key
     - purefb_quota_settings
     - purefb_ra
     - purefb_realm

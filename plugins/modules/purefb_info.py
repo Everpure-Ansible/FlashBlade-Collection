@@ -73,6 +73,10 @@ options:
         list (and the top-level C(file_system_exports) view under
         C(subset=filesystems)/C(subset=all)) instead. These keys will
         be removed from this module in 2.0.0.
+      - The C(admins) subset also returns the array's public keys under
+        C(public_keys) (name, algorithm, key size, key text and the SSH
+        certificate authority policies that use each key) on
+        Purity//FB 4.4.2 / REST API 2.14 or later.
       - The C(arrays) subset reports C(connection_paths) for every array
         connection, one entry per network path with its C(source),
         C(destination), C(status), C(status_details) and C(type).
@@ -251,6 +255,7 @@ SPACE_API_VERSION = "2.11"
 PUBLIC_API_VERSION = "2.12"
 NAP_API_VERSION = "2.13"
 RA_DURATION_API_VERSION = "2.14"
+PUBLIC_KEYS_API_VERSION = "2.14"
 SSH_CA_API_VERSION = "2.14"
 SMTP_ENCRYPT_API_VERSION = "2.15"
 WORM_API_VERSION = "2.15"
@@ -1199,6 +1204,33 @@ def generate_admin_dict(blade):
                 else None
             )
     return admin_info
+
+
+def generate_public_keys_dict(blade):
+    """Return the array's public keys keyed by name, each with its uses"""
+    keys_info = {}
+    res = blade.get_public_keys()
+    if res.status_code != 200:
+        return keys_info
+    uses = {}
+    uses_res = blade.get_public_keys_uses()
+    if uses_res.status_code == 200:
+        for item in list(uses_res.items):
+            ref = getattr(item, "use", None)
+            uses.setdefault(item.name, []).append(
+                {
+                    "name": getattr(ref, "name", None),
+                    "resource_type": getattr(ref, "resource_type", None),
+                }
+            )
+    for key in list(res.items):
+        keys_info[key.name] = {
+            "algorithm": getattr(key, "algorithm", None),
+            "key_size": getattr(key, "key_size", None),
+            "public_key": getattr(key, "public_key", None),
+            "uses": uses.get(key.name, []),
+        }
+    return keys_info
 
 
 def generate_targets_dict(blade):
@@ -3459,6 +3491,8 @@ def main():
         info["filesystems"] = generate_fs_dict(blade, exports_list, worm_policies)
     if "admins" in subset or "all" in subset:
         info["admins"] = generate_admin_dict(blade)
+        if LooseVersion(PUBLIC_KEYS_API_VERSION) <= LooseVersion(api_version):
+            info["public_keys"] = generate_public_keys_dict(blade)
     if "snapshots" in subset or "all" in subset:
         info["snapshots"] = generate_snap_dict(blade)
     if "buckets" in subset or "all" in subset:

@@ -105,6 +105,7 @@ from plugins.modules.purefb_info import (
     generate_realms_dict,
     generate_resource_accesses_dict,
     generate_file_repl_dict,
+    generate_public_keys_dict,
     generate_admin_cache_dict,
     generate_management_access_policies_dict,
     generate_management_access_roles_dict,
@@ -5819,3 +5820,116 @@ class TestGenerateEvictionPoliciesDict:
         blade.get_data_eviction_policies.return_value = Mock(status_code=400, items=[])
         assert generate_eviction_policies_dict(blade) == {}
         blade.get_data_eviction_policies_file_systems.assert_not_called()
+
+
+class TestPurefbInfoPublicKeys:
+    """Public keys read-back of the admins subset"""
+
+    def test_generate_public_keys_dict_groups_uses_by_key(self):
+        key = Mock(spec=["name", "public_key", "algorithm", "key_size"])
+        key.name = "ca-signer"
+        key.public_key = "ssh-ed25519 AAAA"
+        key.algorithm = "ed25519"
+        key.key_size = 256
+        unused = Mock(spec=["name", "public_key", "algorithm", "key_size"])
+        unused.name = "test"
+        unused.public_key = "-----BEGIN PUBLIC KEY-----"
+        unused.algorithm = "rsa"
+        unused.key_size = 2048
+        ref = Mock(spec=["name", "resource_type"])
+        ref.name = "ca-policy"
+        ref.resource_type = "ssh-certificate-authority-policies"
+        use = Mock(spec=["name", "use"])
+        use.name = "ca-signer"
+        use.use = ref
+
+        mock_blade = Mock()
+        mock_blade.get_public_keys.return_value.status_code = 200
+        mock_blade.get_public_keys.return_value.items = [key, unused]
+        mock_blade.get_public_keys_uses.return_value.status_code = 200
+        mock_blade.get_public_keys_uses.return_value.items = [use]
+
+        result = generate_public_keys_dict(mock_blade)
+
+        assert result["ca-signer"] == {
+            "algorithm": "ed25519",
+            "key_size": 256,
+            "public_key": "ssh-ed25519 AAAA",
+            "uses": [
+                {
+                    "name": "ca-policy",
+                    "resource_type": "ssh-certificate-authority-policies",
+                }
+            ],
+        }
+        assert result["test"]["algorithm"] == "rsa"
+        assert result["test"]["uses"] == []
+
+    def test_generate_public_keys_dict_returns_empty_when_endpoint_errors(self):
+        mock_blade = Mock()
+        mock_blade.get_public_keys.return_value.status_code = 400
+        assert generate_public_keys_dict(mock_blade) == {}
+        mock_blade.get_public_keys_uses.assert_not_called()
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_public_keys_dict")
+    @patch("plugins.modules.purefb_info.generate_admin_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_admins_subset_adds_public_keys(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_admin,
+        mock_generate_public_keys,
+        mock_loose_version,
+    ):
+        """admins subset returns public_keys from REST 2.14"""
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["admins"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_blade.get_versions.return_value.items = ["2.14"]
+        mock_get_system.return_value = mock_blade
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+        mock_generate_admin.return_value = {"pureuser": {}}
+        mock_generate_public_keys.return_value = {"ca-signer": {}}
+
+        main()
+
+        mock_generate_admin.assert_called_once_with(mock_blade)
+        mock_generate_public_keys.assert_called_once_with(mock_blade)
+        info = mock_module.exit_json.call_args[1]["purefb_info"]
+        assert info["admins"] == {"pureuser": {}}
+        assert info["public_keys"] == {"ca-signer": {}}
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_public_keys_dict")
+    @patch("plugins.modules.purefb_info.generate_admin_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_admins_subset_skips_public_keys_on_old_rest(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_admin,
+        mock_generate_public_keys,
+        mock_loose_version,
+    ):
+        """admins subset leaves public_keys out before REST 2.14"""
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["admins"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_blade.get_versions.return_value.items = ["2.13"]
+        mock_get_system.return_value = mock_blade
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+        mock_generate_admin.return_value = {}
+
+        main()
+
+        mock_generate_public_keys.assert_not_called()
+        info = mock_module.exit_json.call_args[1]["purefb_info"]
+        assert "public_keys" not in info

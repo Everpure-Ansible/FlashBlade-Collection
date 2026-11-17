@@ -41,6 +41,12 @@ options:
     - Sets the local user's access level to the system
     - A new local user is created with I(readonly) when no role is given.
     - When omitted for an existing user the current role is left unchanged.
+    - A user that holds several management access policies, or a custom one,
+      has no legacy role. The requested role is then satisfied when it is one
+      of the user's policies; the policy set is left alone and a warning names
+      the other policies the user holds. Otherwise the module fails, because
+      the array refuses a role change on such a user.
+      Use M(everpure.flashblade.purefb_mgmt_role) to change its policies.
     type: str
     choices: [ readonly, ops_admin, storage_admin, array_admin ]
     version_added: "1.21.0"
@@ -265,6 +271,58 @@ def get_user(module, blade):
         return list(res.items)[0]
 
 
+def get_role_name(user):
+    """Return the admin's legacy role name, or None.
+
+    The array sets ``role`` only when the admin holds exactly one management
+    access policy that corresponds to a legacy role of the same name. It is
+    null for an admin with no, several, or a custom policy.
+    """
+    return getattr(getattr(user, "role", None), "name", None)
+
+
+def get_policy_names(user):
+    """Return the sorted names of the admin's management access policies"""
+    policies = getattr(user, "management_access_policies", None) or []
+    return sorted(policy.name for policy in policies if getattr(policy, "name", None))
+
+
+def role_change(module, user):
+    """Return True when the requested role has to be set on the local admin.
+
+    An admin without a legacy role is managed through management access
+    policies and the array refuses a role PATCH on it. The requested role
+    counts as satisfied when it is one of those policies, with a warning
+    when the admin holds others too; the policy set itself belongs to
+    purefb_mgmt_role. Any other role fails here, before a call the array
+    would reject.
+    """
+    requested = module.params["role"]
+    if not requested or not getattr(user, "is_local", False):
+        return False
+    current = get_role_name(user)
+    if current is not None:
+        return requested != current
+    policies = get_policy_names(user)
+    if requested.lower() in [policy.lower() for policy in policies]:
+        others = [policy for policy in policies if policy.lower() != requested.lower()]
+        if others:
+            module.warn(
+                "Local User {0} also holds management access policies {1}; role "
+                "{2} is satisfied but not exclusive. Use purefb_mgmt_role to "
+                "change its policies.".format(module.params["name"], others, requested)
+            )
+        return False
+    module.fail_json(
+        msg=(
+            "Local User {0} is managed by management access policies {1} and "
+            "has no legacy role, so role {2} cannot be set. Use "
+            "purefb_mgmt_role to change its policies."
+        ).format(module.params["name"], policies, requested)
+    )
+    return False
+
+
 def has_api_token(user):
     """Return True if the admin currently holds an API token.
 
@@ -378,28 +436,26 @@ def create_local_user(module, blade, user):
                 if has_api_token(user):
                     delete_api_token(module, blade)
                 api_token = create_api_token(module, blade)
-        if (
-            module.params["role"]
-            and module.params["role"] != getattr(user.role, "name", None)
-            and user.is_local
-        ):
-            if module.params["name"] != "pureuser":
-                role_changed = True
-                if not module.check_mode:
-                    res = blade.patch_admins(
-                        names=[module.params["name"]],
-                        admin=AdminPatch(
-                            role=ReferenceWritable(name=module.params["role"])
-                        ),
-                    )
-                    if res.status_code != 200:
-                        module.fail_json(
-                            msg="Local User {0} role changed failed. Error: {1}".format(
-                                module.params["name"], get_error_message(res)
-                            )
-                        )
-            else:
+        if module.params["name"] == "pureuser":
+            # the role of pureuser is fixed, whether it is a legacy role or
+            # the account is managed by management access policies
+            if module.params["role"] and module.params["role"] != get_role_name(user):
                 module.warn("Role for 'pureuser' cannot be modified.")
+        elif role_change(module, user):
+            role_changed = True
+            if not module.check_mode:
+                res = blade.patch_admins(
+                    names=[module.params["name"]],
+                    admin=AdminPatch(
+                        role=ReferenceWritable(name=module.params["role"])
+                    ),
+                )
+                if res.status_code != 200:
+                    module.fail_json(
+                        msg="Local User {0} role changed failed. Error: {1}".format(
+                            module.params["name"], get_error_message(res)
+                        )
+                    )
         if public_key_changed(module, user):
             key_changed = True
             if not module.check_mode:

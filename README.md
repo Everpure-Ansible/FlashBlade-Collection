@@ -115,6 +115,7 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_export - manage filesystem exports on FlashBlade
 - purefb_fleet - manage Fusion fleet members
 - purefb_fs - manage filesystems on a FlashBlade
+- purefb_fs_lock - list and clear file locks, file sessions and SMB open files on a FlashBlade
 - purefb_fs_replica - manage filesystem replica links on a FlashBlade
 - purefb_groupquota - manage individual group quotas on FlashBlade filesystems
 - purefb_hardware - manage hardware LED identifiers and hardware connectors
@@ -127,17 +128,20 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_local_ds - manage FlashBlade Local Directory Services
 - purefb_local_group - manage local groups in a FlashBlade Local Directory Service
 - purefb_local_user - manage local users in a FlashBlade Local Directory Service
+- purefb_maintenance - manage the FlashBlade maintenance window
 - purefb_messages - list, flag and unflag FlashBlade alert messages
 - purefb_mgmt_auth_policy - manage FlashBlade management authentication policies and their members
 - purefb_mgmt_policy - manage FlashBlade management access policies and their rules
 - purefb_mgmt_role - manage FlashBlade custom management roles, permissions, and policy attachment
 - purefb_network - manage the network settings for a FlashBlade
 - purefb_ntp - manage the NTP settings for a FlashBlade
+- purefb_oidc - manage FlashBlade OIDC identity providers
 - purefb_password_policy - manage the FlashBlade management password policy
 - purefb_phonehome - manage the phone home settings for a FlashBlade
 - purefb_pingtrace - perform FlashBlade network diagnostics
 - purefb_policy - manage the filesystem snapshot policies for a FlashBlade
 - purefb_proxy - manage the phone home HTTP proxy settings for a FlashBlade
+- purefb_quota_settings - manage FlashBlade user and group quota notification settings
 - purefb_ra - manage the Remote Assist connections on a FlashBlade
 - purefb_realm - manage the Realms for a FlashBlade
 - purefb_remote_cred - manage the Object Store Remote Credentials on a FlashBlade
@@ -154,7 +158,9 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_snmp_agent - modify the FlashBlade SNMP Agent
 - purefb_snmp_mgr - manage SNMP Managers on a FlashBlade
 - purefb_software_patch - install Purity//FB software patches on a FlashBlade
+- purefb_ssh_ca_policy - manage FlashBlade SSH Certificate Authority policies and their members
 - purefb_subnet - manage network subnets on a FlashBlade
+- purefb_support_diagnostics - run FlashBlade self-diagnostics and report the results
 - purefb_syslog - manage FlashBlade syslog server configuration
 - purefb_target - manage remote S3-capable targets for a FlashBlade
 - purefb_timeout - manage FlashBlade GUI timeout

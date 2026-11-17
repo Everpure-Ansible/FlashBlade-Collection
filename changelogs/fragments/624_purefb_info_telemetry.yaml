@@ -1,0 +1,4 @@
+minor_changes:
+  - purefb_info - add the ``telemetry`` subset reporting telemetry targets, telemetry metrics policies
+    with their rules, targets and member arrays, and metrics collections with their default and
+    supported resolutions (REST 2.29+).

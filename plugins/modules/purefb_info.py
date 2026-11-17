@@ -1914,7 +1914,7 @@ def generate_bucket_dict(blade):
                     abort_incomplete_multipart_uploads_after = None
                 if rule.keep_current_version_until:
                     keep_current_version_until = datetime.fromtimestamp(
-                        rule.keep_current_version_until / 1000
+                        rule.keep_current_version_until / 1000, tz=timezone.utc
                     ).strftime("%Y-%m-%d")
                 else:
                     keep_current_version_until = None
@@ -1926,6 +1926,13 @@ def generate_bucket_dict(blade):
                     "enabled": rule.enabled,
                     "abort_incomplete_multipart_uploads_after (days)": abort_incomplete_multipart_uploads_after,
                     "cleanup_expired_object_delete_marker": rule.cleanup_expired_object_delete_marker,
+                    "keep_previous_versions_count": getattr(
+                        rule, "keep_previous_versions_count", None
+                    ),
+                    "tags": [
+                        {"key": tag.key, "value": tag.value}
+                        for tag in (getattr(rule, "tags", None) or [])
+                    ],
                 }
 
     return bucket_info

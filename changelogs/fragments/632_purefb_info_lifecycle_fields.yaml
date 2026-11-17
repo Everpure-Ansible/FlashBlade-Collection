@@ -1,0 +1,5 @@
+minor_changes:
+  - purefb_info - lifecycle rules now report ``keep_previous_versions_count`` and ``tags``.
+bugfixes:
+  - purefb_info - ``keep_current_version_until`` of a lifecycle rule is rendered in UTC; it was rendered
+    in the controller's local time zone and could be a day early.

@@ -104,6 +104,7 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_bladename - manage FlashBlade name
 - purefb_bucket - manage S3 buckets on a FlashBlade
 - purefb_bucket_access - manage S3 bucket access policies on a FlashBlade
+- purefb_bucket_lifecycle - manage S3 bucket lifecycle policy rules on a FlashBlade
 - purefb_bucket_replica - manage bucket replica links on a FlashBlade
 - purefb_certgrp - manage FlashBlade certificate groups
 - purefb_certs - manage FlashBlade SSL certificates

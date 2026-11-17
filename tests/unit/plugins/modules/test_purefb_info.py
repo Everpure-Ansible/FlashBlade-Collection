@@ -925,6 +925,8 @@ class TestPurefbInfo:
                 "is_local",
                 "role",
                 "management_access_policies",
+                "admin_type",
+                "authorization_model",
                 "locked",
                 "lockout_remaining",
                 "api_token",
@@ -935,13 +937,23 @@ class TestPurefbInfo:
         legacy.is_local = True
         legacy.role = _reference("array_admin")
         legacy.management_access_policies = [_reference("array_admin")]
+        legacy.admin_type = "local-user"
+        legacy.authorization_model = "static"
         legacy.locked = False
         legacy.lockout_remaining = None
         legacy.api_token = Mock(spec=["created_at", "expires_at"])
         legacy.api_token.created_at = 1700000000000
         legacy.api_token.expires_at = 1800000000000
         policy_admin = Mock(
-            spec=["name", "is_local", "role", "management_access_policies", "api_token"]
+            spec=[
+                "name",
+                "is_local",
+                "role",
+                "management_access_policies",
+                "admin_type",
+                "authorization_model",
+                "api_token",
+            ]
         )
         policy_admin.name = "svc-backup"
         policy_admin.is_local = True
@@ -951,6 +963,8 @@ class TestPurefbInfo:
             _reference("storage_admin"),
             _reference("readonly"),
         ]
+        policy_admin.admin_type = "service-account"
+        policy_admin.authorization_model = "static"
         mock_blade = Mock()
         mock_blade.get_admins.return_value.items = [legacy, policy_admin]
 
@@ -958,6 +972,8 @@ class TestPurefbInfo:
 
         assert result["pureuser"]["role"] == "array_admin"
         assert result["pureuser"]["management_access_policies"] == ["array_admin"]
+        assert result["pureuser"]["admin_type"] == "local-user"
+        assert result["pureuser"]["authorization_model"] == "static"
         assert result["pureuser"]["local"] is True
         assert result["pureuser"]["token_created"] == datetime.fromtimestamp(
             1700000000
@@ -970,11 +986,71 @@ class TestPurefbInfo:
             "local": True,
             "role": None,
             "management_access_policies": ["storage_admin", "readonly"],
+            "admin_type": "service-account",
+            "authorization_model": "static",
             "locked": None,
             "lockout_remaining": None,
             "token_expires": None,
             "token_created": None,
         }
+
+    @patch("plugins.modules.purefb_info.get_rest_api_version")
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_admin_dict_between_2_19_and_2_24(
+        self, mock_loose_version, mock_api_version
+    ):
+        """An array at REST 2.20 reports the policy names but not yet the
+        account type or authorization model, which the API adds at 2.24"""
+
+        class _Version:
+            def __init__(self, text):
+                self.parts = tuple(int(part) for part in str(text).split("."))
+
+            def __le__(self, other):
+                return self.parts <= other.parts
+
+        mock_loose_version.side_effect = _Version
+        mock_api_version.return_value = "2.20"
+        admin = Mock(
+            spec=["name", "public_key", "is_local", "role", "locked", "api_token"]
+        )
+        admin.name = "pureuser"
+        admin.public_key = None
+        admin.is_local = True
+        admin.role = _reference("array_admin")
+        admin.locked = False
+        admin.api_token = None
+        mock_blade = Mock()
+        mock_blade.get_admins.return_value.items = [admin]
+
+        result = generate_admin_dict(mock_blade)
+
+        assert result["pureuser"]["management_access_policies"] == []
+        assert "admin_type" not in result["pureuser"]
+        assert "authorization_model" not in result["pureuser"]
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_admin_dict_token_object_without_timestamps(
+        self, mock_loose_version
+    ):
+        """A service account without a token carries an api_token object
+        whose timestamps are null; both token fields still read None"""
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+        admin = Mock(spec=["name", "is_local", "role", "api_token"])
+        admin.name = "svc-backup"
+        admin.is_local = True
+        admin.role = _reference("readonly")
+        admin.api_token = Mock(spec=["created_at", "expires_at", "token"])
+        admin.api_token.created_at = None
+        admin.api_token.expires_at = None
+        admin.api_token.token = None
+        mock_blade = Mock()
+        mock_blade.get_admins.return_value.items = [admin]
+
+        result = generate_admin_dict(mock_blade)
+
+        assert result["svc-backup"]["token_created"] is None
+        assert result["svc-backup"]["token_expires"] is None
 
     def test_generate_password_policies_dict(self):
         """Test generate_password_policies_dict reports all fields in seconds"""

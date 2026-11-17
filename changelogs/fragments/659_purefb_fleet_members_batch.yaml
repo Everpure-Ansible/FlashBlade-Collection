@@ -1,0 +1,3 @@
+minor_changes:
+  - purefb_fleet - add ``members`` to join arrays to the fleet in one batch by management address and
+    administrator credentials (REST 2.27) and ``member_name`` to remove members from the coordinator alone.

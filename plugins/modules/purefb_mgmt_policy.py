@@ -69,11 +69,15 @@ options:
     - Omit (or set to C(null)) to leave the current rule list untouched.
     - Provide an empty list to remove every rule from the policy.
     - On REST API 2.26 and newer rules are added and removed one at a time.
-      Older arrays (REST 2.19 to 2.25) have no per-rule endpoints, so the
-      rule list is sent with the policy at creation and replaced as a whole
-      when it differs on update.
-    - Purity//FB 4.6 (REST 2.21) requires exactly one rule when a policy
-      is created.
+      A rule whose role changes at a scope that stays in the list is
+      modified in place (its id is kept), and new rules are added before
+      stale ones are removed. Older arrays (REST 2.19 to 2.25) have no
+      per-rule endpoints, so the rule list is sent with the policy at
+      creation and replaced as a whole when it differs on update.
+    - Below REST 2.26 the array requires exactly one rule per policy, so a
+      policy is created with one rule and its rule list cannot be emptied;
+      the module refuses an empty list there. From REST 2.26 a policy may
+      hold any number of rules, including none.
     type: list
     elements: dict
     suboptions:
@@ -225,6 +229,25 @@ def _desired_rules_by_key(rules):
     return by_key
 
 
+def _role_name(rule):
+    """Role name of a rule as the array returns it, or an empty string when
+    the role reference is missing (a rule whose role was deleted comes back
+    with ``role: null``)."""
+    return getattr(getattr(rule, "role", None), "name", None) or ""
+
+
+def _current_rule_key(rule):
+    """Identity key of a rule as the array returns it, inline on the policy
+    (REST < 2.26) or from the rules endpoint, tolerating missing role or
+    scope references instead of raising ``AttributeError``."""
+    scope = getattr(rule, "scope", None)
+    return _rule_key(
+        _role_name(rule),
+        getattr(scope, "resource_type", None) or "",
+        getattr(scope, "name", None) or "",
+    )
+
+
 def _validate_rules(module):
     """Reject duplicate rules client-side.
 
@@ -318,37 +341,54 @@ def _reconcile_rules(module, blade, ctx_kwargs):
     current = _get_current_rules(module, blade, ctx_kwargs)
     current_by_key = {}
     for rule in current:
-        key = _rule_key(rule.role.name, rule.scope.resource_type, rule.scope.name)
-        current_by_key[key] = rule
+        current_by_key[_current_rule_key(rule)] = rule
 
     desired_by_key = _desired_rules_by_key(desired)
 
-    to_remove = set(current_by_key) - set(desired_by_key)
-    to_add = set(desired_by_key) - set(current_by_key)
+    # Sorted so that the pairing below is deterministic from run to run.
+    to_remove = sorted(set(current_by_key) - set(desired_by_key))
+    to_add = sorted(set(desired_by_key) - set(current_by_key))
 
     if not to_remove and not to_add:
         return False
 
+    # A rule to remove and a rule to add at the same scope differ only in
+    # role: change the existing rule in place instead of deleting and
+    # re-creating it, so the scope is never left without a rule and the
+    # rule id survives. Rules within a policy are unioned, so which pair is
+    # formed when several roles change at one scope has no effect.
+    added_by_scope = {}
+    for key in to_add:
+        added_by_scope.setdefault(key[1:], []).append(key)
+    to_change = []
+    for key in to_remove:
+        candidates = added_by_scope.get(key[1:])
+        if candidates:
+            to_change.append((key, candidates.pop(0)))
+    paired_old = set(old for old, _new in to_change)
+    paired_new = set(new for _old, new in to_change)
+    to_remove = [key for key in to_remove if key not in paired_old]
+    to_add = [key for key in to_add if key not in paired_new]
+
     if module.check_mode:
         return True
 
-    for key in to_remove:
-        # Rule names (<policy>.<index>) renumber whenever a lower-indexed
-        # rule is deleted, so a name captured before this loop can point at
-        # a different rule (or none) by the time it is used. Rule IDs are
-        # immutable — delete by id only.
-        rule = current_by_key[key]
-        res = blade.delete_management_access_policies_rules(
+    for old_key, new_key in to_change:
+        rule = current_by_key[old_key]
+        role_name = desired_by_key[new_key]["role"]
+        res = blade.patch_management_access_policies_rules(
             ids=[rule.id],
+            rule=ManagementAccessPolicyRule(role=ReferenceWritable(name=role_name)),
             **ctx_kwargs,
         )
         if res.status_code != 200:
             module.fail_json(
                 msg=(
-                    "Failed to remove rule (role={0}, scope={1}/{2}) from "
-                    "policy {3}. Error: {4}"
+                    "Failed to change rule (role={0} to {1}, scope={2}/{3}) "
+                    "on policy {4}. Error: {5}"
                 ).format(
-                    rule.role.name,
+                    _role_name(rule),
+                    role_name,
                     rule.scope.resource_type,
                     rule.scope.name,
                     module.params["name"],
@@ -356,6 +396,9 @@ def _reconcile_rules(module, blade, ctx_kwargs):
                 )
             )
 
+    # Add before removing: the policy grants the union of its rules, so
+    # the transient state never exceeds the old and new lists combined and
+    # a failed add leaves the old rules in place.
     for key in to_add:
         spec = desired_by_key[key]
         role_name = spec["role"]
@@ -384,22 +427,31 @@ def _reconcile_rules(module, blade, ctx_kwargs):
                 )
             )
 
+    for key in to_remove:
+        # Rule names (<policy>.<index>) renumber whenever a lower-indexed
+        # rule is deleted, so a name captured before this loop can point at
+        # a different rule (or none) by the time it is used. Rule IDs are
+        # immutable — delete by id only.
+        rule = current_by_key[key]
+        res = blade.delete_management_access_policies_rules(
+            ids=[rule.id],
+            **ctx_kwargs,
+        )
+        if res.status_code != 200:
+            module.fail_json(
+                msg=(
+                    "Failed to remove rule (role={0}, scope={1}/{2}) from "
+                    "policy {3}. Error: {4}"
+                ).format(
+                    _role_name(rule),
+                    rule.scope.resource_type,
+                    rule.scope.name,
+                    module.params["name"],
+                    get_error_message(res),
+                )
+            )
+
     return True
-
-
-def _inline_rule_key(rule):
-    """Identity key of a rule as the array returns it inside the policy.
-
-    Tolerates missing role/scope references (a rule whose role was deleted
-    comes back with ``role: null``) instead of raising ``AttributeError``.
-    """
-    role = getattr(getattr(rule, "role", None), "name", None) or ""
-    scope = getattr(rule, "scope", None)
-    return _rule_key(
-        role,
-        getattr(scope, "resource_type", None) or "",
-        getattr(scope, "name", None) or "",
-    )
 
 
 def _inline_rules_differ(module, existing):
@@ -411,7 +463,7 @@ def _inline_rules_differ(module, existing):
     """
     current = set()
     for rule in getattr(existing, "rules", None) or []:
-        current.add(_inline_rule_key(rule))
+        current.add(_current_rule_key(rule))
     return current != set(_desired_rules_by_key(module.params["rules"]))
 
 
@@ -594,6 +646,27 @@ def main():
     ctx_kwargs = _ctx(module, api_version)
 
     existing = _get_policy(module, blade, ctx_kwargs)
+
+    rules = module.params["rules"]
+    empty_rules = rules is not None and not rules
+    if (
+        state == "present"
+        and empty_rules
+        and LooseVersion(MIN_RULE_API_VERSION) > LooseVersion(api_version)
+        and (existing is None or getattr(existing, "rules", None))
+    ):
+        # Below REST 2.26 a policy holds exactly one rule and the array
+        # refuses an empty rule list, so refuse it here, before any write
+        # and in check mode too, rather than report a change (or send a
+        # POST or PATCH) the array would reject. A policy that already has
+        # no rules is left alone.
+        module.fail_json(
+            msg=(
+                "Policy {0} cannot be left without rules: FlashBlade REST "
+                "versions below {1} require exactly one rule per management "
+                "access policy."
+            ).format(name, MIN_RULE_API_VERSION)
+        )
 
     if state == "absent":
         if existing is None:

@@ -1,0 +1,12 @@
+---
+minor_changes:
+  - purefb_hardware - manage connectors through ``/network-interfaces/connectors`` on REST 2.17
+    and higher, falling back to the deprecated ``/hardware-connectors`` endpoint on older arrays.
+  - purefb_hardware - add ``port_speed`` and ``lanes_per_port`` (REST 2.20) for 200Gb and 400Gb
+    port configurations; the pair is mutually exclusive with ``speed`` and ``ports`` and is sent
+    in a single PATCH only when it differs from the current configuration.
+  - purefb_hardware - fail with the array error message when the named component does not exist
+    or is not a connector, before any change is made, instead of silently doing nothing.
+  - purefb_inventory - add status details, MAC addresses, temperature sensor readings with
+    thresholds and a ``connectors`` dictionary with lane speed, port count, port speed, lanes per
+    port and transceiver type.

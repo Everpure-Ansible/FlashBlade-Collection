@@ -79,6 +79,7 @@ from plugins.modules.purefb_user import (
     validate_public_key,
     public_key_changed,
     create_local_user,
+    get_user,
     get_role_name,
     get_policy_names,
     role_change,
@@ -1157,6 +1158,58 @@ class TestAuthorizationModel:
         assert module.exit_json.call_args[1]["changed"] is False
 
 
+class TestGetUser:
+    def _blade(self, status_code, items=None):
+        blade = Mock()
+        blade.get_admins.return_value.status_code = status_code
+        if items is not None:
+            blade.get_admins.return_value.items = items
+        return blade
+
+    def test_returns_the_admin(self):
+        module = _module()
+        user = _user()
+        blade = self._blade(200, [user])
+        assert get_user(module, blade) is user
+        blade.get_admins.assert_called_once_with(names=["qa-admin"])
+        module.fail_json.assert_not_called()
+
+    def test_empty_answer_is_absent(self):
+        module = _module()
+        assert get_user(module, self._blade(200, [])) is None
+        module.fail_json.assert_not_called()
+
+    @patch("plugins.modules.purefb_user.get_error_message")
+    def test_missing_admin_is_absent(self, mock_gem):
+        mock_gem.return_value = "Admin does not exist."
+        module = _module()
+        assert get_user(module, self._blade(400)) is None
+        module.fail_json.assert_not_called()
+
+    @patch("plugins.modules.purefb_user.get_error_message")
+    def test_other_error_fails_with_the_array_message(self, mock_gem):
+        mock_gem.return_value = "Service unavailable."
+        module = _module()
+        try:
+            get_user(module, self._blade(503))
+        except SystemExit:
+            pass
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "qa-admin" in msg
+        assert "Service unavailable." in msg
+
+    @patch("plugins.modules.purefb_user.get_error_message")
+    def test_unknown_error_fails(self, mock_gem):
+        mock_gem.return_value = "Unknown error"
+        module = _module()
+        try:
+            get_user(module, self._blade(500))
+        except SystemExit:
+            pass
+        module.fail_json.assert_called_once()
+
+
 @patch("plugins.modules.purefb_user.LooseVersion", _Version)
 @patch("plugins.modules.purefb_user.get_rest_api_version")
 @patch("plugins.modules.purefb_user.get_system")
@@ -1172,9 +1225,11 @@ class TestMain:
         mock_api_version.return_value = version
         return module, blade
 
+    @patch("plugins.modules.purefb_user.get_error_message")
     def test_mutually_exclusive_role_and_policies(
-        self, mock_ansible_module, mock_get_system, mock_api_version
+        self, mock_gem, mock_ansible_module, mock_get_system, mock_api_version
     ):
+        mock_gem.return_value = "Admin does not exist."
         module, blade = self._run(
             mock_ansible_module, mock_get_system, mock_api_version, "2.30"
         )
@@ -1243,10 +1298,17 @@ class TestMain:
         assert "2.19" in module.fail_json.call_args[1]["msg"]
         assert blade.mock_calls == []
 
+    @patch("plugins.modules.purefb_user.get_error_message")
     @patch("plugins.modules.purefb_user.new_admin_post")
     def test_creates_a_service_account(
-        self, mock_body, mock_ansible_module, mock_get_system, mock_api_version
+        self,
+        mock_body,
+        mock_gem,
+        mock_ansible_module,
+        mock_get_system,
+        mock_api_version,
     ):
+        mock_gem.return_value = "Admin does not exist."
         module, blade = self._run(
             mock_ansible_module,
             mock_get_system,
@@ -1307,3 +1369,63 @@ class TestMain:
             pass
         blade.delete_admins.assert_called_once_with(names=["qa-admin"])
         assert module.exit_json.call_args[1]["changed"] is True
+
+    @patch("plugins.modules.purefb_user.get_error_message")
+    def test_read_error_fails_instead_of_creating(
+        self, mock_gem, mock_ansible_module, mock_get_system, mock_api_version
+    ):
+        mock_gem.return_value = "Service unavailable."
+        module, blade = self._run(
+            mock_ansible_module, mock_get_system, mock_api_version, "2.30"
+        )
+        blade.get_admins.return_value.status_code = 503
+        try:
+            main()
+        except SystemExit:
+            pass
+        module.fail_json.assert_called_once()
+        assert "Service unavailable." in module.fail_json.call_args[1]["msg"]
+        blade.post_admins.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    @patch("plugins.modules.purefb_user.get_error_message")
+    def test_read_error_fails_absent_instead_of_reporting_ok(
+        self, mock_gem, mock_ansible_module, mock_get_system, mock_api_version
+    ):
+        mock_gem.return_value = "Service unavailable."
+        module, blade = self._run(
+            mock_ansible_module,
+            mock_get_system,
+            mock_api_version,
+            "2.30",
+            state="absent",
+        )
+        blade.get_admins.return_value.status_code = 500
+        try:
+            main()
+        except SystemExit:
+            pass
+        module.fail_json.assert_called_once()
+        blade.delete_admins.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    @patch("plugins.modules.purefb_user.get_error_message")
+    def test_absent_missing_admin_is_unchanged(
+        self, mock_gem, mock_ansible_module, mock_get_system, mock_api_version
+    ):
+        mock_gem.return_value = "Admin does not exist."
+        module, blade = self._run(
+            mock_ansible_module,
+            mock_get_system,
+            mock_api_version,
+            "2.30",
+            state="absent",
+        )
+        blade.get_admins.return_value.status_code = 400
+        try:
+            main()
+        except SystemExit:
+            pass
+        module.fail_json.assert_not_called()
+        blade.delete_admins.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False

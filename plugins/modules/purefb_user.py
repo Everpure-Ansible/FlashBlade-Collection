@@ -378,13 +378,24 @@ def set_public_key(module, blade, action="change"):
 
 
 def get_user(module, blade):
-    """Return Local User Account or None"""
-    user = None
+    """Return the admin as GET admins reports it, or None when it does not exist.
+
+    The array answers a GET for a missing name with a 400 "Admin does not
+    exist.", so only that error reads as None. Any other failure (an expired
+    token, a busy or restarting array) fails the task with the array's message
+    rather than reading as "absent", which would drive a POST that fails with
+    "already exists" or let ``state=absent`` report ok.
+    """
     res = blade.get_admins(names=[module.params["name"]])
-    if res.status_code != 200:
+    if res.status_code == 200:
+        items = list(res.items)
+        return items[0] if items else None
+    error = get_error_message(res)
+    if error and "does not exist" in str(error).lower():
         return None
-    else:
-        return list(res.items)[0]
+    module.fail_json(
+        msg="Failed to read admin {0}. Error: {1}".format(module.params["name"], error)
+    )
 
 
 def get_role_name(user):

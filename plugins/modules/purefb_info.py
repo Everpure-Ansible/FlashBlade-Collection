@@ -35,8 +35,8 @@ options:
         Possible values for this include all, minimum, config, performance,
         capacity, network, subnets, lags, filesystems, snapshots, buckets,
         replication, policies, arrays, accounts, admins, ad, kerberos,
-        drives, servers, fleet, realms, clients, locks, support and
-        legal_holds.
+        drives, servers, fleet, realms, clients, locks, support,
+        legal_holds and connections.
       - The C(performance) subset reports array-wide performance per protocol
         (C(aggregate), C(http), C(s3), C(nfs), C(smb)), the protocol-specific
         operation breakdowns (C(nfs_ops), C(s3_ops), C(http_ops)), replication
@@ -53,6 +53,17 @@ options:
       - The C(legal_holds) subset lists every file legal hold with its
         description, realms and the paths it is currently applied to.
         Requires REST API 2.17 or later and is skipped on older arrays.
+      - The C(network) subset also reports the physical network connectors
+        as C(network_connectors), their latest performance sample (including
+        the blade network interfaces) as C(network_connector_performance)
+        and the RoCE congestion control settings as
+        C(network_connector_settings) on Purity//FB with REST API version
+        2.17 or higher, and the LLDP neighbours of the ports as
+        C(lldp_neighbors) with REST API version 2.20 or higher.
+      - The C(connections) subset returns the current TCP connections of
+        the array as C(connections) on Purity//FB with REST API version
+        2.18 or higher. The table changes with every call and can be large,
+        so it is not included in C(all) and has to be requested explicitly.
       - The C(filesystems) subset surfaces the legacy file system keys
         C(nfs_rules), C(export_policy), C(smb_client_policy) and
         C(smb_share_policy). Purity//FB marks the underlying fields as
@@ -126,6 +137,18 @@ EXAMPLES = r"""
 - name: show NFS client performance
   debug:
     msg: "{{ blade_info['purefb_info']['clients']['nfs'] }}"
+
+- name: collect network connectors, LLDP neighbours and TCP connections
+  everpure.flashblade.purefb_info:
+    gather_subset:
+      - network
+      - connections
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+  register: blade_info
+- name: show which switch port each uplink is cabled to
+  debug:
+    msg: "{{ blade_info['purefb_info']['lldp_neighbors'] }}"
 """
 
 RETURN = r"""
@@ -133,6 +156,49 @@ purefb_info:
   description: Returns the information collected from the FlashBlade
   returned: always
   type: dict
+  contains:
+    network_connectors:
+      description:
+        - Physical network connectors keyed by connector name, with the
+          connector type, lane speed, lanes per port, port count, port
+          speed and transceiver type.
+      returned: network subset on Purity//FB with REST API 2.17 or higher
+      type: dict
+      version_added: '1.30.0'
+    network_connector_performance:
+      description:
+        - Latest performance sample of every network connector and blade
+          network interface keyed by name, with the link aggregation group,
+          throughput, error, flow control and RDMA counters.
+      returned: network subset on Purity//FB with REST API 2.17 or higher
+      type: dict
+      version_added: '1.30.0'
+    network_connector_settings:
+      description:
+        - RoCE congestion control settings of the network connectors keyed
+          by settings name. Empty until RoCE congestion control has been
+          enabled on the array.
+      returned: network subset on Purity//FB with REST API 2.17 or higher
+      type: dict
+      version_added: '1.30.0'
+    lldp_neighbors:
+      description:
+        - LLDP neighbours keyed by local port name. A port can see more
+          than one neighbour, so each port holds a list of its neighbours
+          in the order the array reports them, each with the neighbour
+          chassis identity, management addresses, capabilities and the
+          neighbour port.
+      returned: network subset on Purity//FB with REST API 2.20 or higher
+      type: dict
+      version_added: '1.30.0'
+    connections:
+      description:
+        - Current TCP connections of the array with state, local and remote
+          address and port, and sample time. Not part of the C(all) subset.
+      returned: connections subset on Purity//FB with REST API 2.18 or higher
+      type: list
+      elements: dict
+      version_added: '1.30.0'
 """
 
 
@@ -187,6 +253,47 @@ REALM_DEFAULTS_API_VERSION = "2.20"
 SUPPORT_DIAGNOSTICS_API_VERSION = "2.16"
 SUPPORT_DIAGNOSTICS_SETTINGS_API_VERSION = "2.24"
 EVICTION_API_VERSION = "2.21"
+# /network-interfaces/connectors, its performance and settings views
+CONNECTORS_API_VERSION = "2.17"
+# /network-interfaces/network-connection-statistics
+NETSTAT_API_VERSION = "2.18"
+# /network-interfaces/neighbors (LLDP)
+NEIGHBOR_API_VERSION = "2.20"
+# Counters of every /network-interfaces/connectors/performance row. The flow
+# control and RDMA counters have been part of the model since REST 2.17.
+CONNECTOR_PERFORMANCE_FIELDS = (
+    "received_bytes_per_sec",
+    "received_packets_per_sec",
+    "transmitted_bytes_per_sec",
+    "transmitted_packets_per_sec",
+    "other_errors_per_sec",
+    "total_errors_per_sec",
+    "received_crc_errors_per_sec",
+    "received_frame_errors_per_sec",
+    "transmitted_carrier_errors_per_sec",
+    "transmitted_dropped_errors_per_sec",
+    "flow_control_received_congestion_packets_per_sec",
+    "flow_control_received_discarded_packets_per_sec",
+    "flow_control_received_lossless_bytes_per_sec",
+    "flow_control_received_pause_frames_per_sec",
+    "flow_control_transmitted_congestion_packets_per_sec",
+    "flow_control_transmitted_discarded_packets_per_sec",
+    "flow_control_transmitted_lossless_bytes_per_sec",
+    "flow_control_transmitted_pause_frames_per_sec",
+    "rdma_received_req_cqe_errors_per_sec",
+    "rdma_received_sequence_errors_per_sec",
+    "rdma_transmitted_local_ack_timeout_errors_per_sec",
+    "time",
+)
+NEIGHBOR_CAPABILITIES = (
+    "bridge",
+    "router",
+    "repeater",
+    "station_only",
+    "telephone",
+    "wlan_access_point",
+    "docsis_cable_device",
+)
 
 
 def _bytes_to_human(bytes_number):
@@ -1190,6 +1297,175 @@ def generate_network_dict(blade):
             "realms": realm_names,
         }
     return net_info
+
+
+def _ref_name(reference):
+    """Name of an SDK reference that may be an object, a plain dict or None."""
+    if isinstance(reference, dict):
+        return reference.get("name")
+    return getattr(reference, "name", None)
+
+
+def generate_network_connectors_dict(blade):
+    """Physical network connectors keyed by connector name (REST 2.17+).
+
+    An unpopulated connector is reported as the array describes it, with a
+    connector type of "-" and zero speeds.
+    """
+    connectors_info = {}
+    res = blade.get_network_interfaces_connectors()
+    if res.status_code != 200:
+        return connectors_info
+    for connector in list(res.items):
+        connectors_info[connector.name] = {
+            "connector_type": getattr(connector, "connector_type", None),
+            "lane_speed": getattr(connector, "lane_speed", None),
+            "lanes_per_port": getattr(connector, "lanes_per_port", None),
+            "port_count": getattr(connector, "port_count", None),
+            "port_speed": getattr(connector, "port_speed", None),
+            "transceiver_type": getattr(connector, "transceiver_type", None),
+        }
+    return connectors_info
+
+
+def generate_network_connector_performance_dict(blade):
+    """Latest performance sample of every connector and blade NIC (REST 2.17+).
+
+    The rows include the blade network interfaces (CHx.FBn), which are not
+    connectors, so the dictionary is keyed independently of the connectors
+    dictionary. Only the items are read; the aggregate total row is not.
+    """
+    perf_info = {}
+    res = blade.get_network_interfaces_connectors_performance()
+    if res.status_code != 200:
+        return perf_info
+    for perf in list(res.items):
+        perf_info[perf.name] = {
+            "link_aggregation_group": _ref_name(
+                getattr(perf, "link_aggregation_group", None)
+            )
+        }
+        for field in CONNECTOR_PERFORMANCE_FIELDS:
+            perf_info[perf.name][field] = getattr(perf, field, None)
+    return perf_info
+
+
+def generate_network_connector_settings_dict(blade):
+    """RoCE congestion control settings of the connectors (REST 2.17+).
+
+    The array answers 400 "Congestion control is not enabled." until RoCE
+    congestion control has been set up, so an error response yields an
+    empty dictionary rather than a failure.
+    """
+    settings_info = {}
+    res = blade.get_network_interfaces_connectors_settings()
+    if res.status_code != 200:
+        return settings_info
+    for setting in list(res.items):
+        roce = getattr(setting, "roce", None)
+        ecn = getattr(roce, "default_ecn", None)
+        pfc = getattr(roce, "default_pfc", None)
+        settings_info[getattr(setting, "name", None) or "default"] = {
+            "roce": {
+                "enabled": getattr(roce, "enabled", None),
+                "network_congestion_mode": getattr(
+                    roce, "network_congestion_mode", None
+                ),
+                "trust_mode": getattr(roce, "trust_mode", None),
+                "default_ecn": {
+                    "marking_probability": getattr(ecn, "marking_probability", None),
+                    "max_ecn_marked_threshold": getattr(
+                        ecn, "max_ecn_marked_threshold", None
+                    ),
+                    "min_ecn_marked_threshold": getattr(
+                        ecn, "min_ecn_marked_threshold", None
+                    ),
+                },
+                "default_pfc": {
+                    "port_buffer": getattr(pfc, "port_buffer", None),
+                    "xoff_threshold": getattr(pfc, "xoff_threshold", None),
+                    "xon_threshold": getattr(pfc, "xon_threshold", None),
+                },
+            }
+        }
+    return settings_info
+
+
+def generate_lldp_neighbors_dict(blade):
+    """LLDP neighbours keyed by local port name (REST 2.20+).
+
+    Neighbours hang off the physical ports (CHx.FMy.ETHz), never off the
+    VIP names that key the network dictionary, so they are kept apart.
+    The array returns one row per neighbour and a port can see more than
+    one (for example through an unmanaged switch), so every port maps to
+    the list of its neighbours in the order the array reports them.
+    """
+    neighbors_info = {}
+    res = blade.get_network_interfaces_neighbors()
+    if res.status_code != 200:
+        return neighbors_info
+    for neighbor in list(res.items):
+        chassis = getattr(neighbor, "neighbor_chassis", None)
+        chassis_id = getattr(chassis, "id", None)
+        port = getattr(neighbor, "neighbor_port", None)
+        port_id = getattr(port, "id", None)
+        capabilities = {}
+        for capability in NEIGHBOR_CAPABILITIES:
+            value = getattr(chassis, capability, None)
+            capabilities[capability] = {
+                "supported": getattr(value, "supported", None),
+                "enabled": getattr(value, "enabled", None),
+            }
+        local_port = _ref_name(getattr(neighbor, "local_port", None))
+        neighbors_info.setdefault(local_port, []).append(
+            {
+                "initial_ttl_in_sec": getattr(neighbor, "initial_ttl_in_sec", None),
+                "neighbor_chassis": {
+                    "id": {
+                        "type": getattr(chassis_id, "type", None),
+                        "value": getattr(chassis_id, "value", None),
+                    },
+                    "name": getattr(chassis, "name", None),
+                    "description": getattr(chassis, "description", None),
+                    "addresses": getattr(chassis, "addresses", None) or [],
+                    "capabilities": capabilities,
+                },
+                "neighbor_port": {
+                    "id": {
+                        "type": getattr(port_id, "type", None),
+                        "value": getattr(port_id, "value", None),
+                    },
+                    "description": getattr(port, "description", None),
+                },
+            }
+        )
+    return neighbors_info
+
+
+def generate_connections_list(blade):
+    """Current TCP connections of the array (REST 2.18+).
+
+    The table changes with every call and is unbounded on a busy array,
+    which is why the connections subset is not part of all.
+    """
+    connections = []
+    res = blade.get_network_interfaces_network_connection_statistics()
+    if res.status_code != 200:
+        return connections
+    for conn in list(res.items):
+        local = getattr(conn, "local", None)
+        remote = getattr(conn, "remote", None)
+        connections.append(
+            {
+                "state": getattr(conn, "current_state", None),
+                "local_address": getattr(local, "address", None),
+                "local_port": getattr(local, "port", None),
+                "remote_address": getattr(remote, "address", None),
+                "remote_port": getattr(remote, "port", None),
+                "time": getattr(conn, "time", None),
+            }
+        )
+    return connections
 
 
 def generate_capacity_dict(blade):
@@ -2469,10 +2745,6 @@ FILE_SESSIONS_API_VERSION = "2.10"
 OPEN_FILES_API_VERSION = "2.17"
 
 
-def _ref_name(ref):
-    return getattr(ref, "name", None) if ref is not None else None
-
-
 def generate_file_locks_dict(blade):
     """Return the active file locks, lock clients, file sessions and open files.
 
@@ -2652,6 +2924,7 @@ def main():
         "locks",
         "support",
         "legal_holds",
+        "connections",
     )
     subset_test = (test in valid_subsets for test in subset)
     if not all(subset_test):
@@ -2674,6 +2947,27 @@ def main():
         info["lag"] = generate_lag_dict(blade)
     if "network" in subset or "all" in subset:
         info["network"] = generate_network_dict(blade)
+    # Connectors, their counters, the RoCE settings and the LLDP neighbours
+    # are keyed by port name, which never matches a VIP name, so they sit
+    # beside `network` rather than inside it.
+    if ("network" in subset or "all" in subset) and LooseVersion(
+        CONNECTORS_API_VERSION
+    ) <= LooseVersion(api_version):
+        info["network_connectors"] = generate_network_connectors_dict(blade)
+        info["network_connector_performance"] = (
+            generate_network_connector_performance_dict(blade)
+        )
+        info["network_connector_settings"] = generate_network_connector_settings_dict(
+            blade
+        )
+        if LooseVersion(NEIGHBOR_API_VERSION) <= LooseVersion(api_version):
+            info["lldp_neighbors"] = generate_lldp_neighbors_dict(blade)
+    # `connections` is a volatile, potentially large table: gathered only
+    # when asked for by name, never as part of `all`.
+    if "connections" in subset and LooseVersion(NETSTAT_API_VERSION) <= LooseVersion(
+        api_version
+    ):
+        info["connections"] = generate_connections_list(blade)
     if "subnets" in subset or "all" in subset:
         info["subnet"] = generate_subnet_dict(blade)
     if "filesystems" in subset or "all" in subset:

@@ -74,6 +74,31 @@ options:
       users within the account that bucket belongs to.
     type: bool
     version_added: 1.15.0
+  account_exports:
+    description:
+    - Servers the account is exported on when it is created. Each element is a
+      dictionary with a C(server) key naming the server. Exports created this way
+      use the array default S3 export policy.
+    - If omitted, the array creates its default export on the default object store
+      server (C(_array_server) for accounts outside a realm) with the default S3
+      export policy.
+    - Set to C([]) (an empty list) to create the account without any export. The
+      buckets of such an account are not reachable over S3 until an export is added
+      with M(everpure.flashblade.purefb_s3acc_export).
+    - Only applied when the account is created. On an existing account the current
+      exports are compared with this list and a warning is issued when they differ;
+      the account is not changed. Add, change or remove the exports of an existing
+      account with M(everpure.flashblade.purefb_s3acc_export).
+    - Requires FlashBlade REST API version 2.20 or later (Purity//FB 4.6.3+).
+    type: list
+    elements: dict
+    suboptions:
+      server:
+        description:
+        - Name of the server the account is exported on.
+        type: str
+        required: true
+    version_added: '1.30.0'
   context:
     description:
     - Name of fleet member on which to perform the operation.
@@ -103,6 +128,21 @@ EXAMPLES = r"""
     fb_url: 10.10.10.2
     api_token: e31060a7-21fc-e277-6240-25983c6c4592
 
+- name: Create object store account foo without any export
+  everpure.flashblade.purefb_s3acc:
+    name: foo
+    account_exports: []
+    fb_url: 10.10.10.2
+    api_token: e31060a7-21fc-e277-6240-25983c6c4592
+
+- name: Create object store account foo exported on server bar
+  everpure.flashblade.purefb_s3acc:
+    name: foo
+    account_exports:
+      - server: bar
+    fb_url: 10.10.10.2
+    api_token: e31060a7-21fc-e277-6240-25983c6c4592
+
 - name: Delete object store account foo
   everpure.flashblade.purefb_s3acc:
     name: foo
@@ -118,8 +158,11 @@ HAS_PYPURECLIENT = True
 try:
     from pypureclient.flashblade import (
         ObjectStoreAccountPatch,
+        ObjectStoreAccountPost,
         BucketDefaults,
         PublicAccessConfig,
+        Reference,
+        ServerForAccountExport,
     )
 except ImportError:
     HAS_PYPURECLIENT = False
@@ -142,6 +185,7 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
 
 PUBLIC_API_VERSION = "2.12"
 CONTEXT_API_VERSION = "2.17"
+ACCOUNT_EXPORTS_API_VERSION = "2.20"
 
 
 def get_s3acc(module, blade):
@@ -159,6 +203,58 @@ def get_s3acc(module, blade):
     if res.status_code == 200:
         return list(res.items)[0]
     return None
+
+
+def _context_kwargs(module):
+    """Build context_names kwargs only when a context is supplied."""
+    if module.params["context"]:
+        return {"context_names": [module.params["context"]]}
+    return {}
+
+
+def _requested_export_servers(module):
+    """Return the server names listed in account_exports, or None when unset."""
+    if module.params["account_exports"] is None:
+        return None
+    return [export["server"] for export in module.params["account_exports"]]
+
+
+def _current_export_servers(module, blade):
+    """Return the sorted names of the servers the account is exported on."""
+    res = blade.get_object_store_account_exports(
+        filter="member.name='{0}'".format(module.params["name"]),
+        **_context_kwargs(module)
+    )
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to get exports of account {0}. Error: {1}".format(
+                module.params["name"], get_error_message(res)
+            )
+        )
+    servers = []
+    for export in list(res.items):
+        server = getattr(export, "server", None)
+        if server is not None:
+            servers.append(server.name)
+    return sorted(servers)
+
+
+def _check_account_exports(module, blade):
+    """Warn when the exports of an existing account differ from account_exports."""
+    requested = _requested_export_servers(module)
+    if requested is None:
+        return
+    current = _current_export_servers(module, blade)
+    if sorted(requested) != current:
+        module.warn(
+            "account_exports only applies when an account is created. Account {0} "
+            "is exported on {1}; account_exports lists {2}. Use purefb_s3acc_export "
+            "to change the exports of an existing account.".format(
+                module.params["name"],
+                ", ".join(current) or "no server",
+                ", ".join(requested) or "no server",
+            )
+        )
 
 
 def update_s3acc(module, blade):
@@ -179,6 +275,7 @@ def update_s3acc(module, blade):
         acc_settings = list(
             blade.get_object_store_accounts(names=[module.params["name"]]).items
         )[0]
+    _check_account_exports(module, blade)
     if LooseVersion(PUBLIC_API_VERSION) <= LooseVersion(api_version):
         public = True
         current_account = {
@@ -300,15 +397,23 @@ def create_s3acc(module, blade):
     changed = True
     api_version = get_rest_api_version(blade)
     if not module.check_mode:
+        post_kwargs = {"names": [module.params["name"]]}
         if (
             LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
             and module.params["context"]
         ):
-            res = blade.post_object_store_accounts(
-                names=[module.params["name"]], context_names=[module.params["context"]]
+            post_kwargs["context_names"] = [module.params["context"]]
+        export_servers = _requested_export_servers(module)
+        if export_servers is not None:
+            # [] creates the account without any export; without a body the
+            # array creates its default export.
+            post_kwargs["object_store_account"] = ObjectStoreAccountPost(
+                account_exports=[
+                    ServerForAccountExport(server=Reference(name=server))
+                    for server in export_servers
+                ]
             )
-        else:
-            res = blade.post_object_store_accounts(names=[module.params["name"]])
+        res = blade.post_object_store_accounts(**post_kwargs)
         if res.status_code != 200:
             module.fail_json(
                 msg="Object Store Account {0} creation failed. Error: {1}".format(
@@ -455,6 +560,11 @@ def main():
             block_public_access=dict(type="bool"),
             quota=dict(type="str"),
             default_quota=dict(type="str"),
+            account_exports=dict(
+                type="list",
+                elements="dict",
+                options=dict(server=dict(type="str", required=True)),
+            ),
             state=dict(default="present", choices=["present", "absent"]),
             context=dict(type="str", default=""),
         )
@@ -477,6 +587,20 @@ def main():
     if module.params["quota"] or module.params["default_quota"]:
         if not HAS_PYPURECLIENT:
             module.fail_json(msg="py-pure-client sdk is required for to set quotas")
+
+    export_servers = _requested_export_servers(module)
+    if export_servers is not None:
+        if not HAS_PYPURECLIENT:
+            module.fail_json(
+                msg="py-pure-client sdk is required to set account_exports"
+            )
+        if LooseVersion(ACCOUNT_EXPORTS_API_VERSION) > LooseVersion(api_version):
+            module.fail_json(
+                msg="account_exports requires FlashBlade REST version {0} or later "
+                "(Purity//FB 4.6.3+)".format(ACCOUNT_EXPORTS_API_VERSION)
+            )
+        if len(set(export_servers)) != len(export_servers):
+            module.fail_json(msg="account_exports contains duplicate server names")
 
     upper = False
     for element in module.params["name"]:

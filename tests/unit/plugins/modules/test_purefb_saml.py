@@ -123,9 +123,9 @@ def _base_params(**overrides):
         "x509_cert": None,
         "signing_credential": None,
         "decryption_credential": None,
-        "enabled": False,
-        "encrypt_asserts": False,
-        "sign_request": False,
+        "enabled": None,
+        "encrypt_asserts": None,
+        "sign_request": None,
         "services": None,
         "binding": None,
         "metadata_url_ca_certificate": None,
@@ -152,6 +152,8 @@ def _current_idp(
     metadata_url_ca_certificate=None,
     metadata_url_ca_certificate_group=None,
     enabled=False,
+    sign_request=False,
+    encrypt_asserts=False,
 ):
     """A GET item shaped like the array's response"""
     idp = Mock(
@@ -190,8 +192,8 @@ def _current_idp(
     idp.idp.url = "https://idp.example.com/sso"
     idp.idp.entity_id = "https://idp.example.com/idp"
     idp.idp.metadata_url = None
-    idp.idp.sign_request_enabled = False
-    idp.idp.encrypt_assertion_enabled = False
+    idp.idp.sign_request_enabled = sign_request
+    idp.idp.encrypt_assertion_enabled = encrypt_asserts
     idp.idp.verification_certificate = _reference(verification_certificate)
     idp.idp.metadata_url_ca_certificate = _reference(metadata_url_ca_certificate)
     idp.idp.metadata_url_ca_certificate_group = _reference(
@@ -396,7 +398,7 @@ class TestPurefbSamlCreate:
         assert idp_kwargs["metadata_url_ca_certificate"] == ("ref", "idp-ca")
         assert idp_kwargs["metadata_url_ca_certificate_group"] is None
         assert idp_kwargs["url"] == "https://idp.example.com/sso"
-        # enabled defaults to false, so no enable PATCH follows the POST
+        # enabled is not given, so no enable PATCH follows the POST
         blade.patch_sso_saml2_idps.assert_not_called()
         module.exit_json.assert_called_once()
         assert module.exit_json.call_args[1]["changed"] is True
@@ -475,6 +477,18 @@ class TestPurefbSamlCreate:
         blade.patch_sso_saml2_idps.assert_called_once()
         models["Saml2Sso"].assert_called_once_with(enabled=True)
         assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_create_omits_unset_flags(self):
+        """Unset signing and encryption flags are left to the array default
+        rather than sent as false, and no enable PATCH follows"""
+        params = _base_params(array_url="https://fb.example.com")
+        module, blade, models = _run(params)
+
+        blade.post_sso_saml2_idps.assert_called_once()
+        idp_kwargs = models["Saml2SsoIdp"].call_args[1]
+        assert idp_kwargs["sign_request_enabled"] is None
+        assert idp_kwargs["encrypt_assertion_enabled"] is None
+        blade.patch_sso_saml2_idps.assert_not_called()
 
     def test_create_check_mode_skips_post(self):
         params = _base_params(array_url="https://fb.example.com", services=["object"])
@@ -681,6 +695,58 @@ class TestPurefbSamlUpdate:
         assert idp_kwargs["metadata_url_ca_certificate"] == ("ref", "idp-ca")
         assert idp_kwargs["metadata_url_ca_certificate_group"] == ("ref", "")
         assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_update_new_field_keeps_enabled_provider_enabled(self):
+        """A task that gives only a new option on an enabled provider sends
+        neither enabled nor the signing and encryption flags, so the provider
+        stays as it is"""
+        params = _base_params(sp_entity_id="https://sp.example.com")
+        current = _current_idp(enabled=True, sign_request=True, encrypt_asserts=True)
+        module, blade, models = _run(params, current=current)
+
+        blade.patch_sso_saml2_idps.assert_called_once()
+        body = models["Saml2Sso"].call_args[1]
+        assert "enabled" not in body
+        idp_kwargs = models["Saml2SsoIdp"].call_args[1]
+        assert "sign_request_enabled" not in idp_kwargs
+        assert "encrypt_assertion_enabled" not in idp_kwargs
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_update_enabled_true_idempotent_on_enabled_provider(self):
+        params = _base_params(enabled=True)
+        module, blade, models = _run(params, current=_current_idp(enabled=True))
+
+        _no_writes(blade)
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    def test_update_enabled_false_disables_provider(self):
+        params = _base_params(enabled=False)
+        module, blade, models = _run(params, current=_current_idp(enabled=True))
+
+        blade.patch_sso_saml2_idps.assert_called_once()
+        body = models["Saml2Sso"].call_args[1]
+        assert body["enabled"] is False
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_update_sign_request_sent_only_when_given(self):
+        params = _base_params(sign_request=True, signing_credential="sp-signing")
+        module, blade, models = _run(params, current=_current_idp())
+
+        blade.patch_sso_saml2_idps.assert_called_once()
+        idp_kwargs = models["Saml2SsoIdp"].call_args[1]
+        assert idp_kwargs["sign_request_enabled"] is True
+        assert "encrypt_assertion_enabled" not in idp_kwargs
+        sp_kwargs = models["Saml2SsoSp"].call_args[1]
+        assert sp_kwargs["signing_credential"] == ("ref", "sp-signing")
+        assert "enabled" not in models["Saml2Sso"].call_args[1]
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_update_flags_idempotent_when_matching(self):
+        params = _base_params(enabled=False, sign_request=False, encrypt_asserts=False)
+        module, blade, models = _run(params, current=_current_idp())
+
+        _no_writes(blade)
+        assert module.exit_json.call_args[1]["changed"] is False
 
     def test_update_check_mode_skips_patch(self):
         params = _base_params(sp_entity_id="https://sp.example.com")

@@ -55,19 +55,20 @@ options:
   enabled:
     description:
     - Defines the enabled state of the identity provider.
-    - Applied on every run, so an enabled identity provider must be given C(true)
-      in every task that updates it.
-    default: false
+    - When not set the identity provider is created disabled and the current
+      state is kept on update.
     type: bool
   encrypt_asserts:
     description:
-    - If set to true, SAML assertions will be encrypted by the identity provider
-    default: false
+    - If set to true, SAML assertions will be encrypted by the identity provider.
+    - When not set the array default of C(false) applies on creation and the
+      current value is kept on update.
     type: bool
   sign_request:
     description:
     - If set to true, SAML requests will be signed by the service provider.
-    default: false
+    - When not set the array default of C(false) applies on creation and the
+      current value is kept on update.
     type: bool
   x509_cert:
     description:
@@ -418,12 +419,16 @@ def update_saml(module, blade, current_idp):
         new_idp["id_ca_group"] = None
     if params["metadata_url_ca_certificate_group"]:
         new_idp["id_ca_cert"] = None
-    # boolean options with defaults are always applied
-    new_idp["enabled"] = params["enabled"]
-    new_idp["id_sign_enabled"] = params["sign_request"]
-    new_idp["id_encrypt_enabled"] = params["encrypt_asserts"]
-    if params["trust_other_saml_sps_in_fleet"] is not None:
-        new_idp["trust_fleet"] = params["trust_other_saml_sps_in_fleet"]
+    # boolean options: an unset option keeps the current value, so a task that
+    # changes another option never disables the provider or turns off signing
+    for key, option in (
+        ("enabled", "enabled"),
+        ("id_sign_enabled", "sign_request"),
+        ("id_encrypt_enabled", "encrypt_asserts"),
+        ("trust_fleet", "trust_other_saml_sps_in_fleet"),
+    ):
+        if params[option] is not None:
+            new_idp[key] = params[option]
     if params["services"] is not None:
         new_idp["services"] = sorted(params["services"])
     if old_idp != new_idp:
@@ -437,26 +442,30 @@ def update_saml(module, blade, current_idp):
             # generating it from the array URL
             if params["sp_entity_id"]:
                 sp_kwargs["entity_id"] = new_idp["sp_entity_id"]
-            idp = Saml2SsoIdp(
-                url=new_idp["id_url"],
-                metadata_url=new_idp["id_metadata"],
-                entity_id=new_idp["id_entity"],
-                sign_request_enabled=new_idp["id_sign_enabled"],
-                encrypt_assertion_enabled=new_idp["id_encrypt_enabled"],
-                verification_certificate=_ref(new_idp["id_cert"]),
-                metadata_url_ca_certificate=_ref_update(
+            idp_kwargs = {
+                "url": new_idp["id_url"],
+                "metadata_url": new_idp["id_metadata"],
+                "entity_id": new_idp["id_entity"],
+                "verification_certificate": _ref(new_idp["id_cert"]),
+                "metadata_url_ca_certificate": _ref_update(
                     new_idp["id_ca_cert"], old_idp["id_ca_cert"]
                 ),
-                metadata_url_ca_certificate_group=_ref_update(
+                "metadata_url_ca_certificate_group": _ref_update(
                     new_idp["id_ca_group"], old_idp["id_ca_group"]
                 ),
-            )
+            }
+            # the boolean flags are sent only when the task gives them
+            if params["sign_request"] is not None:
+                idp_kwargs["sign_request_enabled"] = new_idp["id_sign_enabled"]
+            if params["encrypt_asserts"] is not None:
+                idp_kwargs["encrypt_assertion_enabled"] = new_idp["id_encrypt_enabled"]
             body_kwargs = {
                 "array_url": new_idp["array_url"],
-                "idp": idp,
+                "idp": Saml2SsoIdp(**idp_kwargs),
                 "sp": Saml2SsoSp(**sp_kwargs),
-                "enabled": new_idp["enabled"],
             }
+            if params["enabled"] is not None:
+                body_kwargs["enabled"] = new_idp["enabled"]
             # the array requires services and binding to be sent together, so a
             # change to one carries the current value of the other
             if params["services"] is not None or params["binding"]:
@@ -564,9 +573,9 @@ def main():
             x509_cert=dict(type="str"),
             signing_credential=dict(type="str"),
             decryption_credential=dict(type="str"),
-            enabled=dict(type="bool", default=False),
-            encrypt_asserts=dict(type="bool", default=False),
-            sign_request=dict(type="bool", default=False),
+            enabled=dict(type="bool"),
+            encrypt_asserts=dict(type="bool"),
+            sign_request=dict(type="bool"),
             services=dict(
                 type="list", elements="str", choices=["management", "object"]
             ),

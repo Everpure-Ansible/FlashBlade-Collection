@@ -11,3 +11,6 @@ bugfixes:
   - purefb_saml - ``x509_cert`` is the name of a certificate managed by purefb_certs and is sent
     as a reference and compared by name, as the array stores a certificate reference. The
     ``state=test`` version message now names the version it requires.
+  - purefb_saml - ``enabled``, ``sign_request`` and ``encrypt_asserts`` no longer default to
+    ``false`` and are sent only when given, so a task that changes another option of an enabled
+    identity provider no longer disables it or turns off request signing and assertion encryption.

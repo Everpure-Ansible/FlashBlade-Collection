@@ -248,6 +248,14 @@ def _maintenance_window_list(blade):
     return windows
 
 
+def _reference_name(obj, field):
+    """Name held by a reference field the SDK returns as a dict or an object."""
+    ref = getattr(obj, field, None)
+    if isinstance(ref, dict):
+        return ref.get("name") or None
+    return getattr(ref, "name", None) or None
+
+
 def generate_default_dict(blade):
     default_info = {}
     # NOTE(latent bug): this previously read list(blade.get_versions().items)[0]
@@ -824,6 +832,12 @@ def generate_config_dict(blade):
         config_info["syslog_servers"][server_name] = {
             "uri": server.uri,
             "services": getattr(server, "services", None),
+        }
+    config_info["syslog_settings"] = {}
+    for settings in list(blade.get_syslog_servers_settings().items):
+        config_info["syslog_settings"][settings.name] = {
+            "ca_certificate": _reference_name(settings, "ca_certificate"),
+            "ca_certificate_group": _reference_name(settings, "ca_certificate_group"),
         }
     snmp_agents = list(blade.get_snmp_agents().items)
     config_info["snmp_agents"] = {}
@@ -2397,7 +2411,7 @@ FILE_SESSIONS_API_VERSION = "2.10"
 OPEN_FILES_API_VERSION = "2.17"
 
 
-def _reference_name(ref):
+def _ref_name(ref):
     return getattr(ref, "name", None) if ref is not None else None
 
 
@@ -2420,9 +2434,9 @@ def generate_file_locks_dict(blade):
             lock_range = getattr(lock, "range", None)
             info["file_locks"][lock.name] = {
                 "access_type": getattr(lock, "access_type", None),
-                "client": _reference_name(getattr(lock, "client", None)),
+                "client": _ref_name(getattr(lock, "client", None)),
                 "created_at": getattr(lock, "created_at", None),
-                "file_system": _reference_name(getattr(lock, "source", None)),
+                "file_system": _ref_name(getattr(lock, "source", None)),
                 "inode": getattr(lock, "inode", None),
                 "path": getattr(lock, "path", None),
                 "protocol": getattr(lock, "protocol", None),
@@ -2437,7 +2451,7 @@ def generate_file_locks_dict(blade):
             }
     res = blade.get_file_systems_locks_clients()
     if res.status_code == 200:
-        names = [_reference_name(client) for client in list(res.items)]
+        names = [_ref_name(client) for client in list(res.items)]
         info["file_lock_clients"] = sorted(name for name in names if name)
     if LooseVersion(FILE_SESSIONS_API_VERSION) <= LooseVersion(api_version):
         res = blade.get_file_systems_sessions()
@@ -2445,26 +2459,26 @@ def generate_file_locks_dict(blade):
             for session in list(res.items):
                 info["file_sessions"][session.name] = {
                     "authentication": getattr(session, "authentication", None),
-                    "client": _reference_name(getattr(session, "client", None)),
+                    "client": _ref_name(getattr(session, "client", None)),
                     "connection_time": getattr(session, "connection_time", None),
                     "idle_time": getattr(session, "idle_time", None),
                     "opens": getattr(session, "opens", None),
                     "port": getattr(session, "port", None),
                     "protocol": getattr(session, "protocol", None),
-                    "user": _reference_name(getattr(session, "user", None)),
+                    "user": _ref_name(getattr(session, "user", None)),
                 }
     if LooseVersion(OPEN_FILES_API_VERSION) <= LooseVersion(api_version):
         res = blade.get_file_systems_open_files(protocols=["smb"])
         if res.status_code == 200:
             for open_file in list(res.items):
                 info["open_files"][open_file.id] = {
-                    "client": _reference_name(getattr(open_file, "client", None)),
-                    "file_system": _reference_name(getattr(open_file, "source", None)),
+                    "client": _ref_name(getattr(open_file, "client", None)),
+                    "file_system": _ref_name(getattr(open_file, "source", None)),
                     "lock_count": getattr(open_file, "lock_count", None),
                     "mode": getattr(open_file, "mode", None),
                     "path": getattr(open_file, "path", None),
-                    "session": _reference_name(getattr(open_file, "session", None)),
-                    "user": _reference_name(getattr(open_file, "user", None)),
+                    "session": _ref_name(getattr(open_file, "session", None)),
+                    "user": _ref_name(getattr(open_file, "user", None)),
                 }
     return info
 

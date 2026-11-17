@@ -101,6 +101,7 @@ from plugins.modules.purefb_info import (
     generate_fs_repl_transfer_dict,
     generate_ad_dict,
     _maintenance_window_list,
+    _reference_name,
     generate_admin_dict,
     generate_directory_service_roles_dict,
     generate_legal_holds_dict,
@@ -858,6 +859,25 @@ class TestPurefbInfo:
         # Mock syslog servers
         mock_blade.get_syslog_servers.return_value.items = []
 
+        # Mock syslog server settings - the SDK returns the references as dicts
+        mock_syslog_settings = Mock(
+            spec=["name", "ca_certificate", "ca_certificate_group"]
+        )
+        mock_syslog_settings.name = "management"
+        mock_syslog_settings.ca_certificate = {
+            "name": "global",
+            "id": "cert-id",
+            "resource_type": "certificates",
+        }
+        mock_syslog_settings.ca_certificate_group = {
+            "name": None,
+            "id": None,
+            "resource_type": None,
+        }
+        mock_blade.get_syslog_servers_settings.return_value.items = [
+            mock_syslog_settings
+        ]
+
         # Mock SNMP agents
         mock_blade.get_snmp_agents.return_value.items = []
 
@@ -896,6 +916,9 @@ class TestPurefbInfo:
             "group": "",
             "group_base": "",
             "role": None,
+        }
+        assert result["syslog_settings"] == {
+            "management": {"ca_certificate": "global", "ca_certificate_group": None}
         }
         # gated blocks are skipped below their REST version
         assert "oidc_idps" not in result
@@ -1064,6 +1087,21 @@ class TestPurefbInfo:
             "token_expires": None,
             "token_created": None,
         }
+
+    def test_reference_name_reads_dict_and_object_references(self):
+        """_reference_name handles dict references, object references and unset values"""
+        obj = Mock(spec=["as_dict", "as_object", "unset", "empty"])
+        obj.as_dict = {"name": "global", "id": "x", "resource_type": "certificates"}
+        ref = Mock(spec=["name"])
+        ref.name = "grp"
+        obj.as_object = ref
+        obj.unset = {"name": None, "id": None, "resource_type": None}
+        obj.empty = None
+        assert _reference_name(obj, "as_dict") == "global"
+        assert _reference_name(obj, "as_object") == "grp"
+        assert _reference_name(obj, "unset") is None
+        assert _reference_name(obj, "empty") is None
+        assert _reference_name(obj, "missing") is None
 
     def test_generate_oidc_idps_dict(self):
         """OIDC providers are keyed by name with their URL, PRN and CA references."""

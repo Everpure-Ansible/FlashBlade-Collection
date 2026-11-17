@@ -58,6 +58,7 @@ action_groups:
     - purefb_snap
     - purefb_snmp_agent
     - purefb_snmp_mgr
+    - purefb_software_patch
     - purefb_subnet
     - purefb_syslog
     - purefb_target

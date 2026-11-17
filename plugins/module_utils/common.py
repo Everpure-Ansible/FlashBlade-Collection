@@ -14,6 +14,7 @@ This module adds shared functions for the FlashArray modules
 import platform
 import os
 import re
+import time
 
 from ansible.module_utils.common.process import get_bin_path
 from ansible.module_utils.facts.utils import get_file_content
@@ -82,6 +83,34 @@ def get_error_message(response, default="Unknown error"):
         if errors:
             return errors[0].message
     return default
+
+
+def poll_until(fetch, finished, timeout, interval=10):
+    """Poll ``fetch()`` until ``finished(result)`` is true or ``timeout`` passes.
+
+    ``fetch`` is called at least once and its latest result is returned with a
+    flag that says whether the wait ran out of time, so the caller can report
+    the state the object was left in. The pause between polls never overruns
+    the deadline.
+
+    Args:
+        fetch: Callable returning the current object (or None)
+        finished: Callable taking that object and returning True when done
+        timeout: Seconds to wait in total
+        interval: Seconds between polls (default: 10)
+
+    Returns:
+        tuple: (last result, timed_out)
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        result = fetch()
+        if finished(result):
+            return result, False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return result, True
+        time.sleep(min(interval, remaining))
 
 
 def get_filesystem(module, blade):

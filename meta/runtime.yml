@@ -67,6 +67,7 @@ action_groups:
     - purefb_software_patch
     - purefb_ssh_ca_policy
     - purefb_subnet
+    - purefb_support_diagnostics
     - purefb_syslog
     - purefb_target
     - purefb_timeout

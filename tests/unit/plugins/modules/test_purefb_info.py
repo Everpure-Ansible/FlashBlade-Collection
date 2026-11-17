@@ -104,6 +104,7 @@ from plugins.modules.purefb_info import (
     generate_directory_service_roles_dict,
     generate_oidc_idps_dict,
     generate_quota_settings_dict,
+    generate_support_dict,
 )
 from plugins.module_utils.version import LooseVersion as RealLooseVersion
 from plugins.modules.purefb_info import (
@@ -2234,6 +2235,143 @@ class TestPurefbInfo:
         call_args = mock_module.exit_json.call_args[1]
         assert call_args["purefb_info"]["fleet"] == {"fleet1": {"members": {}}}
         assert "policies" not in call_args["purefb_info"]
+
+    # ---------------- support subset (self-diagnostics) ----------------
+
+    @staticmethod
+    def _diagnostics_run(index, task_id, status, counts):
+        run = Mock(
+            spec=[
+                "index",
+                "task_id",
+                "status",
+                "version",
+                "start_time",
+                "analysis_period",
+                "severity_count",
+            ]
+        )
+        run.index = index
+        run.task_id = task_id
+        run.status = status
+        run.version = "default"
+        run.start_time = 1700003600
+        period = Mock(spec=["start_time", "end_time"])
+        period.start_time = 1700000000
+        period.end_time = 1700003600
+        run.analysis_period = period
+        run.severity_count = []
+        for severity, count in counts:
+            entry = Mock(spec=["severity", "count"])
+            entry.severity = severity
+            entry.count = count
+            run.severity_count.append(entry)
+        return run
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.get_rest_api_version", return_value="2.30")
+    def test_generate_support_dict_reports_runs_and_settings(
+        self, mock_api_version, mock_loose_version
+    ):
+        """Retained runs are keyed by index; the tool version is read on 2.24+."""
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+        mock_blade = Mock()
+        runs = Mock()
+        runs.status_code = 200
+        runs.items = [
+            self._diagnostics_run(1, "task-1", "completed", [("info", 200)]),
+            self._diagnostics_run(
+                2, "task-2", "running", [("info", 5), ("warning", 1)]
+            ),
+        ]
+        mock_blade.get_support_diagnostics.return_value = runs
+        settings = Mock()
+        settings.status_code = 200
+        item = Mock(spec=["version", "last_updated"])
+        item.version = "default"
+        item.last_updated = None
+        settings.items = [item]
+        mock_blade.get_support_diagnostics_settings.return_value = settings
+
+        result = generate_support_dict(mock_blade)
+
+        assert sorted(result["diagnostics"]) == ["1", "2"]
+        assert result["diagnostics"]["1"]["severity_count"] == {
+            "info": 200,
+            "warning": 0,
+            "critical": 0,
+        }
+        assert result["diagnostics"]["2"] == {
+            "task_id": "task-2",
+            "status": "running",
+            "version": "default",
+            "start_time": 1700003600,
+            "analysis_period_start": 1700000000,
+            "analysis_period_end": 1700003600,
+            "severity_count": {"info": 5, "warning": 1, "critical": 0},
+        }
+        assert result["diagnostics_settings"] == {
+            "version": "default",
+            "last_updated": None,
+        }
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.get_rest_api_version", return_value="2.17")
+    def test_generate_support_dict_skips_settings_before_2_24(
+        self, mock_api_version, mock_loose_version
+    ):
+        """No runs and an old array: both sections come back empty, no settings call."""
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+        mock_blade = Mock()
+        runs = Mock()
+        runs.status_code = 200
+        runs.items = []
+        mock_blade.get_support_diagnostics.return_value = runs
+
+        result = generate_support_dict(mock_blade)
+
+        assert result == {"diagnostics": {}, "diagnostics_settings": {}}
+        mock_blade.get_support_diagnostics_settings.assert_not_called()
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_support_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_support_subset(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_support,
+        mock_loose_version,
+    ):
+        """gather_subset=support returns the support section on its own."""
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["support"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        mock_blade = Mock()
+        mock_version = Mock()
+        mock_version.version = "2.30"
+        mock_blade.get_versions.return_value.items = [mock_version]
+        mock_get_system.return_value = mock_blade
+        # version gates ON
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+
+        mock_generate_support.return_value = {
+            "diagnostics": {},
+            "diagnostics_settings": {},
+        }
+
+        main()
+
+        mock_generate_support.assert_called_once_with(mock_blade)
+        call_args = mock_module.exit_json.call_args[1]
+        assert call_args["purefb_info"]["support"] == {
+            "diagnostics": {},
+            "diagnostics_settings": {},
+        }
+        assert "default" not in call_args["purefb_info"]
 
     @patch("plugins.modules.purefb_info.LooseVersion")
     def test_generate_file_locks_dict(self, mock_loose_version):

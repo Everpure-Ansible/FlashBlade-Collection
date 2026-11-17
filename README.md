@@ -160,6 +160,7 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_software_patch - install Purity//FB software patches on a FlashBlade
 - purefb_ssh_ca_policy - manage FlashBlade SSH Certificate Authority policies and their members
 - purefb_subnet - manage network subnets on a FlashBlade
+- purefb_support_diagnostics - run FlashBlade self-diagnostics and report the results
 - purefb_syslog - manage FlashBlade syslog server configuration
 - purefb_target - manage remote S3-capable targets for a FlashBlade
 - purefb_timeout - manage FlashBlade GUI timeout

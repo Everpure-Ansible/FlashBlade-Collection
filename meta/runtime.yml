@@ -62,6 +62,7 @@ action_groups:
     - purefb_snmp_agent
     - purefb_snmp_mgr
     - purefb_software_patch
+    - purefb_ssh_ca_policy
     - purefb_subnet
     - purefb_syslog
     - purefb_target

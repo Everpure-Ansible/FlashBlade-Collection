@@ -1,0 +1,5 @@
+minor_changes:
+  - purefb_s3acc - add ``account_exports`` to create an object store account without any export
+    (``[]``) or exported on specific servers with the default S3 export policy (REST 2.20,
+    Purity//FB 4.6.3). The option only applies when the account is created; the exports of an
+    existing account are managed with ``purefb_s3acc_export``.

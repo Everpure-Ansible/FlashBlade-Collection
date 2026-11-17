@@ -88,43 +88,17 @@ options:
     version_added: "1.9.0"
   actions:
     description:
-    - List of permissions to grant.
+    - List of permissions to grant, for example C(s3:GetObject) or
+      C(s3:PutObjectTagging). C(s3:*) grants every action.
+    - Actions are validated against the list the array publishes
+      (GET /object-store-access-policy-actions, REST 2.2 and later), so an
+      action introduced by a later Purity//FB release is accepted without a
+      collection update. The task fails naming any action the array does
+      not know. The collection's built-in list is used only when the array
+      cannot be asked.
     - System-wide policy rules cannot be deleted or modified
     type: list
     elements: str
-    choices:
-      - s3:*
-      - s3:AbortMultipartUpload
-      - s3:BypassGovernanceRetention
-      - s3:CreateBucket
-      - s3:DeleteBucket
-      - s3:DeleteObject
-      - s3:DeleteObjectVersion
-      - s3:ExtendSafemodeRetentionPeriod
-      - s3:GetBucketAcl
-      - s3:GetBucketLocation
-      - s3:GetBucketVersioning
-      - s3:GetLifecycleConfiguration
-      - s3:GetObject
-      - s3:GetObjectAcl
-      - s3:GetObjectLegalHold
-      - s3:GetObjectLockConfiguration
-      - s3:GetObjectRetention
-      - s3:GetObjectTagging
-      - s3:GetObjectVersion
-      - s3:GetObjectVersionTagging
-      - s3:ListAllMyBuckets
-      - s3:ListBucket
-      - s3:ListBucketMultipartUploads
-      - s3:ListBucketVersions
-      - s3:ListMultipartUploadParts
-      - s3:PutBucketVersioning
-      - s3:PutLifecycleConfiguration
-      - s3:PutObject
-      - s3:PutObjectLegalHold
-      - s3:PutObjectLockConfiguration
-      - s3:PutObjectRetention
-      - s3:ResolveSafemodeConflicts
     version_added: "1.9.0"
   object_resources:
     description:
@@ -305,11 +279,11 @@ options:
   rename:
     description:
     - New name for policy
-    - Applies to snapshot, NFS, SMB and network access policies.
+    - Applies to NFS, SMB and network access policies.
     - WORM data policies cannot be renamed.
-    - Purity//FB up to at least 4.6.4 (REST 2.21) ignores a new name for
-      snapshot policies; the module fails instead of reporting a rename
-      the array did not perform.
+    - Snapshot policies cannot be renamed on any Purity//FB release (4.6.4 ignores
+      the new name, 4.8.8 rejects the request); the module fails rather than
+      report a rename the array did not perform.
     type: str
     version_added: "1.10.0"
   destroy_snapshots:
@@ -396,6 +370,7 @@ options:
       - The retention period used for committing files to WORM status.
         Will be applied if no access time is provided, or the access time is less than the current server time.
         Between I(min_retention) and I(max_retention) periods.
+      - Also the retention period applied to files committed by autocommit.
       - Valid values are weeks (w), days(d), hours(h), minutes(m) and seconds(s).
     type: str
     version_added: '1.19.0'
@@ -403,12 +378,45 @@ options:
     description:
       - State of policy attributes after creation.
       - If set to I(locked) then values of the policy attributes are not allowed to change.
-      - If set to I(locked) then values of the policy attributes can be changed.
+      - If set to I(unlocked) then values of the policy attributes can be changed.
+      - A new policy is created I(unlocked) when not set.
       - Changing from I(unlocked) to I(locked) is allowed, but to change from I(locked) to I(unlocked)
         will require support from Everpure Technical Services.
     type: str
     choices: [ locked, unlocked ]
     version_added: '1.19.0'
+  commit_mode:
+    description:
+      - How files on a WORM file system are committed to WORM status.
+      - Only applies when I(policy_type) is C(worm).
+      - I(manual) allows only an explicit commit by the client, I(autocommit)
+        commits a file automatically once it has been inactive for
+        I(autocommit_delay_period), and I(hybrid) allows both.
+      - A new policy defaults to I(manual) when not set.
+      - Requires Purity//FB 4.8.6 (REST 2.29) or later.
+    type: str
+    choices: [ manual, autocommit, hybrid ]
+    version_added: '1.30.0'
+  autocommit_delay_on:
+    description:
+      - The file timestamp the autocommit inactivity period is measured from,
+        either the creation time or the last modification time.
+      - Only applies when I(policy_type) is C(worm).
+      - A new policy defaults to I(last_modification) when not set.
+      - Requires Purity//FB 4.8.6 (REST 2.29) or later.
+    type: str
+    choices: [ creation, last_modification ]
+    version_added: '1.30.0'
+  autocommit_delay_period:
+    description:
+      - The period of inactivity after which autocommit commits a file,
+        using I(default_retention) as its retention period.
+      - Only applies when I(policy_type) is C(worm).
+      - Valid values are weeks (w), days(d), hours(h), minutes(m) and seconds(s).
+      - A new policy defaults to 24 hours (C(24h)) when not set.
+      - Requires Purity//FB 4.8.6 (REST 2.29) or later.
+    type: str
+    version_added: '1.30.0'
   context:
     description:
     - Name of fleet member on which to perform the operation.
@@ -487,6 +495,19 @@ EXAMPLES = r"""
     account: test
     rule: rule1
     actions: "s3:*"
+    object_resources: "*"
+    fb_url: 10.10.10.2
+    api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+- name: Create an object store access policy rule for object tagging
+  everpure.flashblade.purefb_policy:
+    name: test_os_policy_tagging
+    policy_type: access
+    account: test
+    rule: tagging
+    actions:
+      - s3:GetObjectTagging
+      - s3:PutObjectTagging
+      - s3:DeleteObjectTagging
     object_resources: "*"
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
@@ -621,8 +642,20 @@ EXAMPLES = r"""
     name: worm1
     policy_type: worm
     default_retention: 5d
-    min_rentetion: 20h
-    max_retention: 1y
+    min_retention: 20h
+    max_retention: 52w
+    fb_url: 10.10.10.2
+    api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+- name: Create a WORM Data Policy that commits files automatically
+  everpure.flashblade.purefb_policy:
+    name: worm_auto
+    policy_type: worm
+    default_retention: 5d
+    min_retention: 20h
+    max_retention: 52w
+    commit_mode: autocommit
+    autocommit_delay_on: creation
+    autocommit_delay_period: 2h
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
 """
@@ -647,6 +680,7 @@ try:
         ObjectStoreAccessPolicyPost,
         NetworkAccessPolicy,
         NetworkAccessPolicyRule,
+        WormAutocommitConfig,
         WormDataPolicy,
     )
 except ImportError:
@@ -678,6 +712,7 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
     get_rest_api_version,
 )
 from ansible_collections.everpure.flashblade.plugins.module_utils.time_utils import (
+    TimeConversionError,
     time_to_milliseconds,
 )
 
@@ -691,6 +726,56 @@ CONTEXT_API_VERSION = "2.17"
 # From REST 2.22 the NFS export rule anonuid/anongid are integers on the wire;
 # older arrays declare and accept them only as strings.
 NFS_ANON_INT_API_VERSION = "2.22"
+# From REST 2.29 (Purity//FB 4.8.6) a WORM data policy carries commit_mode and
+# the autocommit configuration.
+WORM_AUTOCOMMIT_API_VERSION = "2.29"
+# GET /object-store-access-policy-actions lists the rule actions the array
+# accepts. It grows with Purity//FB releases, so `actions` is validated
+# against it rather than against a list frozen in the collection.
+OS_ACTIONS_API_VERSION = "2.2"
+# Used only when the array cannot be asked for its own catalogue.
+_OS_ACCESS_ACTIONS_FALLBACK = (
+    "s3:*",
+    "s3:AbortMultipartUpload",
+    "s3:BypassGovernanceRetention",
+    "s3:CreateBucket",
+    "s3:DeleteBucket",
+    "s3:DeleteObject",
+    "s3:DeleteObjectTagging",
+    "s3:DeleteObjectVersion",
+    "s3:DeleteObjectVersionTagging",
+    "s3:ExtendSafemodeRetentionPeriod",
+    "s3:GetBucketAcl",
+    "s3:GetBucketCORS",
+    "s3:GetBucketLocation",
+    "s3:GetBucketPolicy",
+    "s3:GetBucketPolicyStatus",
+    "s3:GetBucketPublicAccessBlock",
+    "s3:GetBucketVersioning",
+    "s3:GetLifecycleConfiguration",
+    "s3:GetObject",
+    "s3:GetObjectAcl",
+    "s3:GetObjectLegalHold",
+    "s3:GetObjectLockConfiguration",
+    "s3:GetObjectRetention",
+    "s3:GetObjectTagging",
+    "s3:GetObjectVersion",
+    "s3:GetObjectVersionTagging",
+    "s3:ListAllMyBuckets",
+    "s3:ListBucket",
+    "s3:ListBucketMultipartUploads",
+    "s3:ListBucketVersions",
+    "s3:ListMultipartUploadParts",
+    "s3:PutBucketVersioning",
+    "s3:PutLifecycleConfiguration",
+    "s3:PutObject",
+    "s3:PutObjectLegalHold",
+    "s3:PutObjectLockConfiguration",
+    "s3:PutObjectRetention",
+    "s3:PutObjectTagging",
+    "s3:PutObjectVersionTagging",
+    "s3:ResolveSafemodeConflicts",
+)
 
 
 def _get_local_tz(module, timezone="UTC"):
@@ -781,6 +866,63 @@ def _context_kwargs(module, versions):
     return {}
 
 
+def _worm_autocommit_config(delay_on, delay_period):
+    """Build the WormAutocommitConfig for the fields that are set.
+
+    Returns None when neither field is set, so callers never send an empty
+    configuration.
+    """
+    config = {}
+    if delay_on is not None:
+        config["delay_on"] = delay_on
+    if delay_period is not None:
+        config["delay_period"] = delay_period
+    if not config:
+        return None
+    return WormAutocommitConfig(**config)
+
+
+def _worm_autocommit_params(module):
+    """Return the task's commit_mode, autocommit_delay_on and
+    autocommit_delay_period (converted to milliseconds), None where unset.
+
+    A malformed period fails the task with a message instead of raising."""
+    period = module.params["autocommit_delay_period"] or None
+    delay_period = None
+    if period is not None:
+        try:
+            delay_period = time_to_milliseconds(period)
+        except TimeConversionError:
+            module.fail_json(
+                msg=(
+                    "autocommit_delay_period {0} is not a valid period. Valid "
+                    "values are weeks (w), days (d), hours (h), minutes (m) "
+                    "and seconds (s)".format(period)
+                )
+            )
+    return (
+        module.params["commit_mode"] or None,
+        module.params["autocommit_delay_on"] or None,
+        delay_period,
+    )
+
+
+def _check_worm_autocommit_version(module, versions):
+    """Fail when a WORM autocommit option is set on an array below REST 2.29."""
+    if (
+        module.params["commit_mode"]
+        or module.params["autocommit_delay_on"]
+        or module.params["autocommit_delay_period"]
+    ) and LooseVersion(WORM_AUTOCOMMIT_API_VERSION) > LooseVersion(versions):
+        module.fail_json(
+            msg=(
+                "commit_mode, autocommit_delay_on and autocommit_delay_period "
+                "require FlashBlade REST version {0} or later "
+                "(Purity//FB 4.8.6)".format(WORM_AUTOCOMMIT_API_VERSION)
+            )
+        )
+
+
 def _default(value, default):
     """Return I(default) when the task did not set I(value)."""
     return default if value is None else value
@@ -794,6 +936,43 @@ def _blank_to_none(value):
 def _sorted_or_none(values):
     """Sorted copy of a list for order-insensitive comparison; [] is unset."""
     return sorted(values) if values else None
+
+
+def _valid_os_actions(module, blade, versions):
+    """Return the object store access policy rule actions this array accepts.
+
+    The array's catalogue is authoritative; the built-in list is used only
+    when the catalogue cannot be read.
+    """
+    if LooseVersion(OS_ACTIONS_API_VERSION) <= LooseVersion(versions):
+        res = blade.get_object_store_access_policy_actions(
+            **_context_kwargs(module, versions)
+        )
+        if res.status_code == 200:
+            names = [action.name for action in res.items]
+            if names:
+                return names
+            reason = "The array returned an empty list."
+        else:
+            reason = "Error: {0}".format(get_error_message(res))
+        module.warn(
+            "Could not read the array's access policy action list, "
+            "validating against the collection's built-in list. {0}".format(reason)
+        )
+    return list(_OS_ACCESS_ACTIONS_FALLBACK)
+
+
+def _check_os_actions(module, blade, versions):
+    """Fail, naming every unknown action, unless all requested actions are valid."""
+    if not module.params["actions"]:
+        return
+    valid = _valid_os_actions(module, blade, versions)
+    unknown = [action for action in module.params["actions"] if action not in valid]
+    if unknown:
+        module.fail_json(
+            msg="Unknown object store access policy action(s): {0}. "
+            "Valid actions: {1}".format(", ".join(unknown), ", ".join(sorted(valid)))
+        )
 
 
 # SMB share permissions, lowest level first.
@@ -1507,48 +1686,33 @@ def create_worm_data_policy(module, blade):
     changed = True
     versions = get_rest_api_version(blade)
     if not module.check_mode:
-        min_retention = time_to_milliseconds(module.params["min_retention"])
-        max_retention = time_to_milliseconds(module.params["max_retention"])
-        default_retention = time_to_milliseconds(module.params["default_retention"])
-        if (
-            LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-            and module.params["context"]
-        ):
-            res = blade.post_worm_data_policies(
-                policy=WormDataPolicy(
-                    enabled=module.params["enabled"],
-                    mode="compliance",
-                    min_retention=min_retention,
-                    max_retention=max_retention,
-                    default_retention=default_retention,
-                    retention_lock=module.params["retention_lock"],
-                ),
-                names=[module.params["name"]],
-                context_names=[module.params["context"]],
-            )
-        else:
-            res = blade.post_worm_data_policies(
-                policy=WormDataPolicy(
-                    enabled=module.params["enabled"],
-                    mode="compliance",
-                    min_retention=min_retention,
-                    max_retention=max_retention,
-                    default_retention=default_retention,
-                    retention_lock=module.params["retention_lock"],
-                ),
-                names=[module.params["name"]],
-            )
+        ctx = _context_kwargs(module, versions)
+        policy_kwargs = {
+            "enabled": module.params["enabled"],
+            "mode": "compliance",
+            "min_retention": time_to_milliseconds(module.params["min_retention"]),
+            "max_retention": time_to_milliseconds(module.params["max_retention"]),
+            "default_retention": time_to_milliseconds(
+                module.params["default_retention"]
+            ),
+            # the array requires the lock state on creation
+            "retention_lock": module.params["retention_lock"] or "unlocked",
+        }
+        # The autocommit fields are sent only when the task sets them, so an
+        # array below REST 2.29 keeps receiving the body it accepts.
+        commit_mode, delay_on, delay_period = _worm_autocommit_params(module)
+        if commit_mode:
+            policy_kwargs["commit_mode"] = commit_mode
+        autocommit_config = _worm_autocommit_config(delay_on, delay_period)
+        if autocommit_config is not None:
+            policy_kwargs["autocommit_config"] = autocommit_config
+        res = blade.post_worm_data_policies(
+            policy=WormDataPolicy(**policy_kwargs),
+            names=[module.params["name"]],
+            **ctx,
+        )
         if res.status_code != 200:
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                and module.params["context"]
-            ):
-                blade.delete_worm_data_policies(
-                    names=[module.params["name"]],
-                    context_names=[module.params["context"]],
-                )
-            else:
-                blade.delete_worm_data_policies(names=[module.params["name"]])
+            blade.delete_worm_data_policies(names=[module.params["name"]], **ctx)
             module.fail_json(
                 msg="Failed to create WORM data policy {0}.Error: {1}".format(
                     module.params["name"], get_error_message(res)
@@ -2186,33 +2350,24 @@ def update_worm_data_policy(module, blade):
 
     changed = False
     versions = get_rest_api_version(blade)
-    if (
-        LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-        and module.params["context"]
-    ):
-        current_policy_config = list(
-            blade.get_worm_data_policies(
-                names=[module.params["name"]], context_names=[module.params["context"]]
-            ).items
-        )[0]
-    else:
-        current_policy_config = list(
-            blade.get_worm_data_policies(names=[module.params["name"]]).items
-        )[0]
+    ctx = _context_kwargs(module, versions)
+    current_policy_config = list(
+        blade.get_worm_data_policies(names=[module.params["name"]], **ctx).items
+    )[0]
+    # commit_mode and the autocommit configuration exist from REST 2.29; a
+    # policy read from an older array has neither attribute.
+    current_autocommit = getattr(current_policy_config, "autocommit_config", None)
     current_policy = {
         "default_retention": current_policy_config.default_retention,
         "enabled": current_policy_config.enabled,
         "max_retention": current_policy_config.max_retention,
         "min_retention": current_policy_config.min_retention,
         "retention_lock": current_policy_config.retention_lock,
+        "commit_mode": getattr(current_policy_config, "commit_mode", None),
+        "autocommit_delay_on": getattr(current_autocommit, "delay_on", None),
+        "autocommit_delay_period": getattr(current_autocommit, "delay_period", None),
     }
-    new_policy = {
-        "default_retention": current_policy_config.default_retention,
-        "enabled": current_policy_config.enabled,
-        "max_retention": current_policy_config.max_retention,
-        "min_retention": current_policy_config.min_retention,
-        "retention_lock": current_policy_config.retention_lock,
-    }
+    new_policy = dict(current_policy)
     if module.params["enabled"] != current_policy["enabled"]:
         new_policy["enabled"] = module.params["enabled"]
     if (
@@ -2244,29 +2399,43 @@ def update_worm_data_policy(module, blade):
         new_policy["min_retention"] = time_to_milliseconds(
             module.params["min_retention"]
         )
+    commit_mode, delay_on, delay_period = _worm_autocommit_params(module)
+    if commit_mode and commit_mode != current_policy["commit_mode"]:
+        new_policy["commit_mode"] = commit_mode
+    if delay_on and delay_on != current_policy["autocommit_delay_on"]:
+        new_policy["autocommit_delay_on"] = delay_on
+    if delay_period and delay_period != current_policy["autocommit_delay_period"]:
+        new_policy["autocommit_delay_period"] = delay_period
     if new_policy != current_policy:
         changed = True
         if not module.check_mode:
-            worm_policy = WormDataPolicy(
-                enabled=new_policy["enabled"],
-                retention_lock=new_policy["retention_lock"],
-                min_retention=new_policy["min_retention"],
-                max_retention=new_policy["max_retention"],
-                default_retention=new_policy["default_retention"],
-            )
+            policy_kwargs = {
+                "enabled": new_policy["enabled"],
+                "retention_lock": new_policy["retention_lock"],
+                "min_retention": new_policy["min_retention"],
+                "max_retention": new_policy["max_retention"],
+                "default_retention": new_policy["default_retention"],
+            }
+            # The autocommit fields are sent only when they change; the
+            # configuration goes as a whole so the unchanged field keeps its
+            # current value.
+            if new_policy["commit_mode"] != current_policy["commit_mode"]:
+                policy_kwargs["commit_mode"] = new_policy["commit_mode"]
             if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                and module.params["context"]
+                new_policy["autocommit_delay_on"]
+                != current_policy["autocommit_delay_on"]
+                or new_policy["autocommit_delay_period"]
+                != current_policy["autocommit_delay_period"]
             ):
-                res = blade.patch_worm_data_policies(
-                    names=[module.params["name"]],
-                    policy=worm_policy,
-                    context_names=[module.params["context"]],
+                policy_kwargs["autocommit_config"] = _worm_autocommit_config(
+                    new_policy["autocommit_delay_on"],
+                    new_policy["autocommit_delay_period"],
                 )
-            else:
-                res = blade.patch_worm_data_policies(
-                    names=[module.params["name"]], policy=worm_policy
-                )
+            res = blade.patch_worm_data_policies(
+                names=[module.params["name"]],
+                policy=WormDataPolicy(**policy_kwargs),
+                **ctx,
+            )
             if res.status_code != 200:
                 module.fail_json(
                     msg="Failed to update WORM data policy {0}. Error: {1}".format(
@@ -3829,26 +3998,33 @@ def rename_snap_policy(module, blade):
             **_context_kwargs(module, versions),
         )
         if res.status_code != 200:
+            # Purity//FB 4.8.8 (REST 2.30) rejects the request outright
+            # ("Missing or invalid parameter"); older releases accept it and
+            # keep the old name (handled below). Either way the array has no
+            # rename for snapshot policies, so say so rather than echo the raw
+            # error.
             module.fail_json(
-                msg="Failed to rename snapshot policy {0} to {1}. Error: {2}".format(
+                msg="Failed to rename snapshot policy {0} to {1}: Purity//FB does "
+                "not support renaming snapshot policies (REST {2}; the array "
+                "answered: {3}).".format(
                     module.params["name"],
                     module.params["rename"],
+                    versions,
                     get_error_message(res),
                 )
             )
-        # Purity//FB (verified on 4.6.4, REST 2.21) answers 200 to a body of
-        # {"name": ...} on PATCH /policies but silently keeps the old name,
-        # whether addressed by names or ids: snapshot policies have no rename
-        # on the array. Check the result rather than report a rename that
-        # never happened.
+        # Purity//FB 4.6.4 (REST 2.21) answers 200 to a body of {"name": ...}
+        # on PATCH /policies but silently keeps the old name, whether
+        # addressed by names or ids. Check the result rather than report a
+        # rename that never happened.
         res = blade.get_policies(
             names=[module.params["rename"]], **_context_kwargs(module, versions)
         )
         if res.status_code != 200:
             module.fail_json(
                 msg="Failed to rename snapshot policy {0} to {1}: the array "
-                "accepted the request but kept the old name. Purity//FB REST "
-                "{2} does not support renaming snapshot policies.".format(
+                "accepted the request but kept the old name. Purity//FB does "
+                "not support renaming snapshot policies (REST {2}).".format(
                     module.params["name"], module.params["rename"], versions
                 )
             )
@@ -3978,17 +4154,27 @@ def copy_policy(module, blade, source):
                 names=[target], policy=Policy(**policy_kwargs), **ctx
             )
         elif policy_type == "worm":
+            policy_kwargs = {
+                "enabled": source.enabled,
+                "mode": source.mode,
+                "min_retention": source.min_retention,
+                "max_retention": source.max_retention,
+                "default_retention": source.default_retention,
+                "retention_lock": source.retention_lock,
+            }
+            # commit_mode and the autocommit configuration exist from REST 2.29
+            commit_mode = getattr(source, "commit_mode", None)
+            if commit_mode is not None:
+                policy_kwargs["commit_mode"] = commit_mode
+            source_autocommit = getattr(source, "autocommit_config", None)
+            autocommit_config = _worm_autocommit_config(
+                getattr(source_autocommit, "delay_on", None),
+                getattr(source_autocommit, "delay_period", None),
+            )
+            if autocommit_config is not None:
+                policy_kwargs["autocommit_config"] = autocommit_config
             res = blade.post_worm_data_policies(
-                names=[target],
-                policy=WormDataPolicy(
-                    enabled=source.enabled,
-                    mode=source.mode,
-                    min_retention=source.min_retention,
-                    max_retention=source.max_retention,
-                    default_retention=source.default_retention,
-                    retention_lock=source.retention_lock,
-                ),
-                **ctx,
+                names=[target], policy=WormDataPolicy(**policy_kwargs), **ctx
             )
         else:
             res = _copy_rule_policy(module, blade, source, versions, ctx)
@@ -4036,44 +4222,7 @@ def main():
             rule=dict(type="str"),
             user=dict(type="str"),
             effect=dict(type="str", choices=["allow", "deny"]),
-            actions=dict(
-                type="list",
-                elements="str",
-                choices=[
-                    "s3:*",
-                    "s3:AbortMultipartUpload",
-                    "s3:BypassGovernanceRetention",
-                    "s3:CreateBucket",
-                    "s3:DeleteBucket",
-                    "s3:DeleteObject",
-                    "s3:DeleteObjectVersion",
-                    "s3:ExtendSafemodeRetentionPeriod",
-                    "s3:GetBucketAcl",
-                    "s3:GetBucketLocation",
-                    "s3:GetBucketVersioning",
-                    "s3:GetLifecycleConfiguration",
-                    "s3:GetObject",
-                    "s3:GetObjectAcl",
-                    "s3:GetObjectLegalHold",
-                    "s3:GetObjectLockConfiguration",
-                    "s3:GetObjectRetention",
-                    "s3:GetObjectTagging",
-                    "s3:GetObjectVersion",
-                    "s3:GetObjectVersionTagging",
-                    "s3:ListAllMyBuckets",
-                    "s3:ListBucket",
-                    "s3:ListBucketMultipartUploads",
-                    "s3:ListBucketVersions",
-                    "s3:ListMultipartUploadParts",
-                    "s3:PutBucketVersioning",
-                    "s3:PutLifecycleConfiguration",
-                    "s3:PutObject",
-                    "s3:PutObjectLegalHold",
-                    "s3:PutObjectLockConfiguration",
-                    "s3:PutObjectRetention",
-                    "s3:ResolveSafemodeConflicts",
-                ],
-            ),
+            actions=dict(type="list", elements="str"),
             object_resources=dict(type="list", elements="str"),
             source_ips=dict(type="list", elements="str"),
             s3_prefixes=dict(type="list", elements="str"),
@@ -4124,6 +4273,11 @@ def main():
             min_retention=dict(type="str"),
             max_retention=dict(type="str"),
             retention_lock=dict(type="str", choices=["locked", "unlocked"]),
+            commit_mode=dict(type="str", choices=["manual", "autocommit", "hybrid"]),
+            autocommit_delay_on=dict(
+                type="str", choices=["creation", "last_modification"]
+            ),
+            autocommit_delay_period=dict(type="str"),
             context=dict(type="str", default=""),
         )
     )
@@ -4201,6 +4355,8 @@ def main():
                         get_error_message(res),
                     )
                 )
+        if state == "present":
+            _check_os_actions(module, blade, versions)
         if policy and state == "present":
             update_os_policy(module, blade)
         elif state == "present" and not policy:
@@ -4549,6 +4705,7 @@ def main():
                     )
                 )
             )
+        _check_worm_autocommit_version(module, versions)
         if not HAS_PYPURECLIENT:
             module.fail_json(msg="py-pure-client sdk is required for this module")
         try:
@@ -4589,35 +4746,6 @@ def main():
             except AttributeError:
                 new_policy = None
         if policy and state == "present" and not module.params["rename"]:
-            if module.params["before_rule"]:
-                if (
-                    LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                    and module.params["context"]
-                ):
-                    res = blade.get_worm_data_policies_rules(
-                        policy_names=[module.params["name"]],
-                        names=[
-                            module.params["name"]
-                            + "."
-                            + str(module.params["before_rule"])
-                        ],
-                        context_names=[module.params["context"]],
-                    )
-                else:
-                    res = blade.get_worm_data_policies_rules(
-                        policy_names=[module.params["name"]],
-                        names=[
-                            module.params["name"]
-                            + "."
-                            + str(module.params["before_rule"])
-                        ],
-                    )
-                if res.status_code != 200:
-                    module.fail_json(
-                        msg="Rule index {0} does not exist.".format(
-                            module.params["before_rule"]
-                        )
-                    )
             update_worm_data_policy(module, blade)
         elif (
             state == "present" and module.params["rename"] and policy and not new_policy

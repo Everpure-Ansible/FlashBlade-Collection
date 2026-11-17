@@ -39,7 +39,17 @@ options:
       No validation is performed for FQDNs.
     - If more than 4 servers are provided, only the first 4 unique
       nameservers will be used.
-    - if no servers are given a default of I(0.pool.ntp.org) will be used.
+    - if no servers are given a default of C(0.pool.ntp.org) will be used.
+  context:
+    description:
+    - Name of fleet member on which to perform the operation.
+    - This requires the array receiving the request is a member of a fleet
+      and the context name to be a member of the same fleet.
+    - Requires Purity//FB 4.8.8 (REST API 2.30) or later. The module fails
+      before any read or write when a context is given on an older array.
+    type: str
+    default: ""
+    version_added: '1.30.0'
 extends_documentation_fragment:
 - everpure.flashblade.everpure.fb
 """
@@ -59,6 +69,15 @@ EXAMPLES = r"""
       - "1.pool.ntp.org"
       - "2.pool.ntp.org"
       - "3.pool.ntp.org"
+    fb_url: 10.10.10.2
+    api_token: e31060a7-21fc-e277-6240-25983c6c4592
+
+- name: Set NTP servers on another member of the fleet
+  everpure.flashblade.purefb_ntp:
+    state: present
+    ntp_servers:
+      - "0.pool.ntp.org"
+    context: fleet-member-2
     fb_url: 10.10.10.2
     api_token: e31060a7-21fc-e277-6240-25983c6c4592
 """
@@ -81,17 +100,55 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.purefb import 
 from ansible_collections.everpure.flashblade.plugins.module_utils.common import (
     remove_duplicates,
     get_error_message,
+    get_rest_api_version,
 )
+from ansible_collections.everpure.flashblade.plugins.module_utils.version import (
+    LooseVersion,
+)
+
+# REST API version at which patch_arrays accepts context_names. get_arrays
+# accepted it from 2.22, but every path of this module may PATCH, so a context
+# requires the later version.
+CONTEXT_API_VERSION = "2.30"
+
+
+def _context_kwargs(module):
+    """Return the context_names kwargs for an SDK call when a context is set"""
+    if module.params["context"]:
+        return {"context_names": [module.params["context"]]}
+    return {}
+
+
+def _get_ntp_servers(module, blade):
+    """Return the NTP servers configured on the (context) array"""
+    res = blade.get_arrays(**_context_kwargs(module))
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to read array NTP settings. Error: {0}".format(
+                get_error_message(res)
+            )
+        )
+    arrays = list(res.items)
+    if len(arrays) != 1:
+        module.fail_json(
+            msg=(
+                "Context {0} matched {1} arrays. "
+                "The context must name a single fleet member."
+            ).format(module.params["context"], len(arrays))
+        )
+    return arrays[0].ntp_servers or []
 
 
 def delete_ntp(module, blade):
     """Delete NTP Servers"""
     changed = False
-    current_servers = list(blade.get_arrays().items)[0].ntp_servers or []
+    current_servers = _get_ntp_servers(module, blade)
     if current_servers:
         changed = True
         if not module.check_mode:
-            res = blade.patch_arrays(array=Array(ntp_servers=[]))
+            res = blade.patch_arrays(
+                array=Array(ntp_servers=[]), **_context_kwargs(module)
+            )
             if res.status_code != 200:
                 module.fail_json(
                     msg="Deletion of NTP servers failed. Error: {0}".format(
@@ -108,7 +165,8 @@ def create_ntp(module, blade):
         if not module.params["ntp_servers"]:
             module.params["ntp_servers"] = ["0.pool.ntp.org"]
         res = blade.patch_arrays(
-            array=Array(ntp_servers=module.params["ntp_servers"][0:4])
+            array=Array(ntp_servers=module.params["ntp_servers"][0:4]),
+            **_context_kwargs(module)
         )
         if res.status_code != 200:
             module.fail_json(
@@ -125,6 +183,7 @@ def main():
         dict(
             ntp_servers=dict(type="list", elements="str"),
             state=dict(type="str", default="present", choices=["absent", "present"]),
+            context=dict(type="str", default=""),
         )
     )
 
@@ -138,12 +197,25 @@ def main():
         module.fail_json(msg="py-pure-client sdk is required for this module")
 
     blade = get_system(module)
+    api_version = get_rest_api_version(blade)
+
+    # Every path of this module may PATCH the array, so a context must be
+    # supported by patch_arrays before anything is read or written.
+    if module.params["context"] and LooseVersion(CONTEXT_API_VERSION) > LooseVersion(
+        api_version
+    ):
+        module.fail_json(
+            msg=(
+                "Fleet context for NTP settings requires FlashBlade REST API "
+                "version {0} (Purity//FB 4.8.8) or later, the array supports {1}."
+            ).format(CONTEXT_API_VERSION, api_version)
+        )
 
     if module.params["state"] == "absent":
         delete_ntp(module, blade)
     else:
         module.params["ntp_servers"] = remove_duplicates(module.params["ntp_servers"])
-        current_servers = list(blade.get_arrays().items)[0].ntp_servers or []
+        current_servers = _get_ntp_servers(module, blade)
         if sorted(current_servers) != sorted(module.params["ntp_servers"][0:4]):
             create_ntp(module, blade)
 

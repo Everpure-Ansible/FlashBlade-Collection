@@ -1264,6 +1264,36 @@ def generate_snap_transfer_dict(blade):
     return snap_transfer_info
 
 
+def generate_fs_repl_transfer_dict(blade):
+    """Transfer status of file system replica links.
+
+    Keyed by snapshot name and then by remote array, so a snapshot that
+    replicates to several arrays (fan-out) keeps one entry per transfer.
+    """
+    fs_transfer_info = {}
+    res = blade.get_file_system_replica_links_transfer()
+    if res.status_code != 200:
+        return fs_transfer_info
+    for transfer in list(res.items):
+        remote = getattr(getattr(transfer, "remote", None), "name", None)
+        fs_transfer_info.setdefault(transfer.name, {})[remote] = {
+            "completed": transfer.completed,
+            "data_transferred": transfer.data_transferred,
+            "progress": transfer.progress,
+            "direction": transfer.direction,
+            "local_snapshot": getattr(
+                getattr(transfer, "local_snapshot", None), "name", None
+            ),
+            "remote": remote,
+            "remote_snapshot": getattr(
+                getattr(transfer, "remote_snapshot", None), "name", None
+            ),
+            "started": transfer.started,
+            "status": transfer.status,
+        }
+    return fs_transfer_info
+
+
 def _connection_paths_by_remote(blade):
     """Group the GET array-connections/path rows by remote array name.
 
@@ -2540,6 +2570,7 @@ def main():
         info["file_replication"] = generate_file_repl_dict(blade)
         info["bucket_replication"] = generate_bucket_repl_dict(blade)
         info["snap_transfers"] = generate_snap_transfer_dict(blade)
+        info["fs_replica_transfers"] = generate_fs_repl_transfer_dict(blade)
         info["remote_credentials"] = generate_remote_creds_dict(blade)
         info["targets"] = generate_targets_dict(blade)
     if "accounts" in subset or "all" in subset:

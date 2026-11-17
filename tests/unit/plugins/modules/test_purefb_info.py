@@ -98,13 +98,17 @@ from plugins.modules.purefb_info import (
     generate_realms_dict,
     generate_resource_accesses_dict,
     generate_file_repl_dict,
+    generate_fs_repl_transfer_dict,
     generate_ad_dict,
     _maintenance_window_list,
+    _reference_name,
     generate_admin_dict,
     generate_directory_service_roles_dict,
+    generate_legal_holds_dict,
     generate_oidc_idps_dict,
     generate_quota_settings_dict,
     generate_support_dict,
+    generate_servers_dict,
 )
 from plugins.module_utils.version import LooseVersion as RealLooseVersion
 from plugins.modules.purefb_info import (
@@ -855,6 +859,25 @@ class TestPurefbInfo:
         # Mock syslog servers
         mock_blade.get_syslog_servers.return_value.items = []
 
+        # Mock syslog server settings - the SDK returns the references as dicts
+        mock_syslog_settings = Mock(
+            spec=["name", "ca_certificate", "ca_certificate_group"]
+        )
+        mock_syslog_settings.name = "management"
+        mock_syslog_settings.ca_certificate = {
+            "name": "global",
+            "id": "cert-id",
+            "resource_type": "certificates",
+        }
+        mock_syslog_settings.ca_certificate_group = {
+            "name": None,
+            "id": None,
+            "resource_type": None,
+        }
+        mock_blade.get_syslog_servers_settings.return_value.items = [
+            mock_syslog_settings
+        ]
+
         # Mock SNMP agents
         mock_blade.get_snmp_agents.return_value.items = []
 
@@ -893,6 +916,9 @@ class TestPurefbInfo:
             "group": "",
             "group_base": "",
             "role": None,
+        }
+        assert result["syslog_settings"] == {
+            "management": {"ca_certificate": "global", "ca_certificate_group": None}
         }
         # gated blocks are skipped below their REST version
         assert "oidc_idps" not in result
@@ -1062,6 +1088,21 @@ class TestPurefbInfo:
             "token_created": None,
         }
 
+    def test_reference_name_reads_dict_and_object_references(self):
+        """_reference_name handles dict references, object references and unset values"""
+        obj = Mock(spec=["as_dict", "as_object", "unset", "empty"])
+        obj.as_dict = {"name": "global", "id": "x", "resource_type": "certificates"}
+        ref = Mock(spec=["name"])
+        ref.name = "grp"
+        obj.as_object = ref
+        obj.unset = {"name": None, "id": None, "resource_type": None}
+        obj.empty = None
+        assert _reference_name(obj, "as_dict") == "global"
+        assert _reference_name(obj, "as_object") == "grp"
+        assert _reference_name(obj, "unset") is None
+        assert _reference_name(obj, "empty") is None
+        assert _reference_name(obj, "missing") is None
+
     def test_generate_oidc_idps_dict(self):
         """OIDC providers are keyed by name with their URL, PRN and CA references."""
         ca_cert = Mock(spec=["name"])
@@ -1155,6 +1196,183 @@ class TestPurefbInfo:
         }
         mock_blade.get_quotas_settings.return_value.status_code = 400
         assert generate_quota_settings_dict(mock_blade) == {}
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_config_dict_saml2sso_fields(self, mock_loose_version):
+        """saml2sso reports the SAML2 service, binding, fleet and SP fields"""
+        mock_blade = Mock()
+        mock_version = Mock()
+        mock_version.version = "2.30"
+        mock_blade.get_versions.return_value.items = [mock_version]
+        # every version gate ON
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+
+        for method in (
+            "get_dns",
+            "get_smtp_servers",
+            "get_alert_watchers",
+            "get_directory_services_roles",
+            "get_certificates",
+            "get_certificate_groups",
+            "get_syslog_servers",
+            "get_snmp_agents",
+            "get_snmp_managers",
+            "get_kmip",
+            "get_syslog_servers_settings",
+            "get_sso_oidc_idps",
+        ):
+            getattr(mock_blade, method).return_value.items = []
+        mock_ds = Mock()
+        mock_ds.name = "management"
+        mock_blade.get_directory_services.return_value.items = [mock_ds]
+        mock_array = Mock()
+        mock_array.ntp_servers = []
+        mock_blade.get_arrays.return_value.items = [mock_array]
+
+        def reference(name):
+            ref = Mock(spec=["name"])
+            ref.name = name
+            return ref
+
+        saml = Mock(
+            spec=[
+                "name",
+                "enabled",
+                "array_url",
+                "prn",
+                "services",
+                "binding",
+                "management",
+                "idp",
+                "sp",
+            ]
+        )
+        saml.name = "PureSSO"
+        saml.enabled = False
+        saml.array_url = "https://fb.example.com"
+        saml.prn = "prn::iam:array-id/local::saml-provider/PureSSO"
+        saml.services = ["management", "object"]
+        saml.binding = "none"
+        saml.management = Mock(spec=["trust_other_saml_sps_in_fleet"])
+        saml.management.trust_other_saml_sps_in_fleet = True
+        saml.idp = Mock()
+        saml.idp.url = "https://idp.example.com/sso"
+        saml.idp.entity_id = "https://idp.example.com/idp"
+        saml.idp.encrypt_assertion_enabled = False
+        saml.idp.sign_request_enabled = True
+        saml.idp.metadata_url = "https://idp.example.com/metadata"
+        saml.idp.metadata_url_ca_certificate = reference("idp-ca")
+        saml.idp.metadata_url_ca_certificate_group = reference(None)
+        saml.idp.verification_certificate = reference("idp-cert")
+        saml.sp = Mock()
+        saml.sp.entity_id = "https://sso.example.com/fleet"
+        saml.sp.assertion_consumer_url = (
+            "https://fb.example.com/login/saml2/sso/PureSSO"
+        )
+        saml.sp.metadata_url = (
+            "https://fb.example.com/saml2/service-provider-metadata/PureSSO"
+        )
+        saml.sp.decryption_credential = reference(None)
+        saml.sp.signing_credential = reference("sp-signing")
+        mock_blade.get_sso_saml2_idps.return_value.items = [saml]
+
+        result = generate_config_dict(mock_blade)
+
+        sso = result["saml2sso"]
+        assert sso["name"] == "PureSSO"
+        assert sso["prn"] == "prn::iam:array-id/local::saml-provider/PureSSO"
+        assert sso["services"] == ["management", "object"]
+        assert sso["binding"] == "none"
+        assert sso["trust_other_saml_sps_in_fleet"] is True
+        assert sso["idp"]["entity_id"] == "https://idp.example.com/idp"
+        assert sso["idp"]["metadata_url_ca_certificate"] == "idp-ca"
+        assert sso["idp"]["metadata_url_ca_certificate_group"] is None
+        assert sso["idp"]["verification_certificate"] == "idp-cert"
+        assert sso["sp"]["entity_id"] == "https://sso.example.com/fleet"
+        assert (
+            sso["sp"]["assertion_consumer_url"]
+            == "https://fb.example.com/login/saml2/sso/PureSSO"
+        )
+        assert (
+            sso["sp"]["metadata_url"]
+            == "https://fb.example.com/saml2/service-provider-metadata/PureSSO"
+        )
+        assert sso["sp"]["decrypt_cred"] is None
+        assert sso["sp"]["sign_cred"] == "sp-signing"
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_config_dict_saml2sso_old_array(self, mock_loose_version):
+        """saml2sso fields a pre-2.17 array lacks are reported as None"""
+        mock_blade = Mock()
+        mock_version = Mock()
+        mock_version.version = "2.16"
+        mock_blade.get_versions.return_value.items = [mock_version]
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+
+        for method in (
+            "get_dns",
+            "get_smtp_servers",
+            "get_alert_watchers",
+            "get_directory_services_roles",
+            "get_certificates",
+            "get_certificate_groups",
+            "get_syslog_servers",
+            "get_snmp_agents",
+            "get_snmp_managers",
+            "get_kmip",
+            "get_syslog_servers_settings",
+            "get_sso_oidc_idps",
+        ):
+            getattr(mock_blade, method).return_value.items = []
+        mock_ds = Mock()
+        mock_ds.name = "management"
+        mock_blade.get_directory_services.return_value.items = [mock_ds]
+        mock_array = Mock()
+        mock_array.ntp_servers = []
+        mock_blade.get_arrays.return_value.items = [mock_array]
+
+        saml = Mock(spec=["name", "enabled", "array_url", "idp", "sp"])
+        saml.name = "PureSSO"
+        saml.enabled = True
+        saml.array_url = "https://fb.example.com"
+        saml.idp = Mock(
+            spec=[
+                "url",
+                "entity_id",
+                "encrypt_assertion_enabled",
+                "sign_request_enabled",
+                "metadata_url",
+                "verification_certificate",
+            ]
+        )
+        saml.idp.url = None
+        saml.idp.entity_id = None
+        saml.idp.encrypt_assertion_enabled = False
+        saml.idp.sign_request_enabled = False
+        saml.idp.metadata_url = "https://idp.example.com/metadata"
+        saml.idp.verification_certificate = Mock(spec=["name"])
+        saml.idp.verification_certificate.name = None
+        saml.sp = Mock(spec=["decryption_credential", "signing_credential"])
+        saml.sp.decryption_credential = Mock(spec=["name"])
+        saml.sp.decryption_credential.name = None
+        saml.sp.signing_credential = Mock(spec=["name"])
+        saml.sp.signing_credential.name = None
+        mock_blade.get_sso_saml2_idps.return_value.items = [saml]
+
+        result = generate_config_dict(mock_blade)
+
+        sso = result["saml2sso"]
+        assert sso["enabled"] is True
+        assert sso["prn"] is None
+        assert sso["services"] is None
+        assert sso["binding"] is None
+        assert sso["trust_other_saml_sps_in_fleet"] is None
+        assert sso["idp"]["metadata_url_ca_certificate"] is None
+        assert sso["idp"]["metadata_url_ca_certificate_group"] is None
+        assert sso["idp"]["verification_certificate"] is None
+        assert sso["sp"]["entity_id"] is None
+        assert sso["sp"]["assertion_consumer_url"] is None
+        assert sso["sp"]["metadata_url"] is None
 
     def test_generate_password_policies_dict(self):
         """Test generate_password_policies_dict reports all fields in seconds"""
@@ -1321,6 +1539,11 @@ class TestPurefbInfo:
         assert result[0]["client_policy"] == "smb_client_pol1"
         assert result[0]["share_policy"] == "smb_share_pol1"
 
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_info.get_rest_api_version",
+        Mock(return_value="2.30"),
+    )
     def test_generate_fs_dict_scopes_exports_per_filesystem(self):
         """generate_fs_dict must scope its file_system_exports list to the
         current filesystem only. A global list leak would attribute exports
@@ -1369,6 +1592,169 @@ class TestPurefbInfo:
         # the misspelt key is kept alongside the correct one
         assert result["fs1"]["multi_protocol"]["safegaurd_acls"] is True
         assert result["fs1"]["multi_protocol"]["safeguard_acls"] is True
+        # a plain filesystem has a source with no name
+        assert result["fs1"]["source"] == {
+            "is_local": None,
+            "name": None,
+            "resource_type": None,
+            "display_name": None,
+            "location": None,
+        }
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_info.get_rest_api_version",
+        Mock(return_value="2.30"),
+    )
+    def test_generate_fs_dict_reports_copy_source(self):
+        """A filesystem copy reports the filesystem it was copied from, and
+        the location comes from the source reference, not the filesystem."""
+        mock_blade = Mock()
+
+        location = Mock()
+        location.name = "array1"
+        source = Mock()
+        source.name = "fs1"
+        source.is_local = True
+        source.resource_type = "file-systems"
+        source.display_name = "fs1"
+        source.location = location
+
+        copy = Mock()
+        copy.name = "fs1-copy"
+        copy.fast_remove_directory_enabled = False
+        copy.snapshot_directory_enabled = False
+        copy.provisioned = 0
+        copy.destroyed = False
+        copy.nfs = Mock(
+            rules=None, v3_enabled=True, v4_1_enabled=True, export_policy=None
+        )
+        copy.smb = Mock(
+            acl_mode=None,
+            client_policy=None,
+            share_policy=None,
+            continuous_availability_enabled=False,
+        )
+        copy.multi_protocol = Mock(safeguard_acls=True, access_control_style=None)
+        copy.hard_limit_enabled = False
+        copy.promotion_status = "promoting"
+        copy.requested_promotion_state = "promoted"
+        copy.writable = True
+        copy.source = source
+        copy.default_group_quota = 0
+        copy.default_user_quota = 0
+        copy.http = Mock(enabled=False)
+
+        mock_blade.get_file_systems.return_value.items = [copy]
+        mock_blade.get_quotas_groups.return_value.items = []
+        mock_blade.get_quotas_users.return_value.items = []
+
+        result = generate_fs_dict(mock_blade)
+
+        assert result["fs1-copy"]["promotion_status"] == "promoting"
+        assert result["fs1-copy"]["source"] == {
+            "is_local": True,
+            "name": "fs1",
+            "resource_type": "file-systems",
+            "display_name": "fs1",
+            "location": "array1",
+        }
+
+    # ==== storage_class read-back: the name purefb_fs compares ====
+
+    def _fs_for_storage_class(self, storage_class):
+        """Minimal file system for generate_fs_dict. ``storage_class`` is the
+        object the array returns, or None for a REST version whose file
+        system model has no such field.
+        """
+        fsys = Mock()
+        fsys.name = "fs1"
+        fsys.fast_remove_directory_enabled = False
+        fsys.snapshot_directory_enabled = False
+        fsys.provisioned = 0
+        fsys.destroyed = False
+        fsys.nfs = Mock(
+            rules=None, v3_enabled=True, v4_1_enabled=False, export_policy=None
+        )
+        fsys.smb = Mock(
+            acl_mode=None,
+            client_policy=None,
+            share_policy=None,
+            continuous_availability_enabled=False,
+        )
+        fsys.multi_protocol = Mock(safeguard_acls=False, access_control_style=None)
+        fsys.hard_limit_enabled = False
+        fsys.promotion_status = None
+        fsys.requested_promotion_state = None
+        fsys.writable = True
+        fsys.source = None
+        fsys.location = None
+        fsys.default_group_quota = 0
+        fsys.default_user_quota = 0
+        fsys.http = Mock(enabled=False)
+        if storage_class is None:
+            del fsys.storage_class
+        else:
+            fsys.storage_class = storage_class
+        return fsys
+
+    def _blade_with_fs(self, fsys):
+        mock_blade = Mock()
+        mock_blade.get_file_systems.return_value.items = [fsys]
+        mock_blade.get_quotas_groups.return_value.items = []
+        mock_blade.get_quotas_users.return_value.items = []
+        return mock_blade
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_info.get_rest_api_version",
+        Mock(return_value="2.17"),
+    )
+    def test_generate_fs_dict_reports_storage_class_name(self):
+        """From REST 2.17 the storage class is reported by name, the value
+        purefb_fs compares its storage_class option with.
+        """
+        storage_class = Mock()
+        storage_class.name = "S500X-S"
+        mock_blade = self._blade_with_fs(self._fs_for_storage_class(storage_class))
+
+        result = generate_fs_dict(mock_blade)
+
+        assert result["fs1"]["storage_class"] == "S500X-S"
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_info.get_rest_api_version",
+        Mock(return_value="2.30"),
+    )
+    def test_generate_fs_dict_storage_class_null_without_storage_classes(self):
+        """Platforms without storage classes return the storage_class object
+        with no name; the key is still reported, as null.
+        """
+        storage_class = Mock()
+        storage_class.name = None
+        mock_blade = self._blade_with_fs(self._fs_for_storage_class(storage_class))
+
+        result = generate_fs_dict(mock_blade)
+
+        assert "storage_class" in result["fs1"]
+        assert result["fs1"]["storage_class"] is None
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_info.get_rest_api_version",
+        Mock(return_value="2.16"),
+    )
+    def test_generate_fs_dict_storage_class_not_reported_before_2_17(self):
+        """Below REST 2.17 the key is not reported, matching the version from
+        which purefb_fs manages the storage class.
+        """
+        mock_blade = self._blade_with_fs(self._fs_for_storage_class(None))
+
+        result = generate_fs_dict(mock_blade)
+
+        assert "storage_class" not in result["fs1"]
+        assert result["fs1"]["nfs_v3"] is True
 
     def test_generate_array_conn_dict_keys_by_remote_and_reads_the_connection(self):
         """The dict is keyed by the remote name, values come from the connection.
@@ -1528,6 +1914,96 @@ class TestPurefbInfo:
         assert result["net2"]["lag"] is None
         assert result["net2"]["vlan"] is None
         assert result["net2"]["interfaces"] == [{"name": "vip1"}]
+
+    @staticmethod
+    def _fs_repl_transfer(name, remote, remote_snapshot):
+        """Build a replica link transfer mock with the SDK model's fields."""
+        transfer = Mock(
+            spec=[
+                "name",
+                "completed",
+                "data_transferred",
+                "progress",
+                "direction",
+                "local_snapshot",
+                "remote",
+                "remote_snapshot",
+                "started",
+                "status",
+            ]
+        )
+        transfer.name = name
+        transfer.completed = 1700000100000
+        transfer.data_transferred = 4096
+        transfer.progress = 1.0
+        transfer.direction = "outbound"
+        transfer.local_snapshot = Mock(spec=[])
+        transfer.remote = remote
+        transfer.remote_snapshot = remote_snapshot
+        transfer.started = 1700000000000
+        transfer.status = "completed"
+        return transfer
+
+    @staticmethod
+    def _ref(name):
+        ref = Mock(spec=["name"])
+        ref.name = name
+        return ref
+
+    def test_generate_fs_repl_transfer_dict_reads_transfers(self):
+        """Replica link transfers are keyed by snapshot name and then by
+        remote array; an empty local_snapshot reference reads as None."""
+        transfer = self._fs_repl_transfer(
+            "fs1.daily-1", self._ref("peer"), self._ref("fs1.daily-1")
+        )
+        response = Mock()
+        response.status_code = 200
+        response.items = [transfer]
+        mock_blade = Mock()
+        mock_blade.get_file_system_replica_links_transfer.return_value = response
+
+        result = generate_fs_repl_transfer_dict(mock_blade)
+
+        assert list(result) == ["fs1.daily-1"]
+        assert list(result["fs1.daily-1"]) == ["peer"]
+        entry = result["fs1.daily-1"]["peer"]
+        assert entry["remote"] == "peer"
+        assert entry["remote_snapshot"] == "fs1.daily-1"
+        assert entry["local_snapshot"] is None
+        assert entry["status"] == "completed"
+        assert entry["data_transferred"] == 4096
+
+    def test_generate_fs_repl_transfer_dict_keeps_fan_out_transfers(self):
+        """The same snapshot transferring to two arrays keeps both entries,
+        and unset remote or remote_snapshot references do not raise."""
+        to_b = self._fs_repl_transfer(
+            "fs1.daily-1", self._ref("arrayB"), self._ref("fs1.daily-1")
+        )
+        to_c = self._fs_repl_transfer("fs1.daily-1", self._ref("arrayC"), None)
+        unset = self._fs_repl_transfer("fs2.daily-1", None, None)
+        response = Mock()
+        response.status_code = 200
+        response.items = [to_b, to_c, unset]
+        mock_blade = Mock()
+        mock_blade.get_file_system_replica_links_transfer.return_value = response
+
+        result = generate_fs_repl_transfer_dict(mock_blade)
+
+        assert sorted(result["fs1.daily-1"]) == ["arrayB", "arrayC"]
+        assert result["fs1.daily-1"]["arrayB"]["remote_snapshot"] == "fs1.daily-1"
+        assert result["fs1.daily-1"]["arrayC"]["remote_snapshot"] is None
+        (orphan,) = result["fs2.daily-1"].values()
+        assert orphan["remote"] is None
+        assert orphan["remote_snapshot"] is None
+        assert orphan["status"] == "completed"
+
+    def test_generate_fs_repl_transfer_dict_returns_empty_on_error(self):
+        response = Mock()
+        response.status_code = 400
+        mock_blade = Mock()
+        mock_blade.get_file_system_replica_links_transfer.return_value = response
+
+        assert generate_fs_repl_transfer_dict(mock_blade) == {}
 
     def test_generate_network_dict_reads_attached_servers_and_subnet(self):
         """server comes from attached_servers[0] and subnet may be a dict.
@@ -1798,6 +2274,121 @@ class TestPurefbInfo:
         assert result["worm1"]["mode"] == "compliance"
         assert result["worm1"]["default_retention"] == 86400000
         assert result["worm1"]["members"] == ["fs1"]
+
+    def test_generate_legal_holds_dict(self):
+        """Legal holds carry description, realms and their held paths."""
+        realm = Mock(spec=["name"])
+        realm.name = "legal"
+        hold = Mock(spec=["name", "description", "realms"])
+        hold.name = "case-42"
+        hold.description = "Litigation hold"
+        hold.realms = [realm]
+        other = Mock(spec=["name", "description", "realms"])
+        other.name = "test"
+        other.description = ""
+        other.realms = []
+        fs_ref = Mock(spec=["name"])
+        fs_ref.name = "evidence"
+        hold_ref = Mock(spec=["name"])
+        hold_ref.name = "case-42"
+        entity = Mock(spec=["file_system", "legal_hold", "path", "status"])
+        entity.file_system = fs_ref
+        entity.legal_hold = hold_ref
+        entity.path = "/case-42"
+        entity.status = "applied"
+        orphan_ref = Mock(spec=["name"])
+        orphan_ref.name = "ghost"
+        orphan = Mock(spec=["file_system", "legal_hold", "path", "status"])
+        orphan.file_system = fs_ref
+        orphan.legal_hold = orphan_ref
+        orphan.path = "/x"
+        orphan.status = "releasing"
+
+        mock_blade = Mock()
+        mock_blade.get_legal_holds.return_value.items = [hold, other]
+        mock_blade.get_legal_holds_held_entities.return_value.items = [
+            entity,
+            orphan,
+        ]
+
+        result = generate_legal_holds_dict(mock_blade)
+
+        assert result == {
+            "case-42": {
+                "description": "Litigation hold",
+                "realms": ["legal"],
+                "held_entities": [
+                    {"file_system": "evidence", "path": "/case-42", "status": "applied"}
+                ],
+            },
+            "test": {"description": "", "realms": [], "held_entities": []},
+        }
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_legal_holds_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_legal_holds_subset(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_legal_holds,
+        mock_loose_version,
+    ):
+        """gather_subset=legal_holds returns the legal_holds section alone."""
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["legal_holds"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        mock_blade = Mock()
+        mock_version = Mock()
+        mock_version.version = "2.17"
+        mock_blade.get_versions.return_value.items = [mock_version]
+        mock_get_system.return_value = mock_blade
+        # version gate ON
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+
+        mock_generate_legal_holds.return_value = {"case-42": {"held_entities": []}}
+
+        main()
+
+        mock_generate_legal_holds.assert_called_once_with(mock_blade)
+        call_args = mock_module.exit_json.call_args[1]
+        assert call_args["purefb_info"] == {
+            "legal_holds": {"case-42": {"held_entities": []}}
+        }
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_legal_holds_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_legal_holds_subset_skipped_below_2_17(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_legal_holds,
+        mock_loose_version,
+    ):
+        """gather_subset=legal_holds is silently skipped on arrays below 2.17."""
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["legal_holds"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        mock_blade = Mock()
+        mock_version = Mock()
+        mock_version.version = "2.16"
+        mock_blade.get_versions.return_value.items = [mock_version]
+        mock_get_system.return_value = mock_blade
+        # version gate OFF
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+
+        main()
+
+        mock_generate_legal_holds.assert_not_called()
+        call_args = mock_module.exit_json.call_args[1]
+        assert call_args["purefb_info"] == {}
 
     def test_generate_tls_policies_dict(self):
         """TLS policies carry their settings and attached interfaces."""
@@ -2197,6 +2788,65 @@ class TestPurefbInfo:
         assert result["fs1"]["status_detail"] is None
         assert result["fs1"]["remote_fs"] == "peer:fs1"
         assert result["fs1"]["policies"] == ["daily"]
+
+    def test_generate_servers_dict_reports_lds_and_realms(self):
+        """Servers report their local directory service and realms. Servers
+        from arrays older than REST 2.24 (no local_directory_service) or 2.19
+        (no realms) report null and an empty list."""
+        dns = Mock(spec=["name"])
+        dns.name = "management"
+        nfs_ds = Mock(spec=["name"])
+        nfs_ds.name = "srv1_nfs"
+        lds = Mock(spec=["name"])
+        lds.name = "srv1_local"
+        realm = Mock(spec=["name"])
+        realm.name = "realm1"
+
+        server_fields = [
+            "name",
+            "created",
+            "dns",
+            "directory_services",
+            "local_directory_service",
+            "realms",
+        ]
+        with_lds = Mock(spec=server_fields)
+        with_lds.name = "srv1"
+        with_lds.created = 1700000000000
+        with_lds.dns = [dns]
+        with_lds.directory_services = [nfs_ds]
+        with_lds.local_directory_service = lds
+        with_lds.realms = [realm]
+
+        # a current array returns an unattached server with the field null
+        unattached = Mock(spec=server_fields)
+        unattached.name = "_array_server"
+        unattached.created = 0
+        unattached.dns = [dns]
+        unattached.directory_services = [nfs_ds]
+        unattached.local_directory_service = None
+        unattached.realms = []
+
+        # an older array returns servers without either field
+        old = Mock(spec=["name", "created", "dns", "directory_services"])
+        old.name = "old"
+        old.created = 0
+        old.dns = [dns]
+        old.directory_services = [nfs_ds]
+
+        mock_blade = Mock()
+        mock_blade.get_servers.return_value.items = [with_lds, unattached, old]
+
+        result = generate_servers_dict(mock_blade)
+
+        assert result["srv1"]["dns"] == ["management"]
+        assert result["srv1"]["directory_services"] == ["srv1_nfs"]
+        assert result["srv1"]["local_directory_service"] == "srv1_local"
+        assert result["srv1"]["realms"] == ["realm1"]
+        assert result["_array_server"]["local_directory_service"] is None
+        assert result["_array_server"]["realms"] == []
+        assert result["old"]["local_directory_service"] is None
+        assert result["old"]["realms"] == []
 
     @patch("plugins.modules.purefb_info.LooseVersion")
     @patch("plugins.modules.purefb_info.generate_fleet_dict")

@@ -280,14 +280,22 @@ options:
     version_added: "1.22.0"
   cancel_in_progress:
     description:
-    - Whether to cancel any existing storage class transitons that are in progress
-      if the file system is requested to changed to another storage class
+    - Whether to cancel any existing storage class transitions that are in progress
+      if the file system is requested to change to another storage class.
+    - Only takes effect together with a I(storage_class) that differs from
+      the file system's current storage class.
     type: bool
     default: false
     version_added: "1.22.0"
   storage_class:
     description:
-    - Name of storage class in Fusion fleet file system is associated with
+    - Name of the storage class the file system is associated with.
+    - Only FlashBlade platforms with storage classes accept this option.
+      Elsewhere the array rejects the change and the module fails with
+      the array error. Check mode reports a pending change on such
+      platforms because the array only rejects the request when it is sent.
+    - When omitted, or when the file system already has the requested
+      storage class, no storage class change is sent.
     type: str
     version_added: "1.22.0"
   context:
@@ -1552,20 +1560,36 @@ def modify_fs(module, blade):
         LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
         and module.params["storage_class"]
     ):
-        if module.params["storage_class"] != current_fs.storage_class:
+        # The array reports storage_class as an object, so only its name is
+        # comparable. Platforms without storage classes return the object
+        # with no name and reject any storage class PATCH, so the PATCH is
+        # only sent when the requested class differs from the current one.
+        current_sc = getattr(getattr(current_fs, "storage_class", None), "name", None)
+        if module.params["storage_class"] != current_sc:
             change_sc = True
-        sc_patch = {
-            "names": [fs_name],
-            "file_system": FileSystemPatch(
-                storage_class=StorageClassInfo(name=module.params["storage_class"])
-            ),
-            "cancel_in_progress_storage_class_transition": module.params[
-                "cancel_in_progress"
-            ],
-        }
-        if module.params["context"]:
-            sc_patch["context_names"] = [module.params["context"]]
-        res = blade.patch_file_systems(**sc_patch)
+            if not module.check_mode:
+                sc_patch = {
+                    "names": [fs_name],
+                    "file_system": FileSystemPatch(
+                        storage_class=StorageClassInfo(
+                            name=module.params["storage_class"]
+                        )
+                    ),
+                    "cancel_in_progress_storage_class_transition": module.params[
+                        "cancel_in_progress"
+                    ],
+                }
+                if module.params["context"]:
+                    sc_patch["context_names"] = [module.params["context"]]
+                res = blade.patch_file_systems(**sc_patch)
+                if res.status_code != 200:
+                    module.fail_json(
+                        msg="Failed to modify storage class for "
+                        "filesystem {0}. Error: {1}".format(
+                            fs_name,
+                            get_error_message(res),
+                        )
+                    )
 
     module.exit_json(
         changed=(

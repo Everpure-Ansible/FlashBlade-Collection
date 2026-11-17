@@ -35,7 +35,8 @@ options:
         Possible values for this include all, minimum, config, performance,
         capacity, network, subnets, lags, filesystems, snapshots, buckets,
         replication, policies, arrays, accounts, admins, ad, kerberos,
-        drives, servers, fleet, realms, clients, locks and support.
+        drives, servers, fleet, realms, clients, locks, support and
+        legal_holds.
       - The C(performance) subset reports array-wide performance per protocol
         (C(aggregate), C(http), C(s3), C(nfs), C(smb)), the protocol-specific
         operation breakdowns (C(nfs_ops), C(s3_ops), C(http_ops)), replication
@@ -49,6 +50,9 @@ options:
         listed per connection, so this subset is not part of C(all) and
         must be requested explicitly. S3 client performance requires
         REST 2.18 (Purity//FB 4.6.0) and is reported empty on older arrays.
+      - The C(legal_holds) subset lists every file legal hold with its
+        description, realms and the paths it is currently applied to.
+        Requires REST API 2.17 or later and is skipped on older arrays.
       - The C(filesystems) subset surfaces the legacy file system keys
         C(nfs_rules), C(export_policy), C(smb_client_policy) and
         C(smb_share_policy). Purity//FB marks the underlying fields as
@@ -167,9 +171,11 @@ PASSWORD_POLICY_API_VERSION = "2.16"
 MAINTENANCE_API_VERSION = "2.16"
 FLEET_API_VERSION = "2.17"
 TLS_API_VERSION = "2.17"
+LEGAL_HOLD_API_VERSION = "2.17"
 EDGE_API_VERSION = "2.18"
 OIDC_API_VERSION = "2.17"
 CLIENTS_S3_API_VERSION = "2.18"
+STORAGE_CLASS_API_VERSION = "2.17"
 REALMS_API_VERSION = "2.19"
 MAP_API_VERSION = "2.19"
 S3_EXPORT_API_VERSION = "2.20"
@@ -241,6 +247,14 @@ def _maintenance_window_list(blade):
                 }
             )
     return windows
+
+
+def _reference_name(obj, field):
+    """Name held by a reference field the SDK returns as a dict or an object."""
+    ref = getattr(obj, field, None)
+    if isinstance(ref, dict):
+        return ref.get("name") or None
+    return getattr(ref, "name", None) or None
 
 
 def generate_default_dict(blade):
@@ -820,6 +834,12 @@ def generate_config_dict(blade):
             "uri": server.uri,
             "services": getattr(server, "services", None),
         }
+    config_info["syslog_settings"] = {}
+    for settings in list(blade.get_syslog_servers_settings().items):
+        config_info["syslog_settings"][settings.name] = {
+            "ca_certificate": _reference_name(settings, "ca_certificate"),
+            "ca_certificate_group": _reference_name(settings, "ca_certificate_group"),
+        }
     snmp_agents = list(blade.get_snmp_agents().items)
     config_info["snmp_agents"] = {}
     for agent in snmp_agents:
@@ -877,13 +897,44 @@ def generate_config_dict(blade):
                 "enabled": saml2[0].enabled,
                 "array_url": saml2[0].array_url,
                 "name": saml2[0].name,
+                "prn": getattr(saml2[0], "prn", None),
+                "services": getattr(saml2[0], "services", None),
+                "binding": getattr(saml2[0], "binding", None),
+                "trust_other_saml_sps_in_fleet": getattr(
+                    getattr(saml2[0], "management", None),
+                    "trust_other_saml_sps_in_fleet",
+                    None,
+                ),
                 "idp": {
                     "url": getattr(saml2[0].idp, "url", None),
+                    "entity_id": getattr(saml2[0].idp, "entity_id", None),
                     "encrypt_enabled": saml2[0].idp.encrypt_assertion_enabled,
                     "sign_enabled": saml2[0].idp.sign_request_enabled,
                     "metadata_url": saml2[0].idp.metadata_url,
+                    "metadata_url_ca_certificate": getattr(
+                        getattr(saml2[0].idp, "metadata_url_ca_certificate", None),
+                        "name",
+                        None,
+                    ),
+                    "metadata_url_ca_certificate_group": getattr(
+                        getattr(
+                            saml2[0].idp, "metadata_url_ca_certificate_group", None
+                        ),
+                        "name",
+                        None,
+                    ),
+                    "verification_certificate": getattr(
+                        getattr(saml2[0].idp, "verification_certificate", None),
+                        "name",
+                        None,
+                    ),
                 },
                 "sp": {
+                    "entity_id": getattr(saml2[0].sp, "entity_id", None),
+                    "assertion_consumer_url": getattr(
+                        saml2[0].sp, "assertion_consumer_url", None
+                    ),
+                    "metadata_url": getattr(saml2[0].sp, "metadata_url", None),
                     "decrypt_cred": getattr(
                         saml2[0].sp.decryption_credential, "name", None
                     ),
@@ -1231,6 +1282,36 @@ def generate_snap_transfer_dict(blade):
             "status": snap_transfer.status,
         }
     return snap_transfer_info
+
+
+def generate_fs_repl_transfer_dict(blade):
+    """Transfer status of file system replica links.
+
+    Keyed by snapshot name and then by remote array, so a snapshot that
+    replicates to several arrays (fan-out) keeps one entry per transfer.
+    """
+    fs_transfer_info = {}
+    res = blade.get_file_system_replica_links_transfer()
+    if res.status_code != 200:
+        return fs_transfer_info
+    for transfer in list(res.items):
+        remote = getattr(getattr(transfer, "remote", None), "name", None)
+        fs_transfer_info.setdefault(transfer.name, {})[remote] = {
+            "completed": transfer.completed,
+            "data_transferred": transfer.data_transferred,
+            "progress": transfer.progress,
+            "direction": transfer.direction,
+            "local_snapshot": getattr(
+                getattr(transfer, "local_snapshot", None), "name", None
+            ),
+            "remote": remote,
+            "remote_snapshot": getattr(
+                getattr(transfer, "remote_snapshot", None), "name", None
+            ),
+            "started": transfer.started,
+            "status": transfer.status,
+        }
+    return fs_transfer_info
 
 
 def _connection_paths_by_remote(blade):
@@ -2101,6 +2182,7 @@ def generate_object_store_accounts_dict(blade):
 def generate_fs_dict(blade, exports=None):
     fs_info = {}
     by_fs = {}
+    api_version = get_rest_api_version(blade)
     for e in exports or []:
         by_fs.setdefault(e.get("filesystem"), []).append(e)
     for fsystem in blade.get_file_systems().items:
@@ -2109,8 +2191,10 @@ def generate_fs_dict(blade, exports=None):
         nfs = getattr(fsystem, "nfs", None)
         smb = getattr(fsystem, "smb", None)
         multi = getattr(fsystem, "multi_protocol", None)
+        # A filesystem copy reports its source filesystem here; a plain
+        # filesystem has a source with no name.
         source = getattr(fsystem, "source", None)
-        location = getattr(fsystem, "location", None)
+        source_location = getattr(source, "location", None)
 
         fs_info[share] = {
             "fast_remove": fsystem.fast_remove_directory_enabled,
@@ -2137,7 +2221,9 @@ def generate_fs_dict(blade, exports=None):
             "source": {
                 "is_local": getattr(source, "is_local", None),
                 "name": getattr(source, "name", None),
-                "location": getattr(location, "name", None),
+                "resource_type": getattr(source, "resource_type", None),
+                "display_name": getattr(source, "display_name", None),
+                "location": getattr(source_location, "name", None),
             },
             "default_group_quota": fsystem.default_group_quota,
             "default_user_quota": fsystem.default_user_quota,
@@ -2156,6 +2242,12 @@ def generate_fs_dict(blade, exports=None):
             ),
             "multi_protocol_safeguard_acls": getattr(multi, "safeguard_acls", None),
         }
+        if LooseVersion(STORAGE_CLASS_API_VERSION) <= LooseVersion(api_version):
+            # The array returns storage_class as an object; platforms without
+            # storage classes return it with no name, so the name is null there.
+            fs_info[share]["storage_class"] = getattr(
+                getattr(fsystem, "storage_class", None), "name", None
+            )
         if exports is not None:
             fs_info[share]["file_system_exports"] = by_fs.get(share, [])
 
@@ -2218,6 +2310,12 @@ def generate_servers_dict(blade):
             ),
             "dns": [dns.name for dns in server.dns],
             "directory_services": [ds.name for ds in server.directory_services],
+            # local_directory_service arrived in REST 2.24 and realms in 2.19;
+            # older arrays return servers without either field
+            "local_directory_service": getattr(
+                getattr(server, "local_directory_service", None), "name", None
+            ),
+            "realms": [realm.name for realm in (getattr(server, "realms", None) or [])],
         }
     return servers_info
 
@@ -2255,6 +2353,36 @@ def generate_file_system_exports_dict(blade):
     return exports
 
 
+def generate_legal_holds_dict(blade):
+    """File legal holds keyed by name, each with the paths it is applied to.
+
+    Requires REST API 2.17+ (LEGAL_HOLD_API_VERSION). Callers gate on it.
+    """
+    holds_info = {}
+    for hold in blade.get_legal_holds().items:
+        holds_info[hold.name] = {
+            "description": getattr(hold, "description", None),
+            "realms": [
+                getattr(realm, "name", None)
+                for realm in (getattr(hold, "realms", None) or [])
+            ],
+            "held_entities": [],
+        }
+    for entity in blade.get_legal_holds_held_entities().items:
+        hold_name = getattr(getattr(entity, "legal_hold", None), "name", None)
+        if hold_name in holds_info:
+            holds_info[hold_name]["held_entities"].append(
+                {
+                    "file_system": getattr(
+                        getattr(entity, "file_system", None), "name", None
+                    ),
+                    "path": getattr(entity, "path", None),
+                    "status": getattr(entity, "status", None),
+                }
+            )
+    return holds_info
+
+
 def generate_fleet_dict(blade):
     fleet_items = list(blade.get_fleets().items)
     if not fleet_items:
@@ -2284,7 +2412,7 @@ FILE_SESSIONS_API_VERSION = "2.10"
 OPEN_FILES_API_VERSION = "2.17"
 
 
-def _reference_name(ref):
+def _ref_name(ref):
     return getattr(ref, "name", None) if ref is not None else None
 
 
@@ -2307,9 +2435,9 @@ def generate_file_locks_dict(blade):
             lock_range = getattr(lock, "range", None)
             info["file_locks"][lock.name] = {
                 "access_type": getattr(lock, "access_type", None),
-                "client": _reference_name(getattr(lock, "client", None)),
+                "client": _ref_name(getattr(lock, "client", None)),
                 "created_at": getattr(lock, "created_at", None),
-                "file_system": _reference_name(getattr(lock, "source", None)),
+                "file_system": _ref_name(getattr(lock, "source", None)),
                 "inode": getattr(lock, "inode", None),
                 "path": getattr(lock, "path", None),
                 "protocol": getattr(lock, "protocol", None),
@@ -2324,7 +2452,7 @@ def generate_file_locks_dict(blade):
             }
     res = blade.get_file_systems_locks_clients()
     if res.status_code == 200:
-        names = [_reference_name(client) for client in list(res.items)]
+        names = [_ref_name(client) for client in list(res.items)]
         info["file_lock_clients"] = sorted(name for name in names if name)
     if LooseVersion(FILE_SESSIONS_API_VERSION) <= LooseVersion(api_version):
         res = blade.get_file_systems_sessions()
@@ -2332,26 +2460,26 @@ def generate_file_locks_dict(blade):
             for session in list(res.items):
                 info["file_sessions"][session.name] = {
                     "authentication": getattr(session, "authentication", None),
-                    "client": _reference_name(getattr(session, "client", None)),
+                    "client": _ref_name(getattr(session, "client", None)),
                     "connection_time": getattr(session, "connection_time", None),
                     "idle_time": getattr(session, "idle_time", None),
                     "opens": getattr(session, "opens", None),
                     "port": getattr(session, "port", None),
                     "protocol": getattr(session, "protocol", None),
-                    "user": _reference_name(getattr(session, "user", None)),
+                    "user": _ref_name(getattr(session, "user", None)),
                 }
     if LooseVersion(OPEN_FILES_API_VERSION) <= LooseVersion(api_version):
         res = blade.get_file_systems_open_files(protocols=["smb"])
         if res.status_code == 200:
             for open_file in list(res.items):
                 info["open_files"][open_file.id] = {
-                    "client": _reference_name(getattr(open_file, "client", None)),
-                    "file_system": _reference_name(getattr(open_file, "source", None)),
+                    "client": _ref_name(getattr(open_file, "client", None)),
+                    "file_system": _ref_name(getattr(open_file, "source", None)),
                     "lock_count": getattr(open_file, "lock_count", None),
                     "mode": getattr(open_file, "mode", None),
                     "path": getattr(open_file, "path", None),
-                    "session": _reference_name(getattr(open_file, "session", None)),
-                    "user": _reference_name(getattr(open_file, "user", None)),
+                    "session": _ref_name(getattr(open_file, "session", None)),
+                    "user": _ref_name(getattr(open_file, "user", None)),
                 }
     return info
 
@@ -2466,6 +2594,7 @@ def main():
         "clients",
         "locks",
         "support",
+        "legal_holds",
     )
     subset_test = (test in valid_subsets for test in subset)
     if not all(subset_test):
@@ -2519,6 +2648,7 @@ def main():
         info["file_replication"] = generate_file_repl_dict(blade)
         info["bucket_replication"] = generate_bucket_repl_dict(blade)
         info["snap_transfers"] = generate_snap_transfer_dict(blade)
+        info["fs_replica_transfers"] = generate_fs_repl_transfer_dict(blade)
         info["remote_credentials"] = generate_remote_creds_dict(blade)
         info["targets"] = generate_targets_dict(blade)
     if "accounts" in subset or "all" in subset:
@@ -2594,6 +2724,10 @@ def main():
         SUPPORT_DIAGNOSTICS_API_VERSION
     ) <= LooseVersion(api_version):
         info["support"] = generate_support_dict(blade)
+    if ("legal_holds" in subset or "all" in subset) and LooseVersion(
+        LEGAL_HOLD_API_VERSION
+    ) <= LooseVersion(api_version):
+        info["legal_holds"] = generate_legal_holds_dict(blade)
     module.exit_json(changed=False, purefb_info=info)
 
 

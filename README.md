@@ -125,6 +125,7 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_keytabs - manage FlashBlade Kerberos keytabs
 - purefb_kmip - manage FlashBlade KMIP servers
 - purefb_lag - manage FlashBlade Link Aggregation Groups
+- purefb_legal_hold - manage FlashBlade file legal holds and the paths they are applied to
 - purefb_lifecycle - manage FlashBlade Bucket Lifecycle Rules
 - purefb_local_ds - manage FlashBlade Local Directory Services
 - purefb_local_group - manage local groups in a FlashBlade Local Directory Service
@@ -145,6 +146,7 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_quota_settings - manage FlashBlade user and group quota notification settings
 - purefb_ra - manage the Remote Assist connections on a FlashBlade
 - purefb_realm - manage the Realms for a FlashBlade
+- purefb_realm_connection - manage the Realm Connections for a FlashBlade
 - purefb_remote_cred - manage the Object Store Remote Credentials on a FlashBlade
 - purefb_resource_access - manage resource access for a FlashBlade
 - purefb_s3_export_policy - manage FlashBlade S3 export policies and their rules
@@ -163,6 +165,7 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_subnet - manage network subnets on a FlashBlade
 - purefb_support_diagnostics - run FlashBlade self-diagnostics and report the results
 - purefb_syslog - manage FlashBlade syslog server configuration
+- purefb_syslog_settings - manage the CA certificate used to validate FlashBlade syslog servers
 - purefb_target - manage remote S3-capable targets for a FlashBlade
 - purefb_timeout - manage FlashBlade GUI timeout
 - purefb_tls_policy - manage FlashBlade TLS policies and their network interface attachments

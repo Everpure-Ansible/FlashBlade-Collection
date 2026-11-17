@@ -95,6 +95,7 @@ from plugins.modules.purefb_info import (
     generate_realms_dict,
     generate_resource_accesses_dict,
     generate_file_repl_dict,
+    generate_legal_holds_dict,
 )
 
 
@@ -1361,6 +1362,121 @@ class TestPurefbInfo:
         assert result["worm1"]["mode"] == "compliance"
         assert result["worm1"]["default_retention"] == 86400000
         assert result["worm1"]["members"] == ["fs1"]
+
+    def test_generate_legal_holds_dict(self):
+        """Legal holds carry description, realms and their held paths."""
+        realm = Mock(spec=["name"])
+        realm.name = "legal"
+        hold = Mock(spec=["name", "description", "realms"])
+        hold.name = "case-42"
+        hold.description = "Litigation hold"
+        hold.realms = [realm]
+        other = Mock(spec=["name", "description", "realms"])
+        other.name = "test"
+        other.description = ""
+        other.realms = []
+        fs_ref = Mock(spec=["name"])
+        fs_ref.name = "evidence"
+        hold_ref = Mock(spec=["name"])
+        hold_ref.name = "case-42"
+        entity = Mock(spec=["file_system", "legal_hold", "path", "status"])
+        entity.file_system = fs_ref
+        entity.legal_hold = hold_ref
+        entity.path = "/case-42"
+        entity.status = "applied"
+        orphan_ref = Mock(spec=["name"])
+        orphan_ref.name = "ghost"
+        orphan = Mock(spec=["file_system", "legal_hold", "path", "status"])
+        orphan.file_system = fs_ref
+        orphan.legal_hold = orphan_ref
+        orphan.path = "/x"
+        orphan.status = "releasing"
+
+        mock_blade = Mock()
+        mock_blade.get_legal_holds.return_value.items = [hold, other]
+        mock_blade.get_legal_holds_held_entities.return_value.items = [
+            entity,
+            orphan,
+        ]
+
+        result = generate_legal_holds_dict(mock_blade)
+
+        assert result == {
+            "case-42": {
+                "description": "Litigation hold",
+                "realms": ["legal"],
+                "held_entities": [
+                    {"file_system": "evidence", "path": "/case-42", "status": "applied"}
+                ],
+            },
+            "test": {"description": "", "realms": [], "held_entities": []},
+        }
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_legal_holds_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_legal_holds_subset(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_legal_holds,
+        mock_loose_version,
+    ):
+        """gather_subset=legal_holds returns the legal_holds section alone."""
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["legal_holds"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        mock_blade = Mock()
+        mock_version = Mock()
+        mock_version.version = "2.17"
+        mock_blade.get_versions.return_value.items = [mock_version]
+        mock_get_system.return_value = mock_blade
+        # version gate ON
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+
+        mock_generate_legal_holds.return_value = {"case-42": {"held_entities": []}}
+
+        main()
+
+        mock_generate_legal_holds.assert_called_once_with(mock_blade)
+        call_args = mock_module.exit_json.call_args[1]
+        assert call_args["purefb_info"] == {
+            "legal_holds": {"case-42": {"held_entities": []}}
+        }
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_legal_holds_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_legal_holds_subset_skipped_below_2_17(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_legal_holds,
+        mock_loose_version,
+    ):
+        """gather_subset=legal_holds is silently skipped on arrays below 2.17."""
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["legal_holds"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        mock_blade = Mock()
+        mock_version = Mock()
+        mock_version.version = "2.16"
+        mock_blade.get_versions.return_value.items = [mock_version]
+        mock_get_system.return_value = mock_blade
+        # version gate OFF
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+
+        main()
+
+        mock_generate_legal_holds.assert_not_called()
+        call_args = mock_module.exit_json.call_args[1]
+        assert call_args["purefb_info"] == {}
 
     def test_generate_tls_policies_dict(self):
         """TLS policies carry their settings and attached interfaces."""

@@ -528,6 +528,8 @@ class TestPurefbInfo:
         mock_support.remote_assist_opened = None
         mock_support.remote_assist_status = "disabled"
         mock_support.remote_assist_duration = 0
+        mock_support.edge_management_enabled = False
+        mock_support.edge_agent_update_enabled = True
         mock_blade.get_support.return_value.items = [mock_support]
 
         # Call function
@@ -549,6 +551,20 @@ class TestPurefbInfo:
         assert result["total_capacity"] == 1000000000
         assert "EULA" in result
         assert result["EULA"] == "Signed"
+
+        # Verify support settings read-back with the 2.14 and 2.18 gates open
+        assert result["remote_assist"]["phonehome_enabled"] is True
+        assert result["remote_assist"]["ra_duration"] == 0
+        assert result["remote_assist"]["edge_management_enabled"] is False
+        assert result["remote_assist"]["edge_agent_update_enabled"] is True
+
+        # With the gates closed (below REST 2.18) the edge keys are not reported
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+        ungated = generate_default_dict(mock_blade)
+        assert ungated["remote_assist"]["phonehome_enabled"] is True
+        assert "ra_duration" not in ungated["remote_assist"]
+        assert "edge_management_enabled" not in ungated["remote_assist"]
+        assert "edge_agent_update_enabled" not in ungated["remote_assist"]
 
         # Verify policy counts
         assert "policies" in result

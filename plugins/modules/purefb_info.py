@@ -126,6 +126,7 @@ SERVERS_API_VERSION = "2.16"
 PASSWORD_POLICY_API_VERSION = "2.16"
 FLEET_API_VERSION = "2.17"
 TLS_API_VERSION = "2.17"
+EDGE_API_VERSION = "2.18"
 REALMS_API_VERSION = "2.19"
 S3_EXPORT_API_VERSION = "2.20"
 
@@ -260,6 +261,14 @@ def generate_default_dict(blade):
     }
     if LooseVersion(RA_DURATION_API_VERSION) <= LooseVersion(api_version):
         default_info["remote_assist"]["ra_duration"] = ra_info.remote_assist_duration
+    if LooseVersion(EDGE_API_VERSION) <= LooseVersion(api_version):
+        # Pure1 Edge Services opt-ins, set by purefb_phonehome
+        default_info["remote_assist"]["edge_management_enabled"] = getattr(
+            ra_info, "edge_management_enabled", None
+        )
+        default_info["remote_assist"]["edge_agent_update_enabled"] = getattr(
+            ra_info, "edge_agent_update_enabled", None
+        )
     return default_info
 
 

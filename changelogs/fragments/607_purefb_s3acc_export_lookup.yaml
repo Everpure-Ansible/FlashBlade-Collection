@@ -1,0 +1,3 @@
+bugfixes:
+  - purefb_s3acc_export - a failed account export lookup is now reported with the array's error instead of being treated as no export. Previously ``state=absent`` reported ok without deleting and ``state=present`` attempted a create that failed with a misleading message.
+  - purefb_s3acc_export - the failure raised when ``py-pure-client`` cannot be imported now carries the import traceback, so a half-installed or broken SDK can be told apart from a missing one.

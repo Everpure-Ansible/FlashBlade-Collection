@@ -61,6 +61,7 @@ action_groups:
     - purefb_subnet
     - purefb_syslog
     - purefb_target
+    - purefb_telemetry_target
     - purefb_timeout
     - purefb_tls_policy
     - purefb_tz

@@ -154,6 +154,7 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_subnet - manage network subnets on a FlashBlade
 - purefb_syslog - manage FlashBlade syslog server configuration
 - purefb_target - manage remote S3-capable targets for a FlashBlade
+- purefb_telemetry_target - manage FlashBlade telemetry metrics targets
 - purefb_timeout - manage FlashBlade GUI timeout
 - purefb_tls_policy - manage FlashBlade TLS policies and their network interface attachments
 - purefb_tz - configure Everpure FlashBlade timezone

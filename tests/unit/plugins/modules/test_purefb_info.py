@@ -95,6 +95,7 @@ from plugins.modules.purefb_info import (
     generate_realms_dict,
     generate_resource_accesses_dict,
     generate_file_repl_dict,
+    generate_telemetry_targets_dict,
 )
 
 
@@ -1645,3 +1646,112 @@ class TestPurefbInfo:
         call_args = mock_module.exit_json.call_args[1]
         assert call_args["purefb_info"]["fleet"] == {"fleet1": {"members": {}}}
         assert "policies" not in call_args["purefb_info"]
+
+    def test_generate_telemetry_targets_dict(self):
+        """Telemetry targets report settings, reference names and attributes."""
+        source = Mock(spec=["name"])
+        source.name = "data-vip"
+        attr = Mock(spec=["key", "value"])
+        attr.key = "env"
+        attr.value = "prod"
+        target = Mock(
+            spec=[
+                "name",
+                "enabled",
+                "endpoint",
+                "transport",
+                "vendor",
+                "source",
+                "ca_certificate",
+                "ca_certificate_group",
+                "client_certificate",
+                "api_token",
+                "resource_attributes",
+            ]
+        )
+        target.name = "otel"
+        target.enabled = True
+        target.endpoint = "collector.example.com:4318/v1/metrics"
+        target.transport = "otlp-http-protobuf-without-tls"
+        target.vendor = "generic-otlp"
+        target.source = source
+        # unset references come back as empty objects
+        target.ca_certificate = {}
+        target.ca_certificate_group = {}
+        target.client_certificate = {}
+        target.api_token = "***"
+        target.resource_attributes = [attr]
+
+        mock_blade = Mock()
+        mock_blade.get_telemetry_targets.return_value.items = [target]
+
+        result = generate_telemetry_targets_dict(mock_blade)
+
+        assert result["otel"]["endpoint"] == "collector.example.com:4318/v1/metrics"
+        assert result["otel"]["transport"] == "otlp-http-protobuf-without-tls"
+        assert result["otel"]["source"] == "data-vip"
+        assert result["otel"]["ca_certificate"] is None
+        assert result["otel"]["api_token_configured"] is True
+        assert result["otel"]["resource_attributes"] == [
+            {"key": "env", "value": "prod"}
+        ]
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_telemetry_targets_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_telemetry_subset(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_telemetry,
+        mock_loose_version,
+    ):
+        """gather_subset=telemetry returns the telemetry_targets section."""
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["telemetry"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        # version gates ON
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+        mock_generate_telemetry.return_value = {"otel": {"enabled": True}}
+
+        main()
+
+        mock_generate_telemetry.assert_called_once_with(mock_blade)
+        call_args = mock_module.exit_json.call_args[1]
+        assert call_args["purefb_info"]["telemetry_targets"] == {
+            "otel": {"enabled": True}
+        }
+        assert "default" not in call_args["purefb_info"]
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_telemetry_targets_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_telemetry_subset_below_gate(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_telemetry,
+        mock_loose_version,
+    ):
+        """gather_subset=telemetry is silent on arrays below REST 2.29."""
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["telemetry"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        # version gates OFF
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+
+        main()
+
+        mock_generate_telemetry.assert_not_called()
+        call_args = mock_module.exit_json.call_args[1]
+        assert "telemetry_targets" not in call_args["purefb_info"]

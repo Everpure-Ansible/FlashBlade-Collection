@@ -81,6 +81,7 @@ from plugins.modules.purefb_info import (
     generate_file_system_exports_dict,
     generate_fs_dict,
     generate_array_conn_dict,
+    generate_all_policies_dict,
     generate_bucket_access_policies_dict,
     generate_lag_dict,
     generate_subnet_dict,
@@ -104,6 +105,7 @@ from plugins.modules.purefb_info import (
     generate_oidc_idps_dict,
     generate_quota_settings_dict,
 )
+from plugins.module_utils.version import LooseVersion as RealLooseVersion
 from plugins.modules.purefb_info import (
     generate_perf_breakdown_dict,
     generate_clients_dict,
@@ -614,6 +616,9 @@ class TestPurefbInfo:
         assert "telemetry_metrics_policies" in result
         assert result["telemetry_metrics_policies"] == 1
         assert result["maintenance_window"] == []
+        # the misspelt key is kept alongside the correct one
+        assert result["network_access_protocol"] == "default"
+        assert result["network_access_policy"] == "default"
 
     def test_maintenance_window_list_with_open_window(self):
         """An open window is reported with human-readable start and end"""
@@ -1408,11 +1413,13 @@ class TestPurefbInfo:
 
         mock_blade = Mock()
         mock_blade.get_array_connections.return_value.items = [conn]
+        mock_blade.get_array_connections_path.return_value.items = []
 
         result = generate_array_conn_dict(mock_blade)
 
         assert list(result) == ["remote-array"]
         entry = result["remote-array"]
+        assert entry["connection_paths"] == []
         assert entry["encrypted"] is False
         assert entry["status"] == "connected"
         assert entry["version"] == "4.3.3"
@@ -1827,9 +1834,17 @@ class TestPurefbInfo:
         member.member = iface_ref
         member.policy = policy_ref
 
+        array_ref = Mock(spec=["name", "resource_type"])
+        array_ref.name = "array1"
+        array_ref.resource_type = "arrays"
+        array_member = Mock(spec=["member", "policy"])
+        array_member.member = array_ref
+        array_member.policy = policy_ref
+
         mock_blade = Mock()
         mock_blade.get_tls_policies.return_value.items = [policy]
         mock_blade.get_tls_policies_network_interfaces.return_value.items = [member]
+        mock_blade.get_tls_policies_members.return_value.items = [array_member]
 
         result = generate_tls_policies_dict(mock_blade)
 
@@ -1837,6 +1852,14 @@ class TestPurefbInfo:
         assert result["tls1"]["min_tls_version"] == "1.2"
         assert result["tls1"]["disabled_tls_ciphers"] == ["RC4"]
         assert result["tls1"]["trusted_client_certificate_authority"] is None
+        assert result["tls1"]["network_interfaces"] == ["vip1"]
+        # tls-policies/members lists the policy applied to the whole array
+        assert result["tls1"]["array_wide"] is True
+
+        # a policy attached only to interfaces is not array-wide
+        mock_blade.get_tls_policies_members.return_value.items = []
+        result = generate_tls_policies_dict(mock_blade)
+        assert result["tls1"]["array_wide"] is False
         assert result["tls1"]["network_interfaces"] == ["vip1"]
 
     def test_generate_ssh_ca_policies_dict(self):
@@ -2254,6 +2277,310 @@ class TestPurefbInfo:
         assert result["ad1"]["ca_certificate"] == "domain_ca"
         assert result["ad1"]["ca_certificate_group"] is None
         assert result["ad1"]["server"] is None
+
+    @staticmethod
+    def _connection(remote_name):
+        """An array connection mock shaped like the real model."""
+        window = Mock(spec=["start", "end"])
+        window.start = None
+        window.end = None
+        throttle = Mock(spec=["default_limit", "window_limit", "window"])
+        throttle.default_limit = None
+        throttle.window_limit = None
+        throttle.window = window
+        remote = Mock(spec=["name"])
+        remote.name = remote_name
+        conn = Mock(
+            spec=[
+                "remote",
+                "encrypted",
+                "replication_addresses",
+                "management_address",
+                "status",
+                "version",
+                "ca_certificate_group",
+                "throttle",
+            ]
+        )
+        conn.remote = remote
+        conn.encrypted = False
+        conn.replication_addresses = ["10.0.0.1"]
+        conn.management_address = "10.0.0.2"
+        conn.status = "connected"
+        conn.version = "4.5.6"
+        conn.ca_certificate_group = None
+        conn.throttle = throttle
+        return conn
+
+    @staticmethod
+    def _path(remote_name, destination, status, **extra):
+        """An array-connections/path row; extra adds optional fields."""
+        remote = Mock(spec=["name"])
+        remote.name = remote_name
+        fields = {
+            "remote": remote,
+            "source": "10.0.0.2",
+            "destination": destination,
+            "status": status,
+            "type": "async-replication",
+        }
+        fields.update(extra)
+        path = Mock(spec=list(fields))
+        for key, value in fields.items():
+            setattr(path, key, value)
+        return path
+
+    def test_generate_array_conn_dict_connection_paths(self):
+        """Each connection lists its network paths from array-connections/path.
+
+        A connected path comes back with status_details empty or without
+        the field at all; both are reported as None. Rows for a remote that
+        is not a connection are ignored.
+        """
+        mock_blade = Mock()
+        mock_blade.get_array_connections.return_value.items = [
+            self._connection("remote-array")
+        ]
+        mock_blade.get_array_connections_path.return_value.items = [
+            self._path("remote-array", "10.0.0.1:80", "connected"),
+            self._path("remote-array", "10.0.0.1:8117", "connected", status_details=""),
+            self._path(
+                "remote-array",
+                "10.0.0.3:8117",
+                "connecting",
+                status_details="Connection refused",
+                type="fleet-management",
+            ),
+            self._path("other-array", "10.0.0.9:80", "connected"),
+        ]
+
+        result = generate_array_conn_dict(mock_blade)
+
+        assert list(result) == ["remote-array"]
+        assert result["remote-array"]["connection_paths"] == [
+            {
+                "source": "10.0.0.2",
+                "destination": "10.0.0.1:80",
+                "status": "connected",
+                "status_details": None,
+                "type": "async-replication",
+            },
+            {
+                "source": "10.0.0.2",
+                "destination": "10.0.0.1:8117",
+                "status": "connected",
+                "status_details": None,
+                "type": "async-replication",
+            },
+            {
+                "source": "10.0.0.2",
+                "destination": "10.0.0.3:8117",
+                "status": "connecting",
+                "status_details": "Connection refused",
+                "type": "fleet-management",
+            },
+        ]
+        mock_blade.get_array_connections_path.assert_called_once_with()
+
+    def test_generate_array_conn_dict_without_connections_skips_paths(self):
+        """No connections means no array-connections/path call."""
+        mock_blade = Mock()
+        mock_blade.get_array_connections.return_value.items = []
+
+        assert generate_array_conn_dict(mock_blade) == {}
+        mock_blade.get_array_connections_path.assert_not_called()
+
+    @staticmethod
+    def _policy(name, policy_id, policy_type):
+        """A policies-all row."""
+        policy = Mock(
+            spec=["name", "id", "enabled", "is_local", "location", "policy_type"]
+        )
+        policy.name = name
+        policy.id = policy_id
+        policy.enabled = True
+        policy.is_local = True
+        policy.location = None
+        policy.policy_type = policy_type
+        return policy
+
+    @staticmethod
+    def _ref(name, ref_id=None, resource_type=None):
+        """A FixedReference."""
+        ref = Mock(spec=["name", "id", "resource_type"])
+        ref.name = name
+        ref.id = ref_id
+        ref.resource_type = resource_type
+        return ref
+
+    @staticmethod
+    def _member_row(policy_ref, member_ref, link=None):
+        """A policies-all/members row."""
+        row = Mock(spec=["policy", "member", "link"])
+        row.policy = policy_ref
+        row.member = member_ref
+        row.link = link
+        return row
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_all_policies_dict_members(self, mock_loose_version):
+        """Every policy carries its members from one policies-all/members call.
+
+        Rows are attributed by policy id, so a realm policy that shares its
+        name with an array-level policy keeps its own members; replica-link
+        members carry the link's file systems; a policy without members
+        reports an empty list.
+        """
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+        link = Mock(spec=["local_file_system", "remote", "remote_file_system"])
+        link.local_file_system = self._ref("fs1")
+        link.remote = self._ref("peer")
+        link.remote_file_system = self._ref("fs1-dr")
+
+        mock_blade = Mock()
+        mock_blade.get_policies_all.return_value.items = [
+            self._policy("daily", "p1", "snapshot"),
+            self._policy("realm1::daily", "p2", "snapshot"),
+            self._policy("device_perf_metrics", "p3", "telemetry-metrics"),
+            self._policy("unused", "p4", "nfs"),
+        ]
+        mock_blade.get_policies_all_members.return_value.items = [
+            self._member_row(
+                self._ref("daily", "p1", "policies"),
+                self._ref("fs1", "f1", "file-systems"),
+            ),
+            self._member_row(
+                self._ref("daily", "p1", "policies"),
+                self._ref("fs1-link", "l1", "file-system-replica-links"),
+                link,
+            ),
+            # the realm policy is reported under its own name but with its id
+            self._member_row(
+                self._ref("daily", "p2", "policies"),
+                self._ref("realm1::fs9", "f9", "file-systems"),
+            ),
+            self._member_row(
+                self._ref("device_perf_metrics", "p3", "telemetry-metrics-policies"),
+                self._ref("array1", "a1", "arrays"),
+            ),
+        ]
+
+        result = generate_all_policies_dict(mock_blade)
+
+        assert result["daily"]["policy_type"] == "snapshot"
+        assert result["daily"]["members"] == [
+            {"name": "fs1", "resource_type": "file-systems"},
+            {
+                "name": "fs1-link",
+                "resource_type": "file-system-replica-links",
+                "link": {
+                    "local_file_system": "fs1",
+                    "remote": "peer",
+                    "remote_file_system": "fs1-dr",
+                },
+            },
+        ]
+        assert result["realm1::daily"]["members"] == [
+            {"name": "realm1::fs9", "resource_type": "file-systems"}
+        ]
+        assert result["device_perf_metrics"]["members"] == [
+            {"name": "array1", "resource_type": "arrays"}
+        ]
+        assert result["unused"]["members"] == []
+        mock_blade.get_policies_all_members.assert_called_once_with()
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_all_policies_dict_members_need_rest_2_2(self, mock_loose_version):
+        """Below REST 2.2 the members call is not made and no key is added."""
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+        mock_blade = Mock()
+        mock_blade.get_policies_all.return_value.items = [
+            self._policy("daily", "p1", "snapshot")
+        ]
+
+        result = generate_all_policies_dict(mock_blade)
+
+        assert result["daily"]["policy_type"] == "snapshot"
+        assert "members" not in result["daily"]
+        mock_blade.get_policies_all_members.assert_not_called()
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_nfs_export_policies_dict")
+    @patch("plugins.modules.purefb_info.generate_object_store_access_policies_dict")
+    @patch("plugins.modules.purefb_info.generate_policies_dict")
+    @patch("plugins.modules.purefb_info.generate_all_policies_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_policies_subset_copies_members_to_snapshot_policies(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_all_policies,
+        mock_generate_policies,
+        mock_generate_access,
+        mock_generate_nfs_export,
+        mock_loose_version,
+    ):
+        """snapshot_policies reuse the members gathered by the policies view.
+
+        No second members call is made; a snapshot policy missing from the
+        policies view, or one gathered below REST 2.2, has no members key.
+        """
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["policies"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        # the other version gates in the policies subset stay off
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+
+        members = [{"name": "fs1", "resource_type": "file-systems"}]
+        mock_generate_all_policies.return_value = {
+            "daily": {"policy_type": "snapshot", "members": members},
+            "nfs1": {"policy_type": "nfs", "members": []},
+        }
+        mock_generate_policies.return_value = {
+            "daily": {"enabled": True},
+            "weekly": {"enabled": True},
+        }
+        mock_generate_access.return_value = {}
+        mock_generate_nfs_export.return_value = {}
+
+        main()
+
+        info = mock_module.exit_json.call_args[1]["purefb_info"]
+        assert info["snapshot_policies"]["daily"]["members"] == members
+        assert "members" not in info["snapshot_policies"]["weekly"]
+        assert info["policies"]["nfs1"]["members"] == []
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    @patch("plugins.modules.purefb_info.get_rest_api_version")
+    def test_generate_all_policies_dict_members_gate_compares_real_versions(
+        self, mock_get_rest_api_version
+    ):
+        """The REST 2.2 gate holds against real version strings.
+
+        2.1 is below the gate, 2.2 meets it and 2.10 is above it (a numeric,
+        not a string, comparison).
+        """
+        mock_blade = Mock()
+        mock_blade.get_policies_all.return_value.items = [
+            self._policy("daily", "p1", "snapshot")
+        ]
+        mock_blade.get_policies_all_members.return_value.items = []
+
+        mock_get_rest_api_version.return_value = "2.1"
+        assert "members" not in generate_all_policies_dict(mock_blade)["daily"]
+        mock_blade.get_policies_all_members.assert_not_called()
+
+        mock_get_rest_api_version.return_value = "2.2"
+        assert generate_all_policies_dict(mock_blade)["daily"]["members"] == []
+        mock_blade.get_policies_all_members.assert_called_once_with()
+
+        mock_get_rest_api_version.return_value = "2.10"
+        assert generate_all_policies_dict(mock_blade)["daily"]["members"] == []
+        assert mock_blade.get_policies_all_members.call_count == 2
 
 
 class _Row(object):

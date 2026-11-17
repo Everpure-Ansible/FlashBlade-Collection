@@ -1,0 +1,6 @@
+minor_changes:
+  - purefb_phonehome - add ``edge_management`` and ``edge_agent_update`` options to opt a FlashBlade
+    in to or out of Pure1 Edge Services (Purity//FB 4.6.0, REST 2.18). The module fails before any
+    write on older arrays, whose SDK model would silently drop the fields.
+  - purefb_info - report ``edge_management_enabled`` and ``edge_agent_update_enabled`` in the default
+    ``remote_assist`` dictionary on Purity//FB 4.6.0 (REST 2.18) or later.

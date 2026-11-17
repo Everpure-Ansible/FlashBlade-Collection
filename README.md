@@ -124,6 +124,7 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_keytabs - manage FlashBlade Kerberos keytabs
 - purefb_kmip - manage FlashBlade KMIP servers
 - purefb_lag - manage FlashBlade Link Aggregation Groups
+- purefb_legal_hold - manage FlashBlade file legal holds and the paths they are applied to
 - purefb_lifecycle - manage FlashBlade Bucket Lifecycle Rules
 - purefb_local_ds - manage FlashBlade Local Directory Services
 - purefb_local_group - manage local groups in a FlashBlade Local Directory Service

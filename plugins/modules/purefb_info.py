@@ -35,7 +35,8 @@ options:
         Possible values for this include all, minimum, config, performance,
         capacity, network, subnets, lags, filesystems, snapshots, buckets,
         replication, policies, arrays, accounts, admins, ad, kerberos,
-        drives, servers, fleet, realms, clients, locks and support.
+        drives, servers, fleet, realms, clients, locks, support and
+        legal_holds.
       - The C(performance) subset reports array-wide performance per protocol
         (C(aggregate), C(http), C(s3), C(nfs), C(smb)), the protocol-specific
         operation breakdowns (C(nfs_ops), C(s3_ops), C(http_ops)), replication
@@ -49,6 +50,9 @@ options:
         listed per connection, so this subset is not part of C(all) and
         must be requested explicitly. S3 client performance requires
         REST 2.18 (Purity//FB 4.6.0) and is reported empty on older arrays.
+      - The C(legal_holds) subset lists every file legal hold with its
+        description, realms and the paths it is currently applied to.
+        Requires REST API 2.17 or later and is skipped on older arrays.
       - The C(filesystems) subset surfaces the legacy file system keys
         C(nfs_rules), C(export_policy), C(smb_client_policy) and
         C(smb_share_policy). Purity//FB marks the underlying fields as
@@ -167,6 +171,7 @@ PASSWORD_POLICY_API_VERSION = "2.16"
 MAINTENANCE_API_VERSION = "2.16"
 FLEET_API_VERSION = "2.17"
 TLS_API_VERSION = "2.17"
+LEGAL_HOLD_API_VERSION = "2.17"
 EDGE_API_VERSION = "2.18"
 OIDC_API_VERSION = "2.17"
 CLIENTS_S3_API_VERSION = "2.18"
@@ -2333,6 +2338,36 @@ def generate_file_system_exports_dict(blade):
     return exports
 
 
+def generate_legal_holds_dict(blade):
+    """File legal holds keyed by name, each with the paths it is applied to.
+
+    Requires REST API 2.17+ (LEGAL_HOLD_API_VERSION). Callers gate on it.
+    """
+    holds_info = {}
+    for hold in blade.get_legal_holds().items:
+        holds_info[hold.name] = {
+            "description": getattr(hold, "description", None),
+            "realms": [
+                getattr(realm, "name", None)
+                for realm in (getattr(hold, "realms", None) or [])
+            ],
+            "held_entities": [],
+        }
+    for entity in blade.get_legal_holds_held_entities().items:
+        hold_name = getattr(getattr(entity, "legal_hold", None), "name", None)
+        if hold_name in holds_info:
+            holds_info[hold_name]["held_entities"].append(
+                {
+                    "file_system": getattr(
+                        getattr(entity, "file_system", None), "name", None
+                    ),
+                    "path": getattr(entity, "path", None),
+                    "status": getattr(entity, "status", None),
+                }
+            )
+    return holds_info
+
+
 def generate_fleet_dict(blade):
     fleet_items = list(blade.get_fleets().items)
     if not fleet_items:
@@ -2517,6 +2552,7 @@ def main():
         "clients",
         "locks",
         "support",
+        "legal_holds",
     )
     subset_test = (test in valid_subsets for test in subset)
     if not all(subset_test):
@@ -2644,6 +2680,10 @@ def main():
         SUPPORT_DIAGNOSTICS_API_VERSION
     ) <= LooseVersion(api_version):
         info["support"] = generate_support_dict(blade)
+    if ("legal_holds" in subset or "all" in subset) and LooseVersion(
+        LEGAL_HOLD_API_VERSION
+    ) <= LooseVersion(api_version):
+        info["legal_holds"] = generate_legal_holds_dict(blade)
     module.exit_json(changed=False, purefb_info=info)
 
 

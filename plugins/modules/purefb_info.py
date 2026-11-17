@@ -128,6 +128,7 @@ FLEET_API_VERSION = "2.17"
 TLS_API_VERSION = "2.17"
 REALMS_API_VERSION = "2.19"
 S3_EXPORT_API_VERSION = "2.20"
+EVICTION_API_VERSION = "2.21"
 
 
 def _bytes_to_human(bytes_number):
@@ -1722,6 +1723,33 @@ def generate_fleet_dict(blade):
     return fleet_info
 
 
+def generate_eviction_policies_dict(blade):
+    """Data eviction policies (REST 2.21) with their attached file systems."""
+    policies_info = {}
+
+    res = blade.get_data_eviction_policies()
+    if res.status_code != 200:
+        return policies_info
+    for policy in list(res.items):
+        policies_info[policy.name] = {
+            "local": getattr(policy, "is_local", None),
+            "enabled": getattr(policy, "enabled", None),
+            "keep_size": getattr(policy, "keep_size", None),
+            "file_systems": [],
+        }
+
+    res = blade.get_data_eviction_policies_file_systems()
+    if res.status_code == 200:
+        for member in list(res.items):
+            policy_name = getattr(getattr(member, "policy", None), "name", None)
+            if policy_name in policies_info:
+                policies_info[policy_name]["file_systems"].append(
+                    getattr(getattr(member, "member", None), "name", None)
+                )
+
+    return policies_info
+
+
 def main():
     argument_spec = purefb_argument_spec()
     argument_spec.update(
@@ -1847,6 +1875,8 @@ def main():
             info["tls_policies"] = generate_tls_policies_dict(blade)
         if LooseVersion(S3_EXPORT_API_VERSION) <= LooseVersion(api_version):
             info["s3_export_policies"] = generate_s3_export_policies_dict(blade)
+        if LooseVersion(EVICTION_API_VERSION) <= LooseVersion(api_version):
+            info["eviction_policies"] = generate_eviction_policies_dict(blade)
     if ("realms" in subset or "all" in subset) and LooseVersion(
         REALMS_API_VERSION
     ) <= LooseVersion(api_version):

@@ -1645,3 +1645,53 @@ class TestPurefbInfo:
         call_args = mock_module.exit_json.call_args[1]
         assert call_args["purefb_info"]["fleet"] == {"fleet1": {"members": {}}}
         assert "policies" not in call_args["purefb_info"]
+
+
+class TestGenerateEvictionPoliciesDict:
+    """Data eviction policies read-back (REST 2.21)."""
+
+    def test_generate_eviction_policies_dict(self):
+        """Policies carry keep_size and their attached file systems."""
+        from plugins.modules.purefb_info import generate_eviction_policies_dict
+
+        policy = Mock(spec=["name", "enabled", "is_local", "keep_size"])
+        policy.name = "edge_cache"
+        policy.enabled = True
+        policy.is_local = True
+        policy.keep_size = 107374182400
+        member = Mock(spec=["policy", "member"])
+        member.policy = Mock(spec=["name"])
+        member.policy.name = "edge_cache"
+        member.member = Mock(spec=["name"])
+        member.member.name = "project_data"
+        stray = Mock(spec=["policy", "member"])
+        stray.policy = Mock(spec=["name"])
+        stray.policy.name = "other"
+        stray.member = Mock(spec=["name"])
+        stray.member.name = "ignored"
+
+        blade = Mock()
+        blade.get_data_eviction_policies.return_value = Mock(
+            status_code=200, items=[policy]
+        )
+        blade.get_data_eviction_policies_file_systems.return_value = Mock(
+            status_code=200, items=[member, stray]
+        )
+
+        assert generate_eviction_policies_dict(blade) == {
+            "edge_cache": {
+                "local": True,
+                "enabled": True,
+                "keep_size": 107374182400,
+                "file_systems": ["project_data"],
+            }
+        }
+
+    def test_generate_eviction_policies_dict_tolerates_errors(self):
+        """A failed policies read yields an empty dict and skips the members read."""
+        from plugins.modules.purefb_info import generate_eviction_policies_dict
+
+        blade = Mock()
+        blade.get_data_eviction_policies.return_value = Mock(status_code=400, items=[])
+        assert generate_eviction_policies_dict(blade) == {}
+        blade.get_data_eviction_policies_file_systems.assert_not_called()

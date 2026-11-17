@@ -99,6 +99,7 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_admin - configure Everpure FlashBlade Global Admin settings
 - purefb_alert - manage alert email settings on a FlashBlade
 - purefb_apiclient - manage API clients for FlashBlade
+- purefb_audits - list FlashBlade audit trail records
 - purefb_banner - manage FlashBlade login banner
 - purefb_bladename - manage FlashBlade name
 - purefb_bucket - manage S3 buckets on a FlashBlade

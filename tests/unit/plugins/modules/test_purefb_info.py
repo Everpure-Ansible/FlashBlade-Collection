@@ -95,6 +95,8 @@ from plugins.modules.purefb_info import (
     generate_realms_dict,
     generate_resource_accesses_dict,
     generate_file_repl_dict,
+    generate_software_dict,
+    generate_support_dict,
 )
 
 
@@ -1645,3 +1647,332 @@ class TestPurefbInfo:
         call_args = mock_module.exit_json.call_args[1]
         assert call_args["purefb_info"]["fleet"] == {"fleet1": {"members": {}}}
         assert "policies" not in call_args["purefb_info"]
+
+
+class TestPurefbInfoSoftwareSupport:
+    """Tests for the software and support subsets."""
+
+    @staticmethod
+    def _response(items):
+        response = Mock()
+        response.status_code = 200
+        response.items = items
+        return response
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_software_dict_keys_repeating_names_by_id(
+        self, mock_loose_version
+    ):
+        """Checks, installations and steps are keyed by id; packages by version."""
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+        check = Mock(spec=["name", "status", "details"])
+        check.name = "Firmware check"
+        check.status = "passed"
+        check.details = "No issues found."
+        task = Mock(
+            spec=[
+                "id",
+                "name",
+                "status",
+                "software_name",
+                "software_version",
+                "software_upgrade_hops",
+                "start_time",
+                "end_time",
+                "details",
+                "checks",
+            ]
+        )
+        task.id = "task-1"
+        task.name = "Purity//FB_4.8.8"
+        task.status = "passed"
+        task.software_name = "Purity//FB"
+        task.software_version = "4.6.4"
+        task.software_upgrade_hops = ["4.6.4", "4.8.8"]
+        task.start_time = 1794862200
+        task.end_time = 1794862433
+        task.details = None
+        task.checks = [check]
+        package = Mock(
+            spec=[
+                "id",
+                "name",
+                "version",
+                "status",
+                "progress",
+                "details",
+                "payload_id",
+                "upgrade_hops",
+            ]
+        )
+        package.id = "679"
+        package.name = "Purity//FB"
+        package.version = "4.8.8"
+        package.status = "download_failed"
+        package.progress = 0.0
+        package.details = "Software download failed"
+        package.payload_id = "abc"
+        package.upgrade_hops = ["4.6.4", "4.8.8"]
+        software_ref = Mock(spec=["id", "name"])
+        software_ref.id = "679"
+        software_ref.name = None
+        installation = Mock(
+            spec=[
+                "id",
+                "name",
+                "status",
+                "mode",
+                "software",
+                "current_step_id",
+                "start_time",
+                "end_time",
+                "details",
+                "override_checks",
+                "upgrade_parameters",
+            ]
+        )
+        installation.id = "inst-1"
+        installation.name = "Purity//FB_4.8.8"
+        installation.status = "paused"
+        installation.mode = "interactive"
+        installation.software = software_ref
+        installation.current_step_id = "step-1"
+        installation.start_time = 1
+        installation.end_time = None
+        installation.details = None
+        installation.override_checks = []
+        installation.upgrade_parameters = None
+        step_check = Mock(spec=["name", "status", "overridable", "details"])
+        step_check.name = "Drive move check"
+        step_check.status = "failed"
+        step_check.overridable = True
+        step_check.details = "-"
+        inst_ref = Mock(spec=["id", "name"])
+        inst_ref.id = "inst-1"
+        inst_ref.name = None
+        step = Mock(
+            spec=[
+                "id",
+                "name",
+                "description",
+                "details",
+                "status",
+                "hop_version",
+                "installation",
+                "start_time",
+                "end_time",
+                "checks",
+            ]
+        )
+        step.id = "step-1"
+        step.name = "upgrade checks"
+        step.description = "Run the upgrade checks"
+        step.details = None
+        step.status = "running"
+        step.hop_version = "4.8.8"
+        step.installation = inst_ref
+        step.start_time = 2
+        step.end_time = None
+        step.checks = [step_check]
+        version = Mock(
+            spec=["name", "version", "release_family", "details", "upgrade_hops"]
+        )
+        version.name = "Purity//FB"
+        version.version = "4.8.9"
+        version.release_family = "4.8"
+        version.details = None
+        version.upgrade_hops = ["4.8.8", "4.8.9"]
+
+        mock_blade = Mock()
+        mock_blade.get_software_check.return_value = self._response([task])
+        mock_blade.get_software_bundle.return_value = self._response([])
+        mock_blade.get_software_patches.return_value = self._response([])
+        mock_blade.get_software_versions.return_value = self._response([version])
+        mock_blade.get_software.return_value = self._response([package])
+        mock_blade.get_software_installations.return_value = self._response(
+            [installation]
+        )
+        mock_blade.get_software_installation_steps.return_value = self._response([step])
+
+        result = generate_software_dict(mock_blade, "2.30")
+
+        assert result["checks"]["task-1"]["name"] == "Purity//FB_4.8.8"
+        assert result["checks"]["task-1"]["software_upgrade_hops"] == ["4.6.4", "4.8.8"]
+        assert result["checks"]["task-1"]["checks"][0]["name"] == "Firmware check"
+        assert result["packages"]["4.8.8"]["status"] == "download_failed"
+        assert result["versions"]["4.8.9"]["release_family"] == "4.8"
+        assert result["installations"]["inst-1"]["software"] == "679"
+        assert result["installations"]["inst-1"]["upgrade_parameters"] == []
+        assert result["installation_steps"]["step-1"]["installation"] == "inst-1"
+        assert (
+            result["installation_steps"]["step-1"]["checks"][0]["overridable"] is True
+        )
+        assert result["bundles"] == {}
+        assert result["patches"] == {}
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_software_dict_respects_version_gates(self, mock_loose_version):
+        """Below REST 2.16 nothing is called and every group is empty."""
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+        mock_blade = Mock()
+
+        result = generate_software_dict(mock_blade, "2.15")
+
+        assert result == {
+            "versions": {},
+            "packages": {},
+            "bundles": {},
+            "checks": {},
+            "patches": {},
+            "installations": {},
+            "installation_steps": {},
+        }
+        mock_blade.get_software_check.assert_not_called()
+        mock_blade.get_software.assert_not_called()
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_support_dict_summarises_manifest(self, mock_loose_version):
+        """The manifest header, space and licensed features are kept, components counted."""
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+        severity = Mock(spec=["severity", "count"])
+        severity.severity = "warning"
+        severity.count = 2
+        period = Mock(spec=["start_time", "end_time"])
+        period.start_time = 10
+        period.end_time = 20
+        run = Mock(
+            spec=[
+                "id",
+                "name",
+                "index",
+                "status",
+                "version",
+                "task_id",
+                "start_time",
+                "analysis_period",
+                "severity_count",
+            ]
+        )
+        run.id = "run-1"
+        run.name = "diag"
+        run.index = 1
+        run.status = "completed"
+        run.version = "default"
+        run.task_id = "t-1"
+        run.start_time = 5
+        run.analysis_period = period
+        run.severity_count = [severity]
+        detail = Mock(
+            spec=[
+                "id",
+                "name",
+                "index",
+                "task_id",
+                "test_name",
+                "test_type",
+                "severity",
+                "result_details",
+            ]
+        )
+        detail.id = "det-1"
+        detail.name = "diag"
+        detail.index = 1.1
+        detail.task_id = "t-1"
+        detail.test_name = "NFS exports"
+        detail.test_type = "file"
+        detail.severity = "warning"
+        detail.result_details = "Review exports"
+        settings = Mock(spec=["version", "last_updated"])
+        settings.version = "default"
+        settings.last_updated = None
+        manifest = Mock(spec=["system_manifest"])
+        manifest.system_manifest = (
+            '{"appliance_id": "a-1", "array_name": "fb1", "domain": "example.com", '
+            '"manifest_source": "system-manifest-service", "manifest_version": "v1", '
+            '"product_family": "FlashBlade//S200", "product_model": "S200", '
+            '"purity_version": "4.8.8", "time_zone": "UTC", "timestamp": 1794902547, '
+            '"space": {"capacity": 10}, '
+            '"components": [{"type": "chassis"}]}'
+        )
+
+        mock_blade = Mock()
+        mock_blade.get_support_diagnostics.return_value = self._response([run])
+        mock_blade.get_support_diagnostics_details.return_value = self._response(
+            [detail]
+        )
+        mock_blade.get_support_diagnostics_settings.return_value = self._response(
+            [settings]
+        )
+        mock_blade.get_support_system_manifest.return_value = self._response([manifest])
+
+        result = generate_support_dict(mock_blade, "2.30")
+
+        assert result["diagnostics"]["runs"]["run-1"]["severity_count"] == {
+            "warning": 2
+        }
+        assert (
+            result["diagnostics"]["runs"]["run-1"]["analysis_period"]["end_time"] == 20
+        )
+        assert result["diagnostics"]["details"]["det-1"]["test_name"] == "NFS exports"
+        assert result["diagnostics"]["settings"] == {
+            "version": "default",
+            "last_updated": None,
+        }
+        assert result["manifest"]["purity_version"] == "4.8.8"
+        assert result["manifest"]["space"] == {"capacity": 10}
+        assert "licensed_features" not in result["manifest"]
+        assert result["manifest"]["component_count"] == 1
+        assert "components" not in result["manifest"]
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_support_dict_handles_bad_manifest_and_empty_lists(
+        self, mock_loose_version
+    ):
+        """Unparseable manifest text yields None fields; empty lists yield empty dicts."""
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+        manifest = Mock(spec=["system_manifest"])
+        manifest.system_manifest = "not json"
+
+        mock_blade = Mock()
+        mock_blade.get_support_diagnostics.return_value = self._response([])
+        mock_blade.get_support_diagnostics_details.return_value = self._response([])
+        mock_blade.get_support_diagnostics_settings.return_value = self._response([])
+        mock_blade.get_support_system_manifest.return_value = self._response([manifest])
+
+        result = generate_support_dict(mock_blade, "2.30")
+
+        assert result["diagnostics"] == {"settings": {}, "runs": {}, "details": {}}
+        assert result["manifest"]["purity_version"] is None
+        assert result["manifest"]["component_count"] is None
+
+    @patch("plugins.modules.purefb_info.generate_support_dict")
+    @patch("plugins.modules.purefb_info.generate_software_dict")
+    @patch("plugins.modules.purefb_info.generate_default_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_software_and_support_subsets(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_default,
+        mock_generate_software,
+        mock_generate_support,
+    ):
+        """gather_subset software/support wire the two generators."""
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["software", "support"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        mock_generate_software.return_value = {"packages": {}}
+        mock_generate_support.return_value = {"manifest": {}}
+
+        main()
+
+        mock_generate_default.assert_not_called()
+        mock_generate_software.assert_called_once()
+        mock_generate_support.assert_called_once()
+        info = mock_module.exit_json.call_args[1]["purefb_info"]
+        assert info["software"] == {"packages": {}}
+        assert info["support"] == {"manifest": {}}

@@ -35,7 +35,16 @@ options:
         Possible values for this include all, minimum, config, performance,
         capacity, network, subnets, lags, filesystems, snapshots, buckets,
         replication, policies, arrays, accounts, admins, ad, kerberos,
-        drives, servers, fleet and realms.
+        drives, servers, fleet, realms, software and support.
+      - The C(software) subset reports the Purity//FB versions the array can
+        upgrade to, the software packages and bundles on the array, the
+        upgrade check tasks, software patches, and the software installations
+        with their steps. Checks, installations and steps are keyed by ID
+        because their names repeat. Times are reported as the array returns
+        them.
+      - The C(support) subset reports the support diagnostics runs, their
+        test results and the diagnostics tool settings, and a summary of the
+        system manifest.
       - The C(filesystems) subset surfaces the legacy file system keys
         C(nfs_rules), C(export_policy), C(smb_client_policy) and
         C(smb_share_policy). Purity//FB marks the underlying fields as
@@ -109,6 +118,7 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.time_utils imp
     milliseconds_to_time,
 )
 from datetime import datetime, timezone
+import json
 import time
 
 KMIP_API_VERSION = "2.1"
@@ -128,6 +138,12 @@ FLEET_API_VERSION = "2.17"
 TLS_API_VERSION = "2.17"
 REALMS_API_VERSION = "2.19"
 S3_EXPORT_API_VERSION = "2.20"
+SOFTWARE_CHECK_API_VERSION = "2.16"
+SOFTWARE_BUNDLE_API_VERSION = "2.24"
+SOFTWARE_API_VERSION = "2.30"
+SUPPORT_DIAGS_API_VERSION = "2.16"
+DIAGS_SETTINGS_API_VERSION = "2.24"
+MANIFEST_API_VERSION = "2.26"
 
 
 def _bytes_to_human(bytes_number):
@@ -1722,6 +1738,237 @@ def generate_fleet_dict(blade):
     return fleet_info
 
 
+def generate_software_dict(blade, api_version):
+    """Software catalogue, packages, bundles, checks, patches and upgrades
+
+    The endpoints arrived in different releases, so each group is gated on
+    its own. Checks, installations and steps repeat their names, so they are
+    keyed on id. Times are reported as the array returns them.
+    """
+    software_info = {
+        "versions": {},
+        "packages": {},
+        "bundles": {},
+        "checks": {},
+        "patches": {},
+        "installations": {},
+        "installation_steps": {},
+    }
+    if LooseVersion(SOFTWARE_CHECK_API_VERSION) <= LooseVersion(api_version):
+        res = blade.get_software_check()
+        if res.status_code == 200:
+            for task in list(res.items):
+                software_info["checks"][task.id] = {
+                    "name": getattr(task, "name", None),
+                    "status": getattr(task, "status", None),
+                    "software_name": getattr(task, "software_name", None),
+                    "software_version": getattr(task, "software_version", None),
+                    "software_upgrade_hops": list(
+                        getattr(task, "software_upgrade_hops", None) or []
+                    ),
+                    "start_time": getattr(task, "start_time", None),
+                    "end_time": getattr(task, "end_time", None),
+                    "details": getattr(task, "details", None),
+                    "checks": [
+                        {
+                            "name": getattr(check, "name", None),
+                            "status": getattr(check, "status", None),
+                            "details": getattr(check, "details", None),
+                        }
+                        for check in (getattr(task, "checks", None) or [])
+                    ],
+                }
+    if LooseVersion(SOFTWARE_BUNDLE_API_VERSION) <= LooseVersion(api_version):
+        res = blade.get_software_bundle()
+        if res.status_code == 200:
+            for bundle in list(res.items):
+                software_info["bundles"][bundle.id] = {
+                    "source": getattr(bundle, "source", None),
+                    "status": getattr(bundle, "status", None),
+                    "software_name": getattr(bundle, "software_name", None),
+                    "software_version": getattr(bundle, "software_version", None),
+                    "download_progress": getattr(bundle, "download_progress", None),
+                    "bytes_downloaded": getattr(bundle, "bytes_downloaded", None),
+                    "bytes_total": getattr(bundle, "bytes_total", None),
+                    "created": getattr(bundle, "created", None),
+                    "details": getattr(bundle, "details", None),
+                }
+        res = blade.get_software_patches()
+        if res.status_code == 200:
+            for patch in list(res.items):
+                software_info["patches"][patch.name] = {
+                    "status": getattr(patch, "status", None),
+                    "progress": getattr(patch, "progress", None),
+                    "description": getattr(patch, "description", None),
+                    "details": getattr(patch, "details", None),
+                    "alert_code": getattr(patch, "alert_code", None),
+                    "ha_reduction_required": getattr(
+                        patch, "ha_reduction_required", None
+                    ),
+                }
+    if LooseVersion(SOFTWARE_API_VERSION) <= LooseVersion(api_version):
+        res = blade.get_software_versions()
+        if res.status_code == 200:
+            for version in list(res.items):
+                software_info["versions"][version.version] = {
+                    "name": getattr(version, "name", None),
+                    "release_family": getattr(version, "release_family", None),
+                    "details": getattr(version, "details", None),
+                    "upgrade_hops": list(getattr(version, "upgrade_hops", None) or []),
+                }
+        res = blade.get_software()
+        if res.status_code == 200:
+            for package in list(res.items):
+                software_info["packages"][package.version] = {
+                    "id": getattr(package, "id", None),
+                    "name": getattr(package, "name", None),
+                    "status": getattr(package, "status", None),
+                    "progress": getattr(package, "progress", None),
+                    "details": getattr(package, "details", None),
+                    "payload_id": getattr(package, "payload_id", None),
+                    "upgrade_hops": list(getattr(package, "upgrade_hops", None) or []),
+                }
+        res = blade.get_software_installations()
+        if res.status_code == 200:
+            for installation in list(res.items):
+                software_info["installations"][installation.id] = {
+                    "name": getattr(installation, "name", None),
+                    "status": getattr(installation, "status", None),
+                    "mode": getattr(installation, "mode", None),
+                    "software": getattr(
+                        getattr(installation, "software", None), "id", None
+                    ),
+                    "current_step_id": getattr(installation, "current_step_id", None),
+                    "start_time": getattr(installation, "start_time", None),
+                    "end_time": getattr(installation, "end_time", None),
+                    "details": getattr(installation, "details", None),
+                    "override_checks": [
+                        {
+                            "name": getattr(check, "name", None),
+                            "args": getattr(check, "args", None),
+                        }
+                        for check in (
+                            getattr(installation, "override_checks", None) or []
+                        )
+                    ],
+                    "upgrade_parameters": list(
+                        getattr(installation, "upgrade_parameters", None) or []
+                    ),
+                }
+        res = blade.get_software_installation_steps()
+        if res.status_code == 200:
+            for step in list(res.items):
+                software_info["installation_steps"][step.id] = {
+                    "name": getattr(step, "name", None),
+                    "description": getattr(step, "description", None),
+                    "details": getattr(step, "details", None),
+                    "status": getattr(step, "status", None),
+                    "hop_version": getattr(step, "hop_version", None),
+                    "installation": getattr(
+                        getattr(step, "installation", None), "id", None
+                    ),
+                    "start_time": getattr(step, "start_time", None),
+                    "end_time": getattr(step, "end_time", None),
+                    "checks": [
+                        {
+                            "name": getattr(check, "name", None),
+                            "status": getattr(check, "status", None),
+                            "overridable": getattr(check, "overridable", None),
+                            "details": getattr(check, "details", None),
+                        }
+                        for check in (getattr(step, "checks", None) or [])
+                    ],
+                }
+    return software_info
+
+
+def generate_support_dict(blade, api_version):
+    """Support diagnostics and a summary of the system manifest
+
+    The manifest is one JSON document of tens of kilobytes, most of it the
+    hardware component tree, so the header fields and the space summary are
+    reported and the components are counted rather than listed.
+    """
+    support_info = {
+        "diagnostics": {"settings": {}, "runs": {}, "details": {}},
+        "manifest": {},
+    }
+    if LooseVersion(SUPPORT_DIAGS_API_VERSION) <= LooseVersion(api_version):
+        res = blade.get_support_diagnostics()
+        if res.status_code == 200:
+            for run in list(res.items):
+                period = getattr(run, "analysis_period", None)
+                support_info["diagnostics"]["runs"][run.id] = {
+                    "name": getattr(run, "name", None),
+                    "index": getattr(run, "index", None),
+                    "status": getattr(run, "status", None),
+                    "version": getattr(run, "version", None),
+                    "task_id": getattr(run, "task_id", None),
+                    "start_time": getattr(run, "start_time", None),
+                    "analysis_period": {
+                        "start_time": getattr(period, "start_time", None),
+                        "end_time": getattr(period, "end_time", None),
+                    },
+                    "severity_count": {
+                        getattr(count, "severity", None): getattr(count, "count", None)
+                        for count in (getattr(run, "severity_count", None) or [])
+                    },
+                }
+        res = blade.get_support_diagnostics_details()
+        if res.status_code == 200:
+            for detail in list(res.items):
+                support_info["diagnostics"]["details"][detail.id] = {
+                    "name": getattr(detail, "name", None),
+                    "index": getattr(detail, "index", None),
+                    "task_id": getattr(detail, "task_id", None),
+                    "test_name": getattr(detail, "test_name", None),
+                    "test_type": getattr(detail, "test_type", None),
+                    "severity": getattr(detail, "severity", None),
+                    "result_details": getattr(detail, "result_details", None),
+                }
+    if LooseVersion(DIAGS_SETTINGS_API_VERSION) <= LooseVersion(api_version):
+        res = blade.get_support_diagnostics_settings()
+        if res.status_code == 200:
+            settings = next(iter(list(res.items)), None)
+            if settings is not None:
+                support_info["diagnostics"]["settings"] = {
+                    "version": getattr(settings, "version", None),
+                    "last_updated": getattr(settings, "last_updated", None),
+                }
+    if LooseVersion(MANIFEST_API_VERSION) <= LooseVersion(api_version):
+        res = blade.get_support_system_manifest()
+        if res.status_code == 200:
+            item = next(iter(list(res.items)), None)
+            raw = getattr(item, "system_manifest", None) if item else None
+            manifest = {}
+            if isinstance(raw, str):
+                try:
+                    manifest = json.loads(raw)
+                except ValueError:
+                    manifest = {}
+            elif isinstance(raw, dict):
+                manifest = raw
+            for field in (
+                "manifest_version",
+                "manifest_source",
+                "product_family",
+                "product_model",
+                "purity_version",
+                "array_name",
+                "appliance_id",
+                "domain",
+                "time_zone",
+                "timestamp",
+                "space",
+            ):
+                support_info["manifest"][field] = manifest.get(field)
+            components = manifest.get("components")
+            support_info["manifest"]["component_count"] = (
+                len(components) if isinstance(components, (list, dict)) else None
+            )
+    return support_info
+
+
 def main():
     argument_spec = purefb_argument_spec()
     argument_spec.update(
@@ -1759,6 +2006,8 @@ def main():
         "servers",
         "fleet",
         "realms",
+        "software",
+        "support",
     )
     subset_test = (test in valid_subsets for test in subset)
     if not all(subset_test):
@@ -1866,6 +2115,10 @@ def main():
         SERVERS_API_VERSION
     ) <= LooseVersion(api_version):
         info["servers"] = generate_servers_dict(blade)
+    if "software" in subset or "all" in subset:
+        info["software"] = generate_software_dict(blade, api_version)
+    if "support" in subset or "all" in subset:
+        info["support"] = generate_support_dict(blade, api_version)
     module.exit_json(changed=False, purefb_info=info)
 
 

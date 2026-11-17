@@ -426,50 +426,80 @@ def _check_protected(module, name, collections):
         )
 
 
+def _rule_index(rule):
+    """Position of a rule within its policy, 0 when the array did not report one."""
+    return getattr(rule, "index", None) or 0
+
+
+def _rule_selector(rule):
+    """Query parameters addressing one existing rule.
+
+    Rules are named <policy>.<index> and the array renumbers the survivors
+    after every delete, so a name read before a delete may address another
+    rule afterwards. The id never changes and is used whenever present.
+    """
+    rule_id = getattr(rule, "id", None)
+    if rule_id:
+        return {"ids": [rule_id]}
+    return {"names": [getattr(rule, "name", None)]}
+
+
 def _rule_changes(policy, desired):
     """Diff the current rules against desired {collection: ms}.
 
-    Returns (rule names to delete, [(rule name, ms)] to patch,
+    Returns (rules to delete, highest index first; [(rule, ms)] to patch;
     [(collection, ms)] to add).
     """
     current = {}
     for rule in getattr(policy, "rules", None) or []:
         collection = getattr(getattr(rule, "collection", None), "name", None)
         if collection:
-            current[collection] = (
-                getattr(rule, "name", None),
-                getattr(rule, "resolution", None),
-            )
-    to_delete = [current[c][0] for c in current if c not in desired]
+            current[collection] = rule
+    to_delete = sorted(
+        (current[c] for c in current if c not in desired),
+        key=_rule_index,
+        reverse=True,
+    )
     to_patch = [
-        (current[c][0], desired[c])
+        (current[c], desired[c])
         for c in desired
-        if c in current and current[c][1] != desired[c]
+        if c in current and getattr(current[c], "resolution", None) != desired[c]
     ]
     to_add = [(c, desired[c]) for c in desired if c not in current]
     return to_delete, to_patch, to_add
 
 
 def _apply_rule_changes(module, blade, name, changes):
+    """Patch first, then delete from the highest index down, then add.
+
+    Rules are addressed as they were read, so the patches go before any
+    delete can renumber them, and each delete then only renumbers rules
+    that are already gone.
+    """
     ctx = _context_kwargs(module)
     to_delete, to_patch, to_add = changes
-    for rule_name in to_delete:
-        res = blade.delete_telemetry_metrics_policies_rules(names=[rule_name], **ctx)
-        if res.status_code != 200:
-            module.fail_json(
-                msg="Failed to delete rule {0} from telemetry metrics policy {1}. "
-                "Error: {2}".format(rule_name, name, get_error_message(res))
-            )
-    for rule_name, resolution in to_patch:
+    for rule, resolution in to_patch:
         res = blade.patch_telemetry_metrics_policies_rules(
-            names=[rule_name],
             rule=TelemetryMetricsPolicyRulePatch(resolution=resolution),
-            **ctx
+            **dict(_rule_selector(rule), **ctx)
         )
         if res.status_code != 200:
             module.fail_json(
                 msg="Failed to update rule {0} of telemetry metrics policy {1}. "
-                "Error: {2}".format(rule_name, name, get_error_message(res))
+                "Error: {2}".format(
+                    getattr(rule, "name", None), name, get_error_message(res)
+                )
+            )
+    for rule in to_delete:
+        res = blade.delete_telemetry_metrics_policies_rules(
+            **dict(_rule_selector(rule), **ctx)
+        )
+        if res.status_code != 200:
+            module.fail_json(
+                msg="Failed to delete rule {0} from telemetry metrics policy {1}. "
+                "Error: {2}".format(
+                    getattr(rule, "name", None), name, get_error_message(res)
+                )
             )
     for collection, resolution in to_add:
         res = blade.post_telemetry_metrics_policies_rules(

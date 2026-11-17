@@ -81,6 +81,8 @@ from plugins.modules.purefb_telemetry_policy import (
     _normalise_collection,
     _desired_rules,
     _rule_changes,
+    _rule_index,
+    _rule_selector,
     _policy_to_dict,
 )
 
@@ -113,12 +115,27 @@ def _collections():
     ]
 
 
-def _rule(name, collection, resolution):
-    rule = Mock(spec=["name", "collection", "resolution"])
+def _rule(name, collection, resolution, with_id=True):
+    """A rule as the array reports it: <policy>.<index> name, index and id."""
+    spec = ["name", "collection", "resolution", "index"]
+    if with_id:
+        spec.append("id")
+    rule = Mock(spec=spec)
     rule.name = name
     rule.collection = _ref(collection)
     rule.resolution = resolution
+    rule.index = int(name.rsplit(".", 1)[1])
+    if with_id:
+        rule.id = "id-" + name
     return rule
+
+
+def _three_rules(name="pol1", with_id=True):
+    return [
+        _rule(name + ".1", FS_SPACE, 300000, with_id),
+        _rule(name + ".2", DEVICE, 30000, with_id),
+        _rule(name + ".3", BUCKET_SPACE, 300000, with_id),
+    ]
 
 
 def _policy(name="pol1", targets=("tgt1",), rules=None, enabled=True, version="v1"):
@@ -326,9 +343,24 @@ class TestPurefbTelemetryPolicyHelpers:
         to_delete, to_patch, to_add = _rule_changes(
             policy, {DEVICE: 300000, BUCKET_SPACE: 300000}
         )
-        assert to_delete == ["pol1.2"]
-        assert to_patch == [("pol1.1", 300000)]
+        assert [rule.name for rule in to_delete] == ["pol1.2"]
+        assert [(rule.name, ms) for rule, ms in to_patch] == [("pol1.1", 300000)]
         assert to_add == [(BUCKET_SPACE, 300000)]
+
+    def test_rule_changes_deletes_highest_index_first(self):
+        policy = _policy(rules=_three_rules())
+        to_delete, to_patch, to_add = _rule_changes(policy, {DEVICE: 300000})
+        assert [rule.name for rule in to_delete] == ["pol1.3", "pol1.1"]
+        assert [(rule.name, ms) for rule, ms in to_patch] == [("pol1.2", 300000)]
+        assert to_add == []
+
+    def test_rule_index_and_selector(self):
+        rule = _rule("pol1.3", DEVICE, 30000)
+        assert _rule_index(rule) == 3
+        assert _rule_selector(rule) == {"ids": ["id-pol1.3"]}
+        unnumbered = _rule("pol1.2", DEVICE, 30000, with_id=False)
+        assert _rule_selector(unnumbered) == {"names": ["pol1.2"]}
+        assert _rule_index(Mock(spec=["name"])) == 0
 
     def test_rule_changes_no_diff(self):
         assert _rule_changes(_policy(), {DEVICE: 30000, FS_SPACE: 300000}) == (
@@ -519,9 +551,9 @@ class TestPurefbTelemetryPolicyMain:
         )
         module = _run_main(params, blade)
         blade.patch_telemetry_metrics_policies_rules.assert_called_once()
-        assert blade.patch_telemetry_metrics_policies_rules.call_args[1]["names"] == [
-            "pol1.1"
-        ]
+        patch_kwargs = blade.patch_telemetry_metrics_policies_rules.call_args[1]
+        assert patch_kwargs["ids"] == ["id-pol1.1"]
+        assert "names" not in patch_kwargs
         mock_rule_patch.assert_called_once_with(resolution=300000)
         blade.post_telemetry_metrics_policies_rules.assert_not_called()
         blade.delete_telemetry_metrics_policies_rules.assert_not_called()
@@ -538,7 +570,7 @@ class TestPurefbTelemetryPolicyMain:
         )
         module = _run_main(params, blade)
         blade.delete_telemetry_metrics_policies_rules.assert_called_once_with(
-            names=["pol1.2"]
+            ids=["id-pol1.2"]
         )
         blade.post_telemetry_metrics_policies_rules.assert_called_once()
         assert blade.post_telemetry_metrics_policies_rules.call_args[1][
@@ -547,11 +579,63 @@ class TestPurefbTelemetryPolicyMain:
         blade.patch_telemetry_metrics_policies_rules.assert_not_called()
         assert module.exit_json.call_args[1]["changed"] is True
 
-    def test_update_empty_rules_removes_all(self):
-        blade = _blade(policies=[_policy()])
+    def test_update_empty_rules_removes_all_highest_index_first(self):
+        blade = _blade(policies=[_policy(rules=_three_rules())])
         module = _run_main(_base_params(rules=[]), blade)
-        assert blade.delete_telemetry_metrics_policies_rules.call_count == 2
+        deleted = [
+            call[1]["ids"]
+            for call in blade.delete_telemetry_metrics_policies_rules.call_args_list
+        ]
+        assert deleted == [["id-pol1.3"], ["id-pol1.2"], ["id-pol1.1"]]
+        blade.patch_telemetry_metrics_policies_rules.assert_not_called()
+        blade.post_telemetry_metrics_policies_rules.assert_not_called()
         assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_update_patches_before_deleting(self):
+        # .1 fs_space, .2 device 30s, .3 bucket -> keep only device, at 5m
+        blade = _blade(policies=[_policy(rules=_three_rules())])
+        params = _base_params(rules=[{"collection": DEVICE, "resolution": "5m"}])
+        module = _run_main(params, blade)
+        rule_calls = [
+            (call[0], call[2])
+            for call in blade.method_calls
+            if call[0].endswith("_telemetry_metrics_policies_rules")
+        ]
+        assert [method for method, kwargs in rule_calls] == [
+            "patch_telemetry_metrics_policies_rules",
+            "delete_telemetry_metrics_policies_rules",
+            "delete_telemetry_metrics_policies_rules",
+        ]
+        assert rule_calls[0][1]["ids"] == ["id-pol1.2"]
+        assert [kwargs["ids"] for method, kwargs in rule_calls[1:]] == [
+            ["id-pol1.3"],
+            ["id-pol1.1"],
+        ]
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_update_rules_without_ids_use_names_highest_index_first(self):
+        blade = _blade(policies=[_policy(rules=_three_rules(with_id=False))])
+        params = _base_params(rules=[{"collection": DEVICE, "resolution": "5m"}])
+        module = _run_main(params, blade)
+        assert blade.patch_telemetry_metrics_policies_rules.call_args[1]["names"] == [
+            "pol1.2"
+        ]
+        deleted = [
+            call[1]["names"]
+            for call in blade.delete_telemetry_metrics_policies_rules.call_args_list
+        ]
+        assert deleted == [["pol1.3"], ["pol1.1"]]
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_update_rule_delete_api_error(self):
+        blade = _blade(policies=[_policy()])
+        blade.delete_telemetry_metrics_policies_rules.return_value = _response(
+            status=400
+        )
+        module = _run_main(_base_params(rules=[]), blade)
+        module.fail_json.assert_called_once()
+        assert "Failed to delete rule pol1.2" in module.fail_json.call_args[1]["msg"]
+        assert blade.delete_telemetry_metrics_policies_rules.call_count == 1
 
     @patch(MODULE + ".TelemetryMetricsPolicyPatch")
     def test_update_targets_patches_with_version(self, mock_patch_model):

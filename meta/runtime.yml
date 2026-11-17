@@ -19,6 +19,7 @@ action_groups:
     - purefb_ds
     - purefb_dsrole
     - purefb_eula
+    - purefb_eviction_policy
     - purefb_export
     - purefb_fleet
     - purefb_fs

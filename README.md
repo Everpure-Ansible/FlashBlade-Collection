@@ -112,6 +112,7 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_ds - manage Directory Services settings on a FlashBlade
 - purefb_dsrole - manage Directory Service Roles on a FlashBlade
 - purefb_eula - manage EULA on FlashBlade
+- purefb_eviction_policy - manage data eviction policies on a FlashBlade
 - purefb_export - manage filesystem exports on FlashBlade
 - purefb_fleet - manage Fusion fleet members
 - purefb_fs - manage filesystems on a FlashBlade

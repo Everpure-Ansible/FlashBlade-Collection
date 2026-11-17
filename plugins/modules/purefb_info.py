@@ -133,6 +133,7 @@ OIDC_API_VERSION = "2.17"
 REALMS_API_VERSION = "2.19"
 MAP_API_VERSION = "2.19"
 S3_EXPORT_API_VERSION = "2.20"
+REALM_DEFAULTS_API_VERSION = "2.20"
 
 
 def _bytes_to_human(bytes_number):
@@ -1532,6 +1533,23 @@ def generate_object_store_virtual_hosts_dict(blade):
 
 def generate_realms_dict(blade):
     realms_info = {}
+    api_version = get_rest_api_version(blade)
+
+    # Default object store server per realm (REST 2.20+). A realm without a
+    # default has an empty object_store list or no defaults entry at all.
+    default_servers = {}
+    if LooseVersion(REALM_DEFAULTS_API_VERSION) <= LooseVersion(api_version):
+        res = blade.get_realms_defaults()
+        if res.status_code == 200:
+            for defaults in res.items:
+                realm_name = getattr(getattr(defaults, "realm", None), "name", None)
+                object_store = getattr(defaults, "object_store", None) or []
+                server = None
+                if object_store:
+                    server = getattr(
+                        getattr(object_store[0], "server", None), "name", None
+                    )
+                default_servers[realm_name] = server
 
     for realm in blade.get_realms().items:
         space = getattr(realm, "space", None)
@@ -1547,6 +1565,7 @@ def generate_realms_dict(blade):
             "default_inbound_tls_policy": getattr(
                 getattr(realm, "default_inbound_tls_policy", None), "name", None
             ),
+            "default_object_server": default_servers.get(realm.name),
             "space": {
                 "data_reduction": getattr(space, "data_reduction", None),
                 "snapshots": getattr(space, "snapshots", None),

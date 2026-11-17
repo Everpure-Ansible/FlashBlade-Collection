@@ -6,6 +6,7 @@ action_groups:
     - purefb_admin
     - purefb_alert
     - purefb_apiclient
+    - purefb_audits
     - purefb_banner
     - purefb_bladename
     - purefb_bucket
@@ -54,6 +55,7 @@ action_groups:
     - purefb_s3user
     - purefb_saml
     - purefb_server
+    - purefb_sessions
     - purefb_smtp
     - purefb_snap
     - purefb_snmp_agent

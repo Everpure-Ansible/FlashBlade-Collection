@@ -1,0 +1,5 @@
+minor_changes:
+  - purefb_dns - add ``context`` to manage a DNS configuration on another fleet member through any array
+    in the fleet (REST API 2.25, Purity//FB 4.8.0). A context below that version is refused before any
+    call, and the local ``source`` interface check is skipped when a context is set because network
+    interfaces take no context.

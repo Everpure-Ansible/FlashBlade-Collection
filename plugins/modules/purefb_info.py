@@ -144,15 +144,21 @@ SPACE_API_VERSION = "2.11"
 PUBLIC_API_VERSION = "2.12"
 NAP_API_VERSION = "2.13"
 RA_DURATION_API_VERSION = "2.14"
+SSH_CA_API_VERSION = "2.14"
 SMTP_ENCRYPT_API_VERSION = "2.15"
 WORM_API_VERSION = "2.15"
 SERVERS_API_VERSION = "2.16"
 PASSWORD_POLICY_API_VERSION = "2.16"
+MAINTENANCE_API_VERSION = "2.16"
 FLEET_API_VERSION = "2.17"
 TLS_API_VERSION = "2.17"
+EDGE_API_VERSION = "2.18"
+OIDC_API_VERSION = "2.17"
 CLIENTS_S3_API_VERSION = "2.18"
 REALMS_API_VERSION = "2.19"
+MAP_API_VERSION = "2.19"
 S3_EXPORT_API_VERSION = "2.20"
+REALM_DEFAULTS_API_VERSION = "2.20"
 
 
 def _bytes_to_human(bytes_number):
@@ -166,6 +172,57 @@ def _bytes_to_human(bytes_number):
             bytes_number = bytes_number / 1024
         return str(round(double_bytes, 2)) + " " + labels[i]
     return None
+
+
+def _reference_names(references):
+    """Return the names in a list of references (None or empty gives [])"""
+    return [
+        reference.name
+        for reference in (references or [])
+        if getattr(reference, "name", None)
+    ]
+
+
+def generate_directory_service_roles_dict(blade, api_version):
+    """Return the directory service role mappings
+
+    ``role`` is null for a mapping with no, several, or a custom management
+    access policy, so it is read through getattr. The policy names are
+    reported from REST 2.19, where the array exposes them.
+    """
+    roles_info = {}
+    report_policies = LooseVersion(MAP_API_VERSION) <= LooseVersion(api_version)
+    for ds_role in list(blade.get_directory_services_roles().items):
+        roles_info[ds_role.name] = {
+            "group": getattr(ds_role, "group", None),
+            "group_base": getattr(ds_role, "group_base", None),
+            "role": getattr(getattr(ds_role, "role", None), "name", None),
+        }
+        if report_policies:
+            roles_info[ds_role.name]["management_access_policies"] = _reference_names(
+                getattr(ds_role, "management_access_policies", None)
+            )
+    return roles_info
+
+
+def _maintenance_window_list(blade):
+    """Return the open maintenance window as a one-item list, or []"""
+    windows = []
+    res = blade.get_maintenance_windows()
+    if res.status_code == 200:
+        for window in list(res.items):
+            windows.append(
+                {
+                    "name": window.name,
+                    "created": datetime.fromtimestamp(
+                        int(window.created) / 1000
+                    ).strftime("%Y-%m-%d %H:%M:%S"),
+                    "expires": datetime.fromtimestamp(
+                        int(window.expires) / 1000
+                    ).strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+    return windows
 
 
 def generate_default_dict(blade):
@@ -285,6 +342,16 @@ def generate_default_dict(blade):
     }
     if LooseVersion(RA_DURATION_API_VERSION) <= LooseVersion(api_version):
         default_info["remote_assist"]["ra_duration"] = ra_info.remote_assist_duration
+    if LooseVersion(MAINTENANCE_API_VERSION) <= LooseVersion(api_version):
+        default_info["maintenance_window"] = _maintenance_window_list(blade)
+    if LooseVersion(EDGE_API_VERSION) <= LooseVersion(api_version):
+        # Pure1 Edge Services opt-ins, set by purefb_phonehome
+        default_info["remote_assist"]["edge_management_enabled"] = getattr(
+            ra_info, "edge_management_enabled", None
+        )
+        default_info["remote_assist"]["edge_agent_update_enabled"] = getattr(
+            ra_info, "edge_agent_update_enabled", None
+        )
     return default_info
 
 
@@ -600,6 +667,26 @@ def generate_perf_dict(blade):
     return perf_info
 
 
+def generate_quota_settings_dict(blade):
+    """Legacy user and group quota notification settings (/quotas/settings).
+
+    Keyed by the settings object name (a single object named management).
+    The array omits contact from the response while it is unset.
+    """
+    quota_settings = {}
+    res = blade.get_quotas_settings()
+    if res.status_code != 200:
+        return quota_settings
+    for settings in list(res.items):
+        quota_settings[settings.name] = {
+            "contact": getattr(settings, "contact", None),
+            "direct_notifications_enabled": getattr(
+                settings, "direct_notifications_enabled", None
+            ),
+        }
+    return quota_settings
+
+
 def generate_config_dict(blade):
     config_info = {}
     api_version = get_rest_api_version(blade)
@@ -610,6 +697,12 @@ def generate_config_dict(blade):
             "nameservers": config.nameservers,
             "domain": config.domain,
             "services": getattr(config, "services", None),
+            "ca_certificate": getattr(
+                getattr(config, "ca_certificate", None), "name", None
+            ),
+            "ca_certificate_group": getattr(
+                getattr(config, "ca_certificate_group", None), "name", None
+            ),
         }
         if hasattr(config, "sources"):
             # sources is a list of references (at most one), not a reference
@@ -627,6 +720,7 @@ def generate_config_dict(blade):
             "sender_domain": getattr(config, "sender_domain", None),
             "encryption_mode": getattr(config, "encryption_mode", None),
         }
+    config_info["quota_settings"] = generate_quota_settings_dict(blade)
     alert_config = list(blade.get_alert_watchers().items)
     config_info["alert_watchers"] = {}
     for config in alert_config:
@@ -657,15 +751,9 @@ def generate_config_dict(blade):
     # Forward backwards compatability
     config_info["array_management"] = config_info["management_directory_service"]
 
-    config_info["directory_service_roles"] = {}
-    roles = list(blade.get_directory_services_roles().items)
-    for ds_role in roles:
-        role_name = ds_role.name
-        config_info["directory_service_roles"][role_name] = {
-            "group": ds_role.group,
-            "group_base": ds_role.group_base,
-            "role": ds_role.role.name,
-        }
+    config_info["directory_service_roles"] = generate_directory_service_roles_dict(
+        blade, api_version
+    )
     config_info["ntp"] = list(blade.get_arrays().items)[0].ntp_servers
     certs = list(blade.get_certificates().items)
     config_info["ssl_certs"] = {}
@@ -782,7 +870,31 @@ def generate_config_dict(blade):
                     "sign_cred": getattr(saml2[0].sp.signing_credential, "name", None),
                 },
             }
+    if LooseVersion(OIDC_API_VERSION) <= LooseVersion(api_version):
+        config_info["oidc_idps"] = generate_oidc_idps_dict(blade)
     return config_info
+
+
+def generate_oidc_idps_dict(blade):
+    """OIDC identity providers keyed by name (an array may hold several)."""
+    idps_info = {}
+    for idp in list(blade.get_sso_oidc_idps().items):
+        idp_cfg = getattr(idp, "idp", None)
+        idps_info[idp.name] = {
+            "enabled": getattr(idp, "enabled", None),
+            "prn": getattr(idp, "prn", None),
+            "services": list(getattr(idp, "services", None) or []),
+            "provider_url": getattr(idp_cfg, "provider_url", None),
+            "ca_certificate": getattr(
+                getattr(idp_cfg, "provider_url_ca_certificate", None), "name", None
+            ),
+            "ca_certificate_group": getattr(
+                getattr(idp_cfg, "provider_url_ca_certificate_group", None),
+                "name",
+                None,
+            ),
+        }
+    return idps_info
 
 
 def generate_subnet_dict(blade):
@@ -830,17 +942,31 @@ def generate_lag_dict(blade):
 
 
 def generate_admin_dict(blade):
+    """Return the array's administrators
+
+    ``role`` is set only when the admin holds exactly one management access
+    policy that corresponds to a legacy role of the same name; it is null for
+    an admin with no, several, or a custom policy, so it is read through
+    getattr. The policy names are reported from REST 2.19, where the array
+    exposes them.
+    """
     admin_info = {}
+    api_version = get_rest_api_version(blade)
+    report_policies = LooseVersion(MAP_API_VERSION) <= LooseVersion(api_version)
     admins = list(blade.get_admins().items)
     for admin in admins:
         admin_name = admin.name
         admin_info[admin_name] = {
-            "public_key": admin.public_key,
-            "local": admin.is_local,
-            "role": admin.role.name,
-            "locked": admin.locked,
+            "public_key": getattr(admin, "public_key", None),
+            "local": getattr(admin, "is_local", None),
+            "role": getattr(getattr(admin, "role", None), "name", None),
+            "locked": getattr(admin, "locked", None),
             "lockout_remaining": getattr(admin, "lockout_remaining", None),
         }
+        if report_policies:
+            admin_info[admin_name]["management_access_policies"] = _reference_names(
+                getattr(admin, "management_access_policies", None)
+            )
         if hasattr(admin.api_token, "expires_at"):
             if admin.api_token.expires_at:
                 admin_info[admin_name]["token_expires"] = datetime.fromtimestamp(
@@ -954,6 +1080,19 @@ def generate_network_dict(blade):
             subnet_name = subnet.get("name")
         else:
             subnet_name = getattr(subnet, "name", None)
+        # realms (REST 2.19) and rdma_enabled (REST 2.28) are absent from
+        # the interface model on older arrays
+        realms = getattr(port, "realms", None) or []
+        if not isinstance(realms, list):
+            realms = []
+        realm_names = [
+            (
+                realm.get("name")
+                if isinstance(realm, dict)
+                else getattr(realm, "name", None)
+            )
+            for realm in realms
+        ]
         net_info[int_name] = {
             "type": getattr(port, "type", None),
             "mtu": getattr(port, "mtu", None),
@@ -966,6 +1105,8 @@ def generate_network_dict(blade):
             "attached_servers": attached_names,
             "subnet": subnet_name,
             "enabled": port.enabled,
+            "rdma_enabled": getattr(port, "rdma_enabled", None),
+            "realms": realm_names,
         }
     return net_info
 
@@ -1295,6 +1436,12 @@ def generate_ad_dict(blade):
             "encryption_types": ad.encryption_types,
             "global_catalog_servers": getattr(ad, "global_catalog_servers", None),
             "server": getattr(getattr(ad, "server", None), "name", None),
+            "ca_certificate": getattr(
+                getattr(ad, "ca_certificate", None), "name", None
+            ),
+            "ca_certificate_group": getattr(
+                getattr(ad, "ca_certificate_group", None), "name", None
+            ),
         }
 
     return ad_info
@@ -1570,6 +1717,40 @@ def generate_tls_policies_dict(blade):
     return policies_info
 
 
+def generate_ssh_ca_policies_dict(blade):
+    policies_info = {}
+    signer_types = {"public-keys": "public_key", "certificates": "certificate"}
+
+    for policy in blade.get_ssh_certificate_authority_policies().items:
+        signer = getattr(policy, "signing_authority", None)
+        signer_type = getattr(signer, "resource_type", None)
+        policies_info[policy.name] = {
+            "local": getattr(policy, "is_local", None),
+            "enabled": getattr(policy, "enabled", None),
+            "signing_authority": getattr(signer, "name", None),
+            "signing_authority_type": signer_types.get(signer_type, signer_type),
+            "static_authorized_principals": getattr(
+                policy, "static_authorized_principals", None
+            )
+            or [],
+            "admins": [],
+            "arrays": [],
+        }
+
+    for member in blade.get_ssh_certificate_authority_policies_members().items:
+        policy_name = getattr(getattr(member, "policy", None), "name", None)
+        if policy_name in policies_info:
+            ref = getattr(member, "member", None)
+            key = (
+                "arrays"
+                if getattr(ref, "resource_type", None) == "arrays"
+                else "admins"
+            )
+            policies_info[policy_name][key].append(getattr(ref, "name", None))
+
+    return policies_info
+
+
 def generate_s3_export_policies_dict(blade):
     policies_info = {}
 
@@ -1626,6 +1807,23 @@ def generate_object_store_virtual_hosts_dict(blade):
 
 def generate_realms_dict(blade):
     realms_info = {}
+    api_version = get_rest_api_version(blade)
+
+    # Default object store server per realm (REST 2.20+). A realm without a
+    # default has an empty object_store list or no defaults entry at all.
+    default_servers = {}
+    if LooseVersion(REALM_DEFAULTS_API_VERSION) <= LooseVersion(api_version):
+        res = blade.get_realms_defaults()
+        if res.status_code == 200:
+            for defaults in res.items:
+                realm_name = getattr(getattr(defaults, "realm", None), "name", None)
+                object_store = getattr(defaults, "object_store", None) or []
+                server = None
+                if object_store:
+                    server = getattr(
+                        getattr(object_store[0], "server", None), "name", None
+                    )
+                default_servers[realm_name] = server
 
     for realm in blade.get_realms().items:
         space = getattr(realm, "space", None)
@@ -1641,6 +1839,7 @@ def generate_realms_dict(blade):
             "default_inbound_tls_policy": getattr(
                 getattr(realm, "default_inbound_tls_policy", None), "name", None
             ),
+            "default_object_server": default_servers.get(realm.name),
             "space": {
                 "data_reduction": getattr(space, "data_reduction", None),
                 "snapshots": getattr(space, "snapshots", None),
@@ -2099,6 +2298,8 @@ def main():
             info["fleet"] = generate_fleet_dict(blade)
         if LooseVersion(TLS_API_VERSION) <= LooseVersion(api_version):
             info["tls_policies"] = generate_tls_policies_dict(blade)
+        if LooseVersion(SSH_CA_API_VERSION) <= LooseVersion(api_version):
+            info["ssh_ca_policies"] = generate_ssh_ca_policies_dict(blade)
         if LooseVersion(S3_EXPORT_API_VERSION) <= LooseVersion(api_version):
             info["s3_export_policies"] = generate_s3_export_policies_dict(blade)
     if ("realms" in subset or "all" in subset) and LooseVersion(

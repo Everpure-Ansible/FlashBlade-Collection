@@ -8,10 +8,12 @@ from __future__ import absolute_import, division, print_function
 __metaclass__ = type
 
 import contextlib
+import datetime
 import sys
 import multiprocessing
 import ctypes
 from unittest.mock import Mock, patch, MagicMock
+from zoneinfo import ZoneInfo
 
 # Mock multiprocessing context for Windows
 if sys.platform == "win32":
@@ -282,31 +284,52 @@ class TestHelpers:
 
     def test_to_epoch_seconds_utc(self):
         module = _module(_base_params(start_time="2026-01-01 00:00:00"))
-        assert _to_epoch_seconds(module, "start_time", "UTC") == JAN_1_2026
+        assert (
+            _to_epoch_seconds(module, "start_time", datetime.timezone.utc) == JAN_1_2026
+        )
 
     def test_to_epoch_seconds_applies_timezone(self):
         module = _module(_base_params(start_time="2026-01-01 00:00:00"))
         # Midnight in Los Angeles is 08:00 UTC in winter
         assert (
-            _to_epoch_seconds(module, "start_time", "America/Los_Angeles")
+            _to_epoch_seconds(module, "start_time", ZoneInfo("America/Los_Angeles"))
             == JAN_1_2026 + 8 * 3600
+        )
+
+    def test_to_epoch_seconds_applies_summer_time(self):
+        module = _module(_base_params(end_time="2026-07-01 12:00:00"))
+        # Noon BST is 11:00 UTC; 2026-07-01 11:00:00 UTC in epoch seconds
+        assert (
+            _to_epoch_seconds(module, "end_time", ZoneInfo("Europe/London"))
+            == 1782903600
         )
 
     def test_to_epoch_seconds_rejects_bad_format(self):
         module = _module(_base_params(end_time="01/01/2026 10:00"))
         with contextlib.suppress(SystemExit):
-            _to_epoch_seconds(module, "end_time", "UTC")
+            _to_epoch_seconds(module, "end_time", datetime.timezone.utc)
         module.fail_json.assert_called_once()
         assert "not a valid date/time" in module.fail_json.call_args[1]["msg"]
 
     def test_resolve_timezone_uses_parameter(self):
         module = _module(_base_params(timezone="Europe/London"))
-        assert _resolve_timezone(module) == "Europe/London"
+        tzinfo = _resolve_timezone(module)
+        assert isinstance(tzinfo, ZoneInfo)
+        assert tzinfo.key == "Europe/London"
+        module.fail_json.assert_not_called()
+
+    def test_resolve_timezone_utc_needs_no_zone_data(self):
+        module = _module(_base_params(timezone="UTC"))
+        with patch(MOD + ".ZoneInfo") as mock_zoneinfo:
+            assert _resolve_timezone(module) is datetime.timezone.utc
+        mock_zoneinfo.assert_not_called()
 
     @patch(MOD + ".get_local_tz", return_value="Asia/Tokyo")
     def test_resolve_timezone_defaults_to_local(self, mock_local_tz):
         module = _module(_base_params())
-        assert _resolve_timezone(module) == "Asia/Tokyo"
+        tzinfo = _resolve_timezone(module)
+        assert isinstance(tzinfo, ZoneInfo)
+        assert tzinfo.key == "Asia/Tokyo"
         mock_local_tz.assert_called_once_with(module)
 
     def test_resolve_timezone_rejects_unknown(self):
@@ -316,13 +339,13 @@ class TestHelpers:
         module.fail_json.assert_called_once()
         assert "Mars/Olympus" in module.fail_json.call_args[1]["msg"]
 
-    @patch(MOD + ".HAS_PYTZ", False)
-    def test_resolve_timezone_requires_pytz(self):
-        module = _module(_base_params(timezone="UTC"))
+    def test_resolve_timezone_rejects_path_like_name(self):
+        """zoneinfo raises ValueError, not a lookup error, for a path-like key."""
+        module = _module(_base_params(timezone="/etc/localtime"))
         with contextlib.suppress(SystemExit):
             _resolve_timezone(module)
         module.fail_json.assert_called_once()
-        assert "pytz" in module.fail_json.call_args[1]["msg"]
+        assert "/etc/localtime" in module.fail_json.call_args[1]["msg"]
 
     @patch(MOD + ".time.time", return_value=1800000000.7)
     def test_analysis_window_defaults_to_last_hour(self, mock_time):

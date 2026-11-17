@@ -229,14 +229,9 @@ tools:
       type: int
 """
 
-HAS_PYTZ = True
-try:
-    import pytz
-except ImportError:
-    HAS_PYTZ = False
-
 import datetime
 import time
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ansible.module_utils.basic import AnsibleModule
 from ansible_collections.everpure.flashblade.plugins.module_utils.purefb import (
@@ -262,16 +257,23 @@ IN_PROGRESS_ERROR = "already running"
 
 
 def _resolve_timezone(module):
-    """Return the IANA timezone name the window times are interpreted in."""
-    if not HAS_PYTZ:
-        module.fail_json(msg="pytz is required to interpret start_time and end_time")
+    """Return the tzinfo the window times are interpreted in.
+
+    The zone is I(timezone) or, when unset, the local zone of the host
+    running the module. UTC is served by the standard library directly so
+    the default works on hosts without system time zone data.
+    """
     tz_name = module.params["timezone"] or get_local_tz(module)
-    if tz_name not in pytz.all_timezones_set:
+    if tz_name == "UTC":
+        return datetime.timezone.utc
+    try:
+        return ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError):
         module.fail_json(msg="Timezone {0} is not valid".format(tz_name))
-    return tz_name
+        return None
 
 
-def _to_epoch_seconds(module, name, tz_name):
+def _to_epoch_seconds(module, name, tzinfo):
     """Convert the YYYY-MM-DD hh:mm:ss value of parameter ``name`` to epoch seconds."""
     value = module.params[name]
     try:
@@ -284,7 +286,7 @@ def _to_epoch_seconds(module, name, tz_name):
             ).format(name, value)
         )
         return None
-    return int(pytz.timezone(tz_name).localize(naive).timestamp())
+    return int(naive.replace(tzinfo=tzinfo).timestamp())
 
 
 def _analysis_window(module):
@@ -295,15 +297,15 @@ def _analysis_window(module):
     epoch. A missing end defaults to now and a missing start to one hour
     before the end, mirroring the array's own default window.
     """
-    tz_name = None
+    tzinfo = None
     if module.params["start_time"] or module.params["end_time"]:
-        tz_name = _resolve_timezone(module)
+        tzinfo = _resolve_timezone(module)
     if module.params["end_time"]:
-        end = _to_epoch_seconds(module, "end_time", tz_name)
+        end = _to_epoch_seconds(module, "end_time", tzinfo)
     else:
         end = int(time.time())
     if module.params["start_time"]:
-        start = _to_epoch_seconds(module, "start_time", tz_name)
+        start = _to_epoch_seconds(module, "start_time", tzinfo)
     else:
         start = end - DEFAULT_WINDOW_SECONDS
     if start >= end:

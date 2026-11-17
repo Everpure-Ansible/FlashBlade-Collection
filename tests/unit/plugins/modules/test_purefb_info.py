@@ -95,6 +95,9 @@ from plugins.modules.purefb_info import (
     generate_realms_dict,
     generate_resource_accesses_dict,
     generate_file_repl_dict,
+    generate_telemetry_targets_dict,
+    generate_telemetry_policies_dict,
+    generate_telemetry_collections_dict,
 )
 
 
@@ -1645,3 +1648,248 @@ class TestPurefbInfo:
         call_args = mock_module.exit_json.call_args[1]
         assert call_args["purefb_info"]["fleet"] == {"fleet1": {"members": {}}}
         assert "policies" not in call_args["purefb_info"]
+
+    # ---------------- telemetry subset ----------------
+
+    def test_generate_telemetry_targets_dict(self):
+        """Telemetry targets report their transport settings, references by
+        name (null for the empty references the array returns) and the masked
+        token as returned."""
+        source = Mock(spec=["name"])
+        source.name = "datavip"
+        empty_ref = Mock(spec=["name"])
+        empty_ref.name = None
+        attribute = Mock(spec=["key", "value"])
+        attribute.key = "env"
+        attribute.value = "prod"
+        target = Mock(
+            spec=[
+                "name",
+                "enabled",
+                "endpoint",
+                "transport",
+                "vendor",
+                "source",
+                "ca_certificate",
+                "ca_certificate_group",
+                "client_certificate",
+                "resource_attributes",
+                "api_token",
+            ]
+        )
+        target.name = "prometheus"
+        target.enabled = True
+        target.endpoint = "10.0.0.1:9090/api/v1/otlp/v1/metrics"
+        target.transport = "otlp-http-protobuf-without-tls"
+        target.vendor = "generic-otlp"
+        target.source = source
+        target.ca_certificate = empty_ref
+        target.ca_certificate_group = empty_ref
+        target.client_certificate = empty_ref
+        target.resource_attributes = [attribute]
+        target.api_token = "***"
+        tokenless = Mock(spec=["name", "enabled", "endpoint", "transport", "vendor"])
+        tokenless.name = "bare"
+        tokenless.enabled = False
+        tokenless.endpoint = "collector:4318"
+        tokenless.transport = "otlp-grpc"
+        tokenless.vendor = "datadog"
+
+        mock_blade = Mock()
+        mock_blade.get_telemetry_targets.return_value.items = [target, tokenless]
+
+        result = generate_telemetry_targets_dict(mock_blade)
+
+        assert result["prometheus"]["source"] == "datavip"
+        assert result["prometheus"]["ca_certificate"] is None
+        assert result["prometheus"]["resource_attributes"] == [
+            {"key": "env", "value": "prod"}
+        ]
+        assert result["prometheus"]["api_token"] == "***"
+        assert result["bare"]["enabled"] is False
+        assert result["bare"]["source"] is None
+        assert result["bare"]["resource_attributes"] == []
+        assert result["bare"]["api_token"] is None
+
+    def test_generate_telemetry_policies_dict(self):
+        """Telemetry policies embed their rules and targets; member arrays
+        come from the /arrays membership endpoint."""
+        collection = Mock(spec=["name"])
+        collection.name = "_device_perf_metrics"
+        rule = Mock(spec=["name", "collection", "resolution", "index"])
+        rule.name = "pol1.1"
+        rule.collection = collection
+        rule.resolution = 30000
+        rule.index = 1
+        target = Mock(spec=["name"])
+        target.name = "prometheus"
+        location = Mock(spec=["name"])
+        location.name = "fb1"
+        policy = Mock(
+            spec=[
+                "name",
+                "enabled",
+                "is_local",
+                "location",
+                "realms",
+                "version",
+                "rules",
+                "targets",
+            ]
+        )
+        policy.name = "pol1"
+        policy.enabled = True
+        policy.is_local = True
+        policy.location = location
+        policy.realms = []
+        policy.version = "v1"
+        policy.rules = [rule]
+        policy.targets = [target]
+        array_ref = Mock(spec=["name"])
+        array_ref.name = "fb1"
+        policy_ref = Mock(spec=["name"])
+        policy_ref.name = "pol1"
+        member = Mock(spec=["member", "policy"])
+        member.member = array_ref
+        member.policy = policy_ref
+        stray_ref = Mock(spec=["name"])
+        stray_ref.name = "unknown"
+        stray = Mock(spec=["member", "policy"])
+        stray.member = array_ref
+        stray.policy = stray_ref
+
+        mock_blade = Mock()
+        mock_blade.get_telemetry_metrics_policies.return_value.items = [policy]
+        mock_blade.get_telemetry_metrics_policies_arrays.return_value.items = [
+            member,
+            stray,
+        ]
+
+        result = generate_telemetry_policies_dict(mock_blade)
+
+        assert result == {
+            "pol1": {
+                "enabled": True,
+                "is_local": True,
+                "location": "fb1",
+                "realms": [],
+                "version": "v1",
+                "targets": ["prometheus"],
+                "rules": [
+                    {
+                        "name": "pol1.1",
+                        "collection": "_device_perf_metrics",
+                        "resolution": 30000,
+                        "index": 1,
+                    }
+                ],
+                "arrays": ["fb1"],
+            }
+        }
+
+    def test_generate_telemetry_collections_dict(self):
+        """Collections report their resolutions as returned and the metrics
+        grouped under them."""
+        collection = Mock(spec=["name", "default_resolution", "supported_resolutions"])
+        collection.name = "_device_perf_metrics"
+        collection.default_resolution = 30000
+        collection.supported_resolutions = [30000, 300000]
+        group = Mock(spec=["name"])
+        group.name = "_device_perf_metrics"
+        metric = Mock(spec=["name"])
+        metric.name = "storage.device.iops"
+        membership = Mock(spec=["group", "member"])
+        membership.group = group
+        membership.member = metric
+
+        mock_blade = Mock()
+        mock_blade.get_telemetry_metrics_collections.return_value.items = [collection]
+        mock_blade.get_telemetry_metrics_collections_metrics.return_value.items = [
+            membership
+        ]
+
+        result = generate_telemetry_collections_dict(mock_blade)
+
+        assert result == {
+            "_device_perf_metrics": {
+                "default_resolution": 30000,
+                "supported_resolutions": [30000, 300000],
+                "metrics": ["storage.device.iops"],
+            }
+        }
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_telemetry_collections_dict")
+    @patch("plugins.modules.purefb_info.generate_telemetry_policies_dict")
+    @patch("plugins.modules.purefb_info.generate_telemetry_targets_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_telemetry_subset(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_targets,
+        mock_generate_policies,
+        mock_generate_collections,
+        mock_loose_version,
+    ):
+        """gather_subset=telemetry returns the three telemetry keys when the
+        array supports REST 2.29."""
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["telemetry"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        mock_blade = Mock()
+        mock_version = Mock()
+        mock_version.version = "2.30"
+        mock_blade.get_versions.return_value.items = [mock_version]
+        mock_get_system.return_value = mock_blade
+        # version gates ON
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+
+        mock_generate_targets.return_value = {"prometheus": {}}
+        mock_generate_policies.return_value = {"pol1": {}}
+        mock_generate_collections.return_value = {"_device_perf_metrics": {}}
+
+        main()
+
+        mock_generate_targets.assert_called_once_with(mock_blade)
+        mock_generate_policies.assert_called_once_with(mock_blade)
+        mock_generate_collections.assert_called_once_with(mock_blade)
+        info = mock_module.exit_json.call_args[1]["purefb_info"]
+        assert info["telemetry_targets"] == {"prometheus": {}}
+        assert info["telemetry_policies"] == {"pol1": {}}
+        assert info["telemetry_collections"] == {"_device_perf_metrics": {}}
+        assert "default" not in info
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_telemetry_targets_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_telemetry_subset_below_required_version(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_targets,
+        mock_loose_version,
+    ):
+        """Below REST 2.29 the telemetry keys are simply absent."""
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["telemetry"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        mock_blade = Mock()
+        mock_version = Mock()
+        mock_version.version = "2.21"
+        mock_blade.get_versions.return_value.items = [mock_version]
+        mock_get_system.return_value = mock_blade
+        # version gates OFF
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+
+        main()
+
+        mock_generate_targets.assert_not_called()
+        info = mock_module.exit_json.call_args[1]["purefb_info"]
+        assert "telemetry_targets" not in info

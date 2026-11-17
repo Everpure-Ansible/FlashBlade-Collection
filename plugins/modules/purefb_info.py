@@ -35,7 +35,11 @@ options:
         Possible values for this include all, minimum, config, performance,
         capacity, network, subnets, lags, filesystems, snapshots, buckets,
         replication, policies, arrays, accounts, admins, ad, kerberos,
-        drives, servers, fleet and realms.
+        drives, servers, fleet, realms and telemetry.
+      - The C(telemetry) subset (REST 2.29+) reports telemetry targets,
+        telemetry metrics policies with their rules, targets and member
+        arrays, and the metrics collections with their default and
+        supported resolutions.
       - The C(filesystems) subset surfaces the legacy file system keys
         C(nfs_rules), C(export_policy), C(smb_client_policy) and
         C(smb_share_policy). Purity//FB marks the underlying fields as
@@ -128,6 +132,7 @@ FLEET_API_VERSION = "2.17"
 TLS_API_VERSION = "2.17"
 REALMS_API_VERSION = "2.19"
 S3_EXPORT_API_VERSION = "2.20"
+TELEMETRY_API_VERSION = "2.29"
 
 
 def _bytes_to_human(bytes_number):
@@ -1722,6 +1727,103 @@ def generate_fleet_dict(blade):
     return fleet_info
 
 
+def generate_telemetry_targets_dict(blade):
+    targets_info = {}
+
+    for target in blade.get_telemetry_targets().items:
+        targets_info[target.name] = {
+            "enabled": getattr(target, "enabled", None),
+            "endpoint": getattr(target, "endpoint", None),
+            "transport": getattr(target, "transport", None),
+            "vendor": getattr(target, "vendor", None),
+            "source": getattr(getattr(target, "source", None), "name", None),
+            "ca_certificate": getattr(
+                getattr(target, "ca_certificate", None), "name", None
+            ),
+            "ca_certificate_group": getattr(
+                getattr(target, "ca_certificate_group", None), "name", None
+            ),
+            "client_certificate": getattr(
+                getattr(target, "client_certificate", None), "name", None
+            ),
+            "resource_attributes": [
+                {
+                    "key": getattr(attribute, "key", None),
+                    "value": getattr(attribute, "value", None),
+                }
+                for attribute in getattr(target, "resource_attributes", None) or []
+            ],
+            # the array returns "***" when a token is set and omits the field
+            # otherwise; the token itself is never readable
+            "api_token": getattr(target, "api_token", None),
+        }
+
+    return targets_info
+
+
+def generate_telemetry_policies_dict(blade):
+    policies_info = {}
+
+    for policy in blade.get_telemetry_metrics_policies().items:
+        policies_info[policy.name] = {
+            "enabled": getattr(policy, "enabled", None),
+            "is_local": getattr(policy, "is_local", None),
+            "location": getattr(getattr(policy, "location", None), "name", None),
+            "realms": [
+                getattr(realm, "name", None)
+                for realm in getattr(policy, "realms", None) or []
+            ],
+            "version": getattr(policy, "version", None),
+            "targets": [
+                getattr(target, "name", None)
+                for target in getattr(policy, "targets", None) or []
+            ],
+            "rules": [
+                {
+                    "name": getattr(rule, "name", None),
+                    "collection": getattr(
+                        getattr(rule, "collection", None), "name", None
+                    ),
+                    "resolution": getattr(rule, "resolution", None),
+                    "index": getattr(rule, "index", None),
+                }
+                for rule in getattr(policy, "rules", None) or []
+            ],
+            "arrays": [],
+        }
+
+    for member in blade.get_telemetry_metrics_policies_arrays().items:
+        policy_name = getattr(getattr(member, "policy", None), "name", None)
+        if policy_name in policies_info:
+            policies_info[policy_name]["arrays"].append(
+                getattr(getattr(member, "member", None), "name", None)
+            )
+
+    return policies_info
+
+
+def generate_telemetry_collections_dict(blade):
+    collections_info = {}
+
+    for collection in blade.get_telemetry_metrics_collections().items:
+        collections_info[collection.name] = {
+            "default_resolution": getattr(collection, "default_resolution", None),
+            "supported_resolutions": list(
+                getattr(collection, "supported_resolutions", None) or []
+            ),
+            "metrics": [],
+        }
+
+    for membership in blade.get_telemetry_metrics_collections_metrics().items:
+        group = getattr(getattr(membership, "group", None), "name", None)
+        if group in collections_info:
+            collections_info[group]["metrics"].append(
+                getattr(getattr(membership, "member", None), "name", None)
+            )
+
+    return collections_info
+
+
 def main():
     argument_spec = purefb_argument_spec()
     argument_spec.update(
@@ -1759,6 +1861,7 @@ def main():
         "servers",
         "fleet",
         "realms",
+        "telemetry",
     )
     subset_test = (test in valid_subsets for test in subset)
     if not all(subset_test):
@@ -1866,6 +1969,12 @@ def main():
         SERVERS_API_VERSION
     ) <= LooseVersion(api_version):
         info["servers"] = generate_servers_dict(blade)
+    if ("telemetry" in subset or "all" in subset) and LooseVersion(
+        TELEMETRY_API_VERSION
+    ) <= LooseVersion(api_version):
+        info["telemetry_targets"] = generate_telemetry_targets_dict(blade)
+        info["telemetry_policies"] = generate_telemetry_policies_dict(blade)
+        info["telemetry_collections"] = generate_telemetry_collections_dict(blade)
     module.exit_json(changed=False, purefb_info=info)
 
 

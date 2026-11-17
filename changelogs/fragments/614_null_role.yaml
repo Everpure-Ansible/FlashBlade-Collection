@@ -1,3 +1,8 @@
 bugfixes:
-  - purefb_user - a requested ``role`` no longer fails on a user that holds several or custom management access policies. The role is satisfied when it is one of the user's policies (a warning names the others); otherwise the module fails and points at ``purefb_mgmt_role``.
-  - purefb_info - the ``admins`` and ``config`` subsets no longer crash on an admin or directory-service role mapping whose legacy role is null, and both report ``management_access_policies`` from REST 2.19.
+  - purefb_user - a requested ``role`` no longer fails on a user that holds
+    several or custom management access policies. The role is satisfied when
+    it is one of the user's policies (a warning names the others); otherwise
+    the module fails and points at ``purefb_mgmt_role``.
+  - purefb_info - the ``admins`` and ``config`` subsets no longer crash on an
+    admin or directory-service role mapping whose legacy role is null, and
+    both report ``management_access_policies`` from REST 2.19.

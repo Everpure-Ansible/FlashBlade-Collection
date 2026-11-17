@@ -462,6 +462,65 @@ class TestPurefbQuotaPolicyMain:
         # rule writes always send ignore_usage, so no hint is appended
         assert "ignore_usage=true" not in msg
 
+    def test_main_create_attach_refusal_reports_policy_created(self):
+        module = _module(_base_params(file_systems=["fs1"]))
+        blade = _blade()
+        blade.post_user_group_quota_policies_file_systems.return_value = _response(400)
+        with patch(MODULE + ".get_error_message", return_value="refused"):
+            _run(module, blade)
+        blade.post_user_group_quota_policies.assert_called_once()
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Failed to attach quota policy qp1 to file system fs1" in msg
+        assert msg.endswith(
+            "refused The policy was created; fix the attachment and re-run."
+        )
+
+    def test_main_create_attach_refusal_keeps_hint_before_created_note(self):
+        module = _module(_base_params(file_systems=["fs1"]))
+        blade = _blade()
+        blade.post_user_group_quota_policies_file_systems.return_value = _response(400)
+        message = "Filesystem already has quotas configured from purequota"
+        with patch(MODULE + ".get_error_message", return_value=message):
+            _run(module, blade)
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "delete_existing_quotas=true" in msg
+        assert msg.index("delete_existing_quotas=true") < msg.index(
+            "The policy was created"
+        )
+
+    def test_main_create_claimed_file_system_reports_policy_created(self):
+        module = _module(_base_params(file_systems=["fs1"]))
+        blade = _blade(attached="other")
+        _run(module, blade)
+        blade.post_user_group_quota_policies.assert_called_once()
+        blade.post_user_group_quota_policies_file_systems.assert_not_called()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "already attached to quota policy other" in msg
+        assert "The policy was created" in msg
+
+    def test_main_create_rule_refusal_reports_policy_created(self):
+        module = _module(_base_params(rules=[_rule_param("user", "1G", id=1)]))
+        blade = _blade()
+        blade.post_user_group_quota_policies_rules.return_value = _response(400)
+        with patch(MODULE + ".get_error_message", return_value="refused"):
+            _run(module, blade)
+        blade.post_user_group_quota_policies.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Failed to add user id 1 rule to quota policy qp1" in msg
+        assert msg.endswith("refused The policy was created; fix rules and re-run.")
+
+    def test_main_update_attach_refusal_has_no_created_note(self):
+        module = _module(_base_params(file_systems=["fs1"]))
+        blade = _blade(policy=_array_policy())
+        blade.post_user_group_quota_policies_file_systems.return_value = _response(400)
+        with patch(MODULE + ".get_error_message", return_value="refused"):
+            _run(module, blade)
+        blade.post_user_group_quota_policies.assert_not_called()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "The policy was created" not in msg
+        assert msg.endswith("refused")
+
     def test_main_idempotent_rerun_makes_no_writes(self):
         module = _module(
             _base_params(

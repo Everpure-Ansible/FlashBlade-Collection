@@ -544,8 +544,11 @@ def _desired_from_current(current):
     }
 
 
-def _post_rule(module, blade, desired, fail=True):
-    """Add a rule; fail the module on error unless fail is False."""
+def _post_rule(module, blade, desired, fail=True, note=""):
+    """Add a rule; fail the module on error unless fail is False.
+
+    note is appended to the failure message, see create_policy.
+    """
     kwargs = dict(
         quota_type=desired["type"],
         quota_limit=desired["quota_limit"],
@@ -565,8 +568,11 @@ def _post_rule(module, blade, desired, fail=True):
     )
     if res.status_code != 200 and fail:
         module.fail_json(
-            msg="Failed to add {0} rule to quota policy {1}. Error: {2}".format(
-                _rule_label(desired), module.params["name"], get_error_message(res)
+            msg="Failed to add {0} rule to quota policy {1}. Error: {2}{3}".format(
+                _rule_label(desired),
+                module.params["name"],
+                get_error_message(res),
+                note,
             )
         )
     return res
@@ -662,7 +668,8 @@ def reconcile_rules(module, blade, desired_rules):
     return True
 
 
-def _attach(module, blade, file_system):
+def _attach(module, blade, file_system, note=""):
+    """Attach the policy to one file system; note is appended on refusal."""
     kwargs = _usage_kwargs(module)
     if module.params["delete_existing_quotas"]:
         kwargs["delete_existing_user_group_quota_settings"] = True
@@ -684,9 +691,10 @@ def _attach(module, blade, file_system):
                 "configured on the file system."
             )
         module.fail_json(
-            msg="Failed to attach quota policy {0} to file system {1}. Error: {2}{3}".format(
-                module.params["name"], file_system, error, hint
-            )
+            msg=(
+                "Failed to attach quota policy {0} to file system {1}. "
+                "Error: {2}{3}{4}"
+            ).format(module.params["name"], file_system, error, hint, note)
         )
 
 
@@ -704,8 +712,11 @@ def _detach(module, blade, file_system):
         )
 
 
-def reconcile_members(module, blade, current=None):
-    """Attach and detach file systems to match the option; True when changed."""
+def reconcile_members(module, blade, current=None, note=""):
+    """Attach and detach file systems to match the option; True when changed.
+
+    note is appended to every attach refusal, see create_policy.
+    """
     desired = module.params["file_systems"]
     if desired is None:
         return False
@@ -722,15 +733,15 @@ def reconcile_members(module, blade, current=None):
             module.fail_json(
                 msg=(
                     "File system {0} is already attached to quota policy {1}; "
-                    "a file system can have only one quota policy"
-                ).format(file_system, other)
+                    "a file system can have only one quota policy.{2}"
+                ).format(file_system, other, note)
             )
     if module.check_mode:
         return True
     for file_system in to_detach:
         _detach(module, blade, file_system)
     for file_system in to_attach:
-        _attach(module, blade, file_system)
+        _attach(module, blade, file_system, note)
     return True
 
 
@@ -775,9 +786,20 @@ def create_policy(module, blade, desired_rules):
                 name, get_error_message(res)
             )
         )
+    # the policy now exists, so a refused rule or attachment must say so;
+    # the next run takes the update path and only adds what is missing
     for desired in desired_rules or []:
-        _post_rule(module, blade, desired)
-    reconcile_members(module, blade)
+        _post_rule(
+            module,
+            blade,
+            desired,
+            note=" The policy was created; fix rules and re-run.",
+        )
+    reconcile_members(
+        module,
+        blade,
+        note=" The policy was created; fix the attachment and re-run.",
+    )
     module.exit_json(changed=True, policy=_policy_facts(module, blade))
 
 

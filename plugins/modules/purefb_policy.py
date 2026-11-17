@@ -279,11 +279,11 @@ options:
   rename:
     description:
     - New name for policy
-    - Applies to snapshot, NFS, SMB and network access policies.
+    - Applies to NFS, SMB and network access policies.
     - WORM data policies cannot be renamed.
-    - Purity//FB up to at least 4.6.4 (REST 2.21) ignores a new name for
-      snapshot policies; the module fails instead of reporting a rename
-      the array did not perform.
+    - Snapshot policies cannot be renamed on any Purity//FB release (4.6.4 ignores
+      the new name, 4.8.8 rejects the request); the module fails rather than
+      report a rename the array did not perform.
     type: str
     version_added: "1.10.0"
   destroy_snapshots:
@@ -3900,26 +3900,33 @@ def rename_snap_policy(module, blade):
             **_context_kwargs(module, versions),
         )
         if res.status_code != 200:
+            # Purity//FB 4.8.8 (REST 2.30) rejects the request outright
+            # ("Missing or invalid parameter"); older releases accept it and
+            # keep the old name (handled below). Either way the array has no
+            # rename for snapshot policies, so say so rather than echo the raw
+            # error.
             module.fail_json(
-                msg="Failed to rename snapshot policy {0} to {1}. Error: {2}".format(
+                msg="Failed to rename snapshot policy {0} to {1}: Purity//FB does "
+                "not support renaming snapshot policies (REST {2}; the array "
+                "answered: {3}).".format(
                     module.params["name"],
                     module.params["rename"],
+                    versions,
                     get_error_message(res),
                 )
             )
-        # Purity//FB (verified on 4.6.4, REST 2.21) answers 200 to a body of
-        # {"name": ...} on PATCH /policies but silently keeps the old name,
-        # whether addressed by names or ids: snapshot policies have no rename
-        # on the array. Check the result rather than report a rename that
-        # never happened.
+        # Purity//FB 4.6.4 (REST 2.21) answers 200 to a body of {"name": ...}
+        # on PATCH /policies but silently keeps the old name, whether
+        # addressed by names or ids. Check the result rather than report a
+        # rename that never happened.
         res = blade.get_policies(
             names=[module.params["rename"]], **_context_kwargs(module, versions)
         )
         if res.status_code != 200:
             module.fail_json(
                 msg="Failed to rename snapshot policy {0} to {1}: the array "
-                "accepted the request but kept the old name. Purity//FB REST "
-                "{2} does not support renaming snapshot policies.".format(
+                "accepted the request but kept the old name. Purity//FB does "
+                "not support renaming snapshot policies (REST {2}).".format(
                     module.params["name"], module.params["rename"], versions
                 )
             )

@@ -1,0 +1,4 @@
+minor_changes:
+  - purefb_snap - add ``detach_policies`` and ``detach_all_policies`` to detach a policy snapshot from
+    its snapshot policies, so it becomes a manual snapshot that retention no longer destroys.
+    Detaching is one-way and a rerun reports no change.

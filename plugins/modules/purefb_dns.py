@@ -59,6 +59,18 @@ options:
     type: str
     choices: [ management, data ]
     default: data
+  context:
+    description:
+    - Name of fleet member on which to perform the operation.
+    - This requires the array receiving the request is a member of a fleet
+      and the context name to be a member of the same fleet.
+    - Requires REST API 2.25 (Purity//FB 4.8.0) or higher.
+    - When set, I(source) is not checked against the array receiving the
+      request, because network interface names belong to the fleet member,
+      which rejects an unknown interface itself.
+    type: str
+    default: ""
+    version_added: '1.30.0'
 extends_documentation_fragment:
 - everpure.flashblade.everpure.fb
 """
@@ -70,6 +82,16 @@ EXAMPLES = r"""
     nameservers:
       - 8.8.8.8
       - 8.8.4.4
+    fb_url: 10.10.10.2
+    api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+
+- name: Set a data DNS configuration on another fleet member
+  everpure.flashblade.purefb_dns:
+    name: server1
+    domain: everpuredata.com
+    nameservers:
+      - 8.8.8.8
+    context: fleet-member-2
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
 
@@ -121,6 +143,24 @@ def _get_source(module, blade):
     return bool(res.status_code == 200)
 
 
+# REST version at which get_dns, post_dns, patch_dns and delete_dns accept
+# the context_names keyword (Purity//FB 4.8.0). get_network_interfaces never
+# takes it, so the source check is skipped when a context is set.
+CONTEXT_API_VERSION = "2.25"
+
+
+def _context_kwargs(module):
+    """Return the context_names kwargs for a fleet context, or {} when unset.
+
+    main() fails before any API call when a context is given below
+    CONTEXT_API_VERSION, so the keyword only reaches an SDK method that
+    accepts it.
+    """
+    if module.params["context"]:
+        return {"context_names": [module.params["context"]]}
+    return {}
+
+
 def delete_dns(module, blade):
     """Delete DNS settings"""
     changed = False
@@ -168,7 +208,8 @@ def create_dns(module, blade):
 def update_multi_dns(module, blade):
     """Update a DNS configuration"""
     changed = False
-    current_dns = list(blade.get_dns(names=[module.params["name"]]).items)[0]
+    ctx = _context_kwargs(module)
+    current_dns = list(blade.get_dns(names=[module.params["name"]], **ctx).items)[0]
     domain = current_dns.domain
     nameservers = current_dns.nameservers
     if module.params["domain"] and current_dns.domain != module.params["domain"]:
@@ -193,7 +234,7 @@ def update_multi_dns(module, blade):
         new_dns = {"domain": domain, "nameservers": nameservers}
         if module.params["source"] is not None:
             new_dns["sources"] = [Reference(name=module.params["source"])]
-        res = blade.patch_dns(names=[module.params["name"]], dns=Dns(**new_dns))
+        res = blade.patch_dns(names=[module.params["name"]], dns=Dns(**new_dns), **ctx)
         if res.status_code != 200:
             module.fail_json(
                 msg="Update to DNS configuration {0} failed. Error: {1}".format(
@@ -206,11 +247,12 @@ def update_multi_dns(module, blade):
 def delete_multi_dns(module, blade):
     """Delete a DNS configuration"""
     changed = True
+    ctx = _context_kwargs(module)
     if module.params["name"] == "management":
         module.fail_json(msg="Management DNS configuration cannot be deleted")
     else:
         if not module.check_mode:
-            res = blade.delete_dns(names=[module.params["name"]])
+            res = blade.delete_dns(names=[module.params["name"]], **ctx)
             if res.status_code != 200:
                 module.fail_json(
                     msg="Failed to delete DNS configuration {0}. Error: {1}".format(
@@ -223,6 +265,7 @@ def delete_multi_dns(module, blade):
 def create_multi_dns(module, blade):
     """Create a DNS configuration"""
     changed = True
+    ctx = _context_kwargs(module)
     if not module.check_mode:
         if module.params["service"] == "data":
             if module.params["source"]:
@@ -234,6 +277,7 @@ def create_multi_dns(module, blade):
                         nameservers=module.params["nameservers"],
                         sources=[Reference(name=module.params["source"].lower())],
                     ),
+                    **ctx,
                 )
             else:
                 res = blade.post_dns(
@@ -243,6 +287,7 @@ def create_multi_dns(module, blade):
                         domain=module.params["domain"],
                         nameservers=module.params["nameservers"],
                     ),
+                    **ctx,
                 )
         else:
             res = blade.post_dns(
@@ -252,6 +297,7 @@ def create_multi_dns(module, blade):
                     domain=module.params["domain"],
                     nameservers=module.params["nameservers"],
                 ),
+                **ctx,
             )
         if res.status_code != 200:
             module.fail_json(
@@ -269,6 +315,7 @@ def main():
     argument_spec.update(
         dict(
             state=dict(type="str", default="present", choices=["absent", "present"]),
+            context=dict(type="str", default=""),
             name=dict(type="str", default="management"),
             domain=dict(type="str"),
             source=dict(type="str"),
@@ -282,16 +329,37 @@ def main():
     state = module.params["state"]
     blade = get_system(module)
     api_version = get_rest_api_version(blade)
+    if module.params["context"] and LooseVersion(CONTEXT_API_VERSION) > LooseVersion(
+        api_version
+    ):
+        module.fail_json(
+            msg="context requires REST API {0} (Purity//FB 4.8.0) or higher.".format(
+                CONTEXT_API_VERSION
+            )
+        )
     if module.params["nameservers"]:
         module.params["nameservers"] = remove_duplicates(module.params["nameservers"])
 
     if LooseVersion(NON_MGMT_DNS) <= LooseVersion(api_version):
-        configs = list(blade.get_dns().items)
+        res = blade.get_dns(**_context_kwargs(module))
+        if res.status_code != 200:
+            module.fail_json(
+                msg="Failed to read DNS configurations. Error: {0}".format(
+                    get_error_message(res)
+                )
+            )
+        configs = list(res.items)
         exists = False
         for config in configs:
             if config.name == module.params["name"]:
                 exists = True
-        if module.params["source"] and not _get_source(module, blade):
+        # get_network_interfaces takes no context and interface names belong
+        # to the fleet member, so the source check only runs locally.
+        if (
+            module.params["source"]
+            and not module.params["context"]
+            and not _get_source(module, blade)
+        ):
             module.fail_json(
                 msg="Specified VIP {0} does not exist.".format(module.params["source"])
             )

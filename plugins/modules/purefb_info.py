@@ -68,8 +68,10 @@ options:
         the array as C(connections) on Purity//FB with REST API version
         2.18 or higher. The table changes with every call and can be large,
         so it is not included in C(all) and has to be requested explicitly.
-      - The C(telemetry) subset reports the telemetry metrics targets
-        (C(telemetry_targets)) and requires REST API 2.29 or later.
+      - The C(telemetry) subset (REST 2.29+) reports telemetry targets,
+        telemetry metrics policies with their rules, targets and member
+        arrays, and the metrics collections with their default and
+        supported resolutions.
       - The C(filesystems) subset surfaces the legacy file system keys
         C(nfs_rules), C(export_policy), C(smb_client_policy) and
         C(smb_share_policy). Purity//FB marks the underlying fields as
@@ -3482,6 +3484,69 @@ def generate_eviction_policies_dict(blade):
     return policies_info
 
 
+def generate_telemetry_policies_dict(blade):
+    policies_info = {}
+
+    for policy in blade.get_telemetry_metrics_policies().items:
+        policies_info[policy.name] = {
+            "enabled": getattr(policy, "enabled", None),
+            "is_local": getattr(policy, "is_local", None),
+            "location": getattr(getattr(policy, "location", None), "name", None),
+            "realms": [
+                getattr(realm, "name", None)
+                for realm in getattr(policy, "realms", None) or []
+            ],
+            "version": getattr(policy, "version", None),
+            "targets": [
+                getattr(target, "name", None)
+                for target in getattr(policy, "targets", None) or []
+            ],
+            "rules": [
+                {
+                    "name": getattr(rule, "name", None),
+                    "collection": getattr(
+                        getattr(rule, "collection", None), "name", None
+                    ),
+                    "resolution": getattr(rule, "resolution", None),
+                    "index": getattr(rule, "index", None),
+                }
+                for rule in getattr(policy, "rules", None) or []
+            ],
+            "arrays": [],
+        }
+
+    for member in blade.get_telemetry_metrics_policies_arrays().items:
+        policy_name = getattr(getattr(member, "policy", None), "name", None)
+        if policy_name in policies_info:
+            policies_info[policy_name]["arrays"].append(
+                getattr(getattr(member, "member", None), "name", None)
+            )
+
+    return policies_info
+
+
+def generate_telemetry_collections_dict(blade):
+    collections_info = {}
+
+    for collection in blade.get_telemetry_metrics_collections().items:
+        collections_info[collection.name] = {
+            "default_resolution": getattr(collection, "default_resolution", None),
+            "supported_resolutions": list(
+                getattr(collection, "supported_resolutions", None) or []
+            ),
+            "metrics": [],
+        }
+
+    for membership in blade.get_telemetry_metrics_collections_metrics().items:
+        group = getattr(getattr(membership, "group", None), "name", None)
+        if group in collections_info:
+            collections_info[group]["metrics"].append(
+                getattr(getattr(membership, "member", None), "name", None)
+            )
+
+    return collections_info
+
+
 def main():
     argument_spec = purefb_argument_spec()
     argument_spec.update(
@@ -3676,6 +3741,8 @@ def main():
         TELEMETRY_API_VERSION
     ) <= LooseVersion(api_version):
         info["telemetry_targets"] = generate_telemetry_targets_dict(blade)
+        info["telemetry_policies"] = generate_telemetry_policies_dict(blade)
+        info["telemetry_collections"] = generate_telemetry_collections_dict(blade)
     # `clients` samples the array for several seconds per protocol and lists
     # S3 clients per connection, so it is opt-in and not part of `all`.
     if "clients" in subset:

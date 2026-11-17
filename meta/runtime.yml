@@ -6,6 +6,7 @@ action_groups:
     - purefb_admin
     - purefb_alert
     - purefb_apiclient
+    - purefb_audits
     - purefb_banner
     - purefb_bladename
     - purefb_bucket
@@ -18,9 +19,11 @@ action_groups:
     - purefb_ds
     - purefb_dsrole
     - purefb_eula
+    - purefb_eviction_policy
     - purefb_export
     - purefb_fleet
     - purefb_fs
+    - purefb_fs_lock
     - purefb_fs_replica
     - purefb_groupquota
     - purefb_hardware
@@ -29,23 +32,28 @@ action_groups:
     - purefb_keytabs
     - purefb_kmip
     - purefb_lag
+    - purefb_legal_hold
     - purefb_lifecycle
     - purefb_local_ds
     - purefb_local_group
     - purefb_local_user
+    - purefb_maintenance
     - purefb_messages
     - purefb_mgmt_auth_policy
     - purefb_mgmt_policy
     - purefb_mgmt_role
     - purefb_network
     - purefb_ntp
+    - purefb_oidc
     - purefb_password_policy
     - purefb_phonehome
     - purefb_pingtrace
     - purefb_policy
     - purefb_proxy
+    - purefb_quota_settings
     - purefb_ra
     - purefb_realm
+    - purefb_realm_connection
     - purefb_remote_cred
     - purefb_resource_access
     - purefb_s3_export_policy
@@ -54,13 +62,19 @@ action_groups:
     - purefb_s3user
     - purefb_saml
     - purefb_server
+    - purefb_sessions
     - purefb_smtp
     - purefb_snap
     - purefb_snmp_agent
     - purefb_snmp_mgr
+    - purefb_software_patch
+    - purefb_ssh_ca_policy
     - purefb_subnet
+    - purefb_support_diagnostics
     - purefb_syslog
+    - purefb_syslog_settings
     - purefb_target
+    - purefb_tgroup
     - purefb_timeout
     - purefb_tls_policy
     - purefb_tz

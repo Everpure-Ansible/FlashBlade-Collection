@@ -27,8 +27,9 @@ description:
   (I(object=ds_attach)).
 - Policies and their rules are managed by
   M(everpure.flashblade.purefb_mgmt_policy).
-- API-client policy attachment is not covered here; it is managed via the
-  I(access_policies) field on M(everpure.flashblade.purefb_apiclient).
+- API-client policy attachment is not covered here. Policies are fixed when
+  the client is created via the I(access_policies) option of
+  M(everpure.flashblade.purefb_apiclient) and cannot be changed afterwards.
 author:
 - Pure Storage Ansible Team (@avk) <pure-ansible-team@everpuredata.com>
 options:

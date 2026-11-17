@@ -1,0 +1,3 @@
+bugfixes:
+  - purefb_mgmt_policy - a rule whose role changes at a scope that stays in the list is now modified in place and new rules are added before stale ones are removed, so a scope is never left without a rule during reconciliation.
+  - purefb_mgmt_policy - an empty ``rules`` list on an array older than REST 2.26 is now refused before any write (in check mode too) instead of sending a request the array rejects.

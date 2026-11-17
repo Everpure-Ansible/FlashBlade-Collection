@@ -87,6 +87,28 @@ options:
         name of the array network access policy and is misspelt. Use
         C(network_access_policy) instead; the misspelt key is kept for
         backwards compatibility and will be removed in 2.0.0.
+      - The C(admins) subset also returns the cached remote administrators
+        under C(admin_cache). The C(config) subset also returns
+        C(certificate_uses) and, on Purity//FB 3.2.3 / REST API 2.1 or
+        later, C(rapid_data_locking).
+      - The C(policies) subset also returns C(management_access_policies)
+        with their rules and members on Purity//FB 4.6.1 / REST API 2.19
+        or later, C(management_authentication_policies) on 4.6.5 / 2.22
+        or later and C(management_access_roles) on 4.8.1 / 2.26 or later.
+      - The C(fleet) subset adds the operating system, version, model,
+        API versions and topology group of each fleet member and also
+        returns C(presets) and C(workloads) on Purity//FB 4.6.7 / REST
+        API 2.23 or later (workload space and performance from 4.8.8 /
+        2.30), C(tgroups) on 4.8.1 / 2.26 or later and
+        C(storage_class_members) on 4.8.3 / 2.27 or later. The C(realms)
+        subset also returns C(realm_connections) and C(remote_realms) on
+        4.8.0 / 2.25 or later. All of these are read from the local array
+        only. C(fleet), its member detail, C(presets), C(workloads) and
+        C(tgroups) are empty on an array that is not in a fleet and when
+        the credentials used lack the fleet rights those endpoints require;
+        C(storage_class_members) lists the local array itself when it is
+        not in a fleet; C(realm_connections) and C(remote_realms) are
+        empty when no realm is connected.
     required: false
     type: list
     elements: str
@@ -241,7 +263,7 @@ LEGAL_HOLD_API_VERSION = "2.17"
 EDGE_API_VERSION = "2.18"
 OIDC_API_VERSION = "2.17"
 CLIENTS_S3_API_VERSION = "2.18"
-STORAGE_CLASS_API_VERSION = "2.17"
+FS_STORAGE_CLASS_API_VERSION = "2.17"
 REALMS_API_VERSION = "2.19"
 MAP_API_VERSION = "2.19"
 S3_EXPORT_API_VERSION = "2.20"
@@ -294,6 +316,13 @@ NEIGHBOR_CAPABILITIES = (
     "wlan_access_point",
     "docsis_cable_device",
 )
+MGMT_AUTH_API_VERSION = "2.22"
+WORKLOAD_API_VERSION = "2.23"
+REALM_CONNECTION_API_VERSION = "2.25"
+MAP_ROLES_API_VERSION = "2.26"
+TGROUP_API_VERSION = "2.26"
+STORAGE_CLASS_API_VERSION = "2.27"
+WORKLOAD_METRICS_API_VERSION = "2.30"
 
 
 def _bytes_to_human(bytes_number):
@@ -2550,7 +2579,7 @@ def generate_fs_dict(blade, exports=None, worm_policies=None):
             ),
             "multi_protocol_safeguard_acls": getattr(multi, "safeguard_acls", None),
         }
-        if LooseVersion(STORAGE_CLASS_API_VERSION) <= LooseVersion(api_version):
+        if LooseVersion(FS_STORAGE_CLASS_API_VERSION) <= LooseVersion(api_version):
             # The array returns storage_class as an object; platforms without
             # storage classes return it with no name, so the name is null there.
             fs_info[share]["storage_class"] = getattr(
@@ -2717,25 +2746,474 @@ def generate_legal_holds_dict(blade):
 
 
 def generate_fleet_dict(blade):
-    fleet_items = list(blade.get_fleets().items)
+    """Return the fleet the array belongs to, keyed by name, with its members
+
+    An array that is not in a fleet answers both reads with no items, and
+    credentials without fleet rights are refused; a refused read gives the
+    same empty structure instead of an error (an error response carries no
+    ``items`` at all).
+    """
+    fleet_info = {}
+    res = blade.get_fleets()
+    if res.status_code != 200:
+        return fleet_info
+    fleet_items = list(res.items)
     if not fleet_items:
-        return {}
+        return fleet_info
 
     fleet_name = fleet_items[0].name
-    members = blade.get_fleets_members().items
-
-    fleet_info = {
-        fleet_name: {
-            "members": {
-                member.member.name: {
-                    "status": member.status,
-                    "status_details": member.status_details,
-                }
-                for member in members
-            }
+    fleet_info[fleet_name] = {"members": {}}
+    res = blade.get_fleets_members()
+    if res.status_code != 200:
+        return fleet_info
+    for member in list(res.items):
+        fleet_info[fleet_name]["members"][member.member.name] = {
+            "status": member.status,
+            "status_details": member.status_details,
         }
-    }
     return fleet_info
+
+
+def _ref_dict(reference):
+    """Return the name and resource type of a reference"""
+    return {
+        "name": getattr(reference, "name", None),
+        "resource_type": getattr(reference, "resource_type", None),
+    }
+
+
+def _epoch_to_string(stamp):
+    """Format a millisecond UNIX timestamp the way the module does elsewhere"""
+    if not stamp:
+        return None
+    return datetime.fromtimestamp(stamp / 1000).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _to_plain(value):
+    """Recursively convert SDK objects into JSON-safe primitives"""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        return [_to_plain(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _to_plain(item) for key, item in value.items()}
+    if hasattr(value, "__dict__"):
+        return {
+            key: _to_plain(item)
+            for key, item in vars(value).items()
+            if not key.startswith("_")
+        }
+    return str(value)
+
+
+def _collate_by_name(items):
+    """Key a list of named SDK objects by their name"""
+    collated = {}
+    for item in items or []:
+        plain = _to_plain(item)
+        name = plain.get("name") if isinstance(plain, dict) else None
+        if name:
+            collated[name] = plain
+    return collated
+
+
+def generate_admin_cache_dict(blade):
+    """Return the cached remote administrators keyed by name
+
+    The cache is reported as it stands; ``refresh`` is never passed because
+    it makes the array look every entry up in the directory service again.
+    ``role`` is null unless the entry holds exactly one management access
+    policy named after a legacy role.
+    """
+    cache_info = {}
+    res = blade.get_admins_cache()
+    if res.status_code != 200:
+        return cache_info
+    for entry in list(res.items):
+        cache_info[entry.name] = {
+            "authorization_model": getattr(entry, "authorization_model", None),
+            "management_access_policies": [
+                _ref_name(policy)
+                for policy in (getattr(entry, "management_access_policies", None) or [])
+            ],
+            "role": _ref_name(getattr(entry, "role", None)),
+            "time": _epoch_to_string(getattr(entry, "time", None)),
+        }
+    return cache_info
+
+
+def generate_management_access_policies_dict(blade):
+    """Return the management access policies with their rules and members
+
+    Rules are reported in evaluation order. Members are the administrators
+    and directory service role mappings the policy applies to.
+    """
+    policies_info = {}
+    res = blade.get_management_access_policies()
+    if res.status_code != 200:
+        return policies_info
+    for policy in list(res.items):
+        policies_info[policy.name] = {
+            "enabled": getattr(policy, "enabled", None),
+            "is_local": getattr(policy, "is_local", None),
+            "location": _ref_name(getattr(policy, "location", None)),
+            "aggregation_strategy": getattr(policy, "aggregation_strategy", None),
+            "realms": [
+                _ref_name(realm) for realm in (getattr(policy, "realms", None) or [])
+            ],
+            "rules": [
+                {
+                    "name": getattr(rule, "name", None),
+                    "index": getattr(rule, "index", None),
+                    "role": _ref_name(getattr(rule, "role", None)),
+                    "scope": _ref_name(getattr(rule, "scope", None)),
+                    "scope_type": getattr(
+                        getattr(rule, "scope", None), "resource_type", None
+                    ),
+                }
+                for rule in (getattr(policy, "rules", None) or [])
+            ],
+            "members": [],
+        }
+    members_res = blade.get_management_access_policies_members()
+    if members_res.status_code == 200:
+        for member in list(members_res.items):
+            policy_name = _ref_name(getattr(member, "policy", None))
+            if policy_name in policies_info:
+                policies_info[policy_name]["members"].append(
+                    _ref_dict(getattr(member, "member", None))
+                )
+    return policies_info
+
+
+def generate_management_access_roles_dict(blade):
+    """Return the roles a management access policy rule can grant"""
+    roles_info = {}
+    res = blade.get_management_access_policies_roles()
+    if res.status_code != 200:
+        return roles_info
+    for role in list(res.items):
+        roles_info[role.name] = {
+            "description": getattr(role, "description", None),
+            "pure_defined": getattr(role, "pure_defined", None),
+        }
+    return roles_info
+
+
+def generate_management_authentication_policies_dict(blade):
+    """Return the management authentication policies with their members"""
+    policies_info = {}
+    res = blade.get_management_authentication_policies()
+    if res.status_code != 200:
+        return policies_info
+    for policy in list(res.items):
+        ssh = getattr(policy, "ssh", None)
+        policies_info[policy.name] = {
+            "enabled": getattr(policy, "enabled", None),
+            "is_local": getattr(policy, "is_local", None),
+            "location": _ref_name(getattr(policy, "location", None)),
+            "realms": [
+                _ref_name(realm) for realm in (getattr(policy, "realms", None) or [])
+            ],
+            "ssh": {
+                "allowed_methods": list(getattr(ssh, "allowed_methods", None) or []),
+                "required_methods": list(getattr(ssh, "required_methods", None) or []),
+            },
+            "members": [],
+        }
+    members_res = blade.get_management_authentication_policies_members()
+    if members_res.status_code == 200:
+        for member in list(members_res.items):
+            policy_name = _ref_name(getattr(member, "policy", None))
+            if policy_name in policies_info:
+                policies_info[policy_name]["members"].append(
+                    _ref_dict(getattr(member, "member", None))
+                )
+    return policies_info
+
+
+def generate_rapid_data_locking_dict(blade):
+    """Return the Rapid Data Locking state and its KMIP server"""
+    res = blade.get_rapid_data_locking()
+    if res.status_code != 200:
+        return {}
+    settings = list(res.items)
+    if not settings:
+        return {}
+    return {
+        "enabled": getattr(settings[0], "enabled", None),
+        "kmip_server": _ref_name(getattr(settings[0], "kmip_server", None)),
+    }
+
+
+def generate_certificate_uses_dict(blade):
+    """Return, per certificate, the objects that use it
+
+    A certificate used through a certificate group reports the group; a
+    certificate nothing uses is absent.
+    """
+    uses_info = {}
+    res = blade.get_certificates_uses()
+    if res.status_code != 200:
+        return uses_info
+    for item in list(res.items):
+        use = getattr(item, "use", None)
+        uses_info.setdefault(item.name, []).append(
+            {
+                "name": _ref_name(use),
+                "resource_type": getattr(use, "resource_type", None),
+                "remote": _ref_name(getattr(use, "remote", None)),
+                "group": _ref_name(getattr(item, "group", None)),
+            }
+        )
+    return uses_info
+
+
+def generate_remote_arrays_dict(blade):
+    """Return the arrays in the current fleet keyed by name
+
+    ``current_fleet_only`` is mandatory: the array answers 400 without it.
+    An array that is not in a fleet returns nothing.
+    """
+    arrays_info = {}
+    res = blade.get_remote_arrays(current_fleet_only=True)
+    if res.status_code != 200:
+        return arrays_info
+    for array in list(res.items):
+        arrays_info[array.name] = {
+            "os": getattr(array, "os", None),
+            "version": getattr(array, "version", None),
+            "model": getattr(array, "model", None),
+            "api_versions": list(getattr(array, "api_versions", None) or []),
+            "is_local": getattr(array, "is_local", None),
+            "topology_group": _ref_name(getattr(array, "topology_group", None)),
+        }
+    return arrays_info
+
+
+def generate_tgroups_dict(blade):
+    """Return the topology groups with their array and group members
+
+    Members come from the members endpoint; the arrays endpoint is not used
+    because it refuses a request without topology group names.
+    """
+    tgroups_info = {}
+    res = blade.get_topology_groups()
+    if res.status_code != 200:
+        return tgroups_info
+    for tgroup in list(res.items):
+        tgroups_info[tgroup.name] = {
+            "context": _ref_name(getattr(tgroup, "context", None)),
+            "parent_topology_group": _ref_name(
+                getattr(tgroup, "parent_topology_group", None)
+            ),
+            "arrays": [],
+            "tgroups": [],
+        }
+    if not tgroups_info:
+        return tgroups_info
+    members_res = blade.get_topology_groups_members()
+    if members_res.status_code != 200:
+        return tgroups_info
+    for member in list(members_res.items):
+        group_name = _ref_name(getattr(member, "topology_group", None))
+        member_ref = getattr(member, "member", None)
+        member_name = _ref_name(member_ref)
+        if group_name not in tgroups_info or not member_name:
+            continue
+        member_info = {
+            "name": member_name,
+            "status": getattr(member, "status", None),
+            "status_details": getattr(member, "status_details", None),
+        }
+        member_type = getattr(member_ref, "resource_type", None)
+        if member_type == "remote-arrays":
+            tgroups_info[group_name]["arrays"].append(member_info)
+        elif member_type == "topology-groups":
+            tgroups_info[group_name]["tgroups"].append(member_info)
+    return tgroups_info
+
+
+def generate_presets_dict(blade):
+    """Return the workload presets keyed by name
+
+    Each configuration list is collated by configuration name; parameters
+    carry their type, metadata and the constraints for that type.
+    """
+    presets_info = {}
+    res = blade.get_presets_workload()
+    if res.status_code != 200:
+        return presets_info
+    for preset in list(res.items):
+        preset_name = getattr(preset, "name", None)
+        if not preset_name:
+            continue
+        parameters = {}
+        for param in getattr(preset, "parameters", None) or []:
+            param_name = getattr(param, "name", None)
+            if not param_name:
+                continue
+            param_type = getattr(param, "type", None)
+            metadata = getattr(param, "metadata", None)
+            constraints = getattr(param, "constraints", None)
+            typed_constraints = None
+            if constraints is not None and param_type:
+                typed_constraints = getattr(constraints, param_type, None)
+            parameters[param_name] = {
+                "type": param_type,
+                "description": getattr(metadata, "description", None),
+                "display_name": getattr(metadata, "display_name", None),
+                "subtype": getattr(metadata, "subtype", None),
+                "constraints": _to_plain(typed_constraints) or {},
+            }
+        exports = getattr(preset, "export_configurations", None)
+        presets_info[preset_name] = {
+            "description": getattr(preset, "description", None),
+            "workload_type": getattr(preset, "workload_type", None),
+            "revision": getattr(preset, "revision", None),
+            "context": _ref_name(getattr(preset, "context", None)),
+            "platform_features": list(getattr(preset, "platform_features", None) or []),
+            "parameters": parameters,
+            "export_configurations": {
+                "nfs": _collate_by_name(getattr(exports, "nfs", None)),
+                "smb": _collate_by_name(getattr(exports, "smb", None)),
+                "smb_share": _collate_by_name(getattr(exports, "smb_share", None)),
+            },
+            "workload_tags": _to_plain(getattr(preset, "workload_tags", None) or []),
+        }
+        for section in (
+            "bucket_configurations",
+            "directory_configurations",
+            "volume_configurations",
+            "placement_configurations",
+            "qos_configurations",
+            "quota_configurations",
+            "snapshot_configurations",
+            "lifecycle_configurations",
+            "periodic_replication_configurations",
+        ):
+            presets_info[preset_name][section] = _collate_by_name(
+                getattr(preset, section, None)
+            )
+    return presets_info
+
+
+def generate_workloads_dict(blade, api_version):
+    """Return the workloads keyed by name with their tags, space and performance
+
+    Space arrives with the workload and performance from its own endpoint,
+    both from REST 2.30; older arrays report neither. Performance is only
+    requested for workloads that are not destroyed.
+    """
+    workloads_info = {}
+    res = blade.get_workloads()
+    if res.status_code != 200:
+        return workloads_info
+    workloads = list(res.items)
+    if not workloads:
+        return workloads_info
+    for workload in workloads:
+        preset = getattr(workload, "preset", None)
+        space = getattr(workload, "space", None)
+        workloads_info[workload.name] = {
+            "context": _ref_name(getattr(workload, "context", None)),
+            "preset": _ref_name(preset),
+            "preset_revision": getattr(preset, "revision", None),
+            "status": getattr(workload, "status", None),
+            "status_details": list(getattr(workload, "status_details", None) or []),
+            "created": _epoch_to_string(getattr(workload, "created", None)),
+            "destroyed": getattr(workload, "destroyed", None),
+            "time_remaining": getattr(workload, "time_remaining", None),
+            "tags": [],
+            "space": _to_plain(space) if space is not None else None,
+            "performance": None,
+        }
+    tags_res = blade.get_workloads_tags()
+    if tags_res.status_code == 200:
+        for tag in list(tags_res.items):
+            resource_name = _ref_name(getattr(tag, "resource", None))
+            if resource_name in workloads_info:
+                workloads_info[resource_name]["tags"].append(
+                    {
+                        "key": getattr(tag, "key", None),
+                        "value": getattr(tag, "value", None),
+                        "namespace": getattr(tag, "namespace", None),
+                        "copyable": getattr(tag, "copyable", None),
+                    }
+                )
+    live_names = [
+        name for name, detail in workloads_info.items() if not detail["destroyed"]
+    ]
+    if live_names and LooseVersion(WORKLOAD_METRICS_API_VERSION) <= LooseVersion(
+        api_version
+    ):
+        perf_res = blade.get_workloads_performance(names=live_names)
+        if perf_res.status_code == 200:
+            for perf in list(perf_res.items):
+                if perf.name in workloads_info:
+                    workloads_info[perf.name]["performance"] = {
+                        field: getattr(perf, field, None)
+                        for field in (
+                            "bytes_per_op",
+                            "bytes_per_read",
+                            "bytes_per_write",
+                            "others_per_sec",
+                            "read_bytes_per_sec",
+                            "reads_per_sec",
+                            "usec_per_other_op",
+                            "usec_per_read_op",
+                            "usec_per_write_op",
+                            "write_bytes_per_sec",
+                            "writes_per_sec",
+                            "time",
+                        )
+                    }
+    return workloads_info
+
+
+def generate_storage_class_members_dict(blade):
+    """Return the storage class of each fleet member array"""
+    members_info = {}
+    res = blade.get_storage_classes_members()
+    if res.status_code != 200:
+        return members_info
+    for item in list(res.items):
+        member_name = _ref_name(getattr(item, "member", None))
+        if member_name:
+            members_info[member_name] = _ref_name(getattr(item, "storage_class", None))
+    return members_info
+
+
+def generate_realm_connections_dict(blade):
+    """Return the realm connections keyed by local realm, then remote realm"""
+    connections_info = {}
+    res = blade.get_realm_connections()
+    if res.status_code != 200:
+        return connections_info
+    for connection in list(res.items):
+        local_realm = _ref_name(getattr(connection, "local_realm", None))
+        remote_realm = _ref_name(getattr(connection, "remote_realm", None))
+        if not local_realm or not remote_realm:
+            continue
+        connections_info.setdefault(local_realm, {})[remote_realm] = {
+            "status": getattr(connection, "status", None),
+        }
+    return connections_info
+
+
+def generate_remote_realms_dict(blade):
+    """Return the realms on connected arrays and the arrays that hold them"""
+    realms_info = {}
+    res = blade.get_remote_realms()
+    if res.status_code != 200:
+        return realms_info
+    for realm in list(res.items):
+        realms_info[realm.name] = {
+            "arrays": [
+                _ref_name(array) for array in (getattr(realm, "arrays", None) or [])
+            ],
+        }
+    return realms_info
 
 
 # File locks, lock clients, file sessions and SMB open files (the read-back
@@ -3082,6 +3560,52 @@ def main():
         LEGAL_HOLD_API_VERSION
     ) <= LooseVersion(api_version):
         info["legal_holds"] = generate_legal_holds_dict(blade)
+    # Security, identity and fleet read-back. This runs after the base
+    # subsets so that the config and fleet sections it adds to exist.
+    if "admins" in subset or "all" in subset:
+        info["admin_cache"] = generate_admin_cache_dict(blade)
+    if "config" in subset or "all" in subset:
+        info["config"]["certificate_uses"] = generate_certificate_uses_dict(blade)
+        if LooseVersion(KMIP_API_VERSION) <= LooseVersion(api_version):
+            info["config"]["rapid_data_locking"] = generate_rapid_data_locking_dict(
+                blade
+            )
+    if "policies" in subset or "all" in subset:
+        if LooseVersion(MAP_API_VERSION) <= LooseVersion(api_version):
+            info["management_access_policies"] = (
+                generate_management_access_policies_dict(blade)
+            )
+        if LooseVersion(MGMT_AUTH_API_VERSION) <= LooseVersion(api_version):
+            info["management_authentication_policies"] = (
+                generate_management_authentication_policies_dict(blade)
+            )
+        if LooseVersion(MAP_ROLES_API_VERSION) <= LooseVersion(api_version):
+            info["management_access_roles"] = generate_management_access_roles_dict(
+                blade
+            )
+    # Fleet members gain the detail the array reports for them whichever
+    # subset produced the fleet key; an array that is not in a fleet is
+    # not asked about remote arrays at all.
+    if info.get("fleet"):
+        remote_arrays = generate_remote_arrays_dict(blade)
+        for fleet in info["fleet"].values():
+            for member_name, member in fleet.get("members", {}).items():
+                member.update(remote_arrays.get(member_name, {}))
+    if ("fleet" in subset or "all" in subset) and LooseVersion(
+        FLEET_API_VERSION
+    ) <= LooseVersion(api_version):
+        if LooseVersion(WORKLOAD_API_VERSION) <= LooseVersion(api_version):
+            info["presets"] = generate_presets_dict(blade)
+            info["workloads"] = generate_workloads_dict(blade, api_version)
+        if LooseVersion(TGROUP_API_VERSION) <= LooseVersion(api_version):
+            info["tgroups"] = generate_tgroups_dict(blade)
+        if LooseVersion(STORAGE_CLASS_API_VERSION) <= LooseVersion(api_version):
+            info["storage_class_members"] = generate_storage_class_members_dict(blade)
+    if ("realms" in subset or "all" in subset) and LooseVersion(
+        REALM_CONNECTION_API_VERSION
+    ) <= LooseVersion(api_version):
+        info["realm_connections"] = generate_realm_connections_dict(blade)
+        info["remote_realms"] = generate_remote_realms_dict(blade)
     module.exit_json(changed=False, purefb_info=info)
 
 

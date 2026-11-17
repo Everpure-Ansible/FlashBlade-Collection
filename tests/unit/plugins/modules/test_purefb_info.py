@@ -982,6 +982,68 @@ class TestPurefbInfo:
         # the misspelt key is kept alongside the correct one
         assert result["fs1"]["multi_protocol"]["safegaurd_acls"] is True
         assert result["fs1"]["multi_protocol"]["safeguard_acls"] is True
+        # a plain filesystem has a source with no name
+        assert result["fs1"]["source"] == {
+            "is_local": None,
+            "name": None,
+            "resource_type": None,
+            "display_name": None,
+            "location": None,
+        }
+
+    def test_generate_fs_dict_reports_copy_source(self):
+        """A filesystem copy reports the filesystem it was copied from, and
+        the location comes from the source reference, not the filesystem."""
+        mock_blade = Mock()
+
+        location = Mock()
+        location.name = "array1"
+        source = Mock()
+        source.name = "fs1"
+        source.is_local = True
+        source.resource_type = "file-systems"
+        source.display_name = "fs1"
+        source.location = location
+
+        copy = Mock()
+        copy.name = "fs1-copy"
+        copy.fast_remove_directory_enabled = False
+        copy.snapshot_directory_enabled = False
+        copy.provisioned = 0
+        copy.destroyed = False
+        copy.nfs = Mock(
+            rules=None, v3_enabled=True, v4_1_enabled=True, export_policy=None
+        )
+        copy.smb = Mock(
+            acl_mode=None,
+            client_policy=None,
+            share_policy=None,
+            continuous_availability_enabled=False,
+        )
+        copy.multi_protocol = Mock(safeguard_acls=True, access_control_style=None)
+        copy.hard_limit_enabled = False
+        copy.promotion_status = "promoting"
+        copy.requested_promotion_state = "promoted"
+        copy.writable = True
+        copy.source = source
+        copy.default_group_quota = 0
+        copy.default_user_quota = 0
+        copy.http = Mock(enabled=False)
+
+        mock_blade.get_file_systems.return_value.items = [copy]
+        mock_blade.get_quotas_groups.return_value.items = []
+        mock_blade.get_quotas_users.return_value.items = []
+
+        result = generate_fs_dict(mock_blade)
+
+        assert result["fs1-copy"]["promotion_status"] == "promoting"
+        assert result["fs1-copy"]["source"] == {
+            "is_local": True,
+            "name": "fs1",
+            "resource_type": "file-systems",
+            "display_name": "fs1",
+            "location": "array1",
+        }
 
     def test_generate_array_conn_dict_keys_by_remote_and_reads_the_connection(self):
         """The dict is keyed by the remote name, values come from the connection.

@@ -376,6 +376,59 @@ class TestPurefbHardware:
         assert "Failed to set identification LED" in msg
         assert "boom" in msg
 
+    # ---------------- main(): components without an LED ----------------
+
+    def test_main_led_disable_without_led_is_noop_with_warning(self):
+        """enabled=false on a component without an LED (None) warns, no PATCH"""
+        module = _module(name="CH1.PWR1", enabled=False)
+        blade = _blade(hardware=_hardware(None))
+        _run_main(module, blade)
+        blade.patch_hardware.assert_not_called()
+        module.fail_json.assert_not_called()
+        module.warn.assert_called_once()
+        assert "no identification LED" in module.warn.call_args[0][0]
+        module.exit_json.assert_called_once_with(changed=False)
+
+    def test_main_led_disable_without_led_idempotent_in_check_mode(self):
+        """Check mode on a component without an LED also reports no change"""
+        module = _module(check_mode=True, name="CH1.PWR1", enabled=False)
+        blade = _blade(hardware=_hardware(None))
+        _run_main(module, blade)
+        blade.patch_hardware.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+    def test_main_led_enable_without_led_fails(self):
+        """enabled=true on a component without an LED fails before any PATCH"""
+        module = _module(name=CONNECTOR, enabled=True)
+        blade = _blade(hardware=_hardware(None))
+        _run_main(module, blade)
+        module.fail_json.assert_called_once()
+        assert "has no identification LED" in module.fail_json.call_args[1]["msg"]
+        blade.patch_hardware.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    def test_main_led_disable_without_led_still_applies_connector_change(self):
+        """enabled=false on a connector is skipped while its speed is changed"""
+        module = _module(enabled=False, speed=40, ports=4)
+        blade = _blade(hardware=_hardware(None), connector=_connector())
+        _run_main(module, blade)
+        blade.patch_hardware.assert_not_called()
+        module.warn.assert_called_once()
+        blade.patch_network_interfaces_connectors.assert_called_once()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_main_led_enable_without_led_fails_before_connector_patch(self):
+        """enabled=true on a connector fails before the connector is touched"""
+        module = _module(enabled=True, speed=40, ports=4)
+        blade = _blade(hardware=_hardware(None), connector=_connector())
+        _run_main(module, blade)
+        module.fail_json.assert_called_once()
+        assert "has no identification LED" in module.fail_json.call_args[1]["msg"]
+        blade.patch_hardware.assert_not_called()
+        blade.patch_network_interfaces_connectors.assert_not_called()
+        blade.patch_hardware_connectors.assert_not_called()
+        module.exit_json.assert_not_called()
+
     # ---------------- main(): legacy connector form ----------------
 
     def test_main_legacy_pair_single_patch_on_network_endpoint(self):

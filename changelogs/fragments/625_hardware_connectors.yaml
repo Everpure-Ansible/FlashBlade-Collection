@@ -10,3 +10,7 @@ minor_changes:
   - purefb_inventory - add status details, MAC addresses, temperature sensor readings with
     thresholds and a ``connectors`` dictionary with lane speed, port count, port speed, lanes per
     port and transceiver type.
+bugfixes:
+  - purefb_hardware - components without an identification LED (connectors and power supplies)
+    no longer report a change on every run when ``enabled`` is false; the request is ignored with
+    a warning, and ``enabled`` true on such a component fails before any change is made.

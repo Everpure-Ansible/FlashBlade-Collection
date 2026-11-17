@@ -41,6 +41,9 @@ options:
   enabled:
     description:
     - State of the component identification LED
+    - Components without an identification LED, such as connectors and power
+      supplies, report no LED state. C(false) is ignored with a warning and
+      C(true) fails.
     type: bool
   speed:
     description:
@@ -227,14 +230,31 @@ def connector_changes(module, connector):
 
 
 def update_led(module, blade, hardware):
-    """Set the identification LED. Return True when a change is or would be made."""
+    """Set the identification LED. Return True when a change is or would be made.
+
+    Components without an identification LED (connectors and power supplies)
+    report identify_enabled as None. Disabling such an LED is a no-op and
+    enabling it fails, so a run never reports a change the array cannot make.
+    """
     name = module.params["name"]
-    if hardware.identify_enabled == module.params["enabled"]:
+    enabled = module.params["enabled"]
+    if hardware.identify_enabled is None:
+        if enabled:
+            module.fail_json(
+                msg="Hardware component {0} has no identification LED".format(name)
+            )
+        module.warn(
+            "Hardware component {0} has no identification LED, enabled ignored".format(
+                name
+            )
+        )
+        return False
+    if hardware.identify_enabled == enabled:
         return False
     if not module.check_mode:
         res = blade.patch_hardware(
             names=[name],
-            hardware=flashblade.Hardware(identify_enabled=module.params["enabled"]),
+            hardware=flashblade.Hardware(identify_enabled=enabled),
         )
         if res.status_code != 200:
             module.fail_json(

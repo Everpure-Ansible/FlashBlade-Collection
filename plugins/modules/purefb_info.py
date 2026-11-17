@@ -141,7 +141,9 @@ purefb_info:
       version_added: '1.30.0'
     lldp_neighbors:
       description:
-        - LLDP neighbours keyed by local port name, with the neighbour
+        - LLDP neighbours keyed by local port name. A port can see more
+          than one neighbour, so each port holds a list of its neighbours
+          in the order the array reports them, each with the neighbour
           chassis identity, management addresses, capabilities and the
           neighbour port.
       returned: network subset on Purity//FB with REST API 2.20 or higher
@@ -919,6 +921,9 @@ def generate_lldp_neighbors_dict(blade):
 
     Neighbours hang off the physical ports (CHx.FMy.ETHz), never off the
     VIP names that key the network dictionary, so they are kept apart.
+    The array returns one row per neighbour and a port can see more than
+    one (for example through an unmanaged switch), so every port maps to
+    the list of its neighbours in the order the array reports them.
     """
     neighbors_info = {}
     res = blade.get_network_interfaces_neighbors()
@@ -937,26 +942,28 @@ def generate_lldp_neighbors_dict(blade):
                 "enabled": getattr(value, "enabled", None),
             }
         local_port = _reference_name(getattr(neighbor, "local_port", None))
-        neighbors_info[local_port] = {
-            "initial_ttl_in_sec": getattr(neighbor, "initial_ttl_in_sec", None),
-            "neighbor_chassis": {
-                "id": {
-                    "type": getattr(chassis_id, "type", None),
-                    "value": getattr(chassis_id, "value", None),
+        neighbors_info.setdefault(local_port, []).append(
+            {
+                "initial_ttl_in_sec": getattr(neighbor, "initial_ttl_in_sec", None),
+                "neighbor_chassis": {
+                    "id": {
+                        "type": getattr(chassis_id, "type", None),
+                        "value": getattr(chassis_id, "value", None),
+                    },
+                    "name": getattr(chassis, "name", None),
+                    "description": getattr(chassis, "description", None),
+                    "addresses": getattr(chassis, "addresses", None) or [],
+                    "capabilities": capabilities,
                 },
-                "name": getattr(chassis, "name", None),
-                "description": getattr(chassis, "description", None),
-                "addresses": getattr(chassis, "addresses", None) or [],
-                "capabilities": capabilities,
-            },
-            "neighbor_port": {
-                "id": {
-                    "type": getattr(port_id, "type", None),
-                    "value": getattr(port_id, "value", None),
+                "neighbor_port": {
+                    "id": {
+                        "type": getattr(port_id, "type", None),
+                        "value": getattr(port_id, "value", None),
+                    },
+                    "description": getattr(port, "description", None),
                 },
-                "description": getattr(port, "description", None),
-            },
-        }
+            }
+        )
     return neighbors_info
 
 

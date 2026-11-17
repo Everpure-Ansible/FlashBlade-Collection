@@ -1880,7 +1880,10 @@ class TestPurefbInfo:
 
         mock_blade.get_network_interfaces_neighbors.assert_called_once_with()
         assert sorted(result) == ["CH1.FM1.ETH1", "CH1.FM1.ETH9"]
-        eth1 = result["CH1.FM1.ETH1"]
+        # every port maps to the list of its neighbours, here one each
+        assert len(result["CH1.FM1.ETH1"]) == 1
+        assert len(result["CH1.FM1.ETH9"]) == 1
+        eth1 = result["CH1.FM1.ETH1"][0]
         assert eth1["initial_ttl_in_sec"] == 120
         assert eth1["neighbor_chassis"]["name"] == "tor-switch-a"
         assert eth1["neighbor_chassis"]["addresses"] == ["10.0.0.72"]
@@ -1909,7 +1912,7 @@ class TestPurefbInfo:
             "id": {"type": "ifname", "value": "Ethernet1/13"},
             "description": "Ethernet1/13",
         }
-        eth9 = result["CH1.FM1.ETH9"]
+        eth9 = result["CH1.FM1.ETH9"][0]
         assert eth9["neighbor_chassis"]["name"] is None
         assert eth9["neighbor_chassis"]["addresses"] == []
         assert eth9["neighbor_chassis"]["capabilities"]["router"] == {
@@ -1917,6 +1920,54 @@ class TestPurefbInfo:
             "enabled": None,
         }
         assert eth9["neighbor_port"]["id"] == {"type": None, "value": None}
+
+    def test_generate_lldp_neighbors_dict_keeps_every_neighbor_of_a_port(self):
+        """A port can see several LLDP neighbours (for example through an
+        unmanaged switch); the array returns one row per neighbour and
+        every row is kept, in the array's order, instead of the last one
+        overwriting the others."""
+        rows = []
+        for chassis_name, chassis_mac, port_value in (
+            ("tor-switch-a", "80:27:6c:d2:8d:fc", "Ethernet1/13"),
+            ("tor-switch-b", "80:27:6c:d2:d1:04", "Ethernet1/21"),
+        ):
+            row = Mock()
+            row.initial_ttl_in_sec = 120
+            row.local_port.name = "CH1.FM1.ETH1"
+            row.neighbor_chassis.name = chassis_name
+            row.neighbor_chassis.id.type = "mac"
+            row.neighbor_chassis.id.value = chassis_mac
+            row.neighbor_port.id.type = "ifname"
+            row.neighbor_port.id.value = port_value
+            rows.append(row)
+        other = Mock()
+        other.local_port.name = "CH1.FM2.ETH1"
+        other.neighbor_chassis.name = "tor-switch-b"
+        mock_blade = Mock()
+        mock_blade.get_network_interfaces_neighbors.return_value = Mock(
+            status_code=200, items=rows + [other]
+        )
+
+        result = generate_lldp_neighbors_dict(mock_blade)
+
+        assert sorted(result) == ["CH1.FM1.ETH1", "CH1.FM2.ETH1"]
+        eth1 = result["CH1.FM1.ETH1"]
+        assert len(eth1) == 2
+        assert [n["neighbor_chassis"]["name"] for n in eth1] == [
+            "tor-switch-a",
+            "tor-switch-b",
+        ]
+        assert [n["neighbor_chassis"]["id"]["value"] for n in eth1] == [
+            "80:27:6c:d2:8d:fc",
+            "80:27:6c:d2:d1:04",
+        ]
+        assert [n["neighbor_port"]["id"]["value"] for n in eth1] == [
+            "Ethernet1/13",
+            "Ethernet1/21",
+        ]
+        assert [n["neighbor_chassis"]["name"] for n in result["CH1.FM2.ETH1"]] == [
+            "tor-switch-b"
+        ]
 
     def test_generate_lldp_neighbors_dict_returns_empty_on_error(self):
         mock_blade = Mock()
@@ -2015,7 +2066,7 @@ class TestPurefbInfo:
         mock_connectors.return_value = {"CH1.FM1.ETH1": {}}
         mock_performance.return_value = {"CH1.FB1": {}}
         mock_settings.return_value = {}
-        mock_neighbors.return_value = {"CH1.FM1.ETH1": {}}
+        mock_neighbors.return_value = {"CH1.FM1.ETH1": [{}]}
 
         result = self._run_main(
             ["network"], "2.30", mock_loose_version, mock_get_version
@@ -2027,7 +2078,7 @@ class TestPurefbInfo:
         assert info["network_connectors"] == {"CH1.FM1.ETH1": {}}
         assert info["network_connector_performance"] == {"CH1.FB1": {}}
         assert info["network_connector_settings"] == {}
-        assert info["lldp_neighbors"] == {"CH1.FM1.ETH1": {}}
+        assert info["lldp_neighbors"] == {"CH1.FM1.ETH1": [{}]}
         assert "connections" not in info
         mock_connections.assert_not_called()
 

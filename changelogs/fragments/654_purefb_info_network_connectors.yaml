@@ -1,7 +1,8 @@
 minor_changes:
   - purefb_info - the ``network`` subset also returns ``network_connectors``, the per-connector
     counters as ``network_connector_performance`` (including the blade network interfaces), the RoCE
-    settings as ``network_connector_settings`` and the LLDP neighbours as ``lldp_neighbors`` on
-    Purity//FB with REST API 2.17 or higher (2.20 for the LLDP neighbours).
+    settings as ``network_connector_settings`` and the LLDP neighbours as ``lldp_neighbors`` (a list
+    of neighbours per local port) on Purity//FB with REST API 2.17 or higher (2.20 for the LLDP
+    neighbours).
   - purefb_info - add the ``connections`` subset returning the current TCP connections of the array
     on Purity//FB with REST API 2.18 or higher; it is not part of ``all``.

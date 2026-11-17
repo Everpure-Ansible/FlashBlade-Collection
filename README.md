@@ -99,6 +99,7 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_admin - configure Everpure FlashBlade Global Admin settings
 - purefb_alert - manage alert email settings on a FlashBlade
 - purefb_apiclient - manage API clients for FlashBlade
+- purefb_audits - list FlashBlade audit trail records
 - purefb_banner - manage FlashBlade login banner
 - purefb_bladename - manage FlashBlade name
 - purefb_bucket - manage S3 buckets on a FlashBlade
@@ -111,9 +112,12 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_ds - manage Directory Services settings on a FlashBlade
 - purefb_dsrole - manage Directory Service Roles on a FlashBlade
 - purefb_eula - manage EULA on FlashBlade
+- purefb_eviction_policy - manage data eviction policies on a FlashBlade
 - purefb_export - manage filesystem exports on FlashBlade
 - purefb_fleet - manage Fusion fleet members
 - purefb_fs - manage filesystems on a FlashBlade
+- purefb_fs_junction - manage file system junctions on a FlashBlade
+- purefb_fs_lock - list and clear file locks, file sessions and SMB open files on a FlashBlade
 - purefb_fs_replica - manage filesystem replica links on a FlashBlade
 - purefb_groupquota - manage individual group quotas on FlashBlade filesystems
 - purefb_hardware - manage hardware LED identifiers and hardware connectors
@@ -122,24 +126,30 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_keytabs - manage FlashBlade Kerberos keytabs
 - purefb_kmip - manage FlashBlade KMIP servers
 - purefb_lag - manage FlashBlade Link Aggregation Groups
+- purefb_legal_hold - manage FlashBlade file legal holds and the paths they are applied to
 - purefb_lifecycle - manage FlashBlade Bucket Lifecycle Rules
 - purefb_local_ds - manage FlashBlade Local Directory Services
 - purefb_local_group - manage local groups in a FlashBlade Local Directory Service
 - purefb_local_user - manage local users in a FlashBlade Local Directory Service
-- purefb_messages - list FlashBlade alert messages
+- purefb_maintenance - manage the FlashBlade maintenance window
+- purefb_messages - list, flag and unflag FlashBlade alert messages
 - purefb_mgmt_auth_policy - manage FlashBlade management authentication policies and their members
 - purefb_mgmt_policy - manage FlashBlade management access policies and their rules
 - purefb_mgmt_role - manage FlashBlade custom management roles, permissions, and policy attachment
 - purefb_network - manage the network settings for a FlashBlade
 - purefb_ntp - manage the NTP settings for a FlashBlade
 - purefb_object_role - manage FlashBlade object store roles and their access policies
+- purefb_oidc - manage FlashBlade OIDC identity providers
 - purefb_password_policy - manage the FlashBlade management password policy
 - purefb_phonehome - manage the phone home settings for a FlashBlade
 - purefb_pingtrace - perform FlashBlade network diagnostics
 - purefb_policy - manage the filesystem snapshot policies for a FlashBlade
 - purefb_proxy - manage the phone home HTTP proxy settings for a FlashBlade
+- purefb_public_key - manage FlashBlade public keys for SSH certificate authority policies
+- purefb_quota_settings - manage FlashBlade user and group quota notification settings
 - purefb_ra - manage the Remote Assist connections on a FlashBlade
 - purefb_realm - manage the Realms for a FlashBlade
+- purefb_realm_connection - manage the Realm Connections for a FlashBlade
 - purefb_remote_cred - manage the Object Store Remote Credentials on a FlashBlade
 - purefb_resource_access - manage resource access for a FlashBlade
 - purefb_s3_export_policy - manage FlashBlade S3 export policies and their rules
@@ -148,13 +158,19 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_s3user - manage the object atore users on a FlashBlade
 - purefb_saml - manage FlashBlade SAML2 service and identity providers
 - purefb_server - manage FlashBlade servers
+- purefb_sessions - list the management login sessions on a FlashBlade
 - purefb_smtp - manage SMTP settings on a FlashBlade
 - purefb_snap - manage filesystem snapshots on a FlashBlade
 - purefb_snmp_agent - modify the FlashBlade SNMP Agent
 - purefb_snmp_mgr - manage SNMP Managers on a FlashBlade
+- purefb_software_patch - install Purity//FB software patches on a FlashBlade
+- purefb_ssh_ca_policy - manage FlashBlade SSH Certificate Authority policies and their members
 - purefb_subnet - manage network subnets on a FlashBlade
+- purefb_support_diagnostics - run FlashBlade self-diagnostics and report the results
 - purefb_syslog - manage FlashBlade syslog server configuration
+- purefb_syslog_settings - manage the CA certificate used to validate FlashBlade syslog servers
 - purefb_target - manage remote S3-capable targets for a FlashBlade
+- purefb_tgroup - manage Fusion topology groups from a FlashBlade
 - purefb_timeout - manage FlashBlade GUI timeout
 - purefb_tls_policy - manage FlashBlade TLS policies and their network interface attachments
 - purefb_tz - configure Everpure FlashBlade timezone

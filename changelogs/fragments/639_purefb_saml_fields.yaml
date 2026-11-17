@@ -1,0 +1,16 @@
+minor_changes:
+  - purefb_saml - add ``services``, ``binding``, ``metadata_url_ca_certificate`` and
+    ``metadata_url_ca_certificate_group`` (REST 2.17) and ``sp_entity_id`` and
+    ``trust_other_saml_sps_in_fleet`` (REST 2.24), each refused on an older array before any
+    write, and return ``prn`` and the resolved ``sp_entity_id``. Services and binding are sent
+    together as the array requires, and setting one metadata URL CA reference clears the other.
+  - purefb_info - report prn, services, binding, the fleet trust flag, the identity provider
+    entity ID, the certificate references and the service provider entity ID, assertion
+    consumer URL and metadata URL in ``config.saml2sso``.
+bugfixes:
+  - purefb_saml - ``x509_cert`` is the name of a certificate managed by purefb_certs and is sent
+    as a reference and compared by name, as the array stores a certificate reference. The
+    ``state=test`` version message now names the version it requires.
+  - purefb_saml - ``enabled``, ``sign_request`` and ``encrypt_asserts`` no longer default to
+    ``false`` and are sent only when given, so a task that changes another option of an enabled
+    identity provider no longer disables it or turns off request signing and assertion encryption.

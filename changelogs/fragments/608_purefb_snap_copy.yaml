@@ -1,0 +1,5 @@
+minor_changes:
+  - purefb_snap - add ``state=copy`` with the new ``target_fs`` option to create a writable filesystem from a snapshot (Purity//FB 4.8.0, REST 2.25). A ``target_fs`` that already exists as a copy of the source reports no change and any other existing filesystem is never overwritten.
+  - purefb_info - the ``filesystems`` subset now reports a filesystem copy's source filesystem together with its ``display_name`` and ``resource_type``.
+bugfixes:
+  - purefb_info - ``source.location`` in the ``filesystems`` subset was always null because it was read from the filesystem instead of its source reference.

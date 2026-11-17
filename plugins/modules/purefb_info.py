@@ -127,6 +127,7 @@ PASSWORD_POLICY_API_VERSION = "2.16"
 FLEET_API_VERSION = "2.17"
 TLS_API_VERSION = "2.17"
 REALMS_API_VERSION = "2.19"
+MAP_API_VERSION = "2.19"
 S3_EXPORT_API_VERSION = "2.20"
 
 
@@ -141,6 +142,37 @@ def _bytes_to_human(bytes_number):
             bytes_number = bytes_number / 1024
         return str(round(double_bytes, 2)) + " " + labels[i]
     return None
+
+
+def _reference_names(references):
+    """Return the names in a list of references (None or empty gives [])"""
+    return [
+        reference.name
+        for reference in (references or [])
+        if getattr(reference, "name", None)
+    ]
+
+
+def generate_directory_service_roles_dict(blade, api_version):
+    """Return the directory service role mappings
+
+    ``role`` is null for a mapping with no, several, or a custom management
+    access policy, so it is read through getattr. The policy names are
+    reported from REST 2.19, where the array exposes them.
+    """
+    roles_info = {}
+    report_policies = LooseVersion(MAP_API_VERSION) <= LooseVersion(api_version)
+    for ds_role in list(blade.get_directory_services_roles().items):
+        roles_info[ds_role.name] = {
+            "group": getattr(ds_role, "group", None),
+            "group_base": getattr(ds_role, "group_base", None),
+            "role": getattr(getattr(ds_role, "role", None), "name", None),
+        }
+        if report_policies:
+            roles_info[ds_role.name]["management_access_policies"] = _reference_names(
+                getattr(ds_role, "management_access_policies", None)
+            )
+    return roles_info
 
 
 def generate_default_dict(blade):
@@ -404,15 +436,9 @@ def generate_config_dict(blade):
     # Forward backwards compatability
     config_info["array_management"] = config_info["management_directory_service"]
 
-    config_info["directory_service_roles"] = {}
-    roles = list(blade.get_directory_services_roles().items)
-    for ds_role in roles:
-        role_name = ds_role.name
-        config_info["directory_service_roles"][role_name] = {
-            "group": ds_role.group,
-            "group_base": ds_role.group_base,
-            "role": ds_role.role.name,
-        }
+    config_info["directory_service_roles"] = generate_directory_service_roles_dict(
+        blade, api_version
+    )
     config_info["ntp"] = list(blade.get_arrays().items)[0].ntp_servers
     certs = list(blade.get_certificates().items)
     config_info["ssl_certs"] = {}
@@ -577,17 +603,31 @@ def generate_lag_dict(blade):
 
 
 def generate_admin_dict(blade):
+    """Return the array's administrators
+
+    ``role`` is set only when the admin holds exactly one management access
+    policy that corresponds to a legacy role of the same name; it is null for
+    an admin with no, several, or a custom policy, so it is read through
+    getattr. The policy names are reported from REST 2.19, where the array
+    exposes them.
+    """
     admin_info = {}
+    api_version = get_rest_api_version(blade)
+    report_policies = LooseVersion(MAP_API_VERSION) <= LooseVersion(api_version)
     admins = list(blade.get_admins().items)
     for admin in admins:
         admin_name = admin.name
         admin_info[admin_name] = {
-            "public_key": admin.public_key,
-            "local": admin.is_local,
-            "role": admin.role.name,
-            "locked": admin.locked,
+            "public_key": getattr(admin, "public_key", None),
+            "local": getattr(admin, "is_local", None),
+            "role": getattr(getattr(admin, "role", None), "name", None),
+            "locked": getattr(admin, "locked", None),
             "lockout_remaining": getattr(admin, "lockout_remaining", None),
         }
+        if report_policies:
+            admin_info[admin_name]["management_access_policies"] = _reference_names(
+                getattr(admin, "management_access_policies", None)
+            )
         if hasattr(admin.api_token, "expires_at"):
             if admin.api_token.expires_at:
                 admin_info[admin_name]["token_expires"] = datetime.fromtimestamp(

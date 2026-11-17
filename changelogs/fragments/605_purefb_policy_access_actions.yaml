@@ -1,0 +1,2 @@
+bugfixes:
+  - purefb_policy - validate the ``actions`` of an object store access policy rule against the list the array publishes instead of a fixed list, so actions added by newer Purity//FB releases (object tagging, bucket policy, CORS, public access) can be used.

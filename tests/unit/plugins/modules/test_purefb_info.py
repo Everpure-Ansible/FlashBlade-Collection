@@ -1177,6 +1177,7 @@ class TestPurefbInfo:
             "get_snmp_agents",
             "get_snmp_managers",
             "get_kmip",
+            "get_sso_oidc_idps",
         ):
             getattr(mock_blade, method).return_value.items = []
         mock_ds = Mock()
@@ -1277,6 +1278,7 @@ class TestPurefbInfo:
             "get_snmp_agents",
             "get_snmp_managers",
             "get_kmip",
+            "get_sso_oidc_idps",
         ):
             getattr(mock_blade, method).return_value.items = []
         mock_ds = Mock()

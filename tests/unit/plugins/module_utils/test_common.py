@@ -7,9 +7,10 @@ from __future__ import absolute_import, division, print_function
 
 __metaclass__ = type
 
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from plugins.module_utils.common import (
     _findstr,
+    poll_until,
     remove_duplicates,
     get_error_message,
     human_to_bytes,
@@ -202,3 +203,58 @@ class TestHumanToReal:
         assert human_to_real("5K") == 5000
         assert human_to_real("2m") == 2000000
         assert human_to_real("2M") == 2000000
+
+
+class TestPollUntil:
+    """Tests for poll_until."""
+
+    @patch("plugins.module_utils.common.time")
+    def test_finished_on_first_fetch_does_not_sleep(self, mock_time):
+        """A result that is already final is returned without sleeping."""
+        mock_time.monotonic.return_value = 100.0
+        fetch = Mock(return_value="done")
+
+        result, timed_out = poll_until(fetch, lambda item: item == "done", 60)
+
+        assert result == "done"
+        assert timed_out is False
+        fetch.assert_called_once()
+        mock_time.sleep.assert_not_called()
+
+    @patch("plugins.module_utils.common.time")
+    def test_polls_until_finished(self, mock_time):
+        """Fetch is repeated with a sleep between polls until finished."""
+        mock_time.monotonic.side_effect = [100.0, 100.0, 110.0, 120.0]
+        fetch = Mock(side_effect=["running", "running", "passed"])
+
+        result, timed_out = poll_until(fetch, lambda item: item == "passed", 60, 10)
+
+        assert result == "passed"
+        assert timed_out is False
+        assert fetch.call_count == 3
+        assert mock_time.sleep.call_args_list == [((10,),), ((10,),)]
+
+    @patch("plugins.module_utils.common.time")
+    def test_timeout_returns_last_result(self, mock_time):
+        """When the deadline passes the last result is returned with timed_out."""
+        mock_time.monotonic.side_effect = [100.0, 100.0, 125.0]
+        fetch = Mock(return_value="running")
+
+        result, timed_out = poll_until(fetch, lambda item: item == "passed", 20, 30)
+
+        assert result == "running"
+        assert timed_out is True
+        assert fetch.call_count == 2
+        # the single sleep was clamped to the time left, not the interval
+        mock_time.sleep.assert_called_once_with(20)
+
+    @patch("plugins.module_utils.common.time")
+    def test_none_result_is_passed_to_finished(self, mock_time):
+        """A fetch returning None is handed to finished, not treated as done."""
+        mock_time.monotonic.side_effect = [100.0, 100.0, 200.0]
+        fetch = Mock(return_value=None)
+
+        result, timed_out = poll_until(fetch, lambda item: item is not None, 5)
+
+        assert result is None
+        assert timed_out is True

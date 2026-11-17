@@ -170,6 +170,7 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
     get_rest_api_version,
 )
 import re
+import time
 
 MIN_LOCAL_USER = "2.15"
 MIN_EXPOSE_API = "2.18"
@@ -361,6 +362,17 @@ def create_api_token(module, blade):
     res = blade.post_admins_api_tokens(
         admin_names=[module.params["name"]], timeout=get_token_ttl(module)
     )
+    if res.status_code != 200 and "already created" in (get_error_message(res) or ""):
+        # Purity//FB 4.8.8 can still report the token that was deleted a
+        # moment ago; give the array a moment and ask once more.
+        module.warn(
+            "API token create retried: the array still reported the token "
+            "deleted a moment ago"
+        )
+        time.sleep(2)
+        res = blade.post_admins_api_tokens(
+            admin_names=[module.params["name"]], timeout=get_token_ttl(module)
+        )
     if res.status_code != 200:
         module.fail_json(
             msg="Failed to create API token. Error: {0}".format(get_error_message(res))

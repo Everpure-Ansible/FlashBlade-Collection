@@ -12,6 +12,8 @@ import multiprocessing
 import ctypes
 from unittest.mock import Mock, patch, MagicMock
 
+import pytest
+
 # Mock multiprocessing context for Windows
 if sys.platform == "win32":
     original_get_context = multiprocessing.get_context
@@ -144,6 +146,94 @@ def _user(public_key=None, role="storage_admin", policies=None):
     user.public_key = public_key
     user.api_token = None
     return user
+
+
+def _token_module(name="svc-ansible"):
+    module = Mock()
+    module.check_mode = False
+    module.params = {"name": name, "timeout": "0"}
+    module.fail_json = Mock(side_effect=SystemExit("fail_json called"))
+    return module
+
+
+def _token_response(status, token=None):
+    res = Mock()
+    res.status_code = status
+    if token is not None:
+        res.items = [Mock(api_token=Mock(token=token))]
+    return res
+
+
+class TestCreateApiToken:
+    """Purity//FB 4.8.8 was seen to answer "API token already created" to a
+    create that followed the delete of the previous token; the module waits
+    and asks once more before giving up."""
+
+    @patch("plugins.modules.purefb_user.time.sleep")
+    @patch("plugins.modules.purefb_user.get_error_message")
+    def test_first_try_succeeds(self, mock_err, mock_sleep):
+        from plugins.modules.purefb_user import create_api_token
+
+        blade = Mock()
+        blade.post_admins_api_tokens.return_value = _token_response(200, "T-1")
+
+        assert create_api_token(_token_module(), blade) == "T-1"
+        assert blade.post_admins_api_tokens.call_count == 1
+        mock_sleep.assert_not_called()
+        mock_err.assert_not_called()
+
+    @patch("plugins.modules.purefb_user.time.sleep")
+    @patch(
+        "plugins.modules.purefb_user.get_error_message",
+        return_value="API token already created",
+    )
+    def test_already_created_is_retried_once(self, _err, mock_sleep):
+        from plugins.modules.purefb_user import create_api_token
+
+        blade = Mock()
+        blade.post_admins_api_tokens.side_effect = [
+            _token_response(400),
+            _token_response(200, "T-2"),
+        ]
+
+        assert create_api_token(_token_module(), blade) == "T-2"
+        calls = blade.post_admins_api_tokens.call_args_list
+        assert len(calls) == 2 and calls[0] == calls[1]
+        mock_sleep.assert_called_once()
+
+    @patch("plugins.modules.purefb_user.time.sleep")
+    @patch(
+        "plugins.modules.purefb_user.get_error_message",
+        return_value="API token already created",
+    )
+    def test_still_present_after_retry_fails(self, _err, mock_sleep):
+        from plugins.modules.purefb_user import create_api_token
+
+        module = _token_module()
+        blade = Mock()
+        blade.post_admins_api_tokens.return_value = _token_response(400)
+
+        with pytest.raises(SystemExit):
+            create_api_token(module, blade)
+        assert blade.post_admins_api_tokens.call_count == 2
+        assert "Failed to create API token" in module.fail_json.call_args[1]["msg"]
+
+    @patch("plugins.modules.purefb_user.time.sleep")
+    @patch(
+        "plugins.modules.purefb_user.get_error_message",
+        return_value="Permission denied",
+    )
+    def test_other_errors_are_not_retried(self, _err, mock_sleep):
+        from plugins.modules.purefb_user import create_api_token
+
+        module = _token_module()
+        blade = Mock()
+        blade.post_admins_api_tokens.return_value = _token_response(400)
+
+        with pytest.raises(SystemExit):
+            create_api_token(module, blade)
+        assert blade.post_admins_api_tokens.call_count == 1
+        mock_sleep.assert_not_called()
 
 
 class TestParsePublicKeys:

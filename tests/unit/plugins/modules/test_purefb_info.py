@@ -1393,6 +1393,9 @@ class TestPurefbInfo:
         assert result["vip1"]["attached_servers"] == ["_array_server"]
         assert result["vip1"]["subnet"] == "data-subnet"
         assert result["vip1"]["address"] == "10.0.0.5"
+        # fields missing from the model on older arrays read back as unset
+        assert result["vip1"]["rdma_enabled"] is None
+        assert result["vip1"]["realms"] == []
 
         # reference-shaped subnet, no attached server
         subnet = Mock(spec=["name"])
@@ -1403,6 +1406,51 @@ class TestPurefbInfo:
         assert result["vip1"]["server"] is None
         assert result["vip1"]["attached_servers"] == []
         assert result["vip1"]["subnet"] == "mgmt"
+
+    def test_generate_network_dict_reports_rdma_and_realms(self):
+        """rdma_enabled (REST 2.28) and realms (REST 2.19) are passed through.
+
+        Realm references arrive as plain dicts on current SDKs and as
+        reference objects on older ones; both shapes reduce to names.
+        """
+        realm_ref = Mock(spec=["name"])
+        realm_ref.name = "realm-2"
+        port = Mock(
+            spec=[
+                "name",
+                "type",
+                "address",
+                "services",
+                "attached_servers",
+                "subnet",
+                "enabled",
+                "rdma_enabled",
+                "realms",
+            ]
+        )
+        port.name = "realm-1::vip1"
+        port.type = "vip"
+        port.address = "10.0.0.6"
+        port.services = ["data"]
+        port.attached_servers = []
+        port.subnet = {"name": "data-subnet"}
+        port.enabled = True
+        port.rdma_enabled = False
+        port.realms = [{"name": "realm-1", "resource_type": "realms"}, realm_ref]
+
+        mock_blade = Mock()
+        mock_blade.get_network_interfaces.return_value.items = [port]
+
+        result = generate_network_dict(mock_blade)
+
+        assert result["realm-1::vip1"]["rdma_enabled"] is False
+        assert result["realm-1::vip1"]["realms"] == ["realm-1", "realm-2"]
+
+        port.rdma_enabled = True
+        port.realms = []
+        result = generate_network_dict(mock_blade)
+        assert result["realm-1::vip1"]["rdma_enabled"] is True
+        assert result["realm-1::vip1"]["realms"] == []
 
     def test_generate_bucket_cross_object_policies_dict_reports_rules(self):
         """The allowed_* lists live on the CORS rules, not on the policy.

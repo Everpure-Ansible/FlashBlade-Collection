@@ -179,6 +179,9 @@ STORAGE_CLASS_API_VERSION = "2.17"
 REALMS_API_VERSION = "2.19"
 MAP_API_VERSION = "2.19"
 S3_EXPORT_API_VERSION = "2.20"
+# From REST 2.29 (Purity//FB 4.8.6) a WORM data policy carries commit_mode and
+# the autocommit configuration.
+WORM_AUTOCOMMIT_API_VERSION = "2.29"
 REALM_DEFAULTS_API_VERSION = "2.20"
 SUPPORT_DIAGNOSTICS_API_VERSION = "2.16"
 SUPPORT_DIAGNOSTICS_SETTINGS_API_VERSION = "2.24"
@@ -1831,6 +1834,10 @@ def generate_network_access_policies_dict(blade):
 
 def generate_worm_data_policies_dict(blade):
     policies_info = {}
+    api_version = get_rest_api_version(blade)
+    has_autocommit = LooseVersion(WORM_AUTOCOMMIT_API_VERSION) <= LooseVersion(
+        api_version
+    )
 
     for policy in blade.get_worm_data_policies().items:
         policies_info[policy.name] = {
@@ -1843,6 +1850,17 @@ def generate_worm_data_policies_dict(blade):
             "max_retention": getattr(policy, "max_retention", None),
             "members": [],
         }
+        if has_autocommit:
+            # commit_mode and the autocommit configuration exist from REST
+            # 2.29; delay_period is in milliseconds like the retentions.
+            autocommit = getattr(policy, "autocommit_config", None)
+            policies_info[policy.name]["commit_mode"] = getattr(
+                policy, "commit_mode", None
+            )
+            policies_info[policy.name]["autocommit_config"] = {
+                "delay_on": getattr(autocommit, "delay_on", None),
+                "delay_period": getattr(autocommit, "delay_period", None),
+            }
 
     for member in blade.get_worm_data_policies_members().items:
         policy_name = getattr(getattr(member, "policy", None), "name", None)

@@ -129,6 +129,11 @@ def _reference(name):
     return reference
 
 
+# The WORM tests compare real REST versions, so they use the collection's own
+# LooseVersion instead of the module_utils mock.
+from plugins.module_utils.version import LooseVersion as _RealLooseVersion
+
+
 class TestPurefbInfo:
     """Test cases for purefb_info module"""
 
@@ -2235,8 +2240,13 @@ class TestPurefbInfo:
             }
         ]
 
-    def test_generate_worm_data_policies_dict(self):
-        """WORM policies carry their retention settings and member list."""
+    @staticmethod
+    def _worm_blade(policy_attrs=None):
+        """A blade with one WORM policy worm1 whose member is fs1.
+
+        policy_attrs adds attributes beyond the retention settings every REST
+        version carries (commit_mode and autocommit_config from REST 2.29)."""
+        policy_attrs = policy_attrs or {}
         policy = Mock(
             spec=[
                 "name",
@@ -2248,6 +2258,7 @@ class TestPurefbInfo:
                 "min_retention",
                 "max_retention",
             ]
+            + sorted(policy_attrs)
         )
         policy.name = "worm1"
         policy.enabled = True
@@ -2257,6 +2268,8 @@ class TestPurefbInfo:
         policy.default_retention = 86400000
         policy.min_retention = 60000
         policy.max_retention = 172800000
+        for attr, value in policy_attrs.items():
+            setattr(policy, attr, value)
         member_ref = Mock(spec=["name"])
         member_ref.name = "fs1"
         policy_ref = Mock(spec=["name"])
@@ -2268,12 +2281,62 @@ class TestPurefbInfo:
         mock_blade = Mock()
         mock_blade.get_worm_data_policies.return_value.items = [policy]
         mock_blade.get_worm_data_policies_members.return_value.items = [member]
+        return mock_blade
 
-        result = generate_worm_data_policies_dict(mock_blade)
+    @staticmethod
+    def _autocommit(delay_on="creation", delay_period=7200000):
+        config = Mock(spec=["delay_on", "delay_period"])
+        config.delay_on = delay_on
+        config.delay_period = delay_period
+        return config
+
+    @patch("plugins.modules.purefb_info.LooseVersion", new=_RealLooseVersion)
+    @patch("plugins.modules.purefb_info.get_rest_api_version", return_value="2.28")
+    def test_generate_worm_data_policies_dict(self, mock_version):
+        """WORM policies carry their retention settings and member list; an
+        array below REST 2.29 has no commit mode or autocommit configuration."""
+        result = generate_worm_data_policies_dict(self._worm_blade())
 
         assert result["worm1"]["mode"] == "compliance"
         assert result["worm1"]["default_retention"] == 86400000
         assert result["worm1"]["members"] == ["fs1"]
+        assert "commit_mode" not in result["worm1"]
+        assert "autocommit_config" not in result["worm1"]
+
+    @patch("plugins.modules.purefb_info.LooseVersion", new=_RealLooseVersion)
+    @patch("plugins.modules.purefb_info.get_rest_api_version", return_value="2.30")
+    def test_generate_worm_data_policies_dict_reports_autocommit(self, mock_version):
+        """From REST 2.29 the commit mode and the autocommit configuration are
+        reported as the array returns them (delay_period in milliseconds)."""
+        blade = self._worm_blade(
+            {"commit_mode": "autocommit", "autocommit_config": self._autocommit()}
+        )
+
+        result = generate_worm_data_policies_dict(blade)
+
+        assert result["worm1"]["commit_mode"] == "autocommit"
+        assert result["worm1"]["autocommit_config"] == {
+            "delay_on": "creation",
+            "delay_period": 7200000,
+        }
+        assert result["worm1"]["members"] == ["fs1"]
+
+    @patch("plugins.modules.purefb_info.LooseVersion", new=_RealLooseVersion)
+    @patch("plugins.modules.purefb_info.get_rest_api_version", return_value="2.29")
+    def test_generate_worm_data_policies_dict_without_autocommit_config(
+        self, mock_version
+    ):
+        """A policy the array returns without an autocommit configuration
+        still gets both keys, with None values, so consumers see one shape."""
+        blade = self._worm_blade({"commit_mode": "manual", "autocommit_config": None})
+
+        result = generate_worm_data_policies_dict(blade)
+
+        assert result["worm1"]["commit_mode"] == "manual"
+        assert result["worm1"]["autocommit_config"] == {
+            "delay_on": None,
+            "delay_period": None,
+        }
 
     def test_generate_legal_holds_dict(self):
         """Legal holds carry description, realms and their held paths."""

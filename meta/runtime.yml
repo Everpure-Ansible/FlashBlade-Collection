@@ -23,6 +23,7 @@ action_groups:
     - purefb_export
     - purefb_fleet
     - purefb_fs
+    - purefb_fs_junction
     - purefb_fs_lock
     - purefb_fs_replica
     - purefb_groupquota

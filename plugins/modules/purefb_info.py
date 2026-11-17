@@ -77,6 +77,10 @@ options:
         C(public_keys) (name, algorithm, key size, key text and the SSH
         certificate authority policies that use each key) on
         Purity//FB 4.4.2 / REST API 2.14 or later.
+      - The C(filesystems) subset also returns a top-level C(junctions)
+        dictionary of file system junctions, keyed by junction name with
+        the origin and destination file systems, the junction path and
+        the junction status. Requires REST API 2.25 (Purity//FB 4.8.0+).
       - The C(arrays) subset reports C(connection_paths) for every array
         connection, one entry per network path with its C(source),
         C(destination), C(status), C(status_details) and C(type).
@@ -328,6 +332,7 @@ MAP_ROLES_API_VERSION = "2.26"
 TGROUP_API_VERSION = "2.26"
 STORAGE_CLASS_API_VERSION = "2.27"
 WORKLOAD_METRICS_API_VERSION = "2.30"
+JUNCTION_API_VERSION = "2.25"
 
 
 def _bytes_to_human(bytes_number):
@@ -2747,6 +2752,25 @@ def generate_file_system_exports_dict(blade):
     return exports
 
 
+def generate_fs_junctions_dict(blade):
+    junctions_info = {}
+    res = blade.get_file_system_junctions()
+    if res.status_code != 200:
+        return junctions_info
+    for junction in list(res.items):
+        junctions_info[junction.name] = {
+            "origin": getattr(
+                getattr(junction, "origin_file_system", None), "name", None
+            ),
+            "destination": getattr(
+                getattr(junction, "destination_file_system", None), "name", None
+            ),
+            "path": getattr(junction, "junction_origin_path", None),
+            "status": getattr(junction, "status", None),
+        }
+    return junctions_info
+
+
 def generate_legal_holds_dict(blade):
     """File legal holds keyed by name, each with the paths it is applied to.
 
@@ -3489,6 +3513,8 @@ def main():
         if LooseVersion(WORM_API_VERSION) <= LooseVersion(api_version):
             worm_policies = generate_fs_worm_policies_dict(blade)
         info["filesystems"] = generate_fs_dict(blade, exports_list, worm_policies)
+        if LooseVersion(JUNCTION_API_VERSION) <= LooseVersion(api_version):
+            info["junctions"] = generate_fs_junctions_dict(blade)
     if "admins" in subset or "all" in subset:
         info["admins"] = generate_admin_dict(blade)
         if LooseVersion(PUBLIC_KEYS_API_VERSION) <= LooseVersion(api_version):

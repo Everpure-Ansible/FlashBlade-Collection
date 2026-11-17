@@ -81,6 +81,7 @@ from plugins.modules.purefb_info import (
     generate_password_policies_dict,
     generate_file_system_exports_dict,
     generate_fs_dict,
+    generate_fs_junctions_dict,
     generate_fs_worm_policies_dict,
     generate_array_conn_dict,
     generate_all_policies_dict,
@@ -1968,6 +1969,125 @@ class TestPurefbInfo:
         assert entry["enabled"] is True
         assert entry["local"] is True
         assert len(entry["rules"]) == 1
+
+    def test_generate_fs_junctions_dict(self):
+        """Junctions are keyed by name with origin, destination, path, status."""
+        origin = Mock(spec=["name"])
+        origin.name = "projects"
+        destination = Mock(spec=["name"])
+        destination.name = "alpha"
+        junction = Mock(
+            spec=[
+                "name",
+                "origin_file_system",
+                "destination_file_system",
+                "junction_origin_path",
+                "status",
+            ]
+        )
+        junction.name = "projects-alpha"
+        junction.origin_file_system = origin
+        junction.destination_file_system = destination
+        junction.junction_origin_path = "/alpha"
+        junction.status = "CONNECTED"
+
+        mock_blade = Mock()
+        mock_blade.get_file_system_junctions.return_value = Mock(
+            status_code=200, items=[junction]
+        )
+
+        result = generate_fs_junctions_dict(mock_blade)
+
+        assert result == {
+            "projects-alpha": {
+                "origin": "projects",
+                "destination": "alpha",
+                "path": "/alpha",
+                "status": "CONNECTED",
+            }
+        }
+
+    def test_generate_fs_junctions_dict_returns_empty_when_endpoint_errors(self):
+        """An error response carries no items; the key must come back empty."""
+        mock_blade = Mock()
+        error = Mock(spec=["status_code", "errors", "headers"])
+        error.status_code = 400
+        mock_blade.get_file_system_junctions.return_value = error
+
+        assert generate_fs_junctions_dict(mock_blade) == {}
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_fs_junctions_dict")
+    @patch("plugins.modules.purefb_info.generate_fs_dict")
+    @patch("plugins.modules.purefb_info.generate_file_system_exports_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_filesystems_subset_includes_junctions(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_exports,
+        mock_generate_fs,
+        mock_generate_junctions,
+        mock_loose_version,
+    ):
+        """The filesystems subset carries the junctions key once the array
+        supports REST 2.25."""
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["filesystems"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        mock_blade = Mock()
+        mock_blade.get_versions.return_value.items = ["2.25"]
+        # every gate is open under the LooseVersion mock, so the WORM lookup runs
+        mock_blade.get_file_systems_worm_data_policies.return_value.items = []
+        mock_get_system.return_value = mock_blade
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+
+        mock_generate_exports.return_value = []
+        mock_generate_fs.return_value = {}
+        mock_generate_junctions.return_value = {"jn1": {"status": "CONNECTED"}}
+
+        main()
+
+        mock_generate_junctions.assert_called_once_with(mock_blade)
+        call_args = mock_module.exit_json.call_args[1]
+        assert call_args["purefb_info"]["junctions"] == {"jn1": {"status": "CONNECTED"}}
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_fs_junctions_dict")
+    @patch("plugins.modules.purefb_info.generate_fs_dict")
+    @patch("plugins.modules.purefb_info.generate_file_system_exports_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_filesystems_subset_skips_junctions_below_gate(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_exports,
+        mock_generate_fs,
+        mock_generate_junctions,
+        mock_loose_version,
+    ):
+        """Below REST 2.25 the junctions endpoint is never called."""
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["filesystems"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+
+        mock_blade = Mock()
+        mock_blade.get_versions.return_value.items = ["2.16"]
+        mock_get_system.return_value = mock_blade
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+
+        mock_generate_fs.return_value = {}
+
+        main()
+
+        mock_generate_junctions.assert_not_called()
+        call_args = mock_module.exit_json.call_args[1]
+        assert "junctions" not in call_args["purefb_info"]
 
     def test_generate_lag_dict_returns_empty_when_endpoint_errors(self):
         """An array in Layer 3 (BGP) mode has no link aggregation groups and

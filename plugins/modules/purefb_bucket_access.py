@@ -47,6 +47,12 @@ options:
     description:
     - Name of the rule in the Bucket Policy
     - Required if I(state) is C(present)
+    - A rule that exists with different content is replaced. The REST API
+      has no PATCH for policy rules, so the replacement is created under a
+      temporary name (the rule name with C(tmp) appended, kept within the
+      63-character limit) before the existing rule is deleted. A rule the
+      array refuses, or stores differently from the request, leaves the
+      existing rule unchanged.
     type: str
   effect:
     description:
@@ -355,344 +361,331 @@ def _cors_rule_matches(module, rule):
     return desired == current
 
 
+# The two policy types share one lookup, create, replace and delete flow;
+# these tables hold what differs between them.
+_ACCESS_RULES = {
+    "label": "access policy",
+    "get_policies": "get_buckets_bucket_access_policies",
+    "post_policies": "post_buckets_bucket_access_policies",
+    "delete_policies": "delete_buckets_bucket_access_policies",
+    "get_rules": "get_buckets_bucket_access_policies_rules",
+    "post_rules": "post_buckets_bucket_access_policies_rules",
+    "delete_rules": "delete_buckets_bucket_access_policies_rules",
+    "matches": _access_rule_matches,
+    "describe": _describe_access_rule,
+    "supported": "The FlashBlade REST API currently only supports "
+    "s3:GetObject on all objects in the bucket for all principals.",
+}
+_CORS_RULES = {
+    "label": "CORS policy",
+    "get_policies": "get_buckets_cross_origin_resource_sharing_policies",
+    "post_policies": "post_buckets_cross_origin_resource_sharing_policies",
+    "delete_policies": "delete_buckets_cross_origin_resource_sharing_policies",
+    "get_rules": "get_buckets_cross_origin_resource_sharing_policies_rules",
+    "post_rules": "post_buckets_cross_origin_resource_sharing_policies_rules",
+    "delete_rules": "delete_buckets_cross_origin_resource_sharing_policies_rules",
+    "matches": _cors_rule_matches,
+    "describe": _describe_cors_rule,
+    "supported": "The FlashBlade REST API currently only supports all "
+    "methods, origin '*' and header '*'.",
+}
+# Policy rule names are 1 to 63 alphanumeric characters. A rule being
+# replaced is first posted under its own name with this suffix appended.
+_RULE_NAME_MAX = 63
+_TEMP_RULE_SUFFIX = "tmp"
+
+
+def _temp_rule_name(rule_name):
+    """Return the temporary name used while a rule is replaced"""
+    return rule_name[: _RULE_NAME_MAX - len(_TEMP_RULE_SUFFIX)] + _TEMP_RULE_SUFFIX
+
+
+def _title(kind):
+    """Return the policy kind's label capitalised for the start of a message"""
+    return kind["label"][:1].upper() + kind["label"][1:]
+
+
+def _policy_exists(module, blade, ctx, kind):
+    """Return whether the bucket has a policy of this kind; a read error is fatal"""
+    bucket = module.params["name"]
+    res = getattr(blade, kind["get_policies"])(bucket_names=[bucket], **ctx)
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to read the {0} of bucket {1}. Error: {2}".format(
+                kind["label"], bucket, get_error_message(res)
+            )
+        )
+    return bool(list(res.items))
+
+
+def _get_rules(module, blade, ctx, kind):
+    """Return the stored rules of the bucket's policy; a read error is fatal
+
+    The rules are listed rather than fetched by name because the array
+    answers a GET for a missing rule name with an error that cannot be told
+    apart from any other failure.
+    """
+    bucket = module.params["name"]
+    res = getattr(blade, kind["get_rules"])(bucket_names=[bucket], **ctx)
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to read the {0} rules of bucket {1}. Error: {2}".format(
+                kind["label"], bucket, get_error_message(res)
+            )
+        )
+    return list(res.items)
+
+
+def _find_rule(rules, name):
+    """Return the rule called name from a list of stored rules, or None"""
+    for rule in rules:
+        if rule.name == name:
+            return rule
+    return None
+
+
+def _read_rule(blade, ctx, kind, bucket, name):
+    """GET one rule by name after it was posted.
+
+    The POST response only echoes the request body (it returns actions that
+    a GET immediately afterwards does not), so a posted rule is always read
+    back rather than taken from the POST response.
+    """
+    return getattr(blade, kind["get_rules"])(bucket_names=[bucket], names=[name], **ctx)
+
+
+def _post_rule(blade, ctx, kind, bucket, name, body):
+    return getattr(blade, kind["post_rules"])(
+        bucket_names=[bucket], names=[name], rule=body, **ctx
+    )
+
+
+def _delete_rule(blade, ctx, kind, bucket, name):
+    return getattr(blade, kind["delete_rules"])(
+        bucket_names=[bucket], names=[name], **ctx
+    )
+
+
+def _remove_temp_rule(blade, ctx, kind, bucket, temp_name):
+    """Delete the temporary rule; return a note for the error message if that fails"""
+    res = _delete_rule(blade, ctx, kind, bucket, temp_name)
+    if res.status_code != 200:
+        return " The temporary rule {0} could not be removed. Error: {1}".format(
+            temp_name, get_error_message(res)
+        )
+    return ""
+
+
+def _replace_rule(module, blade, ctx, kind, body, rules):
+    """Replace a rule whose stored content differs from the request.
+
+    The REST API has no PATCH for policy rules, so the rule has to be
+    deleted and posted again. The replacement is posted under a temporary
+    name first: a rule the array refuses, or stores differently from the
+    request, then leaves the existing rule untouched instead of deleting it.
+    """
+    bucket = module.params["name"]
+    rule_name = module.params["rule"]
+    temp_name = _temp_rule_name(rule_name)
+    label = kind["label"]
+    if _find_rule(rules, temp_name) is not None:
+        module.fail_json(
+            msg="Cannot replace {0} rule {1} in policy {2}: the temporary rule "
+            "name {3} is already in use. Remove or rename that rule first.".format(
+                label, rule_name, bucket, temp_name
+            )
+        )
+    res = _post_rule(blade, ctx, kind, bucket, temp_name, body)
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to replace {0} rule {1} in policy {2}: the array refused "
+            "the new rule and the existing rule was left unchanged. "
+            "Error: {3}".format(label, rule_name, bucket, get_error_message(res))
+        )
+    res = _read_rule(blade, ctx, kind, bucket, temp_name)
+    if res.status_code != 200:
+        error = get_error_message(res)
+        note = _remove_temp_rule(blade, ctx, kind, bucket, temp_name)
+        module.fail_json(
+            msg="Failed to replace {0} rule {1} in policy {2}: the new rule could "
+            "not be read back and the existing rule was left unchanged. "
+            "Error: {3}{4}".format(label, rule_name, bucket, error, note)
+        )
+    stored = list(res.items)[0]
+    if not kind["matches"](module, stored):
+        note = _remove_temp_rule(blade, ctx, kind, bucket, temp_name)
+        module.fail_json(
+            msg="{0} rule {1} in policy {2} cannot be changed as requested: the "
+            "array stored the new rule as {3}. {4} The existing rule was left "
+            "unchanged.{5}".format(
+                _title(kind),
+                rule_name,
+                bucket,
+                kind["describe"](stored),
+                kind["supported"],
+                note,
+            )
+        )
+    res = _delete_rule(blade, ctx, kind, bucket, rule_name)
+    if res.status_code != 200:
+        error = get_error_message(res)
+        note = _remove_temp_rule(blade, ctx, kind, bucket, temp_name)
+        module.fail_json(
+            msg="Failed to replace {0} rule {1} in policy {2}: the existing rule "
+            "could not be deleted. Error: {3}{4}".format(
+                label, rule_name, bucket, error, note
+            )
+        )
+    res = _post_rule(blade, ctx, kind, bucket, rule_name, body)
+    if res.status_code != 200:
+        module.fail_json(
+            changed=True,
+            msg="Failed to recreate {0} rule {1} in policy {2} after deleting it; "
+            "the requested rule is stored under the temporary name {3}. "
+            "Error: {4}".format(
+                label, rule_name, bucket, temp_name, get_error_message(res)
+            ),
+        )
+    res = _delete_rule(blade, ctx, kind, bucket, temp_name)
+    if res.status_code != 200:
+        module.fail_json(
+            changed=True,
+            msg="{0} rule {1} in policy {2} was replaced, but the temporary rule "
+            "{3} could not be deleted. Error: {4}".format(
+                _title(kind), rule_name, bucket, temp_name, get_error_message(res)
+            ),
+        )
+
+
+def _create_rule(module, blade, kind, body):
+    """Create a policy rule, replacing one whose content differs.
+
+    The policy itself may be missing (never created, or removed with its
+    last rule), in which case it is created before the rule is posted.
+    """
+    api_version = get_rest_api_version(blade)
+    ctx = _context_kwargs(module, api_version)
+    bucket = module.params["name"]
+    rule_name = module.params["rule"]
+    label = kind["label"]
+    policy_exists = _policy_exists(module, blade, ctx, kind)
+    rules = _get_rules(module, blade, ctx, kind) if policy_exists else []
+    current = _find_rule(rules, rule_name)
+    if current is not None:
+        if kind["matches"](module, current):
+            module.exit_json(changed=False)
+        if not module.check_mode:
+            _replace_rule(module, blade, ctx, kind, body, rules)
+        module.exit_json(changed=True)
+    if not module.check_mode:
+        if not policy_exists:
+            res = getattr(blade, kind["post_policies"])(bucket_names=[bucket], **ctx)
+            if res.status_code != 200:
+                module.fail_json(
+                    msg="Failed to create the {0} of bucket {1}. Error: {2}".format(
+                        label, bucket, get_error_message(res)
+                    )
+                )
+        res = _post_rule(blade, ctx, kind, bucket, rule_name, body)
+        if res.status_code != 200:
+            module.fail_json(
+                msg="Failed to create {0} rule {1} in policy {2}. Error: {3}".format(
+                    label, rule_name, bucket, get_error_message(res)
+                )
+            )
+        # The array accepts a rule body it cannot honour and stores what it
+        # supports instead (an action list with s3:GetObject and more is kept
+        # as s3:GetObject alone). Left alone, every later run would see the
+        # stored rule differ from the request and replace it again, so a
+        # coerced rule is an error.
+        res = _read_rule(blade, ctx, kind, bucket, rule_name)
+        if res.status_code != 200:
+            module.fail_json(
+                changed=True,
+                msg="{0} rule {1} in policy {2} was created but could not be read "
+                "back. Error: {3}".format(
+                    _title(kind), rule_name, bucket, get_error_message(res)
+                ),
+            )
+        stored = list(res.items)[0]
+        if not kind["matches"](module, stored):
+            module.fail_json(
+                changed=True,
+                msg="{0} rule {1} in policy {2} was not stored as requested: the "
+                "array kept {3}. {4}".format(
+                    _title(kind),
+                    rule_name,
+                    bucket,
+                    kind["describe"](stored),
+                    kind["supported"],
+                ),
+            )
+    module.exit_json(changed=True)
+
+
+def _delete_policy(module, blade, kind):
+    """Delete a policy rule, or the whole policy when no rule is named"""
+    api_version = get_rest_api_version(blade)
+    ctx = _context_kwargs(module, api_version)
+    bucket = module.params["name"]
+    rule_name = module.params["rule"]
+    policy_exists = _policy_exists(module, blade, ctx, kind)
+    if rule_name:
+        rules = _get_rules(module, blade, ctx, kind) if policy_exists else []
+        if _find_rule(rules, rule_name) is None:
+            module.exit_json(changed=False)
+        if not module.check_mode:
+            res = _delete_rule(blade, ctx, kind, bucket, rule_name)
+            if res.status_code != 200:
+                module.fail_json(
+                    msg="Failed to delete {0} rule {1} for bucket {2}. Error: {3}".format(
+                        kind["label"], rule_name, bucket, get_error_message(res)
+                    )
+                )
+    else:
+        if not policy_exists:
+            module.exit_json(changed=False)
+        if not module.check_mode:
+            res = getattr(blade, kind["delete_policies"])(bucket_names=[bucket], **ctx)
+            if res.status_code != 200:
+                module.fail_json(
+                    msg="Failed to delete {0} for bucket {1}. Error: {2}".format(
+                        kind["label"], bucket, get_error_message(res)
+                    )
+                )
+    module.exit_json(changed=True)
+
+
 def delete_cors_policy(module, blade):
     """Delete cross-origin resource sharing policy or rule"""
-    api_version = get_rest_api_version(blade)
-    changed = True
-    if not module.check_mode:
-        if module.params["rule"]:
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-                and module.params["context"]
-            ):
-                res = blade.get_buckets_cross_origin_resource_sharing_policies_rules(
-                    bucket_names=[module.params["name"]],
-                    names=[module.params["rule"]],
-                    context_names=[module.params["context"]],
-                )
-            else:
-                res = blade.get_buckets_cross_origin_resource_sharing_policies_rules(
-                    bucket_names=[module.params["name"]], names=[module.params["rule"]]
-                )
-            if res.status_code != 200:
-                # Rule does not exist, nothing to delete
-                changed = False
-                module.exit_json(changed=changed)
-
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-                and module.params["context"]
-            ):
-                res = blade.delete_buckets_cross_origin_resource_sharing_policies_rules(
-                    names=module.params["rule"],
-                    bucket_names=module.params["name"],
-                    context_names=[module.params["context"]],
-                )
-            else:
-                res = blade.delete_buckets_cross_origin_resource_sharing_policies_rules(
-                    names=module.params["rule"], bucket_names=module.params["name"]
-                )
-            if res.status_code != 200:
-                module.fail_json(
-                    msg="Failed to delete CORS rule {0} for bucket {1}. Error: {2}".format(
-                        module.params["rule"],
-                        module.params["name"],
-                        get_error_message(res),
-                    )
-                )
-        else:
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-                and module.params["context"]
-            ):
-                res = blade.get_buckets_cross_origin_resource_sharing_policies(
-                    bucket_names=[module.params["name"]],
-                    context_names=[module.params["context"]],
-                )
-            else:
-                res = blade.get_buckets_cross_origin_resource_sharing_policies(
-                    bucket_names=[module.params["name"]],
-                )
-            if res.total_item_count == 0:
-                changed = False
-                module.exit_json(changed=changed)
-
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-                and module.params["context"]
-            ):
-                res = blade.delete_buckets_cross_origin_resource_sharing_policies(
-                    bucket_names=module.params["name"],
-                    context_names=[module.params["context"]],
-                )
-            else:
-                res = blade.delete_buckets_cross_origin_resource_sharing_policies(
-                    bucket_names=module.params["name"]
-                )
-            if res.status_code != 200:
-                module.fail_json(
-                    msg="Failed to delete CORS policy for bucket {0}. Error: {1}".format(
-                        module.params["name"], get_error_message(res)
-                    )
-                )
-
-    module.exit_json(changed=changed)
+    _delete_policy(module, blade, _CORS_RULES)
 
 
 def delete_access_policy(module, blade):
     """Delete bucket access policy or rule"""
-
-    changed = True
-    api_version = get_rest_api_version(blade)
-    if not module.check_mode:
-        if module.params["rule"]:
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-                and module.params["context"]
-            ):
-                res = blade.get_buckets_bucket_access_policies_rules(
-                    bucket_names=[module.params["name"]],
-                    names=[module.params["rule"]],
-                    context_names=[module.params["context"]],
-                )
-            else:
-                res = blade.get_buckets_bucket_access_policies_rules(
-                    bucket_names=[module.params["name"]], names=[module.params["rule"]]
-                )
-            if res.status_code != 200:
-                changed = False
-                module.exit_json(changed=changed)
-
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-                and module.params["context"]
-            ):
-                res = blade.delete_buckets_bucket_access_policies_rules(
-                    names=module.params["rule"],
-                    bucket_names=module.params["name"],
-                    context_names=[module.params["context"]],
-                )
-            else:
-                res = blade.delete_buckets_bucket_access_policies_rules(
-                    names=module.params["rule"], bucket_names=module.params["name"]
-                )
-            if res.status_code != 200:
-                module.fail_json(
-                    msg="Failed to delete access rule {0} for bucket {1}. Error: {2}".format(
-                        module.params["rule"],
-                        module.params["name"],
-                        get_error_message(res),
-                    )
-                )
-        else:
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-                and module.params["context"]
-            ):
-                res = blade.get_buckets_bucket_access_policies(
-                    bucket_names=[module.params["name"]],
-                    context_names=[module.params["context"]],
-                )
-            else:
-                res = blade.get_buckets_bucket_access_policies(
-                    bucket_names=[module.params["name"]]
-                )
-            if res.total_item_count == 0:
-                changed = False
-                module.exit_json(changed=changed)
-
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-                and module.params["context"]
-            ):
-                res = blade.delete_buckets_bucket_access_policies(
-                    bucket_names=module.params["name"],
-                    context_names=[module.params["context"]],
-                )
-            else:
-                res = blade.delete_buckets_bucket_access_policies(
-                    bucket_names=module.params["name"]
-                )
-            if res.status_code != 200:
-                module.fail_json(
-                    msg="Failed to delete access policy for bucket {0}. Error: {1}".format(
-                        module.params["name"], get_error_message(res)
-                    )
-                )
-
-    module.exit_json(changed=changed)
+    _delete_policy(module, blade, _ACCESS_RULES)
 
 
 def create_access_policy(module, blade):
     """Create or update a bucket access policy rule (and the policy if needed)"""
-    changed = False
-    api_version = get_rest_api_version(blade)
-    ctx = _context_kwargs(module, api_version)
     bucket = module.params["name"]
-    rule_name = module.params["rule"]
-
-    res = blade.get_buckets_bucket_access_policies_rules(
-        bucket_names=[bucket], names=[rule_name], **ctx
+    body = BucketAccessPolicyRulePost(
+        effect=module.params["effect"],
+        resources=[bucket + "/" + resource for resource in module.params["resources"]],
+        actions=module.params["actions"],
+        principals=BucketAccessPolicyRulePrincipal(all=module.params["principals"]),
     )
-    if res.status_code == 200:
-        if _access_rule_matches(module, list(res.items)[0]):
-            module.exit_json(changed=False)
-        # The REST API has no PATCH for bucket access policy rules, so a rule
-        # whose content differs is replaced: delete it, then recreate it.
-        changed = True
-        if not module.check_mode:
-            res = blade.delete_buckets_bucket_access_policies_rules(
-                bucket_names=[bucket], names=[rule_name], **ctx
-            )
-            if res.status_code != 200:
-                module.fail_json(
-                    msg="Failed to replace access policy rule {0} "
-                    "in policy {1}. Error: {2}".format(
-                        rule_name, bucket, get_error_message(res)
-                    )
-                )
-    else:
-        changed = True
-
-    if not module.check_mode:
-        # The policy itself may be missing (never created, or removed with its
-        # last rule), in which case it has to exist before the rule is posted.
-        res = blade.get_buckets_bucket_access_policies(bucket_names=[bucket], **ctx)
-        if res.status_code != 200 or res.total_item_count == 0:
-            res = blade.post_buckets_bucket_access_policies(
-                bucket_names=[bucket], **ctx
-            )
-            if res.status_code != 200:
-                module.fail_json(
-                    msg="Failed to create initial bucket access policy for {0}. "
-                    "Error: {1}".format(bucket, get_error_message(res))
-                )
-        all_resources = []
-        for resource in module.params["resources"]:
-            all_resources.append(bucket + "/" + resource)
-        res = blade.post_buckets_bucket_access_policies_rules(
-            bucket_names=[bucket],
-            names=[rule_name],
-            rule=BucketAccessPolicyRulePost(
-                effect=module.params["effect"],
-                resources=all_resources,
-                actions=module.params["actions"],
-                principals=BucketAccessPolicyRulePrincipal(
-                    all=module.params["principals"]
-                ),
-            ),
-            **ctx
-        )
-        if res.status_code != 200:
-            module.fail_json(
-                msg="Failed to create access policy rule {0} "
-                "in policy {1}. Error: {2}".format(
-                    rule_name, bucket, get_error_message(res)
-                )
-            )
-        # The array accepts a rule body it cannot honour and stores what it
-        # supports instead (Purity//FB 4.6 keeps s3:GetObject on all objects
-        # for all principals). Left alone, every later run would see the
-        # stored rule differ from the request and replace it again, so the
-        # stored rule is checked here and a coerced rule is an error. The
-        # POST response only echoes the request body (verified on 4.6.4: it
-        # returns the extra actions that a GET immediately afterwards does
-        # not), so the rule has to be read back rather than taken from the
-        # POST response.
-        res = blade.get_buckets_bucket_access_policies_rules(
-            bucket_names=[bucket], names=[rule_name], **ctx
-        )
-        stored = list(res.items) if res.status_code == 200 else []
-        if stored and not _access_rule_matches(module, stored[0]):
-            module.fail_json(
-                changed=True,
-                msg="Access policy rule {0} in policy {1} was not stored as "
-                "requested: the array kept {2}. The FlashBlade REST API "
-                "currently only supports s3:GetObject on all objects in the "
-                "bucket for all principals.".format(
-                    rule_name, bucket, _describe_access_rule(stored[0])
-                ),
-            )
-    module.exit_json(changed=changed)
+    _create_rule(module, blade, _ACCESS_RULES, body)
 
 
 def create_cors_policy(module, blade):
     """Create or update a CORS policy rule (and the policy if needed)"""
-    changed = False
-    api_version = get_rest_api_version(blade)
-    ctx = _context_kwargs(module, api_version)
-    bucket = module.params["name"]
-    rule_name = module.params["rule"]
-
-    res = blade.get_buckets_cross_origin_resource_sharing_policies_rules(
-        bucket_names=[bucket], names=[rule_name], **ctx
+    body = CrossOriginResourceSharingPolicyRulePost(
+        allowed_methods=module.params["methods"],
+        allowed_origins=module.params["origins"],
+        allowed_headers=module.params["headers"],
     )
-    if res.status_code == 200:
-        if _cors_rule_matches(module, list(res.items)[0]):
-            module.exit_json(changed=False)
-        # The REST API has no PATCH for CORS policy rules, so a rule whose
-        # content differs is replaced: delete it, then recreate it.
-        changed = True
-        if not module.check_mode:
-            res = blade.delete_buckets_cross_origin_resource_sharing_policies_rules(
-                bucket_names=[bucket], names=[rule_name], **ctx
-            )
-            if res.status_code != 200:
-                module.fail_json(
-                    msg="Failed to replace CORS policy rule {0} "
-                    "in policy {1}. Error: {2}".format(
-                        rule_name, bucket, get_error_message(res)
-                    )
-                )
-    else:
-        changed = True
-
-    if not module.check_mode:
-        res = blade.get_buckets_cross_origin_resource_sharing_policies(
-            bucket_names=[bucket], **ctx
-        )
-        if res.status_code != 200 or res.total_item_count == 0:
-            res = blade.post_buckets_cross_origin_resource_sharing_policies(
-                bucket_names=[bucket], **ctx
-            )
-            if res.status_code != 200:
-                module.fail_json(
-                    msg="Failed to create initial CORS policy for {0}. "
-                    "Error: {1}".format(bucket, get_error_message(res))
-                )
-        res = blade.post_buckets_cross_origin_resource_sharing_policies_rules(
-            bucket_names=[bucket],
-            names=[rule_name],
-            rule=CrossOriginResourceSharingPolicyRulePost(
-                allowed_methods=module.params["methods"],
-                allowed_origins=module.params["origins"],
-                allowed_headers=module.params["headers"],
-            ),
-            **ctx
-        )
-        if res.status_code != 200:
-            module.fail_json(
-                msg="Failed to create CORS policy rule {0} "
-                "in policy {1}. Error: {2}".format(
-                    rule_name, bucket, get_error_message(res)
-                )
-            )
-        # As for access rules: fail if the array stored something other than
-        # what was asked for, instead of replacing the rule on every run. The
-        # POST response echoes the request, so read the rule back.
-        res = blade.get_buckets_cross_origin_resource_sharing_policies_rules(
-            bucket_names=[bucket], names=[rule_name], **ctx
-        )
-        stored = list(res.items) if res.status_code == 200 else []
-        if stored and not _cors_rule_matches(module, stored[0]):
-            module.fail_json(
-                changed=True,
-                msg="CORS policy rule {0} in policy {1} was not stored as "
-                "requested: the array kept {2}. The FlashBlade REST API "
-                "currently only supports all methods, origin '*' and "
-                "header '*'.".format(rule_name, bucket, _describe_cors_rule(stored[0])),
-            )
-    module.exit_json(changed=changed)
+    _create_rule(module, blade, _CORS_RULES, body)
 
 
 def main():

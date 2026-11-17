@@ -5002,3 +5002,163 @@ class TestPurefbFs:
         mock_fs_patch.assert_any_call(group_ownership="parent-directory")
         mock_blade.patch_file_systems.assert_called()
         mock_module.exit_json.assert_called_with(changed=True)
+
+    # ==== storage_class on modify: compare by name, PATCH only on drift ====
+
+    def _existing_fs_with_storage_class(self, name):
+        """Existing filesystem whose storage_class object carries ``name``.
+        The array always returns the storage_class object; on platforms
+        without storage classes it has no name.
+        """
+        fs = self._existing_fs()
+        fs.storage_class = Mock()
+        fs.storage_class.name = name
+        return fs
+
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.17"),
+    )
+    def test_modify_fs_storage_class_same_is_noop(self, mock_get_filesystem):
+        """The requested class matches storage_class.name: no PATCH and
+        changed=False. The old code compared the string with the
+        StorageClassInfo object, so every run sent a PATCH and reported a
+        change.
+        """
+        params = self.get_default_params()
+        params.update({"storage_class": "S500X-S"})
+        mock_fs = self._existing_fs_with_storage_class("S500X-S")
+
+        mock_module, mock_blade = self._run_modify(params, mock_fs, mock_get_filesystem)
+
+        mock_blade.patch_file_systems.assert_not_called()
+        mock_module.exit_json.assert_called_with(changed=False)
+
+    @patch("plugins.modules.purefb_fs.StorageClassInfo")
+    @patch("plugins.modules.purefb_fs.FileSystemPatch")
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.17"),
+    )
+    def test_modify_fs_storage_class_different_is_patched(
+        self, mock_get_filesystem, mock_fs_patch, mock_sc_info
+    ):
+        """A different class sends exactly one storage_class PATCH carrying
+        cancel_in_progress and reports changed=True.
+        """
+        params = self.get_default_params()
+        params.update({"storage_class": "S500X-A", "cancel_in_progress": True})
+        mock_fs = self._existing_fs_with_storage_class("S500X-S")
+
+        mock_module, mock_blade = self._run_modify(params, mock_fs, mock_get_filesystem)
+
+        mock_sc_info.assert_called_once_with(name="S500X-A")
+        mock_fs_patch.assert_called_once_with(storage_class=mock_sc_info.return_value)
+        mock_blade.patch_file_systems.assert_called_once_with(
+            names=["test-fs"],
+            file_system=mock_fs_patch.return_value,
+            cancel_in_progress_storage_class_transition=True,
+        )
+        mock_module.exit_json.assert_called_with(changed=True)
+
+    @patch("plugins.modules.purefb_fs.StorageClassInfo")
+    @patch("plugins.modules.purefb_fs.FileSystemPatch")
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.17"),
+    )
+    def test_modify_fs_storage_class_with_context(
+        self, mock_get_filesystem, mock_fs_patch, mock_sc_info
+    ):
+        """With a fleet context the storage_class PATCH carries context_names."""
+        params = self.get_default_params()
+        params.update({"storage_class": "S500X-A", "context": "fleet-member"})
+        mock_fs = self._existing_fs_with_storage_class("S500X-S")
+
+        mock_module, mock_blade = self._run_modify(params, mock_fs, mock_get_filesystem)
+
+        mock_blade.patch_file_systems.assert_called_once_with(
+            names=["test-fs"],
+            file_system=mock_fs_patch.return_value,
+            cancel_in_progress_storage_class_transition=False,
+            context_names=["fleet-member"],
+        )
+        mock_module.exit_json.assert_called_with(changed=True)
+
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.17"),
+    )
+    def test_modify_fs_storage_class_check_mode(self, mock_get_filesystem):
+        """Check mode reports the pending change without sending the PATCH."""
+        params = self.get_default_params()
+        params.update({"storage_class": "S500X-A"})
+        mock_fs = self._existing_fs_with_storage_class("S500X-S")
+        mock_module = Mock()
+        mock_module.check_mode = True
+        mock_module.params = params
+        mock_blade = Mock()
+        mock_get_filesystem.return_value = mock_fs
+        mock_blade.get_file_systems.return_value.items = [mock_fs]
+
+        modify_fs(mock_module, mock_blade)
+
+        mock_blade.patch_file_systems.assert_not_called()
+        mock_module.exit_json.assert_called_with(changed=True)
+
+    @patch("plugins.modules.purefb_fs.get_error_message")
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.17"),
+    )
+    def test_modify_fs_storage_class_unsupported_platform_fails(
+        self, mock_get_filesystem, mock_get_error
+    ):
+        """Platforms without storage classes return the storage_class object
+        with no name and answer the PATCH with 400. The old code never
+        looked at the response; the module now fails with the array message.
+        """
+        mock_get_error.return_value = (
+            "Storage classes are not supported on this product."
+        )
+        params = self.get_default_params()
+        params.update({"storage_class": "S500X-S"})
+        mock_fs = self._existing_fs_with_storage_class(None)
+        mock_module = Mock()
+        mock_module.check_mode = False
+        mock_module.params = params
+        mock_module.fail_json.side_effect = Exception("fail_json")
+        mock_blade = Mock()
+        mock_get_filesystem.return_value = mock_fs
+        mock_blade.get_file_systems.return_value.items = [mock_fs]
+        mock_response = Mock()
+        mock_response.status_code = 400
+        mock_blade.patch_file_systems.return_value = mock_response
+
+        try:
+            modify_fs(mock_module, mock_blade)
+        except Exception as exc:  # fail_json stops the module
+            assert str(exc) == "fail_json"
+        else:
+            raise AssertionError("fail_json was not called")
+
+        mock_blade.patch_file_systems.assert_called_once()
+        msg = mock_module.fail_json.call_args.kwargs["msg"]
+        assert "Storage classes are not supported on this product." in msg
+        assert "test-fs" in msg
+        mock_module.exit_json.assert_not_called()

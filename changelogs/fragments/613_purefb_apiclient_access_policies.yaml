@@ -1,4 +1,11 @@
 minor_changes:
-  - purefb_apiclient - add ``access_policies`` to create an API client with one or more management access policies (REST 2.19, Purity//FB 4.6.1). ``role`` remains as an alias for a single built-in policy.
-  - purefb_apiclient - warn when ``access_policies``, ``role``, ``public_key``, ``issuer`` or ``token_ttl`` differ on an existing client, since the array only allows the enabled state to change. ``token_ttl`` no longer has an argument default; 86400 is still applied on create.
+  - purefb_apiclient - add ``access_policies`` to create an API client with one or more management access
+    policies (REST 2.19, Purity//FB 4.6.1). ``role`` remains as an alias for a single built-in policy.
+  - purefb_apiclient - warn when ``access_policies``, ``role``, ``public_key``, ``issuer`` or ``token_ttl``
+    differ on an existing client, since the array only allows the enabled state to change. ``token_ttl`` no
+    longer has an argument default; 86400 is still applied on create.
   - purefb_mgmt_role - documentation now states that API-client policies are fixed when the client is created.
+bugfixes:
+  - purefb_apiclient - an API client lookup error other than ``API client does not exist`` now fails the task
+    instead of being treated as a missing client, so ``state=absent`` no longer reports ok and ``state=present``
+    no longer attempts a create on a transient error. An empty lookup result no longer raises ``IndexError``.

@@ -207,6 +207,29 @@ def _access_policies_supported(api_version):
     return LooseVersion(MIN_ACCESS_POLICIES_API_VERSION) <= LooseVersion(api_version)
 
 
+def _get_client(module, blade):
+    """Return the named API client, or None when it does not exist.
+
+    The array answers a GET for an unknown name with a 400 ("API client
+    does not exist."), so only that error reads as None. Any other failure
+    fails the task instead of masquerading as a missing client, which would
+    let state=absent report ok on a transient error or send a POST for a
+    client that is already there.
+    """
+    res = blade.get_api_clients(names=[module.params["name"]])
+    if res.status_code == 200:
+        items = list(res.items)
+        return items[0] if items else None
+    error = get_error_message(res)
+    if error and "does not exist" in str(error).lower():
+        return None
+    module.fail_json(
+        msg="Failed to get API Client {0}. Error: {1}".format(
+            module.params["name"], error
+        )
+    )
+
+
 def delete_client(module, blade):
     changed = True
     if not module.check_mode:
@@ -383,10 +406,8 @@ def main():
         )
     state = module.params["state"]
 
-    res = blade.get_api_clients(names=[module.params["name"]])
-    exists = bool(res.status_code == 200)
-    if exists:
-        client = list(res.items)[0]
+    client = _get_client(module, blade)
+    exists = client is not None
 
     if not exists and state == "present":
         create_client(module, blade, api_version)

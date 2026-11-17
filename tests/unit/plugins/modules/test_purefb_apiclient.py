@@ -77,6 +77,7 @@ from plugins.modules.purefb_apiclient import (
     delete_client,
     _requested_policies,
     _current_policies,
+    _get_client,
     MIN_ACCESS_POLICIES_API_VERSION,
 )
 
@@ -604,6 +605,7 @@ class TestPurefbApiclientMain:
             access_policies=["readonly"],
             public_key=PUB_KEY,
         )
+        mock_err.return_value = "API client does not exist."
         blade.get_api_clients.return_value = _response(400)
         blade.post_api_clients.return_value = _response(200)
         blade.patch_api_clients.return_value = _response(200)
@@ -680,6 +682,7 @@ class TestPurefbApiclientMain:
         module, blade = self._setup(
             mock_ansible_module, mock_get_system, mock_lv, state="absent"
         )
+        mock_err.return_value = "API client does not exist."
         blade.get_api_clients.return_value = _response(400)
 
         _run(main)
@@ -814,6 +817,7 @@ class TestPurefbApiclientMain:
         )
         mock_version.return_value = "2.17"
         mock_lv.return_value.__le__ = Mock(return_value=False)
+        mock_err.return_value = "API client does not exist."
         blade.get_api_clients.return_value = _response(400)
         blade.post_api_clients.return_value = _response(200)
         blade.patch_api_clients.return_value = _response(200)
@@ -844,3 +848,132 @@ class TestPurefbApiclientMain:
         module.fail_json.assert_called_once()
         assert "py-pure-client" in module.fail_json.call_args[1]["msg"]
         mock_get_system.assert_not_called()
+
+    @patch("plugins.modules.purefb_apiclient.HAS_PYPURECLIENT", True)
+    def test_main_empty_get_creates_without_index_error(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_version,
+        mock_lv,
+        mock_post_model,
+        mock_ref,
+        mock_api_client,
+        mock_err,
+    ):
+        module, blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_lv,
+            access_policies=["readonly"],
+            public_key=PUB_KEY,
+        )
+        blade.get_api_clients.return_value = _response(200, [])
+        blade.post_api_clients.return_value = _response(200)
+        blade.patch_api_clients.return_value = _response(200)
+
+        _run(main)
+
+        blade.post_api_clients.assert_called_once()
+        module.fail_json.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    @patch("plugins.modules.purefb_apiclient.HAS_PYPURECLIENT", True)
+    def test_main_get_error_fails_instead_of_creating(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_version,
+        mock_lv,
+        mock_post_model,
+        mock_ref,
+        mock_api_client,
+        mock_err,
+    ):
+        module, blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_lv,
+            access_policies=["readonly"],
+            public_key=PUB_KEY,
+        )
+        blade.get_api_clients.return_value = _response(500)
+
+        _run(main)
+
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Failed to get API Client ansible-client" in msg
+        assert "boom" in msg
+        blade.post_api_clients.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    @patch("plugins.modules.purefb_apiclient.HAS_PYPURECLIENT", True)
+    def test_main_absent_get_error_fails_instead_of_ok(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_version,
+        mock_lv,
+        mock_post_model,
+        mock_ref,
+        mock_api_client,
+        mock_err,
+    ):
+        module, blade = self._setup(
+            mock_ansible_module, mock_get_system, mock_lv, state="absent"
+        )
+        blade.get_api_clients.return_value = _response(400)
+
+        _run(main)
+
+        module.fail_json.assert_called_once()
+        assert "boom" in module.fail_json.call_args[1]["msg"]
+        blade.delete_api_clients.assert_not_called()
+        module.exit_json.assert_not_called()
+
+
+@patch("plugins.modules.purefb_apiclient.get_error_message", return_value="boom")
+class TestPurefbApiclientGetClient:
+    """_get_client: only the array's not-found answer reads as None."""
+
+    def test_get_client_returns_item(self, mock_err):
+        module = _module()
+        blade = Mock()
+        client = _client()
+        blade.get_api_clients.return_value = _response(200, [client])
+
+        assert _get_client(module, blade) is client
+        blade.get_api_clients.assert_called_once_with(names=["ansible-client"])
+        module.fail_json.assert_not_called()
+
+    def test_get_client_empty_list_is_none(self, mock_err):
+        module = _module()
+        blade = Mock()
+        blade.get_api_clients.return_value = _response(200, [])
+
+        assert _get_client(module, blade) is None
+        module.fail_json.assert_not_called()
+
+    def test_get_client_not_found_is_none(self, mock_err):
+        mock_err.return_value = "API client does not exist."
+        module = _module()
+        blade = Mock()
+        blade.get_api_clients.return_value = _response(400)
+
+        assert _get_client(module, blade) is None
+        module.fail_json.assert_not_called()
+
+    def test_get_client_other_error_fails(self, mock_err):
+        module = _module()
+        blade = Mock()
+        for status in (400, 403, 500):
+            module.fail_json.reset_mock()
+            blade.get_api_clients.return_value = _response(status)
+
+            _run(_get_client, module, blade)
+
+            module.fail_json.assert_called_once()
+            msg = module.fail_json.call_args[1]["msg"]
+            assert "Failed to get API Client ansible-client" in msg
+            assert "boom" in msg

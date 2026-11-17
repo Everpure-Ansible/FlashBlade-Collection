@@ -1,0 +1,11 @@
+minor_changes:
+  - purefb_info - ``arrays`` entries report ``connection_paths``, one entry per network path of the
+    array connection with its ``source``, ``destination``, ``status``, ``status_details`` and ``type``.
+  - purefb_info - ``policies`` entries report ``members`` (Purity//FB REST 2.2 or later) from a single
+    ``policies-all/members`` read, each with ``name`` and ``resource_type``; replica link members carry
+    a ``link`` with the local and remote file systems. ``snapshot_policies`` carry the same ``members``.
+  - purefb_info - ``tls_policies`` entries report ``array_wide``, true when the policy applies to the
+    array as a whole rather than to individual network interfaces.
+  - purefb_info - the ``minimum`` subset reports the array network access policy as
+    ``network_access_policy``; the misspelt ``network_access_protocol`` key is kept and will be removed
+    in 2.0.0.

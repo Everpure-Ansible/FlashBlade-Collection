@@ -1,0 +1,4 @@
+minor_changes:
+  - purefb_bladename - add ``context`` to rename a fleet member through another array in the fleet
+    (REST API 2.30, Purity//FB 4.8.8 to change the name, 2.22 to read it). A context below the required
+    version, or one that resolves to more than one array, is refused before any write.

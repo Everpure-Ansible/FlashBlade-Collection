@@ -85,6 +85,11 @@ from plugins.modules.purefb_info import (
     generate_subnet_dict,
     generate_bucket_cross_object_policies_dict,
     generate_network_dict,
+    generate_network_connectors_dict,
+    generate_network_connector_performance_dict,
+    generate_network_connector_settings_dict,
+    generate_lldp_neighbors_dict,
+    generate_connections_list,
     generate_smb_share_policies_dict,
     generate_network_access_policies_dict,
     generate_worm_data_policies_dict,
@@ -227,6 +232,7 @@ class TestPurefbInfo:
         assert "performance" in call_args["purefb_info"]
         assert call_args["purefb_info"]["performance"] == mock_perf_info
 
+    @patch("plugins.modules.purefb_info.LooseVersion")
     @patch("plugins.modules.purefb_info.generate_config_dict")
     @patch("plugins.modules.purefb_info.generate_capacity_dict")
     @patch("plugins.modules.purefb_info.generate_network_dict")
@@ -241,6 +247,7 @@ class TestPurefbInfo:
         mock_generate_network,
         mock_generate_capacity,
         mock_generate_config,
+        mock_loose_version,
     ):
         """Test main with multiple subsets"""
         # Setup mocks
@@ -254,6 +261,9 @@ class TestPurefbInfo:
         mock_version.version = "2.0.0"
         mock_blade.get_versions.return_value.items = [mock_version]
         mock_get_system.return_value = mock_blade
+        # Version feature gates OFF (the network subset's connector keys
+        # need REST 2.17)
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
 
         mock_config_info = {"dns": {}}
         mock_capacity_info = {"total": 1000}
@@ -1645,3 +1655,467 @@ class TestPurefbInfo:
         call_args = mock_module.exit_json.call_args[1]
         assert call_args["purefb_info"]["fleet"] == {"fleet1": {"members": {}}}
         assert "policies" not in call_args["purefb_info"]
+
+    # network connectors, connector performance and settings, LLDP
+    # neighbours (network subset) and the connections subset
+
+    @staticmethod
+    def _version_tuple(version):
+        """Stand-in for LooseVersion: tuples compare like dotted versions."""
+        return tuple(int(part) for part in str(version).split("."))
+
+    @staticmethod
+    def _error_response(status_code=400):
+        return Mock(spec=["status_code", "errors", "headers"], status_code=status_code)
+
+    def test_generate_network_connectors_dict_reports_empty_ports(self):
+        """An unpopulated port comes back with connector_type "-" and zero
+        speeds; it is reported as the array describes it."""
+        populated = Mock()
+        populated.name = "CH1.FM1.ETH1"
+        populated.connector_type = "QSFP28"
+        populated.lane_speed = 25000000000
+        populated.lanes_per_port = 4
+        populated.port_count = 1
+        populated.port_speed = 100000000000
+        populated.transceiver_type = "AUTO"
+        empty = Mock(
+            spec=[
+                "name",
+                "connector_type",
+                "lane_speed",
+                "port_count",
+                "port_speed",
+                "transceiver_type",
+            ]
+        )
+        empty.name = "CH1.FM1.ETH5"
+        empty.connector_type = "-"
+        empty.lane_speed = 0
+        empty.port_count = 1
+        empty.port_speed = 0
+        empty.transceiver_type = "AUTO"
+        mock_blade = Mock()
+        mock_blade.get_network_interfaces_connectors.return_value = Mock(
+            status_code=200, items=[populated, empty]
+        )
+
+        result = generate_network_connectors_dict(mock_blade)
+
+        assert sorted(result) == ["CH1.FM1.ETH1", "CH1.FM1.ETH5"]
+        assert result["CH1.FM1.ETH1"] == {
+            "connector_type": "QSFP28",
+            "lane_speed": 25000000000,
+            "lanes_per_port": 4,
+            "port_count": 1,
+            "port_speed": 100000000000,
+            "transceiver_type": "AUTO",
+        }
+        assert result["CH1.FM1.ETH5"]["connector_type"] == "-"
+        assert result["CH1.FM1.ETH5"]["port_speed"] == 0
+        # a REST 2.17-2.19 model has no lanes_per_port
+        assert result["CH1.FM1.ETH5"]["lanes_per_port"] is None
+
+    def test_generate_network_connectors_dict_returns_empty_on_error(self):
+        mock_blade = Mock()
+        mock_blade.get_network_interfaces_connectors.return_value = (
+            self._error_response()
+        )
+        assert generate_network_connectors_dict(mock_blade) == {}
+
+    def test_generate_network_connector_performance_dict_keeps_blade_rows(self):
+        """The performance view lists the blade NICs (CHx.FBn) next to the
+        connectors; both are kept, keyed by name, and only the items are
+        read (the aggregate total row of a total_only request is not)."""
+        blade_nic = Mock()
+        blade_nic.name = "CH1.FB1"
+        blade_nic.link_aggregation_group = Mock(spec=["resource_type"])
+        blade_nic.received_bytes_per_sec = 0.0
+        blade_nic.rdma_received_req_cqe_errors_per_sec = 0.0
+        blade_nic.flow_control_received_pause_frames_per_sec = 0.0
+        blade_nic.time = 1794902460000
+        uplink = Mock()
+        uplink.name = "CH1.FM1.ETH1"
+        uplink.link_aggregation_group = Mock()
+        uplink.link_aggregation_group.name = "uplink"
+        uplink.received_bytes_per_sec = 30797.7
+        uplink.time = 1794902460000
+        mock_blade = Mock()
+        mock_blade.get_network_interfaces_connectors_performance.return_value = Mock(
+            status_code=200, items=[blade_nic, uplink]
+        )
+
+        result = generate_network_connector_performance_dict(mock_blade)
+
+        mock_blade.get_network_interfaces_connectors_performance.assert_called_once_with()
+        assert sorted(result) == ["CH1.FB1", "CH1.FM1.ETH1"]
+        assert result["CH1.FB1"]["link_aggregation_group"] is None
+        assert result["CH1.FM1.ETH1"]["link_aggregation_group"] == "uplink"
+        assert result["CH1.FM1.ETH1"]["received_bytes_per_sec"] == 30797.7
+        assert result["CH1.FB1"]["rdma_received_req_cqe_errors_per_sec"] == 0.0
+        assert result["CH1.FB1"]["flow_control_received_pause_frames_per_sec"] == 0.0
+        assert result["CH1.FB1"]["time"] == 1794902460000
+        # every documented counter is present on every row
+        for field in (
+            "transmitted_packets_per_sec",
+            "total_errors_per_sec",
+            "flow_control_transmitted_lossless_bytes_per_sec",
+            "rdma_transmitted_local_ack_timeout_errors_per_sec",
+        ):
+            assert field in result["CH1.FB1"]
+            assert field in result["CH1.FM1.ETH1"]
+
+    def test_generate_network_connector_performance_dict_lag_as_dict(self):
+        """Older SDKs hand references back as plain dicts."""
+        row = Mock()
+        row.name = "CH1.FM1.ETH2"
+        row.link_aggregation_group = {"name": "uplink", "resource_type": "lags"}
+        mock_blade = Mock()
+        mock_blade.get_network_interfaces_connectors_performance.return_value = Mock(
+            status_code=200, items=[row]
+        )
+        result = generate_network_connector_performance_dict(mock_blade)
+        assert result["CH1.FM1.ETH2"]["link_aggregation_group"] == "uplink"
+
+    def test_generate_network_connector_performance_dict_returns_empty_on_error(
+        self,
+    ):
+        mock_blade = Mock()
+        mock_blade.get_network_interfaces_connectors_performance.return_value = (
+            self._error_response()
+        )
+        assert generate_network_connector_performance_dict(mock_blade) == {}
+
+    def test_generate_network_connector_settings_dict_tolerates_disabled(self):
+        """Without RoCE congestion control the array answers 400
+        "Congestion control is not enabled."; that is an empty dict, not a
+        failure."""
+        mock_blade = Mock()
+        mock_blade.get_network_interfaces_connectors_settings.return_value = (
+            self._error_response(400)
+        )
+        assert generate_network_connector_settings_dict(mock_blade) == {}
+
+    def test_generate_network_connector_settings_dict_reads_roce(self):
+        setting = Mock()
+        setting.name = "default-network-connector-settings"
+        setting.roce.enabled = True
+        setting.roce.network_congestion_mode = "lossless"
+        setting.roce.trust_mode = "dscp"
+        setting.roce.default_ecn.marking_probability = 0.0
+        setting.roce.default_ecn.max_ecn_marked_threshold = 1664208
+        setting.roce.default_ecn.min_ecn_marked_threshold = 187452
+        setting.roce.default_pfc.port_buffer = 62992
+        setting.roce.default_pfc.xoff_threshold = 3810
+        setting.roce.default_pfc.xon_threshold = 762
+        unnamed = Mock(spec=["name", "roce"])
+        unnamed.name = None
+        unnamed.roce = None
+        mock_blade = Mock()
+        mock_blade.get_network_interfaces_connectors_settings.return_value = Mock(
+            status_code=200, items=[setting, unnamed]
+        )
+
+        result = generate_network_connector_settings_dict(mock_blade)
+
+        assert result["default-network-connector-settings"] == {
+            "roce": {
+                "enabled": True,
+                "network_congestion_mode": "lossless",
+                "trust_mode": "dscp",
+                "default_ecn": {
+                    "marking_probability": 0.0,
+                    "max_ecn_marked_threshold": 1664208,
+                    "min_ecn_marked_threshold": 187452,
+                },
+                "default_pfc": {
+                    "port_buffer": 62992,
+                    "xoff_threshold": 3810,
+                    "xon_threshold": 762,
+                },
+            }
+        }
+        # a row without a name or RoCE block is still reported, not dropped
+        assert result["default"]["roce"]["enabled"] is None
+        assert result["default"]["roce"]["default_pfc"]["xon_threshold"] is None
+
+    def test_generate_lldp_neighbors_dict_keys_by_local_port(self):
+        """Neighbours are keyed by the physical port name (CH1.FM1.ETH1),
+        never merged into the VIP-keyed network dict."""
+        neighbor = Mock()
+        neighbor.initial_ttl_in_sec = 120
+        neighbor.local_port.name = "CH1.FM1.ETH1"
+        chassis = neighbor.neighbor_chassis
+        chassis.name = "tor-switch-a"
+        chassis.description = "Cisco Nexus Operating System (NX-OS) Software"
+        chassis.addresses = ["10.0.0.72"]
+        chassis.id.type = "mac"
+        chassis.id.value = "80:27:6c:d2:8d:fc"
+        for capability in ("bridge", "router"):
+            getattr(chassis, capability).supported = True
+            getattr(chassis, capability).enabled = True
+        for capability in (
+            "repeater",
+            "station_only",
+            "telephone",
+            "wlan_access_point",
+            "docsis_cable_device",
+        ):
+            getattr(chassis, capability).supported = False
+            getattr(chassis, capability).enabled = False
+        neighbor.neighbor_port.description = "Ethernet1/13"
+        neighbor.neighbor_port.id.type = "ifname"
+        neighbor.neighbor_port.id.value = "Ethernet1/13"
+        # a port whose neighbour sent no chassis or port details
+        bare = Mock(spec=["initial_ttl_in_sec", "local_port"])
+        bare.initial_ttl_in_sec = 120
+        bare.local_port = Mock(spec=["name"])
+        bare.local_port.name = "CH1.FM1.ETH9"
+        mock_blade = Mock()
+        mock_blade.get_network_interfaces_neighbors.return_value = Mock(
+            status_code=200, items=[neighbor, bare]
+        )
+
+        result = generate_lldp_neighbors_dict(mock_blade)
+
+        mock_blade.get_network_interfaces_neighbors.assert_called_once_with()
+        assert sorted(result) == ["CH1.FM1.ETH1", "CH1.FM1.ETH9"]
+        eth1 = result["CH1.FM1.ETH1"]
+        assert eth1["initial_ttl_in_sec"] == 120
+        assert eth1["neighbor_chassis"]["name"] == "tor-switch-a"
+        assert eth1["neighbor_chassis"]["addresses"] == ["10.0.0.72"]
+        assert eth1["neighbor_chassis"]["id"] == {
+            "type": "mac",
+            "value": "80:27:6c:d2:8d:fc",
+        }
+        assert eth1["neighbor_chassis"]["capabilities"]["bridge"] == {
+            "supported": True,
+            "enabled": True,
+        }
+        assert eth1["neighbor_chassis"]["capabilities"]["telephone"] == {
+            "supported": False,
+            "enabled": False,
+        }
+        assert sorted(eth1["neighbor_chassis"]["capabilities"]) == [
+            "bridge",
+            "docsis_cable_device",
+            "repeater",
+            "router",
+            "station_only",
+            "telephone",
+            "wlan_access_point",
+        ]
+        assert eth1["neighbor_port"] == {
+            "id": {"type": "ifname", "value": "Ethernet1/13"},
+            "description": "Ethernet1/13",
+        }
+        eth9 = result["CH1.FM1.ETH9"]
+        assert eth9["neighbor_chassis"]["name"] is None
+        assert eth9["neighbor_chassis"]["addresses"] == []
+        assert eth9["neighbor_chassis"]["capabilities"]["router"] == {
+            "supported": None,
+            "enabled": None,
+        }
+        assert eth9["neighbor_port"]["id"] == {"type": None, "value": None}
+
+    def test_generate_lldp_neighbors_dict_returns_empty_on_error(self):
+        mock_blade = Mock()
+        mock_blade.get_network_interfaces_neighbors.return_value = (
+            self._error_response()
+        )
+        assert generate_lldp_neighbors_dict(mock_blade) == {}
+
+    def test_generate_connections_list(self):
+        """Rows are flattened to state, local/remote address and port and
+        the sample time; the array reports ports as strings."""
+        conn = Mock()
+        conn.current_state = "ESTABLISHED"
+        conn.local.address = "10.0.0.234"
+        conn.local.port = "8117"
+        conn.remote.address = "10.0.0.7"
+        conn.remote.port = "23691"
+        conn.time = 1794902501349
+        bare = Mock(spec=["current_state", "local", "remote", "time"])
+        bare.current_state = "TIME_WAIT"
+        bare.local = None
+        bare.remote = None
+        bare.time = 1794902501349
+        mock_blade = Mock()
+        mock_blade.get_network_interfaces_network_connection_statistics.return_value = (
+            Mock(status_code=200, items=[conn, bare])
+        )
+
+        result = generate_connections_list(mock_blade)
+
+        # no filters: the deprecated local_host/remote_host kwargs are never sent
+        mock_blade.get_network_interfaces_network_connection_statistics.assert_called_once_with()
+        assert result == [
+            {
+                "state": "ESTABLISHED",
+                "local_address": "10.0.0.234",
+                "local_port": "8117",
+                "remote_address": "10.0.0.7",
+                "remote_port": "23691",
+                "time": 1794902501349,
+            },
+            {
+                "state": "TIME_WAIT",
+                "local_address": None,
+                "local_port": None,
+                "remote_address": None,
+                "remote_port": None,
+                "time": 1794902501349,
+            },
+        ]
+
+    def test_generate_connections_list_returns_empty_on_error(self):
+        mock_blade = Mock()
+        mock_blade.get_network_interfaces_network_connection_statistics.return_value = (
+            self._error_response()
+        )
+        assert generate_connections_list(mock_blade) == []
+
+    def _run_main(self, subset, api_version, mock_loose_version, mock_get_version):
+        """Run main() with real version comparisons and return exit_json kwargs."""
+        mock_loose_version.side_effect = self._version_tuple
+        mock_get_version.return_value = api_version
+        with patch("plugins.modules.purefb_info.AnsibleModule") as mock_ansible_module:
+            with patch("plugins.modules.purefb_info.get_system") as mock_get_system:
+                mock_module = Mock()
+                mock_module.params = {"gather_subset": subset}
+                mock_module.check_mode = False
+                mock_ansible_module.return_value = mock_module
+                mock_get_system.return_value = Mock()
+                main()
+                mock_module.exit_json.assert_called_once()
+                return mock_module.exit_json.call_args[1]
+
+    @patch("plugins.modules.purefb_info.get_rest_api_version")
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_connections_list")
+    @patch("plugins.modules.purefb_info.generate_lldp_neighbors_dict")
+    @patch("plugins.modules.purefb_info.generate_network_connector_settings_dict")
+    @patch("plugins.modules.purefb_info.generate_network_connector_performance_dict")
+    @patch("plugins.modules.purefb_info.generate_network_connectors_dict")
+    @patch("plugins.modules.purefb_info.generate_network_dict")
+    def test_main_network_subset_adds_connector_keys(
+        self,
+        mock_network,
+        mock_connectors,
+        mock_performance,
+        mock_settings,
+        mock_neighbors,
+        mock_connections,
+        mock_loose_version,
+        mock_get_version,
+    ):
+        """On REST 2.20+ the network subset carries the four connector keys
+        beside `network`; `connections` is not gathered unless named."""
+        mock_network.return_value = {"vip1": {}}
+        mock_connectors.return_value = {"CH1.FM1.ETH1": {}}
+        mock_performance.return_value = {"CH1.FB1": {}}
+        mock_settings.return_value = {}
+        mock_neighbors.return_value = {"CH1.FM1.ETH1": {}}
+
+        result = self._run_main(
+            ["network"], "2.30", mock_loose_version, mock_get_version
+        )
+
+        info = result["purefb_info"]
+        assert result["changed"] is False
+        assert info["network"] == {"vip1": {}}
+        assert info["network_connectors"] == {"CH1.FM1.ETH1": {}}
+        assert info["network_connector_performance"] == {"CH1.FB1": {}}
+        assert info["network_connector_settings"] == {}
+        assert info["lldp_neighbors"] == {"CH1.FM1.ETH1": {}}
+        assert "connections" not in info
+        mock_connections.assert_not_called()
+
+    @patch("plugins.modules.purefb_info.get_rest_api_version")
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_lldp_neighbors_dict")
+    @patch("plugins.modules.purefb_info.generate_network_connector_settings_dict")
+    @patch("plugins.modules.purefb_info.generate_network_connector_performance_dict")
+    @patch("plugins.modules.purefb_info.generate_network_connectors_dict")
+    @patch("plugins.modules.purefb_info.generate_network_dict")
+    def test_main_network_subset_gates_neighbors_on_2_20(
+        self,
+        mock_network,
+        mock_connectors,
+        mock_performance,
+        mock_settings,
+        mock_neighbors,
+        mock_loose_version,
+        mock_get_version,
+    ):
+        """REST 2.18: connectors, performance and settings are read, the LLDP
+        endpoint (2.20) is not called."""
+        mock_network.return_value = {}
+        mock_connectors.return_value = {}
+        mock_performance.return_value = {}
+        mock_settings.return_value = {}
+
+        info = self._run_main(
+            ["network"], "2.18", mock_loose_version, mock_get_version
+        )["purefb_info"]
+
+        assert "network_connectors" in info
+        assert "network_connector_performance" in info
+        assert "network_connector_settings" in info
+        assert "lldp_neighbors" not in info
+        mock_neighbors.assert_not_called()
+
+    @patch("plugins.modules.purefb_info.get_rest_api_version")
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_lldp_neighbors_dict")
+    @patch("plugins.modules.purefb_info.generate_network_connector_settings_dict")
+    @patch("plugins.modules.purefb_info.generate_network_connector_performance_dict")
+    @patch("plugins.modules.purefb_info.generate_network_connectors_dict")
+    @patch("plugins.modules.purefb_info.generate_network_dict")
+    def test_main_network_subset_skips_connectors_below_2_17(
+        self,
+        mock_network,
+        mock_connectors,
+        mock_performance,
+        mock_settings,
+        mock_neighbors,
+        mock_loose_version,
+        mock_get_version,
+    ):
+        """Below REST 2.17 the network subset is unchanged and none of the
+        connector endpoints is called."""
+        mock_network.return_value = {"vip1": {}}
+
+        info = self._run_main(
+            ["network"], "2.16", mock_loose_version, mock_get_version
+        )["purefb_info"]
+
+        assert info == {"network": {"vip1": {}}}
+        mock_connectors.assert_not_called()
+        mock_performance.assert_not_called()
+        mock_settings.assert_not_called()
+        mock_neighbors.assert_not_called()
+
+    @patch("plugins.modules.purefb_info.get_rest_api_version")
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_connections_list")
+    @patch("plugins.modules.purefb_info.generate_network_dict")
+    def test_main_connections_subset(
+        self, mock_network, mock_connections, mock_loose_version, mock_get_version
+    ):
+        """`connections` is a subset of its own (REST 2.18+): it does not pull
+        the network dict in and is skipped silently on an older array."""
+        mock_connections.return_value = [{"state": "ESTABLISHED"}]
+
+        info = self._run_main(
+            ["connections"], "2.18", mock_loose_version, mock_get_version
+        )["purefb_info"]
+        assert info == {"connections": [{"state": "ESTABLISHED"}]}
+        mock_network.assert_not_called()
+
+        mock_connections.reset_mock()
+        info = self._run_main(
+            ["connections"], "2.17", mock_loose_version, mock_get_version
+        )["purefb_info"]
+        assert info == {}
+        mock_connections.assert_not_called()

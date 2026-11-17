@@ -1,0 +1,4 @@
+minor_changes:
+  - purefb_fs - new ``worm_policy`` and ``eradication_mode`` options create WORM-protected filesystems
+    (Purity//FB REST 2.15). Both are set at creation only; a different value on an existing filesystem
+    fails the task.

@@ -1,0 +1,6 @@
+bugfixes:
+  - purefb_fs - ``storage_class`` was compared with the storage class object
+    the array returns, so every run that set the option sent a storage class
+    change and reported changed. The module now compares the class name, sends
+    the change only when it differs, honours check mode and fails with the
+    array error when the change is rejected.

@@ -1,0 +1,14 @@
+minor_changes:
+  - "purefb_fs_replica - add ``remote_default_exports`` to choose the default exports the array creates
+    for the remote filesystem when a replica link is created; an empty list creates none (REST 2.25)."
+  - "purefb_fs_replica - add ``link_type`` to create ``partial-replica`` (rapid file replication) links
+    and ``replicate_now`` to synchronise an existing partial-replica link (REST 2.17). Policy and delete
+    requests the array rejects on partial-replica links are refused before any write."
+  - "purefb_fs_replica - with ``target_array`` set the module now acts only on the replica link to that
+    array, so a fan-out configuration no longer modifies or deletes whichever link the array lists first."
+  - "purefb_info - the ``replication`` subset reports filesystem replica link transfers as
+    ``fs_replica_transfers``, keyed by snapshot name and remote array."
+bugfixes:
+  - "purefb_fs_replica - check mode now validates that ``target_array`` is connected before reporting a
+    change, so a check-mode run against a disconnected target fails like the real run instead of
+    reporting ``changed``."

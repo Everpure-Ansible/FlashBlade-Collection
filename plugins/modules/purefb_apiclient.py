@@ -20,9 +20,16 @@ module: purefb_apiclient
 version_added: '1.6.0'
 short_description: Manage FlashBlade API Clients
 description:
-- Enable or disable FlashBlade API Clients
+- Create, enable, disable and delete FlashBlade API Clients.
+- The management access policies of an API client are fixed when the client
+  is created. Delete and recreate the client to change them.
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
+notes:
+- The array only allows the enabled state of an existing API client to be
+  changed. I(access_policies), I(role), I(public_key), I(issuer) and
+  I(token_ttl) cannot be changed in place, so when a supplied value differs
+  from the array the module warns and leaves the client as it is.
 options:
   name:
     description:
@@ -35,10 +42,30 @@ options:
     default: present
     choices: [ absent, present ]
     type: str
+  access_policies:
+    description:
+    - Names of the management access policies granted to ID Tokens issued by
+      this API client.
+    - The bearer of an access token may perform actions within the intersection
+      of these policies and those of the array user named in the token.
+    - The built-in policies are C(readonly), C(ops_admin), C(storage_admin) and
+      C(array_admin). Custom policies are managed by
+      M(everpure.flashblade.purefb_mgmt_policy).
+    - Requires Purity//FB 4.6.1 or later (REST API 2.19).
+    - One of I(access_policies) or I(role) is required when creating an API
+      client. Mutually exclusive with I(role).
+    type: list
+    elements: str
+    version_added: '1.30.0'
   role:
     description:
-    - The maximum role allowed for ID Tokens issued by this API client
-    - Required when creating an API client.
+    - Legacy single management access policy for ID Tokens issued by this API
+      client. Equivalent to I(access_policies) with the built-in policy of the
+      same name.
+    - Kept for backwards compatibility. The underlying C(max_role) field is
+      deprecated on the array in favour of access policies, so prefer
+      I(access_policies).
+    - Mutually exclusive with I(access_policies).
     type: str
     choices: [readonly, ops_admin, storage_admin, array_admin]
   issuer:
@@ -55,8 +82,8 @@ options:
     description:
     - Time To Live length in seconds for the exchanged access token
     - Range is 1 second to 1 day (86400 seconds)
+    - Defaults to 86400 when creating an API client.
     type: int
-    default: 86400
   enabled:
     description:
     - State of the API Client Key
@@ -67,24 +94,43 @@ extends_documentation_fragment:
 """
 
 EXAMPLES = r"""
-- name: Create API token ansible-token
+- name: Create API client with a built-in access policy
   everpure.flashblade.purefb_apiclient:
     name: ansible_token
     issuer: "Pure_Storage"
     token_ttl: 3000
+    access_policies:
+      - readonly
+    public_key: "{{lookup('file', 'public_pem_file') }}"
+    fb_url: 10.10.10.2
+    api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
+
+- name: Create API client limited by two access policies
+  everpure.flashblade.purefb_apiclient:
+    name: backup_token
+    access_policies:
+      - readonly
+      - backup-operator
+    public_key: "{{lookup('file', 'public_pem_file') }}"
+    fb_url: 10.10.10.2
+    api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
+
+- name: Create API client using the legacy role option
+  everpure.flashblade.purefb_apiclient:
+    name: legacy_token
     role: array_admin
     public_key: "{{lookup('file', 'public_pem_file') }}"
     fb_url: 10.10.10.2
     api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
 
-- name: Disable API CLient
+- name: Disable API Client
   everpure.flashblade.purefb_apiclient:
     name: ansible_token
     enabled: false
     fb_url: 10.10.10.2
     api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
 
-- name: Enable API CLient
+- name: Enable API Client
   everpure.flashblade.purefb_apiclient:
     name: ansible_token
     enabled: true
@@ -116,7 +162,72 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.purefb import 
 )
 from ansible_collections.everpure.flashblade.plugins.module_utils.common import (
     get_error_message,
+    get_rest_api_version,
 )
+from ansible_collections.everpure.flashblade.plugins.module_utils.version import (
+    LooseVersion,
+)
+
+MIN_ACCESS_POLICIES_API_VERSION = "2.19"
+DEFAULT_TOKEN_TTL = 86400
+
+
+def _requested_policies(module):
+    """Return the de-duplicated policy names the task asks for, or None.
+
+    ``access_policies`` wins; the legacy ``role`` maps to the built-in policy
+    of the same name.
+    """
+    if module.params["access_policies"]:
+        policies = []
+        for policy in module.params["access_policies"]:
+            if policy not in policies:
+                policies.append(policy)
+        return policies
+    if module.params["role"]:
+        return [module.params["role"]]
+    return None
+
+
+def _current_policies(client):
+    """Return the policy names on an existing client.
+
+    Arrays below REST 2.19 report only ``max_role``; treat it as a one-item
+    policy list so the comparison works on every version.
+    """
+    policies = getattr(client, "access_policies", None)
+    if policies:
+        return [policy.name for policy in policies]
+    max_role = getattr(getattr(client, "max_role", None), "name", None)
+    return [max_role] if max_role else []
+
+
+def _access_policies_supported(api_version):
+    """Return True when the array accepts ``access_policies`` (REST 2.19+)."""
+    return LooseVersion(MIN_ACCESS_POLICIES_API_VERSION) <= LooseVersion(api_version)
+
+
+def _get_client(module, blade):
+    """Return the named API client, or None when it does not exist.
+
+    The array answers a GET for an unknown name with a 400 ("API client
+    does not exist."), so only that error reads as None. Any other failure
+    fails the task instead of masquerading as a missing client, which would
+    let state=absent report ok on a transient error or send a POST for a
+    client that is already there.
+    """
+    res = blade.get_api_clients(names=[module.params["name"]])
+    if res.status_code == 200:
+        items = list(res.items)
+        return items[0] if items else None
+    error = get_error_message(res)
+    if error and "does not exist" in str(error).lower():
+        return None
+    module.fail_json(
+        msg="Failed to get API Client {0}. Error: {1}".format(
+            module.params["name"], error
+        )
+    )
 
 
 def delete_client(module, blade):
@@ -125,14 +236,50 @@ def delete_client(module, blade):
         res = blade.delete_api_clients(names=[module.params["name"]])
         if res.status_code != 200:
             module.fail_json(
-                msg="Failed to delete API Client {0}".format(module.params["name"])
+                msg="Failed to delete API Client {0}. Error: {1}".format(
+                    module.params["name"], get_error_message(res)
+                )
             )
     module.exit_json(changed=changed)
 
 
 def update_client(module, blade, client):
-    """Update API Client"""
+    """Update API Client
+
+    The array only allows the enabled state of an existing API client to be
+    changed; there is no PATCH for the access policies, public key, issuer or
+    token TTL. A supplied value that differs from the array is reported as a
+    warning rather than silently ignored.
+    """
     changed = False
+    immutable = []
+    requested = _requested_policies(module)
+    if requested is not None and sorted(requested) != sorted(_current_policies(client)):
+        immutable.append(
+            "access_policies" if module.params["access_policies"] else "role"
+        )
+    if module.params["public_key"] is not None:
+        # Compare ignoring whitespace so line wrapping or a trailing newline
+        # from a file lookup does not count as a different key.
+        current_key = "".join((getattr(client, "public_key", None) or "").split())
+        if "".join(module.params["public_key"].split()) != current_key:
+            immutable.append("public_key")
+    if module.params["issuer"] is not None and module.params["issuer"] != getattr(
+        client, "issuer", None
+    ):
+        immutable.append("issuer")
+    if module.params["token_ttl"] is not None and module.params[
+        "token_ttl"
+    ] * 1000 != getattr(client, "access_token_ttl_in_ms", None):
+        immutable.append("token_ttl")
+    if immutable:
+        module.warn(
+            "API Client {0}: {1} cannot be changed on an existing client and "
+            "will remain as currently set on the array. Delete and recreate "
+            "the client to apply the new value(s).".format(
+                module.params["name"], ", ".join(immutable)
+            )
+        )
     if client.enabled != module.params["enabled"]:
         changed = True
         if not module.check_mode:
@@ -142,33 +289,51 @@ def update_client(module, blade, client):
             )
             if res.status_code != 200:
                 module.fail_json(
-                    msg="Failed to update API Client {0}".format(module.params["name"])
+                    msg="Failed to update API Client {0}. Error: {1}".format(
+                        module.params["name"], get_error_message(res)
+                    )
                 )
     module.exit_json(changed=changed)
 
 
-def create_client(module, blade):
-    """Create API Client"""
+def create_client(module, blade, api_version):
+    """Create API Client
+
+    On REST 2.19 and later the policies are sent as ``access_policies``
+    (``max_role`` is deprecated there); older arrays only accept ``max_role``,
+    so a legacy ``role`` is sent that way. ``main`` has already refused
+    ``access_policies`` on such arrays.
+    """
     changed = True
     if not module.params["public_key"]:
         module.fail_json(msg="public_key is required to create an API Client")
-    if not module.params["role"]:
-        module.fail_json(msg="role is required to create an API Client")
-    if not 1 <= module.params["token_ttl"] <= 86400:
+    policies = _requested_policies(module)
+    if not policies:
+        module.fail_json(
+            msg="access_policies or role is required to create an API Client"
+        )
+    policies_supported = _access_policies_supported(api_version)
+    token_ttl = module.params["token_ttl"]
+    if token_ttl is None:
+        token_ttl = DEFAULT_TOKEN_TTL
+    if not 1 <= token_ttl <= 86400:
         module.fail_json(msg="token_ttl parameter is out of range (1 to 86400)")
-    else:
-        token_ttl = module.params["token_ttl"] * 1000
     if not module.params["issuer"]:
         module.params["issuer"] = module.params["name"]
     if not module.check_mode:
-        api_client = ApiClientsPost(
-            max_role=ReferenceWritable(name=module.params["role"]),
+        client_kwargs = dict(
             issuer=module.params["issuer"],
-            access_token_ttl_in_ms=token_ttl,
+            access_token_ttl_in_ms=token_ttl * 1000,
             public_key=module.params["public_key"],
         )
+        if policies_supported:
+            client_kwargs["access_policies"] = [
+                ReferenceWritable(name=policy) for policy in policies
+            ]
+        else:
+            client_kwargs["max_role"] = ReferenceWritable(name=policies[0])
         res = blade.post_api_clients(
-            names=[module.params["name"]], api_client=api_client
+            names=[module.params["name"]], api_client=ApiClientsPost(**client_kwargs)
         )
         if res.status_code != 200:
             module.fail_json(
@@ -183,7 +348,7 @@ def create_client(module, blade):
             )
             if res.status_code != 200:
                 module.warn(
-                    "API Client {0} created by enable failed. Please investigate.".format(
+                    "API Client {0} created but enable failed. Please investigate.".format(
                         module.params["name"]
                     )
                 )
@@ -201,13 +366,18 @@ def main():
                 type="str",
                 choices=["readonly", "ops_admin", "storage_admin", "array_admin"],
             ),
+            access_policies=dict(type="list", elements="str"),
             public_key=dict(type="str", no_log=True),
-            token_ttl=dict(type="int", default=86400, no_log=False),
+            token_ttl=dict(type="int", no_log=False),
             issuer=dict(type="str"),
         )
     )
 
-    module = AnsibleModule(argument_spec, supports_check_mode=True)
+    module = AnsibleModule(
+        argument_spec,
+        mutually_exclusive=[["role", "access_policies"]],
+        supports_check_mode=True,
+    )
     pattern = re.compile("^[a-zA-Z0-9]([a-zA-Z0-9_-]{0,54}[a-zA-Z0-9])?$")
     if module.params["issuer"]:
         if not pattern.match(module.params["issuer"]):
@@ -226,16 +396,21 @@ def main():
         module.fail_json(msg="py-pure-client sdk is required for this module")
 
     blade = get_system(module)
+    api_version = get_rest_api_version(blade)
+    if module.params["access_policies"] and not _access_policies_supported(api_version):
+        module.fail_json(
+            msg=(
+                "FlashBlade REST version {0} does not support access_policies "
+                "(requires {1}+). Use the role option instead."
+            ).format(api_version, MIN_ACCESS_POLICIES_API_VERSION)
+        )
     state = module.params["state"]
 
-    exists = bool(
-        blade.get_api_clients(names=[module.params["name"]]).status_code == 200
-    )
-    if exists:
-        client = list(blade.get_api_clients(names=[module.params["name"]]).items)[0]
+    client = _get_client(module, blade)
+    exists = client is not None
 
     if not exists and state == "present":
-        create_client(module, blade)
+        create_client(module, blade, api_version)
     elif exists and state == "present":
         update_client(module, blade, client)
     elif exists and state == "absent":

@@ -1,0 +1,11 @@
+minor_changes:
+  - purefb_server - add ``create_local_directory_service`` to create a local
+    directory service together with the server (REST 2.24 or later). It is
+    mutually exclusive with ``local_directory_service``; the local directory
+    service outlives the server and is removed with ``purefb_local_ds``.
+  - purefb_info - the ``servers`` subset reports ``local_directory_service``
+    and ``realms`` for each server.
+bugfixes:
+  - purefb_local_ds - the attach example used ``directory_service`` where
+    ``local_directory_service`` is required to attach a local directory
+    service to a server.

@@ -1,0 +1,7 @@
+minor_changes:
+  - purefb_info - ``performance`` subset now also reports the SMB sample, the NFS, S3 and HTTP
+    per-operation breakdowns (``nfs_ops``, ``s3_ops``, ``http_ops``), array-wide, per-connection and
+    per-target replication performance (``replication``) and per-file-system and per-bucket samples
+    (``filesystems``, ``buckets``).
+  - purefb_info - new opt-in ``clients`` subset (not part of ``all``) lists per-client NFS and S3
+    performance keyed by ``IP:PORT``, capped at 100 entries per list; the S3 listings require REST 2.18.

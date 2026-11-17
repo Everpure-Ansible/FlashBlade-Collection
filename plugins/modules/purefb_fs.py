@@ -141,6 +141,8 @@ options:
   policy:
     description:
       - Filesystem policy to assign to or remove from a filesystem.
+      - A WORM data policy cannot be attached this way, use I(worm_policy)
+        when creating the filesystem.
     required: false
     type: str
   policy_state:
@@ -150,6 +152,35 @@ options:
     default: present
     type: str
     choices: [ "absent", "present" ]
+  worm_policy:
+    description:
+      - Name of the WORM data policy to attach when the filesystem is created.
+        Snapshot and other filesystem policies are attached with I(policy).
+      - A WORM data policy can only be attached at creation time and cannot be
+        changed or removed afterwards. The module fails if an existing
+        filesystem has a different WORM data policy, or none.
+      - The array only creates a WORM filesystem in C(retention-based)
+        eradication mode, so I(eradication_mode) defaults to that value when
+        this option is set.
+      - Requires Purity//FB REST API 2.15 or later.
+    type: str
+    version_added: "1.30.0"
+  eradication_mode:
+    description:
+      - Eradication mode of the filesystem.
+      - C(permission-based) allows a destroyed filesystem to be eradicated
+        based on user permissions.
+      - C(retention-based) prevents eradication while any file in the
+        filesystem is locked or retained. The array requires it for a WORM
+        filesystem and refuses it without I(worm_policy).
+      - Can only be set at creation time and cannot be changed afterwards.
+        The module fails if an existing filesystem has a different mode.
+        When not set the array default (C(permission-based)) applies, except
+        that a filesystem created with I(worm_policy) uses C(retention-based).
+      - Requires Purity//FB REST API 2.15 or later.
+    type: str
+    choices: [ permission-based, retention-based ]
+    version_added: "1.30.0"
   delete_link:
     description:
       - Define if the filesystem can be deleted even if it has a replica link
@@ -277,6 +308,16 @@ EXAMPLES = """
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
+- name: Create a WORM-protected filesystem using WORM data policy worm1
+  everpure.flashblade.purefb_fs:
+    name: compliance-fs
+    size: 1T
+    worm_policy: worm1
+    eradication_mode: retention-based
+    state: present
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
 - name: Create new filesystem in realm
   everpure.flashblade.purefb_fs:
     name: prod-fs
@@ -400,6 +441,7 @@ try:
         Reference,
         Smb,
         FileSystemPost,
+        FileSystemEradicationConfig,
         Nfs,
         SmbPost,
         Http,
@@ -428,6 +470,7 @@ EXPORT_POLICY_API_VERSION = "2.3"
 SMB_POLICY_API_VERSION = "2.10"
 CA_API_VERSION = "2.12"
 GOWNER_API_VERSION = "2.13"
+WORM_API_VERSION = "2.15"
 CONTEXT_API_VERSION = "2.17"
 REALM_API_VERSION = "2.19"
 
@@ -569,6 +612,18 @@ def create_fs(module, blade):
             )
 
         # Build FileSystemPost object
+        fs_kwargs = {}
+        eradication_mode = module.params.get("eradication_mode")
+        if module.params.get("worm_policy") and not eradication_mode:
+            # The array refuses to create a filesystem with a WORM data policy
+            # in any other eradication mode.
+            eradication_mode = "retention-based"
+        if eradication_mode:
+            # eradication_config is accepted on POST only (FileSystemPatch has
+            # no such field), so it is set here and never patched afterwards.
+            fs_kwargs["eradication_config"] = FileSystemEradicationConfig(
+                eradication_mode=eradication_mode
+            )
         fs_obj = FileSystemPost(
             provisioned=size,
             fast_remove_directory_enabled=bool(module.params["fastremove"]),
@@ -583,6 +638,7 @@ def create_fs(module, blade):
             ),
             default_user_quota=user_quota,
             default_group_quota=group_quota,
+            **fs_kwargs
         )
         # Construct filesystem name - if realm provided, prepend realm::
         fs_name = module.params["name"]
@@ -601,6 +657,11 @@ def create_fs(module, blade):
             and module.params["context"]
         ):
             post_kwargs["context_names"] = [module.params["context"]]
+
+        # A WORM data policy can only be attached on POST /file-systems; the
+        # snapshot policy below is still attached after creation as before.
+        if module.params.get("worm_policy"):
+            post_kwargs["policy_names"] = [module.params["worm_policy"]]
 
         # Add default_exports=[""] for realm filesystems (empty string)
         if realm_name:
@@ -818,6 +879,58 @@ def create_fs(module, blade):
                 )
 
     module.exit_json(changed=changed)
+
+
+def _check_create_only_options(module, blade, fsys, api_version):
+    """Refuse a worm_policy or eradication_mode that differs from the
+    existing filesystem ``fsys`` (the object main() already fetched).
+
+    Both are accepted on POST /file-systems only: FileSystemPatch has no
+    eradication_config and a WORM data policy cannot be attached to or
+    detached from an existing filesystem. Runs before any PATCH so a
+    mismatch fails the task without touching the filesystem; matching
+    values are a no-op so a replayed create task stays idempotent.
+    """
+    worm_policy = module.params.get("worm_policy")
+    eradication_mode = module.params.get("eradication_mode")
+    if not worm_policy and not eradication_mode:
+        return
+    fs_name = fsys.name
+    if eradication_mode:
+        current_mode = getattr(
+            getattr(fsys, "eradication_config", None), "eradication_mode", None
+        )
+        if current_mode != eradication_mode:
+            module.fail_json(
+                msg="Filesystem {0} has eradication_mode {1}. The eradication "
+                "mode can only be set when the filesystem is created.".format(
+                    fs_name, current_mode
+                )
+            )
+    if worm_policy:
+        member_kwargs = {"member_names": [fs_name]}
+        if (
+            LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
+            and module.params["context"]
+        ):
+            member_kwargs["context_names"] = [module.params["context"]]
+        res = blade.get_file_systems_worm_data_policies(**member_kwargs)
+        if res.status_code != 200:
+            module.fail_json(
+                msg="Failed to get WORM data policy of filesystem {0}. "
+                "Error: {1}".format(fs_name, get_error_message(res))
+            )
+        attached = [
+            getattr(getattr(item, "policy", None), "name", None)
+            for item in list(res.items)
+        ]
+        if worm_policy not in attached:
+            module.fail_json(
+                msg="Filesystem {0} has WORM data policy {1}. A WORM data policy "
+                "can only be attached when the filesystem is created.".format(
+                    fs_name, ", ".join(name for name in attached if name) or "none"
+                )
+            )
 
 
 def modify_fs(module, blade):
@@ -1546,6 +1659,10 @@ def main():
                 choices=["creator", "parent-directory"], default="creator"
             ),
             policy_state=dict(default="present", choices=["present", "absent"]),
+            worm_policy=dict(type="str"),
+            eradication_mode=dict(
+                type="str", choices=["permission-based", "retention-based"]
+            ),
             state=dict(default="present", choices=["present", "absent"]),
             delete_link=dict(default=False, type="bool"),
             discard_snaps=dict(default=False, type="bool"),
@@ -1573,6 +1690,13 @@ def main():
     state = module.params["state"]
     blade = get_system(module)
     api_version = get_rest_api_version(blade)
+    if (
+        module.params.get("worm_policy") or module.params.get("eradication_mode")
+    ) and LooseVersion(WORM_API_VERSION) > LooseVersion(api_version):
+        module.fail_json(
+            msg="worm_policy and eradication_mode require Purity//FB REST API "
+            "{0} or later".format(WORM_API_VERSION)
+        )
     if (
         LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
         and not module.params["context"]
@@ -1609,6 +1733,7 @@ def main():
     if state == "present" and not fsys:
         create_fs(module, blade)
     elif state == "present" and fsys:
+        _check_create_only_options(module, blade, fsys, api_version)
         modify_fs(module, blade)
     elif state == "absent" and fsys and not fsys.destroyed:
         delete_fs(module, blade)

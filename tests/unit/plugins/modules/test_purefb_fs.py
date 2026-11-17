@@ -93,6 +93,7 @@ from plugins.modules.purefb_fs import (
     delete_fs,
     eradicate_fs,
     modify_fs,
+    _check_create_only_options,
 )
 from plugins.module_utils.version import LooseVersion as RealLooseVersion
 
@@ -4652,6 +4653,515 @@ class TestPurefbFs:
 
         # Verify the module name was updated to qualified format
         assert mock_module.params["name"] == "production-realm::prod-fs"
+
+    # ==== worm_policy / eradication_mode (POST /file-systems only, REST 2.15) ====
+
+    def _worm_members(self, *names):
+        """Mock GET file-systems/worm-data-policies listing the attached
+        policies (200 with zero items when none is attached)."""
+        res = Mock()
+        res.status_code = 200
+        res.total_item_count = len(names)
+        items = []
+        for name in names:
+            item = Mock()
+            item.policy = Mock()
+            item.policy.name = name
+            items.append(item)
+        res.items = items
+        return res
+
+    def _worm_create_module(self, **overrides):
+        """Module mock for create_fs with the PATCH-triggering defaults off."""
+        mock_module = Mock()
+        mock_module.check_mode = False
+        mock_module.fail_json.side_effect = Exception("fail_json")
+        params = self.get_default_params()
+        params.update({"group_ownership": None, "worm_policy": None})
+        params["eradication_mode"] = None
+        params.update(overrides)
+        mock_module.params = params
+        return mock_module
+
+    @patch("plugins.modules.purefb_fs.FileSystemEradicationConfig")
+    @patch("plugins.modules.purefb_fs.FileSystemPost")
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.15"),
+    )
+    def test_create_fs_worm_policy_and_eradication_mode_on_post(
+        self, mock_get_filesystem, mock_fs_post, mock_erad_config
+    ):
+        """worm_policy reaches POST /file-systems as policy_names and
+        eradication_mode as eradication_config on the body; nothing is
+        PATCHed afterwards and the snapshot-policy attach is not used."""
+        mock_module = self._worm_create_module(
+            worm_policy="worm-pol", eradication_mode="retention-based"
+        )
+        mock_blade = Mock()
+        mock_get_filesystem.return_value = None
+        ok = Mock()
+        ok.status_code = 200
+        mock_blade.post_file_systems.return_value = ok
+
+        create_fs(mock_module, mock_blade)
+
+        kwargs = mock_blade.post_file_systems.call_args[1]
+        assert kwargs["names"] == ["test-fs"]
+        assert kwargs["policy_names"] == ["worm-pol"]
+        assert "context_names" not in kwargs
+        mock_erad_config.assert_called_once_with(eradication_mode="retention-based")
+        assert (
+            mock_fs_post.call_args[1]["eradication_config"]
+            is mock_erad_config.return_value
+        )
+        mock_blade.patch_file_systems.assert_not_called()
+        mock_blade.post_policies_file_systems.assert_not_called()
+        mock_module.exit_json.assert_called_with(changed=True)
+
+    @patch("plugins.modules.purefb_fs.FileSystemEradicationConfig")
+    @patch("plugins.modules.purefb_fs.FileSystemPost")
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.30"),
+    )
+    def test_create_fs_without_worm_options_sends_neither(
+        self, mock_get_filesystem, mock_fs_post, mock_erad_config
+    ):
+        """Omitted options never reach the array: no policy_names and no
+        eradication_config, so arrays keep their defaults."""
+        mock_module = self._worm_create_module()
+        mock_blade = Mock()
+        mock_get_filesystem.return_value = None
+        ok = Mock()
+        ok.status_code = 200
+        mock_blade.post_file_systems.return_value = ok
+
+        create_fs(mock_module, mock_blade)
+
+        kwargs = mock_blade.post_file_systems.call_args[1]
+        assert "policy_names" not in kwargs
+        assert "eradication_config" not in mock_fs_post.call_args[1]
+        mock_erad_config.assert_not_called()
+        mock_module.exit_json.assert_called_with(changed=True)
+
+    @patch("plugins.modules.purefb_fs.FileSystemEradicationConfig")
+    @patch("plugins.modules.purefb_fs.FileSystemPost")
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.15"),
+    )
+    def test_create_fs_worm_policy_defaults_to_retention_based(
+        self, mock_get_filesystem, mock_fs_post, mock_erad_config
+    ):
+        """The array only creates a WORM filesystem in retention-based
+        eradication mode, so worm_policy alone sends that mode."""
+        mock_module = self._worm_create_module(worm_policy="worm-pol")
+        mock_blade = Mock()
+        mock_get_filesystem.return_value = None
+        ok = Mock()
+        ok.status_code = 200
+        mock_blade.post_file_systems.return_value = ok
+
+        create_fs(mock_module, mock_blade)
+
+        assert mock_blade.post_file_systems.call_args[1]["policy_names"] == ["worm-pol"]
+        mock_erad_config.assert_called_once_with(eradication_mode="retention-based")
+        assert (
+            mock_fs_post.call_args[1]["eradication_config"]
+            is mock_erad_config.return_value
+        )
+        mock_module.exit_json.assert_called_with(changed=True)
+
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.15"),
+    )
+    def test_create_fs_worm_policy_check_mode_creates_nothing(self):
+        """Check mode reports the create without POSTing anything."""
+        mock_module = self._worm_create_module(worm_policy="worm-pol")
+        mock_module.check_mode = True
+        mock_blade = Mock()
+
+        create_fs(mock_module, mock_blade)
+
+        mock_blade.post_file_systems.assert_not_called()
+        mock_blade.get_realms.assert_not_called()
+        mock_module.exit_json.assert_called_with(changed=True)
+
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.17"),
+    )
+    def test_create_fs_worm_policy_with_context(self, mock_get_filesystem):
+        """policy_names and context_names travel together on the POST."""
+        mock_module = self._worm_create_module(worm_policy="worm-pol", context="fb1")
+        mock_blade = Mock()
+        mock_get_filesystem.return_value = None
+        ok = Mock()
+        ok.status_code = 200
+        mock_blade.post_file_systems.return_value = ok
+
+        create_fs(mock_module, mock_blade)
+
+        kwargs = mock_blade.post_file_systems.call_args[1]
+        assert kwargs["policy_names"] == ["worm-pol"]
+        assert kwargs["context_names"] == ["fb1"]
+        mock_module.exit_json.assert_called_with(changed=True)
+
+    @patch("plugins.modules.purefb_fs.get_error_message", Mock(return_value="boom"))
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.15"),
+    )
+    def test_create_fs_worm_policy_post_failure_fails(self, mock_get_filesystem):
+        """A rejected POST (for example an unknown WORM policy) fails the
+        task with the array message; nothing exists to clean up."""
+        mock_module = self._worm_create_module(worm_policy="missing-pol")
+        mock_blade = Mock()
+        mock_get_filesystem.return_value = None
+        bad = Mock()
+        bad.status_code = 400
+        mock_blade.post_file_systems.return_value = bad
+
+        try:
+            create_fs(mock_module, mock_blade)
+        except Exception as exc:
+            assert str(exc) == "fail_json"
+
+        mock_module.fail_json.assert_called_once()
+        assert "boom" in mock_module.fail_json.call_args[1]["msg"]
+        mock_blade.delete_file_systems.assert_not_called()
+        mock_module.exit_json.assert_not_called()
+
+    def _run_main_with_version(
+        self,
+        version,
+        mock_ansible_module,
+        mock_get_system,
+        mock_get_filesystem,
+        **params
+    ):
+        """Run main() against an array at the given REST version with the
+        filesystem absent; returns the module mock."""
+        mock_module = Mock()
+        mock_module.check_mode = params.pop("check_mode", False)
+        mock_module.fail_json.side_effect = Exception("fail_json")
+        mock_module.params = self.get_default_params()
+        mock_module.params.update(params)
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        mock_get_filesystem.return_value = None
+        ok = Mock()
+        ok.status_code = 200
+        mock_blade.post_file_systems.return_value = ok
+        with patch(
+            "plugins.modules.purefb_fs.get_rest_api_version",
+            Mock(return_value=version),
+        ):
+            try:
+                main()
+            except Exception as exc:
+                assert str(exc) == "fail_json"
+        return mock_module, mock_blade
+
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.get_system")
+    @patch("plugins.modules.purefb_fs.AnsibleModule")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    def test_main_worm_policy_below_2_15_fails_before_any_write(
+        self, mock_ansible_module, mock_get_system, mock_get_filesystem
+    ):
+        """Below REST 2.15 worm_policy fails in main() naming the version
+        and no POST is attempted."""
+        mock_module, mock_blade = self._run_main_with_version(
+            "2.14",
+            mock_ansible_module,
+            mock_get_system,
+            mock_get_filesystem,
+            worm_policy="worm-pol",
+        )
+        mock_module.fail_json.assert_called_once()
+        assert "2.15" in mock_module.fail_json.call_args[1]["msg"]
+        mock_blade.post_file_systems.assert_not_called()
+        mock_blade.patch_file_systems.assert_not_called()
+
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.get_system")
+    @patch("plugins.modules.purefb_fs.AnsibleModule")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    def test_main_eradication_mode_below_2_15_fails_in_check_mode(
+        self, mock_ansible_module, mock_get_system, mock_get_filesystem
+    ):
+        """The gate also covers eradication_mode and runs in check mode."""
+        mock_module, mock_blade = self._run_main_with_version(
+            "2.10",
+            mock_ansible_module,
+            mock_get_system,
+            mock_get_filesystem,
+            eradication_mode="retention-based",
+            check_mode=True,
+        )
+        mock_module.fail_json.assert_called_once()
+        assert "2.15" in mock_module.fail_json.call_args[1]["msg"]
+        mock_blade.post_file_systems.assert_not_called()
+
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.get_system")
+    @patch("plugins.modules.purefb_fs.AnsibleModule")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    def test_main_worm_policy_at_2_15_creates(
+        self, mock_ansible_module, mock_get_system, mock_get_filesystem
+    ):
+        """At exactly REST 2.15 the gate passes and the filesystem is
+        created with the policy on the POST."""
+        mock_module, mock_blade = self._run_main_with_version(
+            "2.15",
+            mock_ansible_module,
+            mock_get_system,
+            mock_get_filesystem,
+            worm_policy="worm-pol",
+            group_ownership=None,
+        )
+        mock_module.fail_json.assert_not_called()
+        kwargs = mock_blade.post_file_systems.call_args[1]
+        assert kwargs["policy_names"] == ["worm-pol"]
+        # exit_json is a Mock, so main() falls through to its final
+        # exit_json(changed=False); the create result is the first call.
+        assert mock_module.exit_json.call_args_list[0][1] == {"changed": True}
+
+    def _worm_modify_module(self, **params):
+        mock_module = Mock()
+        mock_module.check_mode = False
+        mock_module.fail_json.side_effect = Exception("fail_json")
+        mock_module.params = self.get_default_params()
+        mock_module.params["worm_policy"] = None
+        mock_module.params["eradication_mode"] = None
+        mock_module.params.update(params)
+        return mock_module
+
+    def _worm_fs(self, eradication_mode="permission-based"):
+        """Existing filesystem as main() fetched it, with the GET model's
+        eradication_config."""
+        fsys = self._existing_fs()
+        fsys.name = "test-fs"
+        fsys.eradication_config = Mock()
+        fsys.eradication_config.eradication_mode = eradication_mode
+        return fsys
+
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    def test_check_create_only_same_worm_policy_is_noop(self):
+        """Replaying the create task reads the membership of the filesystem
+        main() already holds, finds the same policy and returns quietly
+        without re-querying the filesystem."""
+        mock_module = self._worm_modify_module(worm_policy="worm-pol")
+        mock_blade = Mock()
+        mock_blade.get_file_systems_worm_data_policies.return_value = (
+            self._worm_members("worm-pol")
+        )
+
+        _check_create_only_options(mock_module, mock_blade, self._worm_fs(), "2.15")
+
+        mock_blade.get_file_systems_worm_data_policies.assert_called_once_with(
+            member_names=["test-fs"]
+        )
+        mock_blade.get_file_systems.assert_not_called()
+        mock_module.fail_json.assert_not_called()
+
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    def test_check_create_only_other_worm_policy_fails(self):
+        """A different attached policy cannot be reconciled: fail naming the
+        attached policy."""
+        mock_module = self._worm_modify_module(worm_policy="worm-pol", size="2T")
+        mock_blade = Mock()
+        mock_blade.get_file_systems_worm_data_policies.return_value = (
+            self._worm_members("other-pol")
+        )
+
+        try:
+            _check_create_only_options(mock_module, mock_blade, self._worm_fs(), "2.15")
+        except Exception as exc:
+            assert str(exc) == "fail_json"
+
+        mock_module.fail_json.assert_called_once()
+        msg = mock_module.fail_json.call_args[1]["msg"]
+        assert "other-pol" in msg
+        assert "can only be attached" in msg
+
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    def test_check_create_only_no_worm_policy_attached_fails(self):
+        """GET answers 200 with zero items for a filesystem without a WORM
+        policy; one cannot be attached later, so the task fails."""
+        mock_module = self._worm_modify_module(worm_policy="worm-pol")
+        mock_blade = Mock()
+        mock_blade.get_file_systems_worm_data_policies.return_value = (
+            self._worm_members()
+        )
+
+        try:
+            _check_create_only_options(mock_module, mock_blade, self._worm_fs(), "2.15")
+        except Exception as exc:
+            assert str(exc) == "fail_json"
+
+        mock_module.fail_json.assert_called_once()
+        assert "none" in mock_module.fail_json.call_args[1]["msg"]
+
+    @patch("plugins.modules.purefb_fs.get_error_message", Mock(return_value="boom"))
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    def test_check_create_only_lookup_error_fails_with_context(self):
+        """The membership GET carries context_names on a fleet member and a
+        non-200 answer fails with the array message."""
+        mock_module = self._worm_modify_module(worm_policy="worm-pol", context="fb1")
+        mock_blade = Mock()
+        bad = Mock()
+        bad.status_code = 400
+        mock_blade.get_file_systems_worm_data_policies.return_value = bad
+
+        try:
+            _check_create_only_options(mock_module, mock_blade, self._worm_fs(), "2.17")
+        except Exception as exc:
+            assert str(exc) == "fail_json"
+
+        mock_blade.get_file_systems_worm_data_policies.assert_called_once_with(
+            member_names=["test-fs"], context_names=["fb1"]
+        )
+        mock_module.fail_json.assert_called_once()
+        assert "boom" in mock_module.fail_json.call_args[1]["msg"]
+
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    def test_check_create_only_same_eradication_mode_is_noop(self):
+        """A matching eradication_mode is read from the filesystem object and
+        needs no membership lookup."""
+        mock_module = self._worm_modify_module(eradication_mode="retention-based")
+        mock_blade = Mock()
+
+        _check_create_only_options(
+            mock_module, mock_blade, self._worm_fs("retention-based"), "2.15"
+        )
+
+        mock_blade.get_file_systems_worm_data_policies.assert_not_called()
+        mock_blade.get_file_systems.assert_not_called()
+        mock_module.fail_json.assert_not_called()
+
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    def test_check_create_only_different_eradication_mode_fails(self):
+        """FileSystemPatch has no eradication_config, so a different mode
+        fails naming the current one."""
+        mock_module = self._worm_modify_module(
+            eradication_mode="retention-based", size="2T"
+        )
+        mock_blade = Mock()
+
+        try:
+            _check_create_only_options(
+                mock_module, mock_blade, self._worm_fs("permission-based"), "2.15"
+            )
+        except Exception as exc:
+            assert str(exc) == "fail_json"
+
+        mock_module.fail_json.assert_called_once()
+        msg = mock_module.fail_json.call_args[1]["msg"]
+        assert "permission-based" in msg
+        assert "can only be set" in msg
+        mock_blade.get_file_systems_worm_data_policies.assert_not_called()
+
+    def _run_main_existing(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_get_filesystem,
+        members,
+        **params
+    ):
+        """Run main() at REST 2.15 against an existing filesystem whose WORM
+        membership GET answers ``members``; returns the module and blade."""
+        mock_module = self._worm_modify_module(**params)
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        mock_get_filesystem.return_value = self._worm_fs()
+        mock_blade.get_file_systems_worm_data_policies.return_value = members
+        with patch(
+            "plugins.modules.purefb_fs.get_rest_api_version",
+            Mock(return_value="2.15"),
+        ):
+            try:
+                main()
+            except Exception as exc:
+                assert str(exc) == "fail_json"
+        return mock_module, mock_blade
+
+    @patch("plugins.modules.purefb_fs.modify_fs")
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.get_system")
+    @patch("plugins.modules.purefb_fs.AnsibleModule")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    def test_main_other_worm_policy_fails_before_modify(
+        self, mock_ansible_module, mock_get_system, mock_get_filesystem, mock_modify
+    ):
+        """main() runs the create-only check before modify_fs, so a
+        mismatch fails without any PATCH or policy attach."""
+        mock_module, mock_blade = self._run_main_existing(
+            mock_ansible_module,
+            mock_get_system,
+            mock_get_filesystem,
+            self._worm_members("other-pol"),
+            worm_policy="worm-pol",
+            size="2T",
+        )
+        mock_module.fail_json.assert_called_once()
+        assert "other-pol" in mock_module.fail_json.call_args[1]["msg"]
+        mock_modify.assert_not_called()
+        mock_blade.patch_file_systems.assert_not_called()
+        mock_blade.post_policies_file_systems.assert_not_called()
+
+    @patch("plugins.modules.purefb_fs.modify_fs")
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.get_system")
+    @patch("plugins.modules.purefb_fs.AnsibleModule")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    def test_main_same_worm_policy_reuses_filesystem_and_modifies(
+        self, mock_ansible_module, mock_get_system, mock_get_filesystem, mock_modify
+    ):
+        """Matching values pass the check using the filesystem main()
+        fetched (one GET) and hand over to modify_fs."""
+        mock_module, mock_blade = self._run_main_existing(
+            mock_ansible_module,
+            mock_get_system,
+            mock_get_filesystem,
+            self._worm_members("worm-pol"),
+            worm_policy="worm-pol",
+            eradication_mode="permission-based",
+        )
+        mock_module.fail_json.assert_not_called()
+        assert mock_get_filesystem.call_count == 1
+        mock_blade.get_file_systems_worm_data_policies.assert_called_once_with(
+            member_names=["test-fs"]
+        )
+        mock_modify.assert_called_once_with(mock_module, mock_blade)
 
     # ==== deprecation warnings for legacy FS-level policy fields ====
 

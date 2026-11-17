@@ -61,9 +61,13 @@ options:
     description:
     - Allow deletion of a public key that an SSH certificate authority
       policy still uses.
-    - Deleting such a key removes it from the policy and inactivates every
-      user that authenticates through it, so without this option the
-      module refuses and lists the policies.
+    - The array refuses to delete a key that is in use and offers no way
+      to clear the signing authority of a policy, so with this option the
+      module deletes every SSH certificate authority policy that uses the
+      key and then the key itself. The admins and the array attached to
+      those policies are detached, and user SSH certificates signed by
+      this key are no longer accepted. Without this option the module
+      refuses and lists the policies.
     type: bool
     default: false
 extends_documentation_fragment:
@@ -167,6 +171,8 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.version import
 )
 
 MIN_REQUIRED_API_VERSION = "2.14"
+# REST resource type of the objects that can use a public key
+SSH_CA_POLICY_TYPE = "ssh-certificate-authority-policies"
 
 # "<type> <base64 body> [comment]" - one OpenSSH public key line
 OPENSSH_KEY_LINE = re.compile(r"^(\S+)\s+([A-Za-z0-9+/=]+)(?:\s+.*)?$")
@@ -214,18 +220,22 @@ def get_key(module, blade):
     """Return the public key object, or None when the array has none by that name.
 
     The array answers a GET for an unknown name with a 400 (``Public key
-    does not exist.``) rather than an empty list, so a 400 means absent and
-    any other failure is reported.
+    does not exist.``) rather than an empty list, so only that error reads
+    as absent. Any other failure fails the task instead of masquerading as
+    absent, which would let state=absent report ok, or state=present try to
+    create a key that exists, on a transient error.
     """
     res = blade.get_public_keys(names=[module.params["name"]])
     if res.status_code == 200:
         return _first_item(res)
-    if res.status_code != 400:
-        module.fail_json(
-            msg="Failed to read public key {0}. Error: {1}".format(
-                module.params["name"], get_error_message(res)
-            )
+    error = get_error_message(res)
+    if res.status_code == 400 and "does not exist" in str(error).lower():
+        return None
+    module.fail_json(
+        msg="Failed to read public key {0}. Error: {1}".format(
+            module.params["name"], error
         )
+    )
     return None
 
 
@@ -302,23 +312,59 @@ def check_key(module, blade, key):
     module.exit_json(changed=False, public_key=key_facts(key, get_uses(module, blade)))
 
 
+def _describe_uses(uses):
+    """Return the uses as 'name (resource_type), ...' for a message"""
+    return ", ".join(
+        "{0} ({1})".format(use["name"], use["resource_type"]) for use in uses
+    )
+
+
+def release_key(module, blade, uses):
+    """Delete the SSH certificate authority policies that use the key.
+
+    The array refuses to delete a public key that is in use and ignores a
+    PATCH that clears the signing authority of a policy, so deleting the
+    policy is the only way to release the key. A use of any other kind is
+    reported before anything is deleted.
+    """
+    others = [use for use in uses if use["resource_type"] != SSH_CA_POLICY_TYPE]
+    if others:
+        module.fail_json(
+            msg=(
+                "Public key {0} is used by {1}, which this module cannot "
+                "detach. Remove those uses and try again."
+            ).format(module.params["name"], _describe_uses(others))
+        )
+    for use in uses:
+        if module.check_mode:
+            continue
+        res = blade.delete_ssh_certificate_authority_policies(names=[use["name"]])
+        if res.status_code != 200:
+            module.fail_json(
+                msg=(
+                    "Failed to delete SSH certificate authority policy {0} that "
+                    "uses public key {1}. Error: {2}"
+                ).format(use["name"], module.params["name"], get_error_message(res))
+            )
+        module.warn(
+            "Deleted SSH certificate authority policy {0} because it used public "
+            "key {1} (force)".format(use["name"], module.params["name"])
+        )
+
+
 def delete_key(module, blade):
-    """Delete the public key unless a policy still uses it"""
+    """Delete the public key, first releasing it from its policies when forced"""
     uses = get_uses(module, blade)
     if uses and not module.params["force"]:
         module.fail_json(
             msg=(
-                "Public key {0} is used by {1}. Deleting it removes the key from "
-                "those policies and inactivates the users that authenticate "
-                "through them. Set force: true to delete it anyway."
-            ).format(
-                module.params["name"],
-                ", ".join(
-                    "{0} ({1})".format(use["name"], use["resource_type"])
-                    for use in uses
-                ),
-            )
+                "Public key {0} is used by {1}. The array refuses to delete a key "
+                "that is in use. Set force: true to delete those SSH certificate "
+                "authority policies and then the key."
+            ).format(module.params["name"], _describe_uses(uses))
         )
+    if uses:
+        release_key(module, blade, uses)
     if not module.check_mode:
         res = blade.delete_public_keys(names=[module.params["name"]])
         if res.status_code != 200:

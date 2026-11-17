@@ -10,7 +10,7 @@ __metaclass__ = type
 import sys
 import multiprocessing
 import ctypes
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock, call, patch, MagicMock
 
 import pytest
 
@@ -108,12 +108,30 @@ def _base_params(**overrides):
     return params
 
 
-def _response(status_code=200, items=None):
+NOT_FOUND = "Public key does not exist."
+
+
+def _response(status_code=200, items=None, message=None):
     response = Mock()
     response.status_code = status_code
     response.items = items if items is not None else []
     response.errors = []
+    if message is not None:
+        error = Mock(spec=["message"])
+        error.message = message
+        response.errors = [error]
     return response
+
+
+def _absent():
+    """The array's answer for a key that does not exist: a 400, not an empty list"""
+    return _response(400, message=NOT_FOUND)
+
+
+def _error_message(response, default="Unknown error"):
+    """Stand-in for module_utils.common.get_error_message, which the preamble mocks"""
+    errors = getattr(response, "errors", None) or []
+    return errors[0].message if errors else default
 
 
 def _key(name="ca-signer", public_key=OPENSSH_KEY, algorithm="ed25519", key_size=256):
@@ -151,6 +169,7 @@ def _blade(get_response, versions=None):
     blade.get_public_keys_uses.return_value = _response()
     blade.post_public_keys.return_value = _response(items=[_key()])
     blade.delete_public_keys.return_value = _response()
+    blade.delete_ssh_certificate_authority_policies.return_value = _response()
     return blade
 
 
@@ -192,6 +211,7 @@ class TestKeyMaterial:
         assert _key_material("garbage") != _key_material(OPENSSH_KEY)
 
 
+@patch(MODULE + ".get_error_message", _error_message)
 class TestHelpers:
     """get_key, get_uses and key_facts"""
 
@@ -203,12 +223,25 @@ class TestHelpers:
         assert get_key(module, blade) is key
         blade.get_public_keys.assert_called_once_with(names=["ca-signer"])
 
-    def test_get_key_treats_400_as_absent(self):
+    def test_get_key_treats_does_not_exist_as_absent(self):
         module = _module(_base_params())
         blade = Mock()
-        blade.get_public_keys.return_value = _response(400)
+        blade.get_public_keys.return_value = _absent()
         assert get_key(module, blade) is None
         module.fail_json.assert_not_called()
+
+    def test_get_key_fails_on_other_400(self):
+        # only the not-found 400 reads as absent; a bad request must not
+        module = _module(_base_params())
+        blade = Mock()
+        blade.get_public_keys.return_value = _response(
+            400, message="Syntax error in query."
+        )
+        with pytest.raises(SystemExit):
+            get_key(module, blade)
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Failed to read public key ca-signer" in msg
+        assert "Syntax error in query." in msg
 
     def test_get_key_fails_on_other_errors(self):
         module = _module(_base_params())
@@ -247,6 +280,7 @@ class TestHelpers:
         }
 
 
+@patch(MODULE + ".get_error_message", _error_message)
 @patch(MODULE + ".LooseVersion")
 @patch(MODULE + ".get_system")
 @patch(MODULE + ".AnsibleModule")
@@ -258,7 +292,7 @@ class TestMain:
         self, mock_ansible_module, mock_get_system, mock_loose_version
     ):
         module = _module(_base_params(public_key=OPENSSH_KEY))
-        blade = _blade(_response(400), versions=["2.13"])
+        blade = _blade(_absent(), versions=["2.13"])
         mock_ansible_module.return_value = module
         mock_get_system.return_value = blade
         mock_loose_version.return_value.__gt__ = Mock(return_value=True)
@@ -276,7 +310,7 @@ class TestMain:
         self, mock_post, mock_ansible_module, mock_get_system, mock_loose_version
     ):
         module = _module(_base_params(public_key="\n" + OPENSSH_KEY + "\n"))
-        blade = _blade(_response(400))
+        blade = _blade(_absent())
         _run_main(
             module, blade, mock_ansible_module, mock_get_system, mock_loose_version
         )
@@ -298,10 +332,10 @@ class TestMain:
         self, mock_ansible_module, mock_get_system, mock_loose_version
     ):
         module = _module(_base_params(public_key=PEM_KEY))
-        blade = _blade(_response(400))
+        blade = _blade(_absent())
         blade.post_public_keys.return_value = _response(items=[])
         blade.get_public_keys.side_effect = [
-            _response(400),
+            _absent(),
             _response(items=[_key(public_key=PEM_KEY)]),
         ]
         _run_main(
@@ -314,7 +348,7 @@ class TestMain:
         self, mock_ansible_module, mock_get_system, mock_loose_version
     ):
         module = _module(_base_params(public_key=OPENSSH_KEY), check_mode=True)
-        blade = _blade(_response(400))
+        blade = _blade(_absent())
         _run_main(
             module, blade, mock_ansible_module, mock_get_system, mock_loose_version
         )
@@ -325,7 +359,7 @@ class TestMain:
         self, mock_ansible_module, mock_get_system, mock_loose_version
     ):
         module = _module(_base_params(public_key="  "))
-        blade = _blade(_response(400))
+        blade = _blade(_absent())
         _run_main(
             module, blade, mock_ansible_module, mock_get_system, mock_loose_version
         )
@@ -336,7 +370,7 @@ class TestMain:
         self, mock_ansible_module, mock_get_system, mock_loose_version
     ):
         module = _module(_base_params(public_key=OPENSSH_KEY))
-        blade = _blade(_response(400))
+        blade = _blade(_absent())
         blade.post_public_keys.return_value = _response(400)
         _run_main(
             module, blade, mock_ansible_module, mock_get_system, mock_loose_version
@@ -440,23 +474,113 @@ class TestMain:
         assert "ca-policy (ssh-certificate-authority-policies)" in msg
         assert "force: true" in msg
 
-    def test_absent_force_deletes_used_key(
+    def test_absent_force_deletes_policies_then_key(
         self, mock_ansible_module, mock_get_system, mock_loose_version
     ):
+        # the array refuses to delete a key in use, so force deletes the
+        # policies that use it first and then the key
         module = _module(_base_params(state="absent", force=True))
+        blade = _blade(_response(items=[_key()]))
+        blade.get_public_keys_uses.return_value = _response(
+            items=[_use(), _use(name="other-policy")]
+        )
+        _run_main(
+            module, blade, mock_ansible_module, mock_get_system, mock_loose_version
+        )
+        assert blade.delete_ssh_certificate_authority_policies.call_args_list == [
+            call(names=["ca-policy"]),
+            call(names=["other-policy"]),
+        ]
+        blade.delete_public_keys.assert_called_once_with(names=["ca-signer"])
+        names = [str(c) for c in blade.mock_calls]
+        last_policy_delete = max(
+            i for i, c in enumerate(names) if "delete_ssh_certificate" in c
+        )
+        key_delete = names.index("call.delete_public_keys(names=['ca-signer'])")
+        assert last_policy_delete < key_delete
+        assert module.warn.call_count == 2
+        assert "ca-policy" in module.warn.call_args_list[0][0][0]
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_absent_force_check_mode_deletes_nothing(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        module = _module(_base_params(state="absent", force=True), check_mode=True)
         blade = _blade(_response(items=[_key()]))
         blade.get_public_keys_uses.return_value = _response(items=[_use()])
         _run_main(
             module, blade, mock_ansible_module, mock_get_system, mock_loose_version
         )
-        blade.delete_public_keys.assert_called_once_with(names=["ca-signer"])
+        blade.delete_ssh_certificate_authority_policies.assert_not_called()
+        blade.delete_public_keys.assert_not_called()
+        module.warn.assert_not_called()
         module.exit_json.assert_called_once_with(changed=True)
+
+    def test_absent_force_fails_when_policy_delete_fails(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        module = _module(_base_params(state="absent", force=True))
+        blade = _blade(_response(items=[_key()]))
+        blade.get_public_keys_uses.return_value = _response(items=[_use()])
+        blade.delete_ssh_certificate_authority_policies.return_value = _response(
+            400, message="Policy has members."
+        )
+        _run_main(
+            module, blade, mock_ansible_module, mock_get_system, mock_loose_version
+        )
+        blade.delete_public_keys.assert_not_called()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Failed to delete SSH certificate authority policy ca-policy" in msg
+        assert "Policy has members." in msg
+
+    def test_absent_force_refuses_a_use_it_cannot_detach(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        module = _module(_base_params(state="absent", force=True))
+        blade = _blade(_response(items=[_key()]))
+        blade.get_public_keys_uses.return_value = _response(
+            items=[_use(), _use(name="thing", resource_type="widgets")]
+        )
+        _run_main(
+            module, blade, mock_ansible_module, mock_get_system, mock_loose_version
+        )
+        blade.delete_ssh_certificate_authority_policies.assert_not_called()
+        blade.delete_public_keys.assert_not_called()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "thing (widgets)" in msg
+        assert "cannot detach" in msg
+
+    def test_absent_other_400_on_read_fails(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        # a bad request is not "absent": state=absent must not report ok
+        module = _module(_base_params(state="absent"))
+        blade = _blade(_response(400, message="Syntax error in query."))
+        _run_main(
+            module, blade, mock_ansible_module, mock_get_system, mock_loose_version
+        )
+        blade.get_public_keys_uses.assert_not_called()
+        blade.delete_public_keys.assert_not_called()
+        module.exit_json.assert_not_called()
+        assert "Syntax error in query." in module.fail_json.call_args[1]["msg"]
+
+    def test_present_other_400_on_read_fails(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        # a bad request is not "absent": state=present must not try to create
+        module = _module(_base_params(public_key=OPENSSH_KEY))
+        blade = _blade(_response(400, message="Syntax error in query."))
+        _run_main(
+            module, blade, mock_ansible_module, mock_get_system, mock_loose_version
+        )
+        blade.post_public_keys.assert_not_called()
+        assert "Failed to read public key" in module.fail_json.call_args[1]["msg"]
 
     def test_absent_missing_key_is_idempotent(
         self, mock_ansible_module, mock_get_system, mock_loose_version
     ):
         module = _module(_base_params(state="absent"))
-        blade = _blade(_response(400))
+        blade = _blade(_absent())
         _run_main(
             module, blade, mock_ansible_module, mock_get_system, mock_loose_version
         )

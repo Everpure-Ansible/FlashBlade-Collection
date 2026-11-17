@@ -23,6 +23,10 @@ description:
 - Create or delete volumes and filesystem snapshots on Everpure FlashBlades.
 - Restoring a filesystem uses the snapshot named by I(suffix) when one is
   given, otherwise the latest snapshot of the filesystem.
+- Copying a snapshot (I(state=copy)) creates a new writable filesystem,
+  named by I(target_fs), holding the snapshot's data. The snapshot is the
+  one named by I(suffix) when one is given, otherwise the latest snapshot
+  of the filesystem. Requires Purity//FB 4.8.0 (REST API 2.25) or higher.
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
@@ -34,13 +38,15 @@ options:
   suffix:
     description:
     - Suffix of snapshot name.
-    - With I(state=restore), names the snapshot to restore from. If not
-      given the latest snapshot of the filesystem is used.
+    - With I(state=restore) or I(state=copy), names the snapshot to use.
+      If not given the latest snapshot of the filesystem is used.
     type: str
   state:
     description:
     - Define whether the filesystem snapshot should exist or not.
-    choices: [ absent, present, restore ]
+    - I(restore) overwrites filesystem I(name) with the snapshot's data.
+    - I(copy) creates the new filesystem I(target_fs) from the snapshot.
+    choices: [ absent, present, restore, copy ]
     default: present
     type: str
   target:
@@ -50,6 +56,29 @@ options:
     - This is only applicable when I(now) is B(true)
     type: str
     version_added: "1.7.0"
+  target_fs:
+    description:
+    - Name of the new filesystem to create from the snapshot with
+      I(state=copy). May be realm-qualified as C(realm::name).
+    - The copy is created with the settings the array assigns to a
+      filesystem copy, which is an unlimited size with its protocols
+      disabled and no exports; enable access with
+      M(everpure.flashblade.purefb_fs) afterwards.
+    - The array takes a baseline snapshot of the copy. While the copy
+      exists neither that snapshot nor the source snapshot can be
+      destroyed, and once the copy is eradicated the source snapshot
+      stays a baseline snapshot that only I(latest_replica=true) destroys.
+    - The array may allow only one copy per source filesystem, and a
+      destroyed but not yet eradicated copy counts towards that limit;
+      the task fails with the array's message when the limit is reached.
+      Filesystems created before Purity//FB 3.0 cannot be copied.
+      Purity//FB 4.8.5 or higher is recommended.
+    - If I(target_fs) already exists and is a copy of I(name) the task
+      reports no change. Any other existing filesystem is never
+      overwritten and the task fails.
+    - Requires Purity//FB 4.8.0 (REST API 2.25) or higher.
+    type: str
+    version_added: '1.30.0'
   now:
     description:
     - Whether to initiate a snapshot replication immeadiately
@@ -79,6 +108,33 @@ options:
     type: str
     default: ""
     version_added: "1.22.0"
+  detach_policies:
+    description:
+    - Names of snapshot policies to detach from the snapshot named by
+      I(name) and I(suffix). Only valid with I(state=present) on an
+      existing snapshot that is not destroyed.
+    - Detaching is one-way. The array has no call to attach a snapshot to
+      a policy again, so a detached snapshot is no longer subject to the
+      policy's retention and stays until it is destroyed.
+    - A policy that is not attached to the snapshot is ignored, so a
+      second run reports no change. An empty list detaches nothing.
+    - Each policy is detached with its own request. The array may refuse
+      one, for example a retention-locked (SafeMode) policy or a
+      replication baseline snapshot; the task then fails naming that
+      policy with the array's message, and the policies detached before
+      it stay detached.
+    - Policies in a realm are matched on their full C(realm::policy) name.
+    type: list
+    elements: str
+    version_added: '1.30.0'
+  detach_all_policies:
+    description:
+    - Detach the snapshot named by I(name) and I(suffix) from every
+      snapshot policy attached to it. Mutually exclusive with
+      I(detach_policies), which describes the behaviour.
+    type: bool
+    default: false
+    version_added: '1.30.0'
 extends_documentation_fragment:
 - everpure.flashblade.everpure.fb
 """
@@ -133,6 +189,15 @@ EXAMPLES = r"""
     api_token: e31060a7-21fc-e277-6240-25983c6c4592
     state: restore
 
+- name: Create writable filesystem foo_copy from snapshot foo.ansible
+  everpure.flashblade.purefb_snap:
+    name: foo
+    suffix: ansible
+    target_fs: foo_copy
+    fb_url: 10.10.10.2
+    api_token: e31060a7-21fc-e277-6240-25983c6c4592
+    state: copy
+
 - name: Eradicate snapshot named foo.snap
   everpure.flashblade.purefb_snap:
     name: foo
@@ -141,9 +206,36 @@ EXAMPLES = r"""
     fb_url: 10.10.10.2
     api_token: e31060a7-21fc-e277-6240-25983c6c4592
     state: absent
+
+- name: Detach policy snapshot foo.2026_01_01_00_00 from snapshot policy daily
+  everpure.flashblade.purefb_snap:
+    name: foo
+    suffix: 2026_01_01_00_00
+    detach_policies:
+      - daily
+    fb_url: 10.10.10.2
+    api_token: e31060a7-21fc-e277-6240-25983c6c4592
+    state: present
+
+- name: Detach policy snapshot foo.2026_01_01_00_00 from all its snapshot policies
+  everpure.flashblade.purefb_snap:
+    name: foo
+    suffix: 2026_01_01_00_00
+    detach_all_policies: true
+    fb_url: 10.10.10.2
+    api_token: e31060a7-21fc-e277-6240-25983c6c4592
+    state: present
 """
 
 RETURN = r"""
+promotion_status:
+  description:
+  - Promotion state of the filesystem created with I(state=copy). The
+    array reports C(promoting) while the copy is in progress and
+    C(promoted) once it is complete.
+  returned: when I(state=copy)
+  type: str
+  sample: promoting
 """
 
 from ansible.module_utils.basic import AnsibleModule
@@ -175,6 +267,7 @@ except ImportError:
 
 SNAP_NOW_API = "2.10"
 CONTEXT_API_VERSION = "2.17"
+COPY_API_VERSION = "2.25"
 
 
 def get_latest_fssnapshot(module, blade):
@@ -231,6 +324,26 @@ def get_fssnapshot(module, blade):
                 module.params["name"] + "." + module.params["suffix"]
             ],
         )
+    if res.status_code == 200:
+        items = list(res.items)
+        if items:
+            return items[0]
+    return None
+
+
+def get_target_filesystem(module, blade):
+    """Return the filesystem named by target_fs, or None"""
+    api_version = get_rest_api_version(blade)
+    if (
+        LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
+        and module.params["context"]
+    ):
+        res = blade.get_file_systems(
+            names=[module.params["target_fs"]],
+            context_names=[module.params["context"]],
+        )
+    else:
+        res = blade.get_file_systems(names=[module.params["target_fs"]])
     if res.status_code == 200:
         items = list(res.items)
         if items:
@@ -378,6 +491,98 @@ def restore_snapshot(module, blade, snap=None):
     module.exit_json(changed=changed)
 
 
+def copy_snapshot(module, blade, filesystem, snap=None):
+    """Create a new writable filesystem from a snapshot.
+
+    The snapshot is the one named by ``suffix`` when the caller gave one
+    (``snap``, or None if it does not exist), otherwise the latest snapshot
+    of the filesystem. The target is created with ``include_snapshot`` so
+    the array copies the snapshot's data into it. A target that already
+    exists as a copy of the source is left alone; any other existing
+    filesystem is never overwritten.
+    """
+    api_version = get_rest_api_version(blade)
+    if filesystem is None:
+        module.fail_json(
+            msg="Filesystem {0} does not exist, cannot copy a snapshot of it.".format(
+                module.params["name"]
+            )
+        )
+    if module.params["suffix_given"]:
+        snapname = module.params["name"] + "." + module.params["suffix"]
+        if snap is None:
+            module.fail_json(
+                msg="Snapshot {0} does not exist, cannot copy from it.".format(snapname)
+            )
+        if snap.destroyed:
+            module.fail_json(
+                msg="Snapshot {0} is destroyed. Recover it before copying.".format(
+                    snapname
+                )
+            )
+    else:
+        snapname = get_latest_fssnapshot(module, blade)
+        if snapname is None:
+            module.fail_json(
+                msg="Filesystem {0} has no snapshots to copy from.".format(
+                    module.params["name"]
+                )
+            )
+    target_name = module.params["target_fs"]
+    target = get_target_filesystem(module, blade)
+    changed = False
+    promotion_status = None
+    if target is None:
+        changed = True
+        if not module.check_mode:
+            post_kwargs = {
+                "names": [target_name],
+                "include_snapshot": True,
+                "file_system": FileSystemPost(source=Reference(name=snapname)),
+            }
+            if (
+                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
+                and module.params["context"]
+            ):
+                post_kwargs["context_names"] = [module.params["context"]]
+            if "::" in target_name:
+                # Realm-scoped filesystems are created without default exports
+                post_kwargs["default_exports"] = ["''"]
+            res = blade.post_file_systems(**post_kwargs)
+            if res.status_code != 200:
+                module.fail_json(
+                    msg="Failed to copy snapshot {0} to new filesystem {1}. Error: {2}".format(
+                        snapname, target_name, get_error_message(res)
+                    )
+                )
+            items = list(res.items)
+            if items:
+                promotion_status = getattr(items[0], "promotion_status", None)
+    else:
+        name = module.params["name"]
+        source_name = getattr(getattr(target, "source", None), "name", None)
+        # A realm-scoped source may read back as realm::name or as name
+        is_copy = source_name in (name, name.split("::")[-1])
+        if target.destroyed and is_copy:
+            module.fail_json(
+                msg="Filesystem {0} exists but is destroyed. "
+                "Recover or eradicate it before copying to it.".format(target_name)
+            )
+        if target.destroyed:
+            module.fail_json(
+                msg="Filesystem {0} exists but is destroyed and is not a copy of {1}. "
+                "Eradicate it before copying to it; existing filesystems "
+                "are not overwritten.".format(target_name, name)
+            )
+        if not is_copy:
+            module.fail_json(
+                msg="Filesystem {0} already exists and is not a copy of {1}. "
+                "Existing filesystems are not overwritten.".format(target_name, name)
+            )
+        promotion_status = getattr(target, "promotion_status", None)
+    module.exit_json(changed=changed, promotion_status=promotion_status)
+
+
 def recover_snapshot(module, blade):
     """Recover deleted Snapshot"""
     changed = True
@@ -410,6 +615,89 @@ def recover_snapshot(module, blade):
 def update_snapshot(module, blade):
     """Update Snapshot"""
     changed = False
+    module.exit_json(changed=changed)
+
+
+def _attached_policy_names(snap):
+    """Return the names of the snapshot policies attached to a snapshot.
+
+    REST 2.12 and later report every attached policy in ``policies``;
+    earlier versions report the single policy in ``policy``.
+    """
+    names = []
+    for policy in getattr(snap, "policies", None) or []:
+        policy_name = getattr(policy, "name", None)
+        if policy_name and policy_name not in names:
+            names.append(policy_name)
+    if not names:
+        policy_name = getattr(getattr(snap, "policy", None), "name", None)
+        if policy_name:
+            names.append(policy_name)
+    return names
+
+
+def detach_snapshot_policies(module, blade, snap):
+    """Detach a snapshot from snapshot policies.
+
+    The snapshot is the one named by ``name`` and ``suffix``. Detaching is
+    one-way (the array has no call to attach a snapshot to a policy again),
+    so only the policies still attached are sent and a rerun is a no-op.
+    Each policy is sent in its own request: a refusal by the array, for
+    example for a retention-locked policy or a replication baseline
+    snapshot, names that policy and leaves the earlier detaches in place.
+    """
+    api_version = get_rest_api_version(blade)
+    # Checked here, not with mutually_exclusive: Ansible counts supplied
+    # keys, which would reject an explicit detach_all_policies=false.
+    if module.params["detach_policies"] and module.params["detach_all_policies"]:
+        module.fail_json(
+            msg="detach_policies and detach_all_policies are mutually exclusive."
+        )
+    if module.params["state"] != "present":
+        module.fail_json(
+            msg="detach_policies and detach_all_policies require state=present."
+        )
+    if not module.params["suffix_given"]:
+        module.fail_json(msg="suffix is required to detach policies from a snapshot.")
+    snapname = module.params["name"] + "." + module.params["suffix"]
+    if snap is None:
+        module.fail_json(
+            msg="Snapshot {0} does not exist, cannot detach policies from it.".format(
+                snapname
+            )
+        )
+    if snap.destroyed:
+        module.fail_json(
+            msg="Snapshot {0} is destroyed. Recover it before detaching policies.".format(
+                snapname
+            )
+        )
+    attached = _attached_policy_names(snap)
+    if module.params["detach_all_policies"]:
+        to_detach = attached
+    else:
+        to_detach = []
+        for policy_name in module.params["detach_policies"]:
+            if policy_name in attached and policy_name not in to_detach:
+                to_detach.append(policy_name)
+    changed = bool(to_detach)
+    if changed and not module.check_mode:
+        kwargs = {"member_names": [snapname]}
+        if (
+            LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
+            and module.params["context"]
+        ):
+            kwargs["context_names"] = [module.params["context"]]
+        for policy_name in to_detach:
+            res = blade.delete_file_system_snapshots_policies(
+                policy_names=[policy_name], **kwargs
+            )
+            if res.status_code != 200:
+                module.fail_json(
+                    msg="Failed to detach policy {0} from snapshot {1}. Error: {2}".format(
+                        policy_name, snapname, get_error_message(res)
+                    )
+                )
     module.exit_json(changed=changed)
 
 
@@ -492,14 +780,19 @@ def main():
             suffix=dict(type="str"),
             now=dict(type="bool", default=False),
             target=dict(type="str", aliases=["targets"]),
+            target_fs=dict(type="str"),
             eradicate=dict(default="false", type="bool"),
-            state=dict(default="present", choices=["present", "absent", "restore"]),
+            state=dict(
+                default="present", choices=["present", "absent", "restore", "copy"]
+            ),
             latest_replica=dict(default="false", type="bool"),
             context=dict(type="str", default=""),
+            detach_policies=dict(type="list", elements="str"),
+            detach_all_policies=dict(type="bool", default=False),
         )
     )
 
-    required_if = [["now", True, ["target"]]]
+    required_if = [["now", True, ["target"]], ["state", "copy", ["target_fs"]]]
     module = AnsibleModule(
         argument_spec, required_if=required_if, supports_check_mode=True
     )
@@ -534,8 +827,19 @@ def main():
                 SNAP_NOW_API
             )
         )
+    if state == "copy" and LooseVersion(COPY_API_VERSION) > LooseVersion(api_version):
+        module.fail_json(
+            msg="Minimum FlashBlade REST version for filesystem copy from snapshot: {0}".format(
+                COPY_API_VERSION
+            )
+        )
     filesystem = get_filesystem(module, blade)
     snap = get_fssnapshot(module, blade)
+    if (
+        module.params["detach_policies"] is not None
+        or module.params["detach_all_policies"]
+    ):
+        detach_snapshot_policies(module, blade, snap)
     if state == "present" and filesystem and not filesystem.destroyed and not snap:
         create_snapshot(module, blade)
     elif (
@@ -560,6 +864,8 @@ def main():
         update_snapshot(module, blade)
     elif state == "restore" and filesystem:
         restore_snapshot(module, blade, snap)
+    elif state == "copy":
+        copy_snapshot(module, blade, filesystem, snap)
     elif state == "absent" and snap and not snap.destroyed:
         delete_snapshot(module, blade)
     elif state == "absent" and snap and snap.destroyed and module.params["eradicate"]:

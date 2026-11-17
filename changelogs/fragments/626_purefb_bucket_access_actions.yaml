@@ -1,0 +1,12 @@
+bugfixes:
+  - purefb_bucket_access - validate the ``actions`` of a bucket access policy rule against the
+    list the array publishes instead of a fixed list, so actions added by newer Purity//FB
+    releases reach the array and unknown actions are refused by name.
+  - purefb_bucket_access - examples now name the module correctly, and the documentation notes
+    that a rule for all principals is a public policy the bucket and its account must allow.
+  - purefb_bucket_access - a rule whose content differs from the request is now replaced through a
+    temporary copy (the rule name with ``tmp`` appended), so a replacement the array refuses or
+    stores differently leaves the existing rule in place instead of deleting it first.
+  - purefb_bucket_access - ``state=absent`` fails on an error reading the policy or its rules instead
+    of reporting nothing to delete, and in check mode reports whether a rule or policy would be
+    deleted.

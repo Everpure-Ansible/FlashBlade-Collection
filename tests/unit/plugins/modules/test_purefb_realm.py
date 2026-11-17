@@ -1022,3 +1022,878 @@ class TestPurefbRealm:
         assert (
             "without_default_access_list" in mock_module.fail_json.call_args[1]["msg"]
         )
+
+
+def _realm_module(default_object_server, check_mode=False, **overrides):
+    """Mock AnsibleModule for an existing realm with default_object_server."""
+    mock_module = Mock()
+    mock_module.exit_json = Mock(side_effect=SystemExit)
+    mock_module.fail_json = Mock(side_effect=SystemExit)
+    params = {
+        "name": "test-realm",
+        "without_default_access_list": True,
+        "state": "present",
+        "qos_policy": None,
+        "eradicate": False,
+        "rename": None,
+        "default_object_server": default_object_server,
+    }
+    params.update(overrides)
+    mock_module.params = params
+    mock_module.check_mode = check_mode
+    return mock_module
+
+
+def _defaults_response(server_name):
+    """GET realms/defaults answer: one entry whose object_store names the
+    server, or an empty object_store when server_name is None."""
+    res = Mock()
+    res.status_code = 200
+    entry = Mock()
+    if server_name is None:
+        entry.object_store = []
+    else:
+        store_default = Mock()
+        store_default.server = Mock()
+        store_default.server.name = server_name
+        entry.object_store = [store_default]
+    res.items = [entry]
+    return res
+
+
+def _ok():
+    res = Mock()
+    res.status_code = 200
+    return res
+
+
+def _error(message="boom"):
+    res = Mock()
+    res.status_code = 400
+    err = Mock()
+    err.message = message
+    res.errors = [err]
+    return res
+
+
+@patch("plugins.modules.purefb_realm.Reference")
+@patch("plugins.modules.purefb_realm.ObjectStoreDefault")
+@patch("plugins.modules.purefb_realm.RealmDefaults")
+@patch("plugins.modules.purefb_realm.get_pending_realm")
+@patch("plugins.modules.purefb_realm.get_realm")
+@patch("plugins.modules.purefb_realm.LooseVersion")
+@patch("plugins.modules.purefb_realm.get_system")
+@patch("plugins.modules.purefb_realm.AnsibleModule")
+@patch("plugins.modules.purefb_realm.HAS_PURESTORAGE", True)
+class TestPurefbRealmDefaultObjectServer:
+    """default_object_server: GET/PATCH realms/defaults (REST 2.20)."""
+
+    def _setup(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_realm,
+        mock_get_pending_realm,
+        module,
+        current_default,
+        realm_exists=True,
+        pending=None,
+    ):
+        mock_ansible_module.return_value = module
+        mock_blade = Mock()
+        mock_blade.get_versions.return_value.items = ["2.30"]
+        mock_get_system.return_value = mock_blade
+        # both version gates pass
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_get_realm.return_value = realm_exists
+        mock_get_pending_realm.return_value = pending
+        # no QoS policy on the realm
+        mock_blade.get_qos_policies_members.return_value = _error()
+        mock_blade.get_realms_defaults.return_value = _defaults_response(
+            current_default
+        )
+        mock_blade.get_servers.return_value = _ok()
+        mock_blade.patch_realms_defaults.return_value = _ok()
+        mock_blade.patch_realms.return_value = _ok()
+        mock_blade.post_realms.return_value = _ok()
+        return mock_blade
+
+    def test_set_qualifies_bare_name(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_realm,
+        mock_get_pending_realm,
+        mock_realm_defaults,
+        mock_object_store_default,
+        mock_reference,
+    ):
+        """A bare server name is qualified with the realm name before the
+        existence check and the PATCH."""
+        module = _realm_module("srv")
+        blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_loose_version,
+            mock_get_realm,
+            mock_get_pending_realm,
+            module,
+            current_default=None,
+        )
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        blade.get_realms_defaults.assert_called_once_with(realm_names=["test-realm"])
+        blade.get_servers.assert_called_once_with(names=["test-realm::srv"])
+        mock_reference.assert_called_once_with(name="test-realm::srv")
+        mock_object_store_default.assert_called_once_with(
+            server=mock_reference.return_value
+        )
+        mock_realm_defaults.assert_called_once_with(
+            object_store=[mock_object_store_default.return_value]
+        )
+        blade.patch_realms_defaults.assert_called_once_with(
+            realm_names=["test-realm"],
+            default_realm_configuration=mock_realm_defaults.return_value,
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_already_set_is_noop(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_realm,
+        mock_get_pending_realm,
+        mock_realm_defaults,
+        mock_object_store_default,
+        mock_reference,
+    ):
+        """Fully qualified name equal to the current default: nothing sent."""
+        module = _realm_module("test-realm::srv")
+        blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_loose_version,
+            mock_get_realm,
+            mock_get_pending_realm,
+            module,
+            current_default="test-realm::srv",
+        )
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        blade.get_servers.assert_not_called()
+        blade.patch_realms_defaults.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+    def test_clear_sends_empty_object_store(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_realm,
+        mock_get_pending_realm,
+        mock_realm_defaults,
+        mock_object_store_default,
+        mock_reference,
+    ):
+        """An empty string clears the default with object_store=[]."""
+        module = _realm_module("")
+        blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_loose_version,
+            mock_get_realm,
+            mock_get_pending_realm,
+            module,
+            current_default="test-realm::srv",
+        )
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        blade.get_servers.assert_not_called()
+        mock_object_store_default.assert_not_called()
+        mock_realm_defaults.assert_called_once_with(object_store=[])
+        blade.patch_realms_defaults.assert_called_once_with(
+            realm_names=["test-realm"],
+            default_realm_configuration=mock_realm_defaults.return_value,
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_clear_when_already_clear_is_noop(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_realm,
+        mock_get_pending_realm,
+        mock_realm_defaults,
+        mock_object_store_default,
+        mock_reference,
+    ):
+        module = _realm_module("")
+        blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_loose_version,
+            mock_get_realm,
+            mock_get_pending_realm,
+            module,
+            current_default=None,
+        )
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        blade.patch_realms_defaults.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+    def test_check_mode_reports_change_without_patch(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_realm,
+        mock_get_pending_realm,
+        mock_realm_defaults,
+        mock_object_store_default,
+        mock_reference,
+    ):
+        module = _realm_module("srv", check_mode=True)
+        blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_loose_version,
+            mock_get_realm,
+            mock_get_pending_realm,
+            module,
+            current_default=None,
+        )
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        blade.get_servers.assert_called_once_with(names=["test-realm::srv"])
+        blade.patch_realms_defaults.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_missing_server_fails_before_patch(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_realm,
+        mock_get_pending_realm,
+        mock_realm_defaults,
+        mock_object_store_default,
+        mock_reference,
+    ):
+        module = _realm_module("srv")
+        blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_loose_version,
+            mock_get_realm,
+            mock_get_pending_realm,
+            module,
+            current_default=None,
+        )
+        blade.get_servers.return_value = _error()
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        blade.patch_realms_defaults.assert_not_called()
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "test-realm::srv does not exist in realm test-realm" in msg
+
+    def test_requires_rest_2_20(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_realm,
+        mock_get_pending_realm,
+        mock_realm_defaults,
+        mock_object_store_default,
+        mock_reference,
+    ):
+        """Realms exist from 2.19 but the defaults endpoint needs 2.20; the
+        gate fails before any read or write."""
+        module = _realm_module("srv")
+        blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_loose_version,
+            mock_get_realm,
+            mock_get_pending_realm,
+            module,
+            current_default=None,
+        )
+        # realm gate passes, realm-defaults gate fails
+        mock_loose_version.return_value.__gt__ = Mock(side_effect=[False, True])
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        blade.get_realms_defaults.assert_not_called()
+        blade.patch_realms_defaults.assert_not_called()
+        module.fail_json.assert_called_once()
+        assert "4.6.3" in module.fail_json.call_args[1]["msg"]
+
+    def test_patch_failure_is_reported(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_realm,
+        mock_get_pending_realm,
+        mock_realm_defaults,
+        mock_object_store_default,
+        mock_reference,
+    ):
+        module = _realm_module("srv")
+        blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_loose_version,
+            mock_get_realm,
+            mock_get_pending_realm,
+            module,
+            current_default=None,
+        )
+        blade.patch_realms_defaults.return_value = _error("nope")
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Setting default object store server for realm test-realm" in msg
+
+    def test_defaults_read_failure_is_reported(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_realm,
+        mock_get_pending_realm,
+        mock_realm_defaults,
+        mock_object_store_default,
+        mock_reference,
+    ):
+        module = _realm_module("srv")
+        blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_loose_version,
+            mock_get_realm,
+            mock_get_pending_realm,
+            module,
+            current_default=None,
+        )
+        blade.get_realms_defaults.return_value = _error("nope")
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        blade.patch_realms_defaults.assert_not_called()
+        module.fail_json.assert_called_once()
+        assert "Failed to read defaults" in module.fail_json.call_args[1]["msg"]
+
+    def test_no_defaults_entry_means_unset(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_realm,
+        mock_get_pending_realm,
+        mock_realm_defaults,
+        mock_object_store_default,
+        mock_reference,
+    ):
+        """A realm with no defaults entry at all counts as unset."""
+        module = _realm_module("srv")
+        blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_loose_version,
+            mock_get_realm,
+            mock_get_pending_realm,
+            module,
+            current_default=None,
+        )
+        blade.get_realms_defaults.return_value.items = []
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        blade.patch_realms_defaults.assert_called_once()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_create_checks_server_before_post_then_sets_default(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_realm,
+        mock_get_pending_realm,
+        mock_realm_defaults,
+        mock_object_store_default,
+        mock_reference,
+    ):
+        module = _realm_module("srv")
+        blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_loose_version,
+            mock_get_realm,
+            mock_get_pending_realm,
+            module,
+            current_default=None,
+            realm_exists=None,
+        )
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        blade.get_servers.assert_called_with(names=["test-realm::srv"])
+        blade.post_realms.assert_called_once_with(
+            names=["test-realm"], without_default_access_list=True
+        )
+        blade.patch_realms_defaults.assert_called_once_with(
+            realm_names=["test-realm"],
+            default_realm_configuration=mock_realm_defaults.return_value,
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_create_with_missing_server_fails_before_post(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_realm,
+        mock_get_pending_realm,
+        mock_realm_defaults,
+        mock_object_store_default,
+        mock_reference,
+    ):
+        module = _realm_module("srv")
+        blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_loose_version,
+            mock_get_realm,
+            mock_get_pending_realm,
+            module,
+            current_default=None,
+            realm_exists=None,
+        )
+        blade.get_servers.return_value = _error()
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        blade.post_realms.assert_not_called()
+        blade.patch_realms_defaults.assert_not_called()
+        module.fail_json.assert_called_once()
+        assert "does not exist in realm" in module.fail_json.call_args[1]["msg"]
+
+    def test_rename_applies_default_under_new_name(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_realm,
+        mock_get_pending_realm,
+        mock_realm_defaults,
+        mock_object_store_default,
+        mock_reference,
+    ):
+        module = _realm_module("srv", rename="new-realm")
+        blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_loose_version,
+            mock_get_realm,
+            mock_get_pending_realm,
+            module,
+            current_default=None,
+        )
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        blade.patch_realms.assert_called_once()
+        blade.get_realms_defaults.assert_called_once_with(realm_names=["new-realm"])
+        # checked under the old name before the rename, under the new name
+        # when the default is applied
+        assert [c[1]["names"] for c in blade.get_servers.call_args_list] == [
+            ["test-realm::srv"],
+            ["new-realm::srv"],
+        ]
+        mock_reference.assert_called_once_with(name="new-realm::srv")
+        blade.patch_realms_defaults.assert_called_once_with(
+            realm_names=["new-realm"],
+            default_realm_configuration=mock_realm_defaults.return_value,
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_recover_applies_default(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_realm,
+        mock_get_pending_realm,
+        mock_realm_defaults,
+        mock_object_store_default,
+        mock_reference,
+    ):
+        module = _realm_module("srv")
+        blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_loose_version,
+            mock_get_realm,
+            mock_get_pending_realm,
+            module,
+            current_default=None,
+            realm_exists=None,
+            pending=True,
+        )
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        blade.patch_realms.assert_called_once()
+        blade.patch_realms_defaults.assert_called_once_with(
+            realm_names=["test-realm"],
+            default_realm_configuration=mock_realm_defaults.return_value,
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_absent_ignores_default_object_server(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_realm,
+        mock_get_pending_realm,
+        mock_realm_defaults,
+        mock_object_store_default,
+        mock_reference,
+    ):
+        module = _realm_module("srv", state="absent")
+        blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_loose_version,
+            mock_get_realm,
+            mock_get_pending_realm,
+            module,
+            current_default=None,
+        )
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        blade.patch_realms.assert_called_once()
+        blade.get_realms_defaults.assert_not_called()
+        blade.patch_realms_defaults.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_rename_check_mode_refuses_missing_server(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_realm,
+        mock_get_pending_realm,
+        mock_realm_defaults,
+        mock_object_store_default,
+        mock_reference,
+    ):
+        """Until the rename lands the server is named under the old realm;
+        check mode refuses a missing one without renaming anything."""
+        module = _realm_module("srv", rename="new-realm", check_mode=True)
+        blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_loose_version,
+            mock_get_realm,
+            mock_get_pending_realm,
+            module,
+            current_default=None,
+        )
+        blade.get_servers.return_value = _error()
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        blade.get_servers.assert_called_once_with(names=["test-realm::srv"])
+        blade.patch_realms.assert_not_called()
+        blade.patch_realms_defaults.assert_not_called()
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "test-realm::srv does not exist in realm test-realm" in msg
+
+    def test_rename_check_mode_reports_change_without_writes(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_realm,
+        mock_get_pending_realm,
+        mock_realm_defaults,
+        mock_object_store_default,
+        mock_reference,
+    ):
+        module = _realm_module("srv", rename="new-realm", check_mode=True)
+        blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_loose_version,
+            mock_get_realm,
+            mock_get_pending_realm,
+            module,
+            current_default=None,
+        )
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        blade.get_servers.assert_called_once_with(names=["test-realm::srv"])
+        blade.patch_realms.assert_not_called()
+        blade.get_realms_defaults.assert_not_called()
+        blade.patch_realms_defaults.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_rename_accepts_server_qualified_with_old_name(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_realm,
+        mock_get_pending_realm,
+        mock_realm_defaults,
+        mock_object_store_default,
+        mock_reference,
+    ):
+        """A value qualified with the old realm name is applied under the
+        new one after the rename."""
+        module = _realm_module("test-realm::srv", rename="new-realm")
+        blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_loose_version,
+            mock_get_realm,
+            mock_get_pending_realm,
+            module,
+            current_default=None,
+        )
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        assert [c[1]["names"] for c in blade.get_servers.call_args_list] == [
+            ["test-realm::srv"],
+            ["new-realm::srv"],
+        ]
+        mock_reference.assert_called_once_with(name="new-realm::srv")
+        blade.patch_realms_defaults.assert_called_once_with(
+            realm_names=["new-realm"],
+            default_realm_configuration=mock_realm_defaults.return_value,
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_already_renamed_rerun_reconciles_default(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_realm,
+        mock_get_pending_realm,
+        mock_realm_defaults,
+        mock_object_store_default,
+        mock_reference,
+    ):
+        """name=old rename=new after the rename happened: no realm write,
+        but the default is still reconciled under the new name."""
+        module = _realm_module("srv", rename="new-realm")
+        blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_loose_version,
+            mock_get_realm,
+            mock_get_pending_realm,
+            module,
+            current_default=None,
+            realm_exists=None,
+        )
+        # the old name is gone, the new one exists
+        blade.get_realms.return_value = _ok()
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        blade.post_realms.assert_not_called()
+        blade.patch_realms.assert_not_called()
+        blade.get_realms_defaults.assert_called_once_with(realm_names=["new-realm"])
+        blade.get_servers.assert_called_once_with(names=["new-realm::srv"])
+        blade.patch_realms_defaults.assert_called_once_with(
+            realm_names=["new-realm"],
+            default_realm_configuration=mock_realm_defaults.return_value,
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_already_renamed_rerun_with_default_in_place_is_noop(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_realm,
+        mock_get_pending_realm,
+        mock_realm_defaults,
+        mock_object_store_default,
+        mock_reference,
+    ):
+        module = _realm_module("test-realm::srv", rename="new-realm")
+        blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_loose_version,
+            mock_get_realm,
+            mock_get_pending_realm,
+            module,
+            current_default="new-realm::srv",
+            realm_exists=None,
+        )
+        blade.get_realms.return_value = _ok()
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        blade.post_realms.assert_not_called()
+        blade.patch_realms.assert_not_called()
+        blade.get_servers.assert_not_called()
+        blade.patch_realms_defaults.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+    def test_recover_check_mode_refuses_missing_server(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_realm,
+        mock_get_pending_realm,
+        mock_realm_defaults,
+        mock_object_store_default,
+        mock_reference,
+    ):
+        module = _realm_module("srv", check_mode=True)
+        blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_loose_version,
+            mock_get_realm,
+            mock_get_pending_realm,
+            module,
+            current_default=None,
+            realm_exists=None,
+            pending=True,
+        )
+        blade.get_servers.return_value = _error()
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        blade.patch_realms.assert_not_called()
+        blade.patch_realms_defaults.assert_not_called()
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "test-realm::srv does not exist in realm test-realm" in msg
+
+    def test_missing_sdk_fails_before_any_array_call(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_loose_version,
+        mock_get_realm,
+        mock_get_pending_realm,
+        mock_realm_defaults,
+        mock_object_store_default,
+        mock_reference,
+    ):
+        module = _realm_module("srv")
+        self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_loose_version,
+            mock_get_realm,
+            mock_get_pending_realm,
+            module,
+            current_default=None,
+        )
+
+        # a method-level patch decorator would be entered before the
+        # class-level HAS_PURESTORAGE=True patch, so patch inline instead
+        with patch("plugins.modules.purefb_realm.HAS_PURESTORAGE", False):
+            try:
+                main()
+            except SystemExit:
+                pass
+
+        module.fail_json.assert_called_once_with(
+            msg="py-pure-client sdk is required for this module"
+        )
+        mock_get_system.assert_not_called()

@@ -61,9 +61,9 @@ options:
         C(storage_class_members) on 4.8.3 / 2.27 or later. The C(realms)
         subset also returns C(realm_connections) and C(remote_realms) on
         4.8.0 / 2.25 or later. All of these are read from the local array
-        only. The member detail, C(presets), C(workloads) and C(tgroups)
-        are empty on an array that is not in a fleet and when the
-        credentials used lack the fleet rights those endpoints require;
+        only. C(fleet), its member detail, C(presets), C(workloads) and
+        C(tgroups) are empty on an array that is not in a fleet and when
+        the credentials used lack the fleet rights those endpoints require;
         C(storage_class_members) lists the local array itself when it is
         not in a fleet; C(realm_connections) and C(remote_realms) are
         empty when no realm is connected.
@@ -1731,24 +1731,31 @@ def generate_file_system_exports_dict(blade):
 
 
 def generate_fleet_dict(blade):
-    fleet_items = list(blade.get_fleets().items)
+    """Return the fleet the array belongs to, keyed by name, with its members
+
+    An array that is not in a fleet answers both reads with no items, and
+    credentials without fleet rights are refused; a refused read gives the
+    same empty structure instead of an error (an error response carries no
+    ``items`` at all).
+    """
+    fleet_info = {}
+    res = blade.get_fleets()
+    if res.status_code != 200:
+        return fleet_info
+    fleet_items = list(res.items)
     if not fleet_items:
-        return {}
+        return fleet_info
 
     fleet_name = fleet_items[0].name
-    members = blade.get_fleets_members().items
-
-    fleet_info = {
-        fleet_name: {
-            "members": {
-                member.member.name: {
-                    "status": member.status,
-                    "status_details": member.status_details,
-                }
-                for member in members
-            }
+    fleet_info[fleet_name] = {"members": {}}
+    res = blade.get_fleets_members()
+    if res.status_code != 200:
+        return fleet_info
+    for member in list(res.items):
+        fleet_info[fleet_name]["members"][member.member.name] = {
+            "status": member.status,
+            "status_details": member.status_details,
         }
-    }
     return fleet_info
 
 

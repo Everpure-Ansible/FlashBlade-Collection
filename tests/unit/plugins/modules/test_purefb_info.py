@@ -109,6 +109,7 @@ from plugins.modules.purefb_info import (
     generate_storage_class_members_dict,
     generate_realm_connections_dict,
     generate_remote_realms_dict,
+    generate_fleet_dict,
 )
 
 
@@ -2106,6 +2107,72 @@ class TestPurefbInfo:
     # ------------------------------------------------------------------
     # fleet read-back
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _error_response(status_code=400):
+        """A refused read: pypureclient's ErrorResponse has no ``items``"""
+        res = Mock(spec=["status_code", "errors", "headers"])
+        res.status_code = status_code
+        res.errors = []
+        res.headers = {}
+        return res
+
+    def test_generate_fleet_dict_reports_members(self):
+        fleet = Mock(spec=["name"])
+        fleet.name = "fleet1"
+        member1 = Mock(spec=["member", "status", "status_details"])
+        member1.member = self._ref("array1", "arrays")
+        member1.status = "joined"
+        member1.status_details = None
+        member2 = Mock(spec=["member", "status", "status_details"])
+        member2.member = self._ref("array2", "arrays")
+        member2.status = "joining"
+        member2.status_details = "waiting for key exchange"
+        mock_blade = Mock()
+        mock_blade.get_fleets.return_value = self._response([fleet])
+        mock_blade.get_fleets_members.return_value = self._response([member1, member2])
+
+        result = generate_fleet_dict(mock_blade)
+
+        assert result == {
+            "fleet1": {
+                "members": {
+                    "array1": {"status": "joined", "status_details": None},
+                    "array2": {
+                        "status": "joining",
+                        "status_details": "waiting for key exchange",
+                    },
+                }
+            }
+        }
+
+    def test_generate_fleet_dict_not_in_fleet(self):
+        """An array that is not in a fleet answers with no items; the
+        members are not asked for."""
+        mock_blade = Mock()
+        mock_blade.get_fleets.return_value = self._response([])
+
+        assert generate_fleet_dict(mock_blade) == {}
+        mock_blade.get_fleets_members.assert_not_called()
+
+    def test_generate_fleet_dict_fleets_read_refused(self):
+        """A refused /fleets read returns an empty fleet key rather than
+        failing on the missing ``items`` of the error response."""
+        mock_blade = Mock()
+        mock_blade.get_fleets.return_value = self._error_response()
+
+        assert generate_fleet_dict(mock_blade) == {}
+        mock_blade.get_fleets_members.assert_not_called()
+
+    def test_generate_fleet_dict_members_read_refused(self):
+        """A refused /fleets/members read keeps the fleet with no members."""
+        fleet = Mock(spec=["name"])
+        fleet.name = "fleet1"
+        mock_blade = Mock()
+        mock_blade.get_fleets.return_value = self._response([fleet])
+        mock_blade.get_fleets_members.return_value = self._error_response()
+
+        assert generate_fleet_dict(mock_blade) == {"fleet1": {"members": {}}}
 
     def test_generate_remote_arrays_dict_requires_current_fleet_only(self):
         array = Mock(

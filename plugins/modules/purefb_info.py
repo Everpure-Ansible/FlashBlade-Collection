@@ -35,7 +35,20 @@ options:
         Possible values for this include all, minimum, config, performance,
         capacity, network, subnets, lags, filesystems, snapshots, buckets,
         replication, policies, arrays, accounts, admins, ad, kerberos,
-        drives, servers, fleet and realms.
+        drives, servers, fleet, realms and clients.
+      - The C(performance) subset reports array-wide performance per protocol
+        (C(aggregate), C(http), C(s3), C(nfs), C(smb)), the protocol-specific
+        operation breakdowns (C(nfs_ops), C(s3_ops), C(http_ops)), replication
+        performance (array-wide, per array connection and per target under
+        C(replication)) and point-in-time per-object samples keyed by name
+        under C(filesystems) and C(buckets).
+      - The C(clients) subset lists per-client NFS and S3 performance from
+        the array's client sample. Clients are reported as C(IP:PORT) and
+        each list is capped at the first 100 entries the array returns.
+        Sampling takes several seconds per protocol and S3 clients are
+        listed per connection, so this subset is not part of C(all) and
+        must be requested explicitly. S3 client performance requires
+        REST 2.18 (Purity//FB 4.6.0) and is reported empty on older arrays.
       - The C(filesystems) subset surfaces the legacy file system keys
         C(nfs_rules), C(export_policy), C(smb_client_policy) and
         C(smb_share_policy). Purity//FB marks the underlying fields as
@@ -98,6 +111,17 @@ EXAMPLES = r"""
 - name: show all information
   debug:
     msg: "{{ blade_info['purefb_info'] }}"
+
+- name: collect per-client performance (opt-in, not part of all)
+  everpure.flashblade.purefb_info:
+    gather_subset:
+      - clients
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+  register: blade_info
+- name: show NFS client performance
+  debug:
+    msg: "{{ blade_info['purefb_info']['clients']['nfs'] }}"
 """
 
 RETURN = r"""
@@ -135,14 +159,21 @@ SPACE_API_VERSION = "2.11"
 PUBLIC_API_VERSION = "2.12"
 NAP_API_VERSION = "2.13"
 RA_DURATION_API_VERSION = "2.14"
+SSH_CA_API_VERSION = "2.14"
 SMTP_ENCRYPT_API_VERSION = "2.15"
 WORM_API_VERSION = "2.15"
 SERVERS_API_VERSION = "2.16"
 PASSWORD_POLICY_API_VERSION = "2.16"
+MAINTENANCE_API_VERSION = "2.16"
 FLEET_API_VERSION = "2.17"
 TLS_API_VERSION = "2.17"
+EDGE_API_VERSION = "2.18"
+OIDC_API_VERSION = "2.17"
+CLIENTS_S3_API_VERSION = "2.18"
 REALMS_API_VERSION = "2.19"
+MAP_API_VERSION = "2.19"
 S3_EXPORT_API_VERSION = "2.20"
+REALM_DEFAULTS_API_VERSION = "2.20"
 
 
 def _bytes_to_human(bytes_number):
@@ -156,6 +187,57 @@ def _bytes_to_human(bytes_number):
             bytes_number = bytes_number / 1024
         return str(round(double_bytes, 2)) + " " + labels[i]
     return None
+
+
+def _reference_names(references):
+    """Return the names in a list of references (None or empty gives [])"""
+    return [
+        reference.name
+        for reference in (references or [])
+        if getattr(reference, "name", None)
+    ]
+
+
+def generate_directory_service_roles_dict(blade, api_version):
+    """Return the directory service role mappings
+
+    ``role`` is null for a mapping with no, several, or a custom management
+    access policy, so it is read through getattr. The policy names are
+    reported from REST 2.19, where the array exposes them.
+    """
+    roles_info = {}
+    report_policies = LooseVersion(MAP_API_VERSION) <= LooseVersion(api_version)
+    for ds_role in list(blade.get_directory_services_roles().items):
+        roles_info[ds_role.name] = {
+            "group": getattr(ds_role, "group", None),
+            "group_base": getattr(ds_role, "group_base", None),
+            "role": getattr(getattr(ds_role, "role", None), "name", None),
+        }
+        if report_policies:
+            roles_info[ds_role.name]["management_access_policies"] = _reference_names(
+                getattr(ds_role, "management_access_policies", None)
+            )
+    return roles_info
+
+
+def _maintenance_window_list(blade):
+    """Return the open maintenance window as a one-item list, or []"""
+    windows = []
+    res = blade.get_maintenance_windows()
+    if res.status_code == 200:
+        for window in list(res.items):
+            windows.append(
+                {
+                    "name": window.name,
+                    "created": datetime.fromtimestamp(
+                        int(window.created) / 1000
+                    ).strftime("%Y-%m-%d %H:%M:%S"),
+                    "expires": datetime.fromtimestamp(
+                        int(window.expires) / 1000
+                    ).strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+    return windows
 
 
 def generate_default_dict(blade):
@@ -277,7 +359,244 @@ def generate_default_dict(blade):
     }
     if LooseVersion(RA_DURATION_API_VERSION) <= LooseVersion(api_version):
         default_info["remote_assist"]["ra_duration"] = ra_info.remote_assist_duration
+    if LooseVersion(MAINTENANCE_API_VERSION) <= LooseVersion(api_version):
+        default_info["maintenance_window"] = _maintenance_window_list(blade)
+    if LooseVersion(EDGE_API_VERSION) <= LooseVersion(api_version):
+        # Pure1 Edge Services opt-ins, set by purefb_phonehome
+        default_info["remote_assist"]["edge_management_enabled"] = getattr(
+            ra_info, "edge_management_enabled", None
+        )
+        default_info["remote_assist"]["edge_agent_update_enabled"] = getattr(
+            ra_info, "edge_agent_update_enabled", None
+        )
     return default_info
+
+
+# Performance samples (array, file system, bucket and client rows) share one
+# metric layout; the protocol-specific endpoints each have their own.
+PERF_FIELDS = (
+    "bytes_per_op",
+    "bytes_per_read",
+    "bytes_per_write",
+    "others_per_sec",
+    "read_bytes_per_sec",
+    "reads_per_sec",
+    "time",
+    "usec_per_other_op",
+    "usec_per_read_op",
+    "usec_per_write_op",
+    "write_bytes_per_sec",
+    "writes_per_sec",
+)
+NFS_OPS_FIELDS = (
+    "accesses_per_sec",
+    "aggregate_file_metadata_creates_per_sec",
+    "aggregate_file_metadata_modifies_per_sec",
+    "aggregate_file_metadata_reads_per_sec",
+    "aggregate_other_per_sec",
+    "aggregate_share_metadata_reads_per_sec",
+    "aggregate_usec_per_file_metadata_create_op",
+    "aggregate_usec_per_file_metadata_modify_op",
+    "aggregate_usec_per_file_metadata_read_op",
+    "aggregate_usec_per_other_op",
+    "aggregate_usec_per_share_metadata_read_op",
+    "creates_per_sec",
+    "fsinfos_per_sec",
+    "fsstats_per_sec",
+    "getattrs_per_sec",
+    "links_per_sec",
+    "lookups_per_sec",
+    "mkdirs_per_sec",
+    "pathconfs_per_sec",
+    "readdirpluses_per_sec",
+    "readdirs_per_sec",
+    "readlinks_per_sec",
+    "reads_per_sec",
+    "removes_per_sec",
+    "renames_per_sec",
+    "rmdirs_per_sec",
+    "setattrs_per_sec",
+    "symlinks_per_sec",
+    "time",
+    "usec_per_access_op",
+    "usec_per_create_op",
+    "usec_per_fsinfo_op",
+    "usec_per_fsstat_op",
+    "usec_per_getattr_op",
+    "usec_per_link_op",
+    "usec_per_lookup_op",
+    "usec_per_mkdir_op",
+    "usec_per_pathconf_op",
+    "usec_per_read_op",
+    "usec_per_readdir_op",
+    "usec_per_readdirplus_op",
+    "usec_per_readlink_op",
+    "usec_per_remove_op",
+    "usec_per_rename_op",
+    "usec_per_rmdir_op",
+    "usec_per_setattr_op",
+    "usec_per_symlink_op",
+    "usec_per_write_op",
+    "writes_per_sec",
+)
+S3_OPS_FIELDS = (
+    "others_per_sec",
+    "read_buckets_per_sec",
+    "read_objects_per_sec",
+    "time",
+    "usec_per_other_op",
+    "usec_per_read_bucket_op",
+    "usec_per_read_object_op",
+    "usec_per_write_bucket_op",
+    "usec_per_write_object_op",
+    "write_buckets_per_sec",
+    "write_objects_per_sec",
+)
+HTTP_OPS_FIELDS = (
+    "others_per_sec",
+    "read_dirs_per_sec",
+    "read_files_per_sec",
+    "time",
+    "usec_per_other_op",
+    "usec_per_read_dir_op",
+    "usec_per_read_file_op",
+    "usec_per_write_dir_op",
+    "usec_per_write_file_op",
+    "write_dirs_per_sec",
+    "write_files_per_sec",
+)
+REPL_PERF_FIELDS = ("received_bytes_per_sec", "transmitted_bytes_per_sec")
+OBJECT_BACKLOG_FIELDS = (
+    "bytes_count",
+    "delete_ops_count",
+    "other_ops_count",
+    "put_ops_count",
+)
+# The array samples clients for several seconds per request and lists S3
+# clients per connection, so the listings are capped like the CLI does.
+CLIENTS_PERF_LIMIT = 100
+
+
+def _perf_fields(sample, fields):
+    """Return the requested metric fields of a performance sample as a dict.
+
+    Fields the array did not report come back as None; a missing sample
+    gives an empty dict so callers can store the result as-is.
+    """
+    if sample is None:
+        return {}
+    return {field: getattr(sample, field, None) for field in fields}
+
+
+def _perf_items(response):
+    """Return the items of a successful list response, or an empty list."""
+    if getattr(response, "status_code", None) != 200:
+        return []
+    return list(response.items)
+
+
+def _perf_first(response):
+    """Return the first item of a successful list response, or None."""
+    items = _perf_items(response)
+    return items[0] if items else None
+
+
+def _replication_perf(sample):
+    """Flatten a ResourcePerformanceReplication sample.
+
+    ``aggregate`` and ``periodic`` carry bytes received/transmitted per
+    second; ``continuous`` adds the object replication backlog. The array
+    omits sub-objects it has no data for, so every level is optional.
+    """
+    if sample is None:
+        return {}
+    continuous = getattr(sample, "continuous", None)
+    repl_info = {
+        "aggregate": _perf_fields(getattr(sample, "aggregate", None), REPL_PERF_FIELDS),
+        "periodic": _perf_fields(getattr(sample, "periodic", None), REPL_PERF_FIELDS),
+        "continuous": _perf_fields(continuous, REPL_PERF_FIELDS),
+        "time": getattr(sample, "time", None),
+    }
+    if continuous is not None:
+        repl_info["continuous"]["object_backlog"] = _perf_fields(
+            getattr(continuous, "object_backlog", None), OBJECT_BACKLOG_FIELDS
+        )
+    return repl_info
+
+
+def generate_perf_breakdown_dict(blade):
+    """Protocol, replication and per-object performance for the performance subset.
+
+    Every endpoint used here exists since REST 2.0, so there is no version
+    gate. A failed GET leaves its key empty instead of failing the gather.
+    """
+    breakdown = {
+        "smb": _perf_fields(
+            _perf_first(blade.get_arrays_performance(protocol="smb")), PERF_FIELDS
+        ),
+        "nfs_ops": _perf_fields(
+            _perf_first(blade.get_arrays_nfs_specific_performance()), NFS_OPS_FIELDS
+        ),
+        "s3_ops": _perf_fields(
+            _perf_first(blade.get_arrays_s3_specific_performance()), S3_OPS_FIELDS
+        ),
+        "http_ops": _perf_fields(
+            _perf_first(blade.get_arrays_http_specific_performance()),
+            HTTP_OPS_FIELDS,
+        ),
+        "replication": _replication_perf(
+            _perf_first(blade.get_arrays_performance_replication())
+        ),
+        "filesystems": {},
+        "buckets": {},
+    }
+    breakdown["replication"]["array_connections"] = {}
+    breakdown["replication"]["targets"] = {}
+    for conn in _perf_items(blade.get_array_connections_performance_replication()):
+        remote = getattr(getattr(conn, "remote", None), "name", None) or getattr(
+            conn, "id", None
+        )
+        if remote:
+            breakdown["replication"]["array_connections"][remote] = _replication_perf(
+                conn
+            )
+    for target in _perf_items(blade.get_targets_performance_replication()):
+        breakdown["replication"]["targets"][target.name] = _replication_perf(target)
+    for fsys in _perf_items(blade.get_file_systems_performance()):
+        breakdown["filesystems"][fsys.name] = _perf_fields(fsys, PERF_FIELDS)
+    for bucket in _perf_items(blade.get_buckets_performance()):
+        breakdown["buckets"][bucket.name] = _perf_fields(bucket, PERF_FIELDS)
+    for bucket in _perf_items(blade.get_buckets_s3_specific_performance()):
+        breakdown["buckets"].setdefault(bucket.name, {})["s3"] = _perf_fields(
+            bucket, S3_OPS_FIELDS
+        )
+    return breakdown
+
+
+def generate_clients_dict(blade, api_version):
+    """Per-client performance for the opt-in clients subset.
+
+    Clients are reported as IP:PORT and each listing is capped at
+    CLIENTS_PERF_LIMIT entries. The protocol selector and the S3-specific
+    listing need REST 2.18; older arrays get the S3 keys back empty.
+    """
+    clients_info = {"nfs": {}, "s3": {}, "s3_ops": {}}
+    for client in _perf_items(
+        blade.get_arrays_clients_performance(limit=CLIENTS_PERF_LIMIT)
+    ):
+        clients_info["nfs"][client.name] = _perf_fields(client, PERF_FIELDS)
+    if LooseVersion(CLIENTS_S3_API_VERSION) <= LooseVersion(api_version):
+        for client in _perf_items(
+            blade.get_arrays_clients_performance(
+                protocol="s3", limit=CLIENTS_PERF_LIMIT
+            )
+        ):
+            clients_info["s3"][client.name] = _perf_fields(client, PERF_FIELDS)
+        for client in _perf_items(
+            blade.get_arrays_clients_s3_specific_performance(limit=CLIENTS_PERF_LIMIT)
+        ):
+            clients_info["s3_ops"][client.name] = _perf_fields(client, S3_OPS_FIELDS)
+    return clients_info
 
 
 def generate_perf_dict(blade):
@@ -361,7 +680,28 @@ def generate_perf_dict(blade):
                 obj_repl_perf.periodic, "transmitted_bytes_per_sec", None
             ),
         }
+    perf_info.update(generate_perf_breakdown_dict(blade))
     return perf_info
+
+
+def generate_quota_settings_dict(blade):
+    """Legacy user and group quota notification settings (/quotas/settings).
+
+    Keyed by the settings object name (a single object named management).
+    The array omits contact from the response while it is unset.
+    """
+    quota_settings = {}
+    res = blade.get_quotas_settings()
+    if res.status_code != 200:
+        return quota_settings
+    for settings in list(res.items):
+        quota_settings[settings.name] = {
+            "contact": getattr(settings, "contact", None),
+            "direct_notifications_enabled": getattr(
+                settings, "direct_notifications_enabled", None
+            ),
+        }
+    return quota_settings
 
 
 def generate_config_dict(blade):
@@ -374,6 +714,12 @@ def generate_config_dict(blade):
             "nameservers": config.nameservers,
             "domain": config.domain,
             "services": getattr(config, "services", None),
+            "ca_certificate": getattr(
+                getattr(config, "ca_certificate", None), "name", None
+            ),
+            "ca_certificate_group": getattr(
+                getattr(config, "ca_certificate_group", None), "name", None
+            ),
         }
         if hasattr(config, "sources"):
             # sources is a list of references (at most one), not a reference
@@ -391,6 +737,7 @@ def generate_config_dict(blade):
             "sender_domain": getattr(config, "sender_domain", None),
             "encryption_mode": getattr(config, "encryption_mode", None),
         }
+    config_info["quota_settings"] = generate_quota_settings_dict(blade)
     alert_config = list(blade.get_alert_watchers().items)
     config_info["alert_watchers"] = {}
     for config in alert_config:
@@ -421,15 +768,9 @@ def generate_config_dict(blade):
     # Forward backwards compatability
     config_info["array_management"] = config_info["management_directory_service"]
 
-    config_info["directory_service_roles"] = {}
-    roles = list(blade.get_directory_services_roles().items)
-    for ds_role in roles:
-        role_name = ds_role.name
-        config_info["directory_service_roles"][role_name] = {
-            "group": ds_role.group,
-            "group_base": ds_role.group_base,
-            "role": ds_role.role.name,
-        }
+    config_info["directory_service_roles"] = generate_directory_service_roles_dict(
+        blade, api_version
+    )
     config_info["ntp"] = list(blade.get_arrays().items)[0].ntp_servers
     certs = list(blade.get_certificates().items)
     config_info["ssl_certs"] = {}
@@ -546,7 +887,31 @@ def generate_config_dict(blade):
                     "sign_cred": getattr(saml2[0].sp.signing_credential, "name", None),
                 },
             }
+    if LooseVersion(OIDC_API_VERSION) <= LooseVersion(api_version):
+        config_info["oidc_idps"] = generate_oidc_idps_dict(blade)
     return config_info
+
+
+def generate_oidc_idps_dict(blade):
+    """OIDC identity providers keyed by name (an array may hold several)."""
+    idps_info = {}
+    for idp in list(blade.get_sso_oidc_idps().items):
+        idp_cfg = getattr(idp, "idp", None)
+        idps_info[idp.name] = {
+            "enabled": getattr(idp, "enabled", None),
+            "prn": getattr(idp, "prn", None),
+            "services": list(getattr(idp, "services", None) or []),
+            "provider_url": getattr(idp_cfg, "provider_url", None),
+            "ca_certificate": getattr(
+                getattr(idp_cfg, "provider_url_ca_certificate", None), "name", None
+            ),
+            "ca_certificate_group": getattr(
+                getattr(idp_cfg, "provider_url_ca_certificate_group", None),
+                "name",
+                None,
+            ),
+        }
+    return idps_info
 
 
 def generate_subnet_dict(blade):
@@ -594,17 +959,31 @@ def generate_lag_dict(blade):
 
 
 def generate_admin_dict(blade):
+    """Return the array's administrators
+
+    ``role`` is set only when the admin holds exactly one management access
+    policy that corresponds to a legacy role of the same name; it is null for
+    an admin with no, several, or a custom policy, so it is read through
+    getattr. The policy names are reported from REST 2.19, where the array
+    exposes them.
+    """
     admin_info = {}
+    api_version = get_rest_api_version(blade)
+    report_policies = LooseVersion(MAP_API_VERSION) <= LooseVersion(api_version)
     admins = list(blade.get_admins().items)
     for admin in admins:
         admin_name = admin.name
         admin_info[admin_name] = {
-            "public_key": admin.public_key,
-            "local": admin.is_local,
-            "role": admin.role.name,
-            "locked": admin.locked,
+            "public_key": getattr(admin, "public_key", None),
+            "local": getattr(admin, "is_local", None),
+            "role": getattr(getattr(admin, "role", None), "name", None),
+            "locked": getattr(admin, "locked", None),
             "lockout_remaining": getattr(admin, "lockout_remaining", None),
         }
+        if report_policies:
+            admin_info[admin_name]["management_access_policies"] = _reference_names(
+                getattr(admin, "management_access_policies", None)
+            )
         if hasattr(admin.api_token, "expires_at"):
             if admin.api_token.expires_at:
                 admin_info[admin_name]["token_expires"] = datetime.fromtimestamp(
@@ -718,6 +1097,19 @@ def generate_network_dict(blade):
             subnet_name = subnet.get("name")
         else:
             subnet_name = getattr(subnet, "name", None)
+        # realms (REST 2.19) and rdma_enabled (REST 2.28) are absent from
+        # the interface model on older arrays
+        realms = getattr(port, "realms", None) or []
+        if not isinstance(realms, list):
+            realms = []
+        realm_names = [
+            (
+                realm.get("name")
+                if isinstance(realm, dict)
+                else getattr(realm, "name", None)
+            )
+            for realm in realms
+        ]
         net_info[int_name] = {
             "type": getattr(port, "type", None),
             "mtu": getattr(port, "mtu", None),
@@ -730,6 +1122,8 @@ def generate_network_dict(blade):
             "attached_servers": attached_names,
             "subnet": subnet_name,
             "enabled": port.enabled,
+            "rdma_enabled": getattr(port, "rdma_enabled", None),
+            "realms": realm_names,
         }
     return net_info
 
@@ -1132,6 +1526,12 @@ def generate_ad_dict(blade):
             "encryption_types": ad.encryption_types,
             "global_catalog_servers": getattr(ad, "global_catalog_servers", None),
             "server": getattr(getattr(ad, "server", None), "name", None),
+            "ca_certificate": getattr(
+                getattr(ad, "ca_certificate", None), "name", None
+            ),
+            "ca_certificate_group": getattr(
+                getattr(ad, "ca_certificate_group", None), "name", None
+            ),
         }
 
     return ad_info
@@ -1417,6 +1817,40 @@ def generate_tls_policies_dict(blade):
     return policies_info
 
 
+def generate_ssh_ca_policies_dict(blade):
+    policies_info = {}
+    signer_types = {"public-keys": "public_key", "certificates": "certificate"}
+
+    for policy in blade.get_ssh_certificate_authority_policies().items:
+        signer = getattr(policy, "signing_authority", None)
+        signer_type = getattr(signer, "resource_type", None)
+        policies_info[policy.name] = {
+            "local": getattr(policy, "is_local", None),
+            "enabled": getattr(policy, "enabled", None),
+            "signing_authority": getattr(signer, "name", None),
+            "signing_authority_type": signer_types.get(signer_type, signer_type),
+            "static_authorized_principals": getattr(
+                policy, "static_authorized_principals", None
+            )
+            or [],
+            "admins": [],
+            "arrays": [],
+        }
+
+    for member in blade.get_ssh_certificate_authority_policies_members().items:
+        policy_name = getattr(getattr(member, "policy", None), "name", None)
+        if policy_name in policies_info:
+            ref = getattr(member, "member", None)
+            key = (
+                "arrays"
+                if getattr(ref, "resource_type", None) == "arrays"
+                else "admins"
+            )
+            policies_info[policy_name][key].append(getattr(ref, "name", None))
+
+    return policies_info
+
+
 def generate_s3_export_policies_dict(blade):
     policies_info = {}
 
@@ -1473,6 +1907,23 @@ def generate_object_store_virtual_hosts_dict(blade):
 
 def generate_realms_dict(blade):
     realms_info = {}
+    api_version = get_rest_api_version(blade)
+
+    # Default object store server per realm (REST 2.20+). A realm without a
+    # default has an empty object_store list or no defaults entry at all.
+    default_servers = {}
+    if LooseVersion(REALM_DEFAULTS_API_VERSION) <= LooseVersion(api_version):
+        res = blade.get_realms_defaults()
+        if res.status_code == 200:
+            for defaults in res.items:
+                realm_name = getattr(getattr(defaults, "realm", None), "name", None)
+                object_store = getattr(defaults, "object_store", None) or []
+                server = None
+                if object_store:
+                    server = getattr(
+                        getattr(object_store[0], "server", None), "name", None
+                    )
+                default_servers[realm_name] = server
 
     for realm in blade.get_realms().items:
         space = getattr(realm, "space", None)
@@ -1488,6 +1939,7 @@ def generate_realms_dict(blade):
             "default_inbound_tls_policy": getattr(
                 getattr(realm, "default_inbound_tls_policy", None), "name", None
             ),
+            "default_object_server": default_servers.get(realm.name),
             "space": {
                 "data_reduction": getattr(space, "data_reduction", None),
                 "snapshots": getattr(space, "snapshots", None),
@@ -1859,6 +2311,7 @@ def main():
         "servers",
         "fleet",
         "realms",
+        "clients",
     )
     subset_test = (test in valid_subsets for test in subset)
     if not all(subset_test):
@@ -1950,6 +2403,8 @@ def main():
             info["fleet"] = generate_fleet_dict(blade)
         if LooseVersion(TLS_API_VERSION) <= LooseVersion(api_version):
             info["tls_policies"] = generate_tls_policies_dict(blade)
+        if LooseVersion(SSH_CA_API_VERSION) <= LooseVersion(api_version):
+            info["ssh_ca_policies"] = generate_ssh_ca_policies_dict(blade)
         if LooseVersion(S3_EXPORT_API_VERSION) <= LooseVersion(api_version):
             info["s3_export_policies"] = generate_s3_export_policies_dict(blade)
     if ("realms" in subset or "all" in subset) and LooseVersion(
@@ -1971,6 +2426,10 @@ def main():
         SERVERS_API_VERSION
     ) <= LooseVersion(api_version):
         info["servers"] = generate_servers_dict(blade)
+    # `clients` samples the array for several seconds per protocol and lists
+    # S3 clients per connection, so it is opt-in and not part of `all`.
+    if "clients" in subset:
+        info["clients"] = generate_clients_dict(blade, api_version)
     module.exit_json(changed=False, purefb_info=info)
 
 

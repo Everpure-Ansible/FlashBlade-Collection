@@ -769,6 +769,179 @@ class TestPurefbInfo:
         assert cert["certificate_type"] == "external"
         assert cert["intermediate_certificate"] == "-----BEGIN CERTIFICATE-----"
 
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_config_dict_saml2sso_fields(self, mock_loose_version):
+        """saml2sso reports the SAML2 service, binding, fleet and SP fields"""
+        mock_blade = Mock()
+        mock_version = Mock()
+        mock_version.version = "2.30"
+        mock_blade.get_versions.return_value.items = [mock_version]
+        # every version gate ON
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+
+        for method in (
+            "get_dns",
+            "get_smtp_servers",
+            "get_alert_watchers",
+            "get_directory_services_roles",
+            "get_certificates",
+            "get_certificate_groups",
+            "get_syslog_servers",
+            "get_snmp_agents",
+            "get_snmp_managers",
+            "get_kmip",
+        ):
+            getattr(mock_blade, method).return_value.items = []
+        mock_ds = Mock()
+        mock_ds.name = "management"
+        mock_blade.get_directory_services.return_value.items = [mock_ds]
+        mock_array = Mock()
+        mock_array.ntp_servers = []
+        mock_blade.get_arrays.return_value.items = [mock_array]
+
+        def reference(name):
+            ref = Mock(spec=["name"])
+            ref.name = name
+            return ref
+
+        saml = Mock(
+            spec=[
+                "name",
+                "enabled",
+                "array_url",
+                "prn",
+                "services",
+                "binding",
+                "management",
+                "idp",
+                "sp",
+            ]
+        )
+        saml.name = "PureSSO"
+        saml.enabled = False
+        saml.array_url = "https://fb.example.com"
+        saml.prn = "prn::iam:array-id/local::saml-provider/PureSSO"
+        saml.services = ["management", "object"]
+        saml.binding = "none"
+        saml.management = Mock(spec=["trust_other_saml_sps_in_fleet"])
+        saml.management.trust_other_saml_sps_in_fleet = True
+        saml.idp = Mock()
+        saml.idp.url = "https://idp.example.com/sso"
+        saml.idp.entity_id = "https://idp.example.com/idp"
+        saml.idp.encrypt_assertion_enabled = False
+        saml.idp.sign_request_enabled = True
+        saml.idp.metadata_url = "https://idp.example.com/metadata"
+        saml.idp.metadata_url_ca_certificate = reference("idp-ca")
+        saml.idp.metadata_url_ca_certificate_group = reference(None)
+        saml.idp.verification_certificate = reference("idp-cert")
+        saml.sp = Mock()
+        saml.sp.entity_id = "https://sso.example.com/fleet"
+        saml.sp.assertion_consumer_url = (
+            "https://fb.example.com/login/saml2/sso/PureSSO"
+        )
+        saml.sp.metadata_url = (
+            "https://fb.example.com/saml2/service-provider-metadata/PureSSO"
+        )
+        saml.sp.decryption_credential = reference(None)
+        saml.sp.signing_credential = reference("sp-signing")
+        mock_blade.get_sso_saml2_idps.return_value.items = [saml]
+
+        result = generate_config_dict(mock_blade)
+
+        sso = result["saml2sso"]
+        assert sso["name"] == "PureSSO"
+        assert sso["prn"] == "prn::iam:array-id/local::saml-provider/PureSSO"
+        assert sso["services"] == ["management", "object"]
+        assert sso["binding"] == "none"
+        assert sso["trust_other_saml_sps_in_fleet"] is True
+        assert sso["idp"]["entity_id"] == "https://idp.example.com/idp"
+        assert sso["idp"]["metadata_url_ca_certificate"] == "idp-ca"
+        assert sso["idp"]["metadata_url_ca_certificate_group"] is None
+        assert sso["idp"]["verification_certificate"] == "idp-cert"
+        assert sso["sp"]["entity_id"] == "https://sso.example.com/fleet"
+        assert (
+            sso["sp"]["assertion_consumer_url"]
+            == "https://fb.example.com/login/saml2/sso/PureSSO"
+        )
+        assert (
+            sso["sp"]["metadata_url"]
+            == "https://fb.example.com/saml2/service-provider-metadata/PureSSO"
+        )
+        assert sso["sp"]["decrypt_cred"] is None
+        assert sso["sp"]["sign_cred"] == "sp-signing"
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_config_dict_saml2sso_old_array(self, mock_loose_version):
+        """saml2sso fields a pre-2.17 array lacks are reported as None"""
+        mock_blade = Mock()
+        mock_version = Mock()
+        mock_version.version = "2.16"
+        mock_blade.get_versions.return_value.items = [mock_version]
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+
+        for method in (
+            "get_dns",
+            "get_smtp_servers",
+            "get_alert_watchers",
+            "get_directory_services_roles",
+            "get_certificates",
+            "get_certificate_groups",
+            "get_syslog_servers",
+            "get_snmp_agents",
+            "get_snmp_managers",
+            "get_kmip",
+        ):
+            getattr(mock_blade, method).return_value.items = []
+        mock_ds = Mock()
+        mock_ds.name = "management"
+        mock_blade.get_directory_services.return_value.items = [mock_ds]
+        mock_array = Mock()
+        mock_array.ntp_servers = []
+        mock_blade.get_arrays.return_value.items = [mock_array]
+
+        saml = Mock(spec=["name", "enabled", "array_url", "idp", "sp"])
+        saml.name = "PureSSO"
+        saml.enabled = True
+        saml.array_url = "https://fb.example.com"
+        saml.idp = Mock(
+            spec=[
+                "url",
+                "entity_id",
+                "encrypt_assertion_enabled",
+                "sign_request_enabled",
+                "metadata_url",
+                "verification_certificate",
+            ]
+        )
+        saml.idp.url = None
+        saml.idp.entity_id = None
+        saml.idp.encrypt_assertion_enabled = False
+        saml.idp.sign_request_enabled = False
+        saml.idp.metadata_url = "https://idp.example.com/metadata"
+        saml.idp.verification_certificate = Mock(spec=["name"])
+        saml.idp.verification_certificate.name = None
+        saml.sp = Mock(spec=["decryption_credential", "signing_credential"])
+        saml.sp.decryption_credential = Mock(spec=["name"])
+        saml.sp.decryption_credential.name = None
+        saml.sp.signing_credential = Mock(spec=["name"])
+        saml.sp.signing_credential.name = None
+        mock_blade.get_sso_saml2_idps.return_value.items = [saml]
+
+        result = generate_config_dict(mock_blade)
+
+        sso = result["saml2sso"]
+        assert sso["enabled"] is True
+        assert sso["prn"] is None
+        assert sso["services"] is None
+        assert sso["binding"] is None
+        assert sso["trust_other_saml_sps_in_fleet"] is None
+        assert sso["idp"]["metadata_url_ca_certificate"] is None
+        assert sso["idp"]["metadata_url_ca_certificate_group"] is None
+        assert sso["idp"]["verification_certificate"] is None
+        assert sso["sp"]["entity_id"] is None
+        assert sso["sp"]["assertion_consumer_url"] is None
+        assert sso["sp"]["metadata_url"] is None
+
     def test_generate_password_policies_dict(self):
         """Test generate_password_policies_dict reports all fields in seconds"""
         mock_blade = Mock()

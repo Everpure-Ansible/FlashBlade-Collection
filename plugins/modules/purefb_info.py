@@ -516,13 +516,44 @@ def generate_config_dict(blade):
                 "enabled": saml2[0].enabled,
                 "array_url": saml2[0].array_url,
                 "name": saml2[0].name,
+                "prn": getattr(saml2[0], "prn", None),
+                "services": getattr(saml2[0], "services", None),
+                "binding": getattr(saml2[0], "binding", None),
+                "trust_other_saml_sps_in_fleet": getattr(
+                    getattr(saml2[0], "management", None),
+                    "trust_other_saml_sps_in_fleet",
+                    None,
+                ),
                 "idp": {
                     "url": getattr(saml2[0].idp, "url", None),
+                    "entity_id": getattr(saml2[0].idp, "entity_id", None),
                     "encrypt_enabled": saml2[0].idp.encrypt_assertion_enabled,
                     "sign_enabled": saml2[0].idp.sign_request_enabled,
                     "metadata_url": saml2[0].idp.metadata_url,
+                    "metadata_url_ca_certificate": getattr(
+                        getattr(saml2[0].idp, "metadata_url_ca_certificate", None),
+                        "name",
+                        None,
+                    ),
+                    "metadata_url_ca_certificate_group": getattr(
+                        getattr(
+                            saml2[0].idp, "metadata_url_ca_certificate_group", None
+                        ),
+                        "name",
+                        None,
+                    ),
+                    "verification_certificate": getattr(
+                        getattr(saml2[0].idp, "verification_certificate", None),
+                        "name",
+                        None,
+                    ),
                 },
                 "sp": {
+                    "entity_id": getattr(saml2[0].sp, "entity_id", None),
+                    "assertion_consumer_url": getattr(
+                        saml2[0].sp, "assertion_consumer_url", None
+                    ),
+                    "metadata_url": getattr(saml2[0].sp, "metadata_url", None),
                     "decrypt_cred": getattr(
                         saml2[0].sp.decryption_credential, "name", None
                     ),

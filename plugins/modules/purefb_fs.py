@@ -110,8 +110,49 @@ options:
     description:
       - Promote/demote a filesystem.
       - Can only demote the file-system if it is in a replica-link relationship.
+      - A filesystem that is C(demoting) in a planned failover cannot be
+        promoted directly; use I(abort_quiesce) to cancel the failover.
     required: false
     type: bool
+  quiesce:
+    description:
+      - Planned failover control, used together with I(promote) set to C(false).
+      - When C(true), a promoted filesystem starts a planned failover. It moves
+        to C(demoting) while the data not yet replicated is sent to the target
+        and becomes C(demoted) once replication completes. The module returns
+        as soon as the array accepts the request; follow the promotion status
+        with M(everpure.flashblade.purefb_info).
+      - When C(false), a C(demoting) filesystem skips the remaining replication
+        and is demoted immediately. Data not yet replicated is lost, so
+        I(discard_snaps) must also be C(true). On a promoted filesystem
+        C(false) is the same as omitting I(quiesce).
+      - When omitted, I(promote) set to C(false) requests a regular demotion
+        without a planned failover, as in earlier releases.
+      - Requires Purity//FB 4.8.4+ (REST API 2.28+) on both the source and the
+        target FlashBlade, and a replica link that does not fan out. The array
+        refuses a planned failover while a replication transfer is in progress,
+        and refuses to destroy the filesystem or delete its replica link while
+        it is C(demoting).
+      - The array takes a snapshot named C(<filesystem>.quiesce.<timestamp>) on
+        the source. It keeps the longest retention of the snapshot policies on
+        the replica link, or has to be removed manually when the link has none.
+    required: false
+    type: bool
+    version_added: "1.30.0"
+  abort_quiesce:
+    description:
+      - Cancel a planned failover, used together with I(promote) set to C(true).
+      - On the source, a C(demoting) filesystem returns to C(promoted). On the
+        target, whose replica link is C(quiescing), the target is promoted and
+        the source rolls back to C(promoted). Any in-progress data transfer is
+        cancelled.
+      - Nothing is sent, and no change is reported, when no planned failover is
+        in progress. A regular promotion is never sent with this option.
+      - Requires Purity//FB 4.8.4+ (REST API 2.28+).
+    required: false
+    type: bool
+    default: false
+    version_added: "1.30.0"
   fastremove:
     description:
       - Define whether the fast remove directory is enabled for the filesystem.
@@ -159,6 +200,8 @@ options:
   discard_snaps:
     description:
       - Allow a filesystem to be demoted.
+      - Also required to skip a planned failover, that is I(quiesce) set to
+        C(false) on a C(demoting) filesystem.
     required: false
     default: false
     type: bool
@@ -334,6 +377,31 @@ EXAMPLES = """
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
+- name: Start a planned failover of filesystem foo (quiesce, then demote)
+  everpure.flashblade.purefb_fs:
+    name: foo
+    promote: false
+    quiesce: true
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Skip the remaining replication and demote filesystem foo now
+  everpure.flashblade.purefb_fs:
+    name: foo
+    promote: false
+    quiesce: false
+    discard_snaps: true
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Abort the planned failover of filesystem foo
+  everpure.flashblade.purefb_fs:
+    name: foo
+    promote: true
+    abort_quiesce: true
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
 - name: Modify attributes of an existing filesystem named foo
   everpure.flashblade.purefb_fs:
     name: foo
@@ -430,6 +498,7 @@ CA_API_VERSION = "2.12"
 GOWNER_API_VERSION = "2.13"
 CONTEXT_API_VERSION = "2.17"
 REALM_API_VERSION = "2.19"
+QUIESCE_API_VERSION = "2.28"
 
 
 def _item_count(res):
@@ -447,6 +516,82 @@ def _item_count(res):
         return len(list(res.items))
     except TypeError:
         return 0
+
+
+def _failover_action(module, blade, fsys, fs_name):
+    """Classify a planned-failover request.
+
+    Returns the FileSystemPatch field to send ("quiesce", "skip_quiesce" or
+    "abort_quiesce"), "noop" when the planned failover is already in the
+    requested state, or None when the request belongs to the regular
+    promote/demote path. The caller has checked that promote is set and that
+    the array supports planned failover.
+    """
+    status = fsys.promotion_status
+    if module.params["promote"]:
+        if not module.params.get("abort_quiesce"):
+            return None
+        if status == "demoting":
+            return "abort_quiesce"
+        # A demoted target only shows the failover on its inbound link.
+        if status == "demoted" and _link_quiescing(module, blade, fs_name):
+            return "abort_quiesce"
+        return "noop"
+    quiesce = module.params.get("quiesce")
+    if quiesce is None:
+        return None
+    if quiesce:
+        return "quiesce" if status == "promoted" else "noop"
+    if status == "demoting":
+        return "skip_quiesce"
+    return None
+
+
+def _link_quiescing(module, blade, fs_name):
+    """Return True when a replica link of the filesystem is quiescing."""
+    kwargs = {"local_file_system_names": [fs_name]}
+    if module.params["context"]:
+        kwargs["context_names"] = [module.params["context"]]
+    res = blade.get_file_system_replica_links(**kwargs)
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to get replica links for filesystem {0}. Error: {1}".format(
+                fs_name, get_error_message(res)
+            )
+        )
+    links = list(res.items)
+    return any(getattr(link, "status", None) == "quiescing" for link in links)
+
+
+def _patch_failover(module, blade, fs_name, action):
+    """Send the dedicated planned-failover PATCH for ``action``.
+
+    The three controls are FileSystemPatch body fields that modify a
+    promotion-state request: the array refuses each flag unless the same
+    body carries requested_promotion_state (demoted for quiesce and
+    skip_quiesce, promoted for abort_quiesce). The PATCH is sent on its own
+    so that no other attribute rides along with a failover request.
+    """
+    body = {action: True}
+    if action == "abort_quiesce":
+        body["requested_promotion_state"] = "promoted"
+    else:
+        body["requested_promotion_state"] = "demoted"
+    kwargs = {"names": [fs_name], "file_system": FileSystemPatch(**body)}
+    if action == "skip_quiesce":
+        # Skipping discards the data not yet replicated; the array only
+        # accepts that with discard_non_snapshotted_data, and refuses the
+        # same flag on a quiesce request.
+        kwargs["discard_non_snapshotted_data"] = True
+    if module.params["context"]:
+        kwargs["context_names"] = [module.params["context"]]
+    res = blade.patch_file_systems(**kwargs)
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Planned failover ({0}) failed for filesystem {1}. Error: {2}".format(
+                action, fs_name, get_error_message(res)
+            )
+        )
 
 
 def create_fs(module, blade):
@@ -1019,8 +1164,23 @@ def modify_fs(module, blade):
         ):
             new_fsys["writable"] = module.params["writable"]
             mod_fs = True
+    failover = None
     if module.params["promote"] is not None:
+        failover = _failover_action(module, blade, fsys, fs_name)
+    if failover == "skip_quiesce" and not module.params["discard_snaps"]:
+        module.fail_json(
+            msg="Filesystem {0} is demoting. Skipping the planned failover "
+            "discards the data not yet replicated; set discard_snaps=true "
+            "to confirm.".format(fs_name)
+        )
+    if module.params["promote"] is not None and failover is None:
         if module.params["promote"] and fsys.promotion_status != "promoted":
+            if fsys.promotion_status == "demoting":
+                module.fail_json(
+                    msg="Filesystem {0} is demoting in a planned failover and "
+                    "cannot be promoted directly. Use abort_quiesce=true to "
+                    "cancel the failover.".format(fs_name)
+                )
             new_fsys["requested_promotion_state"] = "promoted"
             mod_fs = True
         if not module.params["promote"] and fsys.promotion_status == "promoted":
@@ -1133,6 +1293,10 @@ def modify_fs(module, blade):
                         fs_name, get_error_message(res)
                     )
                 )
+    if failover in ("quiesce", "skip_quiesce", "abort_quiesce"):
+        changed = True
+        if not module.check_mode:
+            _patch_failover(module, blade, fs_name, failover)
     if (
         LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
         and module.params["context"]
@@ -1534,6 +1698,8 @@ def main():
             snapshot=dict(type="bool"),
             writable=dict(type="bool"),
             promote=dict(type="bool"),
+            quiesce=dict(type="bool"),
+            abort_quiesce=dict(type="bool", default=False),
             fastremove=dict(type="bool"),
             hard_limit=dict(type="bool"),
             user_quota=dict(type="str"),
@@ -1573,6 +1739,20 @@ def main():
     state = module.params["state"]
     blade = get_system(module)
     api_version = get_rest_api_version(blade)
+    if module.params.get("quiesce") is not None or module.params.get("abort_quiesce"):
+        # Planned failover controls: gate and validate before any write.
+        if LooseVersion(QUIESCE_API_VERSION) > LooseVersion(api_version):
+            module.fail_json(
+                msg="Planned failover (quiesce, abort_quiesce) requires "
+                "Purity//FB 4.8.4+ (REST API {0}+)".format(QUIESCE_API_VERSION)
+            )
+        if (
+            module.params.get("quiesce") is not None
+            and module.params["promote"] is not False
+        ):
+            module.fail_json(msg="quiesce is only valid with promote=false")
+        if module.params.get("abort_quiesce") and not module.params["promote"]:
+            module.fail_json(msg="abort_quiesce is only valid with promote=true")
     if (
         LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
         and not module.params["context"]

@@ -336,7 +336,7 @@ class TestMain:
         blade.patch_arrays.assert_not_called()
         module.exit_json.assert_called_once_with(changed=True)
 
-    @patch(MODULE + ".pytz")
+    @patch(MODULE + ".pytz", create=True)
     @patch(MODULE + "._get_local_tz")
     def test_local_timezone_fallback(
         self,
@@ -362,7 +362,7 @@ class TestMain:
         blade.patch_arrays.assert_called_once_with(mock_fb.Array.return_value)
         module.exit_json.assert_called_once_with(changed=True)
 
-    @patch(MODULE + ".pytz")
+    @patch(MODULE + ".pytz", create=True)
     @patch(MODULE + "._get_local_tz")
     def test_invalid_local_timezone_fails(
         self,

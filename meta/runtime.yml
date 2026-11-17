@@ -47,6 +47,7 @@ action_groups:
     - purefb_pingtrace
     - purefb_policy
     - purefb_proxy
+    - purefb_quota_settings
     - purefb_ra
     - purefb_realm
     - purefb_remote_cred

@@ -102,6 +102,7 @@ from plugins.modules.purefb_info import (
     generate_admin_dict,
     generate_directory_service_roles_dict,
     generate_oidc_idps_dict,
+    generate_quota_settings_dict,
 )
 
 
@@ -1108,6 +1109,36 @@ class TestPurefbInfo:
         mock_blade.get_sso_oidc_idps.return_value.items = []
 
         assert generate_oidc_idps_dict(mock_blade) == {}
+
+    def test_generate_quota_settings_dict_without_contact(self):
+        """generate_quota_settings_dict reads the singleton; contact is absent when unset"""
+        mock_blade = Mock()
+        settings = Mock(spec=["name", "direct_notifications_enabled"])
+        settings.name = "management"
+        settings.direct_notifications_enabled = False
+        mock_blade.get_quotas_settings.return_value.status_code = 200
+        mock_blade.get_quotas_settings.return_value.items = [settings]
+        assert generate_quota_settings_dict(mock_blade) == {
+            "management": {"contact": None, "direct_notifications_enabled": False}
+        }
+
+    def test_generate_quota_settings_dict_with_contact_and_api_error(self):
+        """generate_quota_settings_dict reports a set contact and returns {} on an API error"""
+        mock_blade = Mock()
+        settings = Mock(spec=["name", "contact", "direct_notifications_enabled"])
+        settings.name = "management"
+        settings.contact = "storage-admins@example.com"
+        settings.direct_notifications_enabled = True
+        mock_blade.get_quotas_settings.return_value.status_code = 200
+        mock_blade.get_quotas_settings.return_value.items = [settings]
+        assert generate_quota_settings_dict(mock_blade) == {
+            "management": {
+                "contact": "storage-admins@example.com",
+                "direct_notifications_enabled": True,
+            }
+        }
+        mock_blade.get_quotas_settings.return_value.status_code = 400
+        assert generate_quota_settings_dict(mock_blade) == {}
 
     def test_generate_password_policies_dict(self):
         """Test generate_password_policies_dict reports all fields in seconds"""

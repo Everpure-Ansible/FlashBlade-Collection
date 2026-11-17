@@ -1,0 +1,2 @@
+minor_changes:
+  - purefb_messages - add ``flag`` and ``unflag`` lists to flag or dismiss alerts by name or ID, patching only alerts whose flagged value differs. The ``flagged`` filter documentation now states that FlashBlade alerts are flagged by default and that unflagged alerts are those an administrator has dismissed.

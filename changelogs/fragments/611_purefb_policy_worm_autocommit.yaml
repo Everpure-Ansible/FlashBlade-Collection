@@ -1,0 +1,10 @@
+minor_changes:
+  - purefb_policy - ``policy_type=worm`` gains ``commit_mode``, ``autocommit_delay_on`` and
+    ``autocommit_delay_period`` (Purity//FB 4.8.6, REST 2.29), and ``state=copy`` carries them.
+  - purefb_info - ``worm_data_policies`` reports ``commit_mode`` and ``autocommit_config``
+    (``delay_on`` and ``delay_period`` in milliseconds) on Purity//FB 4.8.6 (REST 2.29) and later.
+bugfixes:
+  - purefb_policy - WORM data policies are created ``unlocked`` when ``retention_lock`` is not
+    set, as the array requires the lock state on creation.
+  - purefb_policy - ``before_rule`` on an existing WORM data policy no longer fails with
+    ``AttributeError`` (WORM policies have no rules).

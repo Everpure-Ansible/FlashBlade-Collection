@@ -1,0 +1,5 @@
+---
+minor_changes:
+  - purefb_timeout - add ``context`` to manage the GUI idle timeout of another fleet member
+    (Purity//FB 4.8.8, REST 2.30). A context on an older array fails before any read or write,
+    and a context that resolves to more than one array, such as a fleet name, is refused.

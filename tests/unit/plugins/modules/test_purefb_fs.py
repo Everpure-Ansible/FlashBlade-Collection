@@ -116,6 +116,8 @@ class TestPurefbFs:
             "snapshot": None,
             "writable": None,
             "promote": None,
+            "quiesce": None,
+            "abort_quiesce": False,
             "fastremove": None,
             "hard_limit": None,
             "user_quota": None,
@@ -1810,6 +1812,603 @@ class TestPurefbFs:
         # Verify
         mock_blade.patch_file_systems.assert_called()
         mock_module.exit_json.assert_called()
+
+    # ==== planned failover: quiesce / skip_quiesce / abort_quiesce (REST 2.28) ====
+
+    def _failover_params(self, **overrides):
+        """Default params for a planned-failover request on test-fs."""
+        params = self.get_default_params()
+        params.update(overrides)
+        return params
+
+    def _link_response(self, status):
+        """GET file-system-replica-links answer with one link in ``status``."""
+        res = Mock()
+        res.status_code = 200
+        link = Mock()
+        link.status = status
+        res.items = [link]
+        return res
+
+    def _failing_module(self, params, check_mode=False):
+        """Module mock whose fail_json stops execution like real Ansible."""
+        mock_module = Mock()
+        mock_module.check_mode = check_mode
+        mock_module.params = params
+        mock_module.fail_json.side_effect = SystemExit(1)
+        return mock_module
+
+    @patch("plugins.modules.purefb_fs.FileSystemPatch")
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.28"),
+    )
+    def test_modify_fs_quiesce_promoted_sends_dedicated_patch(
+        self, mock_get_filesystem, mock_fs_patch
+    ):
+        """promote=false with quiesce=true on a promoted filesystem sends one
+        PATCH whose body is FileSystemPatch(requested_promotion_state="demoted",
+        quiesce=True) and nothing else: no other attribute, no discard flag
+        (the array refuses it with quiesce), no replica-link GET.
+        """
+        params = self._failover_params(promote=False, quiesce=True)
+        mock_fs = self._existing_fs()
+
+        mock_module, mock_blade = self._run_modify(params, mock_fs, mock_get_filesystem)
+
+        mock_fs_patch.assert_called_once_with(
+            requested_promotion_state="demoted", quiesce=True
+        )
+        mock_blade.patch_file_systems.assert_called_once_with(
+            names=["test-fs"], file_system=mock_fs_patch.return_value
+        )
+        mock_blade.get_file_system_replica_links.assert_not_called()
+        mock_module.exit_json.assert_called_with(changed=True)
+
+    @patch("plugins.modules.purefb_fs.FileSystemPatch")
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.28"),
+    )
+    def test_modify_fs_quiesce_passes_fleet_context(
+        self, mock_get_filesystem, mock_fs_patch
+    ):
+        """The failover PATCH carries context_names when a context is set."""
+        params = self._failover_params(
+            promote=False, quiesce=True, context="fleet-member"
+        )
+        mock_fs = self._existing_fs()
+
+        mock_module, mock_blade = self._run_modify(params, mock_fs, mock_get_filesystem)
+
+        mock_blade.patch_file_systems.assert_called_once_with(
+            names=["test-fs"],
+            file_system=mock_fs_patch.return_value,
+            context_names=["fleet-member"],
+        )
+        mock_module.exit_json.assert_called_with(changed=True)
+
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.28"),
+    )
+    def test_modify_fs_quiesce_while_demoting_is_noop(self, mock_get_filesystem):
+        """A rerun while the failover is still replicating changes nothing."""
+        params = self._failover_params(promote=False, quiesce=True)
+        mock_fs = self._existing_fs(
+            promotion_status="demoting", requested_promotion_state="demoted"
+        )
+
+        mock_module, mock_blade = self._run_modify(params, mock_fs, mock_get_filesystem)
+
+        mock_blade.patch_file_systems.assert_not_called()
+        mock_module.exit_json.assert_called_with(changed=False)
+
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.28"),
+    )
+    def test_modify_fs_quiesce_when_demoted_is_noop(self, mock_get_filesystem):
+        """A rerun after the failover completed changes nothing."""
+        params = self._failover_params(promote=False, quiesce=True)
+        mock_fs = self._existing_fs(
+            promotion_status="demoted", requested_promotion_state="demoted"
+        )
+
+        mock_module, mock_blade = self._run_modify(params, mock_fs, mock_get_filesystem)
+
+        mock_blade.patch_file_systems.assert_not_called()
+        mock_module.exit_json.assert_called_with(changed=False)
+
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.28"),
+    )
+    def test_modify_fs_quiesce_check_mode(self, mock_get_filesystem):
+        """Check mode reports the pending failover without sending it."""
+        params = self._failover_params(promote=False, quiesce=True)
+        mock_module = Mock()
+        mock_module.check_mode = True
+        mock_module.params = params
+        mock_blade = Mock()
+        mock_fs = self._existing_fs()
+        mock_get_filesystem.return_value = mock_fs
+        mock_blade.get_file_systems.return_value.items = [mock_fs]
+
+        modify_fs(mock_module, mock_blade)
+
+        mock_blade.patch_file_systems.assert_not_called()
+        mock_module.exit_json.assert_called_with(changed=True)
+
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.28"),
+    )
+    @patch(
+        "plugins.modules.purefb_fs.get_error_message",
+        Mock(return_value="Operation not permitted."),
+    )
+    def test_modify_fs_quiesce_array_error_is_surfaced(self, mock_get_filesystem):
+        """A refused quiesce (no replica link, mixed versions, transfer in
+        progress) fails with the array's own message.
+        """
+        params = self._failover_params(promote=False, quiesce=True)
+        mock_module = self._failing_module(params)
+        mock_blade = Mock()
+        mock_fs = self._existing_fs()
+        mock_get_filesystem.return_value = mock_fs
+        mock_blade.get_file_systems.return_value.items = [mock_fs]
+        error_res = Mock()
+        error_res.status_code = 400
+        mock_blade.patch_file_systems.return_value = error_res
+
+        try:
+            modify_fs(mock_module, mock_blade)
+        except SystemExit:
+            pass
+
+        mock_module.fail_json.assert_called_once()
+        msg = mock_module.fail_json.call_args[1]["msg"]
+        assert "quiesce" in msg
+        assert "Operation not permitted." in msg
+        mock_module.exit_json.assert_not_called()
+
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.28"),
+    )
+    def test_modify_fs_skip_quiesce_requires_discard_snaps(self, mock_get_filesystem):
+        """quiesce=false on a demoting filesystem discards unreplicated data,
+        so it is refused before any PATCH unless discard_snaps is true.
+        """
+        params = self._failover_params(promote=False, quiesce=False)
+        mock_module = self._failing_module(params)
+        mock_blade = Mock()
+        mock_fs = self._existing_fs(
+            promotion_status="demoting", requested_promotion_state="demoted"
+        )
+        mock_get_filesystem.return_value = mock_fs
+
+        try:
+            modify_fs(mock_module, mock_blade)
+        except SystemExit:
+            pass
+
+        mock_module.fail_json.assert_called_once()
+        assert "discard_snaps" in mock_module.fail_json.call_args[1]["msg"]
+        mock_blade.patch_file_systems.assert_not_called()
+
+    @patch("plugins.modules.purefb_fs.FileSystemPatch")
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.28"),
+    )
+    def test_modify_fs_skip_quiesce_sends_skip_with_discard(
+        self, mock_get_filesystem, mock_fs_patch
+    ):
+        """quiesce=false with discard_snaps=true on a demoting filesystem sends
+        FileSystemPatch(requested_promotion_state="demoted", skip_quiesce=True)
+        with discard_non_snapshotted_data.
+        """
+        params = self._failover_params(promote=False, quiesce=False, discard_snaps=True)
+        mock_fs = self._existing_fs(
+            promotion_status="demoting", requested_promotion_state="demoted"
+        )
+
+        mock_module, mock_blade = self._run_modify(params, mock_fs, mock_get_filesystem)
+
+        mock_fs_patch.assert_called_once_with(
+            requested_promotion_state="demoted", skip_quiesce=True
+        )
+        mock_blade.patch_file_systems.assert_called_once_with(
+            names=["test-fs"],
+            file_system=mock_fs_patch.return_value,
+            discard_non_snapshotted_data=True,
+        )
+        mock_module.exit_json.assert_called_with(changed=True)
+
+    @patch("plugins.modules.purefb_fs.FileSystemPatch")
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.28"),
+    )
+    def test_modify_fs_quiesce_false_on_promoted_demotes_immediately(
+        self, mock_get_filesystem, mock_fs_patch
+    ):
+        """quiesce=false on a promoted filesystem is the pre-existing
+        immediate demotion (requested_promotion_state=demoted), never a
+        skip_quiesce.
+        """
+        params = self._failover_params(promote=False, quiesce=False, discard_snaps=True)
+        mock_module = Mock()
+        mock_module.check_mode = False
+        mock_module.params = params
+        mock_blade = Mock()
+        mock_fs = self._existing_fs()
+        mock_get_filesystem.return_value = mock_fs
+        mock_blade.get_file_systems.return_value.items = [mock_fs]
+        mock_blade.get_file_system_replica_links.return_value = self._link_response(
+            "idle"
+        )
+        ok_res = Mock()
+        ok_res.status_code = 200
+        mock_blade.patch_file_systems.return_value = ok_res
+
+        modify_fs(mock_module, mock_blade)
+
+        sent = [call.kwargs for call in mock_fs_patch.call_args_list]
+        assert any(k.get("requested_promotion_state") == "demoted" for k in sent)
+        assert not any("skip_quiesce" in k or "quiesce" in k for k in sent)
+        mock_blade.patch_file_systems.assert_called_once()
+        patch_kwargs = mock_blade.patch_file_systems.call_args.kwargs
+        assert patch_kwargs["discard_non_snapshotted_data"] is True
+        mock_module.exit_json.assert_called_with(changed=True)
+
+    @patch("plugins.modules.purefb_fs.FileSystemPatch")
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.28"),
+    )
+    def test_modify_fs_abort_quiesce_on_demoting_source(
+        self, mock_get_filesystem, mock_fs_patch
+    ):
+        """promote=true with abort_quiesce=true on the demoting source sends
+        FileSystemPatch(requested_promotion_state="promoted", abort_quiesce=True)
+        without looking up the link.
+        """
+        params = self._failover_params(promote=True, abort_quiesce=True)
+        mock_fs = self._existing_fs(
+            promotion_status="demoting", requested_promotion_state="demoted"
+        )
+
+        mock_module, mock_blade = self._run_modify(params, mock_fs, mock_get_filesystem)
+
+        mock_fs_patch.assert_called_once_with(
+            requested_promotion_state="promoted", abort_quiesce=True
+        )
+        mock_blade.patch_file_systems.assert_called_once_with(
+            names=["test-fs"], file_system=mock_fs_patch.return_value
+        )
+        mock_blade.get_file_system_replica_links.assert_not_called()
+        mock_module.exit_json.assert_called_with(changed=True)
+
+    @patch("plugins.modules.purefb_fs.FileSystemPatch")
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.28"),
+    )
+    def test_modify_fs_abort_quiesce_on_quiescing_target(
+        self, mock_get_filesystem, mock_fs_patch
+    ):
+        """A demoted target shows the failover only on its replica link; a
+        quiescing link makes abort_quiesce send the abort PATCH.
+        """
+        params = self._failover_params(promote=True, abort_quiesce=True)
+        mock_module = Mock()
+        mock_module.check_mode = False
+        mock_module.params = params
+        mock_blade = Mock()
+        mock_fs = self._existing_fs(
+            promotion_status="demoted", requested_promotion_state="demoted"
+        )
+        mock_get_filesystem.return_value = mock_fs
+        mock_blade.get_file_systems.return_value.items = [mock_fs]
+        mock_blade.get_file_system_replica_links.return_value = self._link_response(
+            "quiescing"
+        )
+        ok_res = Mock()
+        ok_res.status_code = 200
+        mock_blade.patch_file_systems.return_value = ok_res
+
+        modify_fs(mock_module, mock_blade)
+
+        mock_blade.get_file_system_replica_links.assert_called_once_with(
+            local_file_system_names=["test-fs"]
+        )
+        mock_fs_patch.assert_called_once_with(
+            requested_promotion_state="promoted", abort_quiesce=True
+        )
+        mock_blade.patch_file_systems.assert_called_once_with(
+            names=["test-fs"], file_system=mock_fs_patch.return_value
+        )
+        mock_module.exit_json.assert_called_with(changed=True)
+
+    @patch("plugins.modules.purefb_fs.FileSystemPatch")
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.28"),
+    )
+    def test_modify_fs_abort_quiesce_without_failover_is_noop(
+        self, mock_get_filesystem, mock_fs_patch
+    ):
+        """abort_quiesce on a demoted filesystem whose link is idle changes
+        nothing and never falls back to a regular promotion.
+        """
+        params = self._failover_params(promote=True, abort_quiesce=True)
+        mock_module = Mock()
+        mock_module.check_mode = False
+        mock_module.params = params
+        mock_blade = Mock()
+        mock_fs = self._existing_fs(
+            promotion_status="demoted", requested_promotion_state="demoted"
+        )
+        mock_get_filesystem.return_value = mock_fs
+        mock_blade.get_file_systems.return_value.items = [mock_fs]
+        mock_blade.get_file_system_replica_links.return_value = self._link_response(
+            "idle"
+        )
+
+        modify_fs(mock_module, mock_blade)
+
+        mock_fs_patch.assert_not_called()
+        mock_blade.patch_file_systems.assert_not_called()
+        mock_module.exit_json.assert_called_with(changed=False)
+
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.28"),
+    )
+    def test_modify_fs_abort_quiesce_on_promoted_is_noop(self, mock_get_filesystem):
+        """A rerun after the abort completed (filesystem promoted again)
+        changes nothing and needs no replica-link lookup.
+        """
+        params = self._failover_params(promote=True, abort_quiesce=True)
+        mock_fs = self._existing_fs()
+
+        mock_module, mock_blade = self._run_modify(params, mock_fs, mock_get_filesystem)
+
+        mock_blade.get_file_system_replica_links.assert_not_called()
+        mock_blade.patch_file_systems.assert_not_called()
+        mock_module.exit_json.assert_called_with(changed=False)
+
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.28"),
+    )
+    def test_modify_fs_promote_while_demoting_fails(self, mock_get_filesystem):
+        """The array denies a plain promotion during a planned failover, so
+        promote=true without abort_quiesce fails before any PATCH.
+        """
+        params = self._failover_params(promote=True)
+        mock_module = self._failing_module(params)
+        mock_blade = Mock()
+        mock_fs = self._existing_fs(
+            promotion_status="demoting", requested_promotion_state="demoted"
+        )
+        mock_get_filesystem.return_value = mock_fs
+
+        try:
+            modify_fs(mock_module, mock_blade)
+        except SystemExit:
+            pass
+
+        mock_module.fail_json.assert_called_once()
+        assert "abort_quiesce" in mock_module.fail_json.call_args[1]["msg"]
+        mock_blade.patch_file_systems.assert_not_called()
+
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.get_system")
+    @patch("plugins.modules.purefb_fs.AnsibleModule")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.27"),
+    )
+    def test_main_quiesce_below_rest_2_28_fails(
+        self, mock_ansible_module, mock_get_system, mock_get_filesystem
+    ):
+        """quiesce is gated in main() on REST 2.28 before any write."""
+        params = self._failover_params(promote=False, quiesce=True)
+        mock_module = self._failing_module(params)
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        mock_get_filesystem.return_value = self._existing_fs()
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        mock_module.fail_json.assert_called_once()
+        assert "2.28" in mock_module.fail_json.call_args[1]["msg"]
+        mock_blade.patch_file_systems.assert_not_called()
+
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.get_system")
+    @patch("plugins.modules.purefb_fs.AnsibleModule")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.27"),
+    )
+    def test_main_abort_quiesce_below_rest_2_28_fails(
+        self, mock_ansible_module, mock_get_system, mock_get_filesystem
+    ):
+        """abort_quiesce is gated in main() on REST 2.28 before any write."""
+        params = self._failover_params(promote=True, abort_quiesce=True)
+        mock_module = self._failing_module(params)
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        mock_get_filesystem.return_value = self._existing_fs(
+            promotion_status="demoting", requested_promotion_state="demoted"
+        )
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        mock_module.fail_json.assert_called_once()
+        assert "2.28" in mock_module.fail_json.call_args[1]["msg"]
+        mock_blade.patch_file_systems.assert_not_called()
+
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.get_system")
+    @patch("plugins.modules.purefb_fs.AnsibleModule")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.28"),
+    )
+    def test_main_quiesce_requires_promote_false(
+        self, mock_ansible_module, mock_get_system, mock_get_filesystem
+    ):
+        """quiesce without promote=false is refused before any write."""
+        params = self._failover_params(quiesce=True)
+        mock_module = self._failing_module(params)
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        mock_get_filesystem.return_value = self._existing_fs()
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        mock_module.fail_json.assert_called_once()
+        assert "promote=false" in mock_module.fail_json.call_args[1]["msg"]
+        mock_blade.patch_file_systems.assert_not_called()
+
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.get_system")
+    @patch("plugins.modules.purefb_fs.AnsibleModule")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.28"),
+    )
+    def test_main_abort_quiesce_requires_promote_true(
+        self, mock_ansible_module, mock_get_system, mock_get_filesystem
+    ):
+        """abort_quiesce without promote=true is refused before any write."""
+        params = self._failover_params(promote=False, abort_quiesce=True)
+        mock_module = self._failing_module(params)
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        mock_get_filesystem.return_value = self._existing_fs()
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        mock_module.fail_json.assert_called_once()
+        assert "promote=true" in mock_module.fail_json.call_args[1]["msg"]
+        mock_blade.patch_file_systems.assert_not_called()
+
+    @patch("plugins.modules.purefb_fs.FileSystemPatch")
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.get_system")
+    @patch("plugins.modules.purefb_fs.AnsibleModule")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.28"),
+    )
+    def test_main_quiesce_on_rest_2_28_sends_patch(
+        self, mock_ansible_module, mock_get_system, mock_get_filesystem, mock_fs_patch
+    ):
+        """End to end on a standalone 2.28 array: the gate passes and the
+        quiesce PATCH is sent.
+        """
+        params = self._failover_params(promote=False, quiesce=True)
+        mock_module = Mock()
+        mock_module.check_mode = False
+        mock_module.params = params
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        mock_fs = self._existing_fs()
+        mock_get_filesystem.return_value = mock_fs
+        mock_blade.get_file_systems.return_value.items = [mock_fs]
+        no_fleet = Mock()
+        no_fleet.status_code = 400
+        mock_blade.get_fleets.return_value = no_fleet
+        ok_res = Mock()
+        ok_res.status_code = 200
+        mock_blade.patch_file_systems.return_value = ok_res
+
+        main()
+
+        mock_fs_patch.assert_called_once_with(
+            requested_promotion_state="demoted", quiesce=True
+        )
+        mock_blade.patch_file_systems.assert_called_once_with(
+            names=["test-fs"], file_system=mock_fs_patch.return_value
+        )
+        mock_module.fail_json.assert_not_called()
+        mock_module.exit_json.assert_any_call(changed=True)
 
     @patch("plugins.modules.purefb_fs.get_filesystem")
     @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
@@ -5512,3 +6111,163 @@ class TestPurefbFs:
         mock_fs_patch.assert_any_call(group_ownership="parent-directory")
         mock_blade.patch_file_systems.assert_called()
         mock_module.exit_json.assert_called_with(changed=True)
+
+    # ==== storage_class on modify: compare by name, PATCH only on drift ====
+
+    def _existing_fs_with_storage_class(self, name):
+        """Existing filesystem whose storage_class object carries ``name``.
+        The array always returns the storage_class object; on platforms
+        without storage classes it has no name.
+        """
+        fs = self._existing_fs()
+        fs.storage_class = Mock()
+        fs.storage_class.name = name
+        return fs
+
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.17"),
+    )
+    def test_modify_fs_storage_class_same_is_noop(self, mock_get_filesystem):
+        """The requested class matches storage_class.name: no PATCH and
+        changed=False. The old code compared the string with the
+        StorageClassInfo object, so every run sent a PATCH and reported a
+        change.
+        """
+        params = self.get_default_params()
+        params.update({"storage_class": "S500X-S"})
+        mock_fs = self._existing_fs_with_storage_class("S500X-S")
+
+        mock_module, mock_blade = self._run_modify(params, mock_fs, mock_get_filesystem)
+
+        mock_blade.patch_file_systems.assert_not_called()
+        mock_module.exit_json.assert_called_with(changed=False)
+
+    @patch("plugins.modules.purefb_fs.StorageClassInfo")
+    @patch("plugins.modules.purefb_fs.FileSystemPatch")
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.17"),
+    )
+    def test_modify_fs_storage_class_different_is_patched(
+        self, mock_get_filesystem, mock_fs_patch, mock_sc_info
+    ):
+        """A different class sends exactly one storage_class PATCH carrying
+        cancel_in_progress and reports changed=True.
+        """
+        params = self.get_default_params()
+        params.update({"storage_class": "S500X-A", "cancel_in_progress": True})
+        mock_fs = self._existing_fs_with_storage_class("S500X-S")
+
+        mock_module, mock_blade = self._run_modify(params, mock_fs, mock_get_filesystem)
+
+        mock_sc_info.assert_called_once_with(name="S500X-A")
+        mock_fs_patch.assert_called_once_with(storage_class=mock_sc_info.return_value)
+        mock_blade.patch_file_systems.assert_called_once_with(
+            names=["test-fs"],
+            file_system=mock_fs_patch.return_value,
+            cancel_in_progress_storage_class_transition=True,
+        )
+        mock_module.exit_json.assert_called_with(changed=True)
+
+    @patch("plugins.modules.purefb_fs.StorageClassInfo")
+    @patch("plugins.modules.purefb_fs.FileSystemPatch")
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.17"),
+    )
+    def test_modify_fs_storage_class_with_context(
+        self, mock_get_filesystem, mock_fs_patch, mock_sc_info
+    ):
+        """With a fleet context the storage_class PATCH carries context_names."""
+        params = self.get_default_params()
+        params.update({"storage_class": "S500X-A", "context": "fleet-member"})
+        mock_fs = self._existing_fs_with_storage_class("S500X-S")
+
+        mock_module, mock_blade = self._run_modify(params, mock_fs, mock_get_filesystem)
+
+        mock_blade.patch_file_systems.assert_called_once_with(
+            names=["test-fs"],
+            file_system=mock_fs_patch.return_value,
+            cancel_in_progress_storage_class_transition=False,
+            context_names=["fleet-member"],
+        )
+        mock_module.exit_json.assert_called_with(changed=True)
+
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.17"),
+    )
+    def test_modify_fs_storage_class_check_mode(self, mock_get_filesystem):
+        """Check mode reports the pending change without sending the PATCH."""
+        params = self.get_default_params()
+        params.update({"storage_class": "S500X-A"})
+        mock_fs = self._existing_fs_with_storage_class("S500X-S")
+        mock_module = Mock()
+        mock_module.check_mode = True
+        mock_module.params = params
+        mock_blade = Mock()
+        mock_get_filesystem.return_value = mock_fs
+        mock_blade.get_file_systems.return_value.items = [mock_fs]
+
+        modify_fs(mock_module, mock_blade)
+
+        mock_blade.patch_file_systems.assert_not_called()
+        mock_module.exit_json.assert_called_with(changed=True)
+
+    @patch("plugins.modules.purefb_fs.get_error_message")
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.17"),
+    )
+    def test_modify_fs_storage_class_unsupported_platform_fails(
+        self, mock_get_filesystem, mock_get_error
+    ):
+        """Platforms without storage classes return the storage_class object
+        with no name and answer the PATCH with 400. The old code never
+        looked at the response; the module now fails with the array message.
+        """
+        mock_get_error.return_value = (
+            "Storage classes are not supported on this product."
+        )
+        params = self.get_default_params()
+        params.update({"storage_class": "S500X-S"})
+        mock_fs = self._existing_fs_with_storage_class(None)
+        mock_module = Mock()
+        mock_module.check_mode = False
+        mock_module.params = params
+        mock_module.fail_json.side_effect = Exception("fail_json")
+        mock_blade = Mock()
+        mock_get_filesystem.return_value = mock_fs
+        mock_blade.get_file_systems.return_value.items = [mock_fs]
+        mock_response = Mock()
+        mock_response.status_code = 400
+        mock_blade.patch_file_systems.return_value = mock_response
+
+        try:
+            modify_fs(mock_module, mock_blade)
+        except Exception as exc:  # fail_json stops the module
+            assert str(exc) == "fail_json"
+        else:
+            raise AssertionError("fail_json was not called")
+
+        mock_blade.patch_file_systems.assert_called_once()
+        msg = mock_module.fail_json.call_args.kwargs["msg"]
+        assert "Storage classes are not supported on this product." in msg
+        assert "test-fs" in msg
+        mock_module.exit_json.assert_not_called()

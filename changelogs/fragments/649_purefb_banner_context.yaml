@@ -1,0 +1,3 @@
+minor_changes:
+  - purefb_banner - add ``context`` parameter to manage the login banner of a fleet member
+    (requires Purity//FB 4.8.8, REST 2.30).

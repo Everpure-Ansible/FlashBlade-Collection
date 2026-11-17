@@ -683,7 +683,8 @@ class TestUpdateSnapPolicy:
 class TestRenameSnapPolicy:
     """Snapshot policy rename must carry the new name on the wire and must be
     checked afterwards: Purity//FB 4.6.4 (REST 2.21) answers 200 to
-    {"name": ...} on PATCH /policies and keeps the old name."""
+    {"name": ...} on PATCH /policies and keeps the old name, while 4.8.8
+    (REST 2.30) rejects the PATCH outright."""
 
     @patch("plugins.modules.purefb_policy.LooseVersion")
     def test_rename_sends_name_in_policy_body(self, mock_loose_version):
@@ -734,6 +735,38 @@ class TestRenameSnapPolicy:
         msg = module.fail_json.call_args[1]["msg"]
         assert "kept the old name" in msg
         assert "does not support renaming snapshot policies" in msg
+        module.exit_json.assert_not_called()
+
+    @patch(
+        "plugins.modules.purefb_policy.get_error_message",
+        return_value="Missing or invalid parameter.",
+    )
+    @patch("plugins.modules.purefb_policy.LooseVersion")
+    def test_rename_rejected_by_array_fails_clearly(
+        self, mock_loose_version, _get_error_message
+    ):
+        """Purity//FB 4.8.8 (REST 2.30) answers 400 "Missing or invalid
+        parameter" to the rename PATCH. The module must still say that
+        snapshot policies cannot be renamed, not just echo the array."""
+        import plugins.modules.purefb_policy as pol
+
+        pol.Policy.reset_mock()
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+        module = _snap_module()
+        module.params["rename"] = "weekly_snap_policy"
+        blade = _snap_blade(_snap_rule())
+        rejected = Mock()
+        rejected.status_code = 400
+        blade.patch_policies.return_value = rejected
+
+        with pytest.raises(SystemExit):
+            rename_snap_policy(module, blade)
+
+        blade.patch_policies.assert_called_once()
+        blade.get_policies.assert_not_called()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "does not support renaming snapshot policies" in msg
+        assert "Missing or invalid parameter" in msg
         module.exit_json.assert_not_called()
 
     @patch("plugins.modules.purefb_policy.LooseVersion")

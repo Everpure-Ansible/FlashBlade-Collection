@@ -100,6 +100,8 @@ def _module(**overrides):
         "target_fs": "fs-copy",
         "eradicate": False,
         "state": "copy",
+        "detach_policies": None,
+        "detach_all_policies": False,
         "latest_replica": False,
         "context": "",
     }

@@ -35,7 +35,7 @@ options:
         Possible values for this include all, minimum, config, performance,
         capacity, network, subnets, lags, filesystems, snapshots, buckets,
         replication, policies, arrays, accounts, admins, ad, kerberos,
-        drives, servers, fleet, realms and clients.
+        drives, servers, fleet, realms, clients and locks.
       - The C(performance) subset reports array-wide performance per protocol
         (C(aggregate), C(http), C(s3), C(nfs), C(smb)), the protocol-specific
         operation breakdowns (C(nfs_ops), C(s3_ops), C(http_ops)), replication
@@ -2274,6 +2274,85 @@ def generate_fleet_dict(blade):
     return fleet_info
 
 
+# File locks, lock clients, file sessions and SMB open files (the read-back
+# for purefb_fs_lock). Locks need REST 2.8, sessions 2.10, open files 2.17.
+FILE_LOCKS_API_VERSION = "2.8"
+FILE_SESSIONS_API_VERSION = "2.10"
+OPEN_FILES_API_VERSION = "2.17"
+
+
+def _reference_name(ref):
+    return getattr(ref, "name", None) if ref is not None else None
+
+
+def generate_file_locks_dict(blade):
+    """Return the active file locks, lock clients, file sessions and open files.
+
+    Point-in-time data that changes as clients work. Open files are only
+    tracked for SMB, so they are queried with protocols=smb.
+    """
+    api_version = get_rest_api_version(blade)
+    info = {
+        "file_locks": {},
+        "file_lock_clients": [],
+        "file_sessions": {},
+        "open_files": {},
+    }
+    res = blade.get_file_systems_locks()
+    if res.status_code == 200:
+        for lock in list(res.items):
+            lock_range = getattr(lock, "range", None)
+            info["file_locks"][lock.name] = {
+                "access_type": getattr(lock, "access_type", None),
+                "client": _reference_name(getattr(lock, "client", None)),
+                "created_at": getattr(lock, "created_at", None),
+                "file_system": _reference_name(getattr(lock, "source", None)),
+                "inode": getattr(lock, "inode", None),
+                "path": getattr(lock, "path", None),
+                "protocol": getattr(lock, "protocol", None),
+                "range": (
+                    None
+                    if lock_range is None
+                    else {
+                        "length": getattr(lock_range, "length", None),
+                        "offset": getattr(lock_range, "offset", None),
+                    }
+                ),
+            }
+    res = blade.get_file_systems_locks_clients()
+    if res.status_code == 200:
+        names = [_reference_name(client) for client in list(res.items)]
+        info["file_lock_clients"] = sorted(name for name in names if name)
+    if LooseVersion(FILE_SESSIONS_API_VERSION) <= LooseVersion(api_version):
+        res = blade.get_file_systems_sessions()
+        if res.status_code == 200:
+            for session in list(res.items):
+                info["file_sessions"][session.name] = {
+                    "authentication": getattr(session, "authentication", None),
+                    "client": _reference_name(getattr(session, "client", None)),
+                    "connection_time": getattr(session, "connection_time", None),
+                    "idle_time": getattr(session, "idle_time", None),
+                    "opens": getattr(session, "opens", None),
+                    "port": getattr(session, "port", None),
+                    "protocol": getattr(session, "protocol", None),
+                    "user": _reference_name(getattr(session, "user", None)),
+                }
+    if LooseVersion(OPEN_FILES_API_VERSION) <= LooseVersion(api_version):
+        res = blade.get_file_systems_open_files(protocols=["smb"])
+        if res.status_code == 200:
+            for open_file in list(res.items):
+                info["open_files"][open_file.id] = {
+                    "client": _reference_name(getattr(open_file, "client", None)),
+                    "file_system": _reference_name(getattr(open_file, "source", None)),
+                    "lock_count": getattr(open_file, "lock_count", None),
+                    "mode": getattr(open_file, "mode", None),
+                    "path": getattr(open_file, "path", None),
+                    "session": _reference_name(getattr(open_file, "session", None)),
+                    "user": _reference_name(getattr(open_file, "user", None)),
+                }
+    return info
+
+
 def main():
     argument_spec = purefb_argument_spec()
     argument_spec.update(
@@ -2312,6 +2391,7 @@ def main():
         "fleet",
         "realms",
         "clients",
+        "locks",
     )
     subset_test = (test in valid_subsets for test in subset)
     if not all(subset_test):
@@ -2430,6 +2510,10 @@ def main():
     # S3 clients per connection, so it is opt-in and not part of `all`.
     if "clients" in subset:
         info["clients"] = generate_clients_dict(blade, api_version)
+    if ("locks" in subset or "all" in subset) and LooseVersion(
+        FILE_LOCKS_API_VERSION
+    ) <= LooseVersion(api_version):
+        info.update(generate_file_locks_dict(blade))
     module.exit_json(changed=False, purefb_info=info)
 
 

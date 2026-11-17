@@ -2235,6 +2235,71 @@ class TestPurefbInfo:
         assert call_args["purefb_info"]["fleet"] == {"fleet1": {"members": {}}}
         assert "policies" not in call_args["purefb_info"]
 
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_file_locks_dict(self, mock_loose_version):
+        """The locks subset returns locks, lock clients, sessions and SMB open files."""
+        # Imported here so the shared import block above stays untouched.
+        from plugins.modules.purefb_info import generate_file_locks_dict
+
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+
+        def ref(name):
+            item = Mock()
+            item.name = name
+            return item
+
+        lock = ref("lock1")
+        lock.access_type = "exclusive"
+        lock.client = ref("10.0.0.1")
+        lock.created_at = 1700000000000
+        lock.inode = 42
+        lock.path = "/build/output.db"
+        lock.protocol = "NLM"
+        lock.range = Mock(length=0, offset=0)
+        lock.source = ref("fs1")
+        session = ref("sess1")
+        session.authentication = "NTLMv2"
+        session.client = ref("10.0.0.1")
+        session.connection_time = 1700000000000
+        session.idle_time = 5000
+        session.opens = 2
+        session.port = 51234
+        session.protocol = "smb"
+        session.user = ref("alice")
+        open_file = Mock()
+        open_file.id = "of1"
+        open_file.client = ref("10.0.0.1")
+        open_file.lock_count = 1
+        open_file.mode = "rw"
+        open_file.path = "/build/output.db"
+        open_file.session = ref("sess1")
+        open_file.source = ref("fs1")
+        open_file.user = ref("alice")
+
+        blade = Mock()
+        blade.get_file_systems_locks.return_value = Mock(status_code=200, items=[lock])
+        blade.get_file_systems_locks_clients.return_value = Mock(
+            status_code=200, items=[ref("10.0.0.1")]
+        )
+        blade.get_file_systems_sessions.return_value = Mock(
+            status_code=200, items=[session]
+        )
+        blade.get_file_systems_open_files.return_value = Mock(
+            status_code=200, items=[open_file]
+        )
+
+        result = generate_file_locks_dict(blade)
+
+        assert result["file_locks"]["lock1"]["client"] == "10.0.0.1"
+        assert result["file_locks"]["lock1"]["file_system"] == "fs1"
+        assert result["file_locks"]["lock1"]["range"] == {"length": 0, "offset": 0}
+        assert result["file_lock_clients"] == ["10.0.0.1"]
+        assert result["file_sessions"]["sess1"]["user"] == "alice"
+        assert result["file_sessions"]["sess1"]["protocol"] == "smb"
+        assert result["open_files"]["of1"]["session"] == "sess1"
+        assert result["open_files"]["of1"]["mode"] == "rw"
+        blade.get_file_systems_open_files.assert_called_once_with(protocols=["smb"])
+
     def test_generate_ad_dict_reports_ca_references(self):
         """The CA certificate and group names are read back, None when unset."""
         ca = Mock(spec=["name"])

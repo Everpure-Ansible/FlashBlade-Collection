@@ -45,6 +45,20 @@ options:
         list (and the top-level C(file_system_exports) view under
         C(subset=filesystems)/C(subset=all)) instead. These keys will
         be removed from this module in 2.0.0.
+      - The C(arrays) subset reports C(connection_paths) for every array
+        connection, one entry per network path with its C(source),
+        C(destination), C(status), C(status_details) and C(type).
+      - The C(policies) subset reports C(members) for every policy
+        (Purity//FB REST 2.2 or later), each with the member C(name) and
+        C(resource_type); replica link members also carry a C(link) with
+        the local and remote file systems. Snapshot policies in
+        C(snapshot_policies) carry the same C(members). TLS policies
+        report C(array_wide), true when the policy applies to the array
+        as a whole.
+      - The C(minimum) subset key C(network_access_protocol) holds the
+        name of the array network access policy and is misspelt. Use
+        C(network_access_policy) instead; the misspelt key is kept for
+        backwards compatibility and will be removed in 2.0.0.
     required: false
     type: list
     elements: str
@@ -112,6 +126,7 @@ from datetime import datetime, timezone
 import time
 
 KMIP_API_VERSION = "2.1"
+POLICY_MEMBERS_API_VERSION = "2.2"
 DRIVES_API_VERSION = "2.5"
 SECURITY_API_VERSION = "2.7"
 BUCKET_API_VERSION = "2.8"
@@ -240,6 +255,8 @@ def generate_default_dict(blade):
         default_info["network_access_protocol"] = getattr(
             defaults.network_access_policy, "name", "None"
         )
+        # the key above is misspelt; it is kept for backwards compatibility
+        default_info["network_access_policy"] = default_info["network_access_protocol"]
     ra_info = list(blade.get_support().items)[0]
     if ra_info.remote_assist_active:
         ra_expires = datetime.fromtimestamp(
@@ -819,6 +836,29 @@ def generate_snap_transfer_dict(blade):
     return snap_transfer_info
 
 
+def _connection_paths_by_remote(blade):
+    """Group the GET array-connections/path rows by remote array name.
+
+    One connection has several paths (one per replication address and
+    port). ``status_details`` is only meaningful when a path is not
+    connected; the array returns it empty or omits it otherwise, so both
+    shapes are normalised to None.
+    """
+    paths = {}
+    for path in blade.get_array_connections_path().items:
+        remote_name = getattr(getattr(path, "remote", None), "name", None)
+        paths.setdefault(remote_name, []).append(
+            {
+                "source": getattr(path, "source", None),
+                "destination": getattr(path, "destination", None),
+                "status": getattr(path, "status", None),
+                "status_details": getattr(path, "status_details", None) or None,
+                "type": getattr(path, "type", None),
+            }
+        )
+    return paths
+
+
 def generate_array_conn_dict(blade):
     array_conn_info = {}
     arrays = list(blade.get_array_connections().items)
@@ -854,6 +894,14 @@ def generate_array_conn_dict(blade):
                 ),
             },
         }
+    # Per-path status of each connection (REST 2.0), the first thing to
+    # check when replication or fleet management misbehaves.
+    if array_conn_info:
+        paths = _connection_paths_by_remote(blade)
+        for remote_name in array_conn_info:
+            array_conn_info[remote_name]["connection_paths"] = paths.get(
+                remote_name, []
+            )
     return array_conn_info
 
 
@@ -879,6 +927,42 @@ def generate_policies_dict(blade):
     return policies_info
 
 
+def _policy_members_by_name(blade, policies):
+    """Map policy name -> members from one GET policies-all/members call.
+
+    The endpoint covers every policy type (snapshot, access, telemetry,
+    network, TLS ...) in a single response. Rows are attributed by policy
+    id first, so a realm-scoped policy that shares its name with an
+    array-level one keeps its own members. The server refuses responses
+    over 150,000 rows, which an info read does not approach.
+    """
+    names_by_id = {policy.id: policy.name for policy in policies}
+    members = {}
+    for row in blade.get_policies_all_members().items:
+        policy_ref = getattr(row, "policy", None)
+        policy_name = names_by_id.get(
+            getattr(policy_ref, "id", None), getattr(policy_ref, "name", None)
+        )
+        member_ref = getattr(row, "member", None)
+        member = {
+            "name": getattr(member_ref, "name", None),
+            "resource_type": getattr(member_ref, "resource_type", None),
+        }
+        if member["resource_type"] == "file-system-replica-links":
+            link = getattr(row, "link", None)
+            member["link"] = {
+                "local_file_system": getattr(
+                    getattr(link, "local_file_system", None), "name", None
+                ),
+                "remote": getattr(getattr(link, "remote", None), "name", None),
+                "remote_file_system": getattr(
+                    getattr(link, "remote_file_system", None), "name", None
+                ),
+            }
+        members.setdefault(policy_name, []).append(member)
+    return members
+
+
 def generate_all_policies_dict(blade):
     policies_info = {}
     policies = list(blade.get_policies_all().items)
@@ -891,6 +975,12 @@ def generate_all_policies_dict(blade):
             "location": getattr(getattr(policy, "location", None), "name", None),
             "policy_type": policy.policy_type,
         }
+    if LooseVersion(POLICY_MEMBERS_API_VERSION) <= LooseVersion(
+        get_rest_api_version(blade)
+    ):
+        members = _policy_members_by_name(blade, policies)
+        for policy_name in policies_info:
+            policies_info[policy_name]["members"] = members.get(policy_name, [])
     return policies_info
 
 
@@ -1313,6 +1403,16 @@ def generate_tls_policies_dict(blade):
             policies_info[policy_name]["network_interfaces"].append(
                 getattr(getattr(member, "member", None), "name", None)
             )
+
+    # tls-policies/members also lists the policy applied to the array as a
+    # whole (member resource_type "arrays"); interface members are above.
+    for policy_name in policies_info:
+        policies_info[policy_name]["array_wide"] = False
+    for member in blade.get_tls_policies_members().items:
+        policy_name = getattr(getattr(member, "policy", None), "name", None)
+        member_type = getattr(getattr(member, "member", None), "resource_type", None)
+        if member_type == "arrays" and policy_name in policies_info:
+            policies_info[policy_name]["array_wide"] = True
 
     return policies_info
 
@@ -1801,6 +1901,11 @@ def main():
     if "policies" in subset or "all" in subset:
         info["policies"] = generate_all_policies_dict(blade)
         info["snapshot_policies"] = generate_policies_dict(blade)
+        # snapshot policies share the membership gathered by the policies
+        # view, so no second members call is made
+        for name, snap_policy in info["snapshot_policies"].items():
+            if "members" in info["policies"].get(name, {}):
+                snap_policy["members"] = info["policies"][name]["members"]
     if "arrays" in subset or "all" in subset:
         info["arrays"] = generate_array_conn_dict(blade)
     if "replication" in subset or "all" in subset:

@@ -96,6 +96,7 @@ from plugins.modules.purefb_info import (
     generate_realms_dict,
     generate_resource_accesses_dict,
     generate_file_repl_dict,
+    _maintenance_window_list,
     generate_admin_dict,
     generate_directory_service_roles_dict,
 )
@@ -539,6 +540,10 @@ class TestPurefbInfo:
         mock_support.remote_assist_duration = 0
         mock_blade.get_support.return_value.items = [mock_support]
 
+        # Mock maintenance window (for MAINTENANCE_API_VERSION) - none open
+        mock_blade.get_maintenance_windows.return_value.status_code = 200
+        mock_blade.get_maintenance_windows.return_value.items = []
+
         # Call function
         result = generate_default_dict(mock_blade)
 
@@ -578,6 +583,42 @@ class TestPurefbInfo:
         assert result["worm_policies"] == 1
         assert "telemetry_metrics_policies" in result
         assert result["telemetry_metrics_policies"] == 1
+        assert result["maintenance_window"] == []
+
+    def test_maintenance_window_list_with_open_window(self):
+        """An open window is reported with human-readable start and end"""
+        window = Mock()
+        window.name = "array"
+        window.created = 1700000000000
+        window.expires = 1700014400000
+        mock_blade = Mock()
+        mock_blade.get_maintenance_windows.return_value.status_code = 200
+        mock_blade.get_maintenance_windows.return_value.items = [window]
+
+        result = _maintenance_window_list(mock_blade)
+
+        assert result == [
+            {
+                "name": "array",
+                "created": datetime.fromtimestamp(1700000000).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+                "expires": datetime.fromtimestamp(1700014400).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+            }
+        ]
+
+    def test_maintenance_window_list_empty_and_error(self):
+        """No open window, or a failed GET, yields an empty list"""
+        mock_blade = Mock()
+        mock_blade.get_maintenance_windows.return_value.status_code = 200
+        mock_blade.get_maintenance_windows.return_value.items = []
+        assert _maintenance_window_list(mock_blade) == []
+
+        mock_blade.get_maintenance_windows.return_value.status_code = 400
+        mock_blade.get_maintenance_windows.return_value.items = [Mock()]
+        assert _maintenance_window_list(mock_blade) == []
 
     def test_generate_perf_dict(self):
         """Test generate_perf_dict function"""

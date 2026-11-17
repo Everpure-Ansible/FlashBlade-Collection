@@ -127,6 +127,7 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_local_ds - manage FlashBlade Local Directory Services
 - purefb_local_group - manage local groups in a FlashBlade Local Directory Service
 - purefb_local_user - manage local users in a FlashBlade Local Directory Service
+- purefb_maintenance - manage the FlashBlade maintenance window
 - purefb_messages - list, flag and unflag FlashBlade alert messages
 - purefb_mgmt_auth_policy - manage FlashBlade management authentication policies and their members
 - purefb_mgmt_policy - manage FlashBlade management access policies and their rules

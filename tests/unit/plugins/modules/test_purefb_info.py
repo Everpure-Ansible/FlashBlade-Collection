@@ -1321,6 +1321,11 @@ class TestPurefbInfo:
         assert result[0]["client_policy"] == "smb_client_pol1"
         assert result[0]["share_policy"] == "smb_share_pol1"
 
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_info.get_rest_api_version",
+        Mock(return_value="2.30"),
+    )
     def test_generate_fs_dict_scopes_exports_per_filesystem(self):
         """generate_fs_dict must scope its file_system_exports list to the
         current filesystem only. A global list leak would attribute exports
@@ -1431,6 +1436,102 @@ class TestPurefbInfo:
             "display_name": "fs1",
             "location": "array1",
         }
+
+    # ==== storage_class read-back: the name purefb_fs compares ====
+
+    def _fs_for_storage_class(self, storage_class):
+        """Minimal file system for generate_fs_dict. ``storage_class`` is the
+        object the array returns, or None for a REST version whose file
+        system model has no such field.
+        """
+        fsys = Mock()
+        fsys.name = "fs1"
+        fsys.fast_remove_directory_enabled = False
+        fsys.snapshot_directory_enabled = False
+        fsys.provisioned = 0
+        fsys.destroyed = False
+        fsys.nfs = Mock(
+            rules=None, v3_enabled=True, v4_1_enabled=False, export_policy=None
+        )
+        fsys.smb = Mock(
+            acl_mode=None,
+            client_policy=None,
+            share_policy=None,
+            continuous_availability_enabled=False,
+        )
+        fsys.multi_protocol = Mock(safeguard_acls=False, access_control_style=None)
+        fsys.hard_limit_enabled = False
+        fsys.promotion_status = None
+        fsys.requested_promotion_state = None
+        fsys.writable = True
+        fsys.source = None
+        fsys.location = None
+        fsys.default_group_quota = 0
+        fsys.default_user_quota = 0
+        fsys.http = Mock(enabled=False)
+        if storage_class is None:
+            del fsys.storage_class
+        else:
+            fsys.storage_class = storage_class
+        return fsys
+
+    def _blade_with_fs(self, fsys):
+        mock_blade = Mock()
+        mock_blade.get_file_systems.return_value.items = [fsys]
+        mock_blade.get_quotas_groups.return_value.items = []
+        mock_blade.get_quotas_users.return_value.items = []
+        return mock_blade
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_info.get_rest_api_version",
+        Mock(return_value="2.17"),
+    )
+    def test_generate_fs_dict_reports_storage_class_name(self):
+        """From REST 2.17 the storage class is reported by name, the value
+        purefb_fs compares its storage_class option with.
+        """
+        storage_class = Mock()
+        storage_class.name = "S500X-S"
+        mock_blade = self._blade_with_fs(self._fs_for_storage_class(storage_class))
+
+        result = generate_fs_dict(mock_blade)
+
+        assert result["fs1"]["storage_class"] == "S500X-S"
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_info.get_rest_api_version",
+        Mock(return_value="2.30"),
+    )
+    def test_generate_fs_dict_storage_class_null_without_storage_classes(self):
+        """Platforms without storage classes return the storage_class object
+        with no name; the key is still reported, as null.
+        """
+        storage_class = Mock()
+        storage_class.name = None
+        mock_blade = self._blade_with_fs(self._fs_for_storage_class(storage_class))
+
+        result = generate_fs_dict(mock_blade)
+
+        assert "storage_class" in result["fs1"]
+        assert result["fs1"]["storage_class"] is None
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_info.get_rest_api_version",
+        Mock(return_value="2.16"),
+    )
+    def test_generate_fs_dict_storage_class_not_reported_before_2_17(self):
+        """Below REST 2.17 the key is not reported, matching the version from
+        which purefb_fs manages the storage class.
+        """
+        mock_blade = self._blade_with_fs(self._fs_for_storage_class(None))
+
+        result = generate_fs_dict(mock_blade)
+
+        assert "storage_class" not in result["fs1"]
+        assert result["fs1"]["nfs_v3"] is True
 
     def test_generate_array_conn_dict_keys_by_remote_and_reads_the_connection(self):
         """The dict is keyed by the remote name, values come from the connection.

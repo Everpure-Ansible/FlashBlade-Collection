@@ -170,6 +170,7 @@ TLS_API_VERSION = "2.17"
 EDGE_API_VERSION = "2.18"
 OIDC_API_VERSION = "2.17"
 CLIENTS_S3_API_VERSION = "2.18"
+STORAGE_CLASS_API_VERSION = "2.17"
 REALMS_API_VERSION = "2.19"
 MAP_API_VERSION = "2.19"
 S3_EXPORT_API_VERSION = "2.20"
@@ -2100,6 +2101,7 @@ def generate_object_store_accounts_dict(blade):
 def generate_fs_dict(blade, exports=None):
     fs_info = {}
     by_fs = {}
+    api_version = get_rest_api_version(blade)
     for e in exports or []:
         by_fs.setdefault(e.get("filesystem"), []).append(e)
     for fsystem in blade.get_file_systems().items:
@@ -2159,6 +2161,12 @@ def generate_fs_dict(blade, exports=None):
             ),
             "multi_protocol_safeguard_acls": getattr(multi, "safeguard_acls", None),
         }
+        if LooseVersion(STORAGE_CLASS_API_VERSION) <= LooseVersion(api_version):
+            # The array returns storage_class as an object; platforms without
+            # storage classes return it with no name, so the name is null there.
+            fs_info[share]["storage_class"] = getattr(
+                getattr(fsystem, "storage_class", None), "name", None
+            )
         if exports is not None:
             fs_info[share]["file_system_exports"] = by_fs.get(share, [])
 

@@ -21,6 +21,8 @@ version_added: '1.10.0'
 short_description: Configure Everpure FlashBlade timezone
 description:
 - Configure the timezone for a Everpure FlashBlade.
+- Fleet context on array settings requires FlashBlade REST API version 2.30
+  or later (Purity//FB 4.8.8+).
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
@@ -28,6 +30,15 @@ options:
     description:
     - If not provided, the module will attempt to get the current local timezone from the server
     type: str
+  context:
+    description:
+    - Name of fleet member on which to perform the operation.
+    - This requires the array receiving the request is a member of a fleet
+      and the context name to be a member of the same fleet.
+    - Requires FlashBlade REST API version 2.30 or later (Purity//FB 4.8.8+).
+    type: str
+    default: ""
+    version_added: '1.30.0'
 extends_documentation_fragment:
 - everpure.flashblade.everpure.fb
 """
@@ -36,6 +47,13 @@ EXAMPLES = r"""
 - name: Set FlashBlade Timezone to Americas/Los_Angeles
   everpure.flashblade.purefb_tz:
     timezone: "America/Los_Angeles"
+    fb_url: 10.10.10.2
+    api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
+
+- name: Set the timezone on a fleet member
+  everpure.flashblade.purefb_tz:
+    timezone: "Europe/London"
+    context: fb-member-02
     fb_url: 10.10.10.2
     api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
 """
@@ -69,7 +87,15 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.purefb import 
 from ansible_collections.everpure.flashblade.plugins.module_utils.common import (
     _findstr,
     get_error_message,
+    get_rest_api_version,
 )
+from ansible_collections.everpure.flashblade.plugins.module_utils.version import (
+    LooseVersion,
+)
+
+# context_names arrived on GET /arrays at REST 2.22 and on PATCH /arrays at 2.30
+GET_CONTEXT_API_VERSION = "2.22"
+PATCH_CONTEXT_API_VERSION = "2.30"
 
 
 def _get_local_tz(module, timezone="UTC"):
@@ -145,14 +171,33 @@ def _get_local_tz(module, timezone="UTC"):
     return timezone
 
 
-def set_timezone(module, blade):
+def _context_kwargs(module, api_version, min_version):
+    """Return context_names kwargs when a context is set and the method takes it.
+
+    The constants record where the SDK gained the kwarg (GET /arrays at REST
+    2.22, PATCH /arrays at 2.30). main() refuses a context on any array below
+    2.30 before either call, so both gates are met whenever a context reaches
+    this helper; the per-method gate stays as a guard against handing the SDK
+    a kwarg its signature does not have.
+    """
+    if module.params["context"] and LooseVersion(min_version) <= LooseVersion(
+        api_version
+    ):
+        return {"context_names": [module.params["context"]]}
+    return {}
+
+
+def set_timezone(module, blade, api_version):
     """Set timezone"""
     changed = True
     if not module.check_mode:
-        res = blade.patch_arrays(flashblade.Array(time_zone=module.params["timezone"]))
+        res = blade.patch_arrays(
+            flashblade.Array(time_zone=module.params["timezone"]),
+            **_context_kwargs(module, api_version, PATCH_CONTEXT_API_VERSION)
+        )
         if res.status_code != 200:
             module.fail_json(
-                msg="Failed to timezone. Error: {0}".format(get_error_message(res))
+                msg="Failed to set timezone. Error: {0}".format(get_error_message(res))
             )
 
     module.exit_json(changed=changed)
@@ -163,6 +208,7 @@ def main():
     argument_spec.update(
         dict(
             timezone=dict(type="str"),
+            context=dict(type="str", default=""),
         )
     )
 
@@ -174,6 +220,16 @@ def main():
         module.fail_json(msg="pytz is required for this module")
 
     blade = get_system(module)
+    api_version = get_rest_api_version(blade)
+    if module.params["context"] and LooseVersion(
+        PATCH_CONTEXT_API_VERSION
+    ) > LooseVersion(api_version):
+        module.fail_json(
+            msg=(
+                "context requires FlashBlade REST version {0} or later "
+                "(Purity//FB 4.8.8+); this array supports {1}"
+            ).format(PATCH_CONTEXT_API_VERSION, api_version)
+        )
 
     if not module.params["timezone"]:
         module.params["timezone"] = _get_local_tz(module)
@@ -182,10 +238,18 @@ def main():
                 msg="Timezone {0} is not valid".format(module.params["timezone"])
             )
 
-    blade = get_system(module)
-    current_tz = list(blade.get_arrays().items)[0].time_zone
+    res = blade.get_arrays(
+        **_context_kwargs(module, api_version, GET_CONTEXT_API_VERSION)
+    )
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to get array settings. Error: {0}".format(
+                get_error_message(res)
+            )
+        )
+    current_tz = list(res.items)[0].time_zone
     if current_tz != module.params["timezone"]:
-        set_timezone(module, blade)
+        set_timezone(module, blade, api_version)
 
     module.exit_json(changed=False)
 

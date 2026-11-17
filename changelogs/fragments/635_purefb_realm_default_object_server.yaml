@@ -1,0 +1,5 @@
+minor_changes:
+  - purefb_realm - add ``default_object_server`` to set or clear the default object store server of a
+    realm (Purity//FB 4.6.3, REST 2.20). A bare server name is qualified as ``realm::server`` and an
+    empty string clears the default.
+  - purefb_info - report ``default_object_server`` for each realm in the ``realms`` subset.

@@ -1,0 +1,8 @@
+minor_changes:
+  - purefb_fleet - add ``members`` to join arrays to the fleet in one batch by management address and
+    administrator credentials (REST 2.27) and ``member_name`` to remove members from the coordinator alone.
+bugfixes:
+  - purefb_fleet - ``state=absent`` no longer deletes the fleet when running in check mode.
+  - purefb_fleet - ``rename`` now resolves the fleet this array belongs to (checking the response and
+    skipping fleets the array is not a member of) and patches that fleet when ``name`` is omitted;
+    an array without a fleet fails with a clear message instead of a traceback.

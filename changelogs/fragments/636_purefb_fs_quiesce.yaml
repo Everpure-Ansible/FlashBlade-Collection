@@ -1,0 +1,6 @@
+---
+minor_changes:
+  - purefb_fs - add ``quiesce`` and ``abort_quiesce`` for the planned failover of a replicated
+    filesystem (Purity//FB 4.8.4+, REST 2.28+). ``quiesce`` with ``promote=false`` replicates the
+    outstanding data before demoting, ``quiesce=false`` skips the remaining replication of a
+    demoting filesystem, and ``abort_quiesce`` with ``promote=true`` cancels the failover.

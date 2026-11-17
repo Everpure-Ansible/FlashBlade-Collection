@@ -1218,6 +1218,7 @@ class TestPurefbInfo:
             "get_snmp_agents",
             "get_snmp_managers",
             "get_kmip",
+            "get_syslog_servers_settings",
             "get_sso_oidc_idps",
         ):
             getattr(mock_blade, method).return_value.items = []
@@ -1319,6 +1320,7 @@ class TestPurefbInfo:
             "get_snmp_agents",
             "get_snmp_managers",
             "get_kmip",
+            "get_syslog_servers_settings",
             "get_sso_oidc_idps",
         ):
             getattr(mock_blade, method).return_value.items = []
@@ -1599,6 +1601,11 @@ class TestPurefbInfo:
             "location": None,
         }
 
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_info.get_rest_api_version",
+        Mock(return_value="2.30"),
+    )
     def test_generate_fs_dict_reports_copy_source(self):
         """A filesystem copy reports the filesystem it was copied from, and
         the location comes from the source reference, not the filesystem."""

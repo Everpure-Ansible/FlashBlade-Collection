@@ -81,6 +81,7 @@ from plugins.modules.purefb_info import (
     generate_fs_dict,
     generate_array_conn_dict,
     generate_bucket_access_policies_dict,
+    generate_bucket_dict,
     generate_lag_dict,
     generate_subnet_dict,
     generate_bucket_cross_object_policies_dict,
@@ -1645,3 +1646,71 @@ class TestPurefbInfo:
         call_args = mock_module.exit_json.call_args[1]
         assert call_args["purefb_info"]["fleet"] == {"fleet1": {"members": {}}}
         assert "policies" not in call_args["purefb_info"]
+
+    def test_generate_bucket_dict_reports_lifecycle_v2_fields(self):
+        """Lifecycle rules report keep_previous_versions_count and tags.
+
+        Both fields are on the legacy /lifecycle-rules response from REST 2.29
+        and are read via getattr, so a rule from an older array yields None
+        and an empty list instead of an AttributeError. The expiry date is
+        rendered in UTC, the zone the modules write it in.
+        """
+        bucket = Mock()
+        bucket.name = "bkt"
+        bucket.id = "bkt-id"
+        bucket.destroyed = False
+
+        tag = Mock()
+        tag.key = "env"
+        tag.value = "dev"
+        rule = Mock()
+        rule.bucket.name = "bkt"
+        rule.rule_id = "rule1"
+        rule.keep_previous_version_for = 2 * 86400000
+        rule.keep_current_version_for = None
+        rule.abort_incomplete_multipart_uploads_after = None
+        rule.keep_current_version_until = None
+        rule.prefix = "logs/"
+        rule.enabled = True
+        rule.cleanup_expired_object_delete_marker = False
+        rule.keep_previous_versions_count = 3
+        rule.tags = [tag]
+
+        legacy_fields = [
+            "bucket",
+            "rule_id",
+            "keep_previous_version_for",
+            "keep_current_version_for",
+            "abort_incomplete_multipart_uploads_after",
+            "keep_current_version_until",
+            "prefix",
+            "enabled",
+            "cleanup_expired_object_delete_marker",
+        ]
+        legacy_rule = Mock(spec=legacy_fields)
+        legacy_rule.bucket = Mock()
+        legacy_rule.bucket.name = "bkt"
+        legacy_rule.rule_id = "legacy"
+        legacy_rule.keep_previous_version_for = None
+        legacy_rule.keep_current_version_for = 30 * 86400000
+        legacy_rule.abort_incomplete_multipart_uploads_after = None
+        legacy_rule.keep_current_version_until = 1893456000000
+        legacy_rule.prefix = None
+        legacy_rule.enabled = True
+        legacy_rule.cleanup_expired_object_delete_marker = False
+
+        mock_blade = Mock()
+        mock_blade.get_buckets.return_value.items = [bucket]
+        mock_blade.get_lifecycle_rules.return_value.items = [rule, legacy_rule]
+
+        result = generate_bucket_dict(mock_blade)
+
+        mock_blade.get_lifecycle_rules.assert_called_once_with(bucket_ids=["bkt-id"])
+        rules = result["bkt"]["lifecycle_rules"]
+        assert rules["rule1"]["keep_previous_version_for (days)"] == 2
+        assert rules["rule1"]["keep_previous_versions_count"] == 3
+        assert rules["rule1"]["tags"] == [{"key": "env", "value": "dev"}]
+        assert rules["legacy"]["keep_current_version_for (days)"] == 30
+        assert rules["legacy"]["keep_current_version_until"] == "2030-01-01"
+        assert rules["legacy"]["keep_previous_versions_count"] is None
+        assert rules["legacy"]["tags"] == []

@@ -10,6 +10,7 @@ action_groups:
     - purefb_bladename
     - purefb_bucket
     - purefb_bucket_access
+    - purefb_bucket_lifecycle
     - purefb_bucket_replica
     - purefb_certgrp
     - purefb_certs

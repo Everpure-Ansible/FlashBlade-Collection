@@ -433,7 +433,7 @@ class TestCheckState:
             mock_ansible_module, mock_get_system, mock_loose_version, _base_params()
         )
         blade.get_software_check.side_effect = [_response([])] + [
-            _response([_check_task(status="running")]) for _ in range(10)
+            _response([_check_task(status="running")]) for unused in range(10)
         ]
         blade.post_software_check.return_value = _response(
             [_check_task(status="queued")]

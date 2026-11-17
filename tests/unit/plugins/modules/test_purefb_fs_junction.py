@@ -224,10 +224,26 @@ class TestPurefbFsJunction:
         module.params = _base_params()
         assert _get_junction(module, _blade()) is None
 
-    def test_get_junction_returns_none_on_error(self):
-        module = Mock()
-        module.params = _base_params()
-        assert _get_junction(module, _blade(get_status=400)) is None
+    @patch(
+        "plugins.modules.purefb_fs_junction.get_error_message",
+        return_value="Cannot find array in fleet",
+    )
+    def test_get_junction_fails_on_error(self, mock_get_error_message):
+        """A failed read fails the task instead of reading as absent"""
+        module = _module(_base_params(context="nosucharray"))
+        blade = _blade(get_status=400)
+
+        try:
+            _get_junction(module, blade)
+        except SystemExit:
+            pass
+
+        module.fail_json.assert_called_once_with(
+            msg=(
+                "Failed to read file system junction projects-alpha. "
+                "Error: Cannot find array in fleet"
+            )
+        )
 
     # ---------------- main() flows ----------------
 
@@ -842,3 +858,55 @@ class TestPurefbFsJunction:
         module.fail_json.assert_called_once()
         assert "py-pure-client" in module.fail_json.call_args[1]["msg"]
         mock_get_system.assert_not_called()
+
+    @patch("plugins.modules.purefb_fs_junction.LooseVersion")
+    @patch("plugins.modules.purefb_fs_junction.get_system")
+    @patch("plugins.modules.purefb_fs_junction.AnsibleModule")
+    @patch("plugins.modules.purefb_fs_junction.HAS_PYPURECLIENT", True)
+    def test_main_absent_fails_when_read_fails(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        """A failed GET with state=absent fails instead of reporting ok"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        module = _module(_base_params(state="absent", context="nosucharray"))
+        mock_ansible_module.return_value = module
+        blade = _blade(get_status=400)
+        mock_get_system.return_value = blade
+
+        _run_main()
+
+        blade.get_file_system_junctions.assert_called_once_with(
+            names=["projects-alpha"], context_names=["nosucharray"]
+        )
+        blade.delete_file_system_junctions.assert_not_called()
+        module.exit_json.assert_not_called()
+        module.fail_json.assert_called_once()
+        assert (
+            "Failed to read file system junction projects-alpha"
+            in module.fail_json.call_args[1]["msg"]
+        )
+
+    @patch("plugins.modules.purefb_fs_junction.LooseVersion")
+    @patch("plugins.modules.purefb_fs_junction.get_system")
+    @patch("plugins.modules.purefb_fs_junction.AnsibleModule")
+    @patch("plugins.modules.purefb_fs_junction.HAS_PYPURECLIENT", True)
+    def test_main_present_fails_when_read_fails(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        """A failed GET with state=present fails instead of creating"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        module = _module(_base_params())
+        mock_ansible_module.return_value = module
+        blade = _blade(get_status=500)
+        mock_get_system.return_value = blade
+
+        _run_main()
+
+        blade.post_file_system_junctions.assert_not_called()
+        blade.delete_file_system_junctions.assert_not_called()
+        module.exit_json.assert_not_called()
+        module.fail_json.assert_called_once()
+        assert (
+            "Failed to read file system junction projects-alpha"
+            in module.fail_json.call_args[1]["msg"]
+        )

@@ -264,14 +264,26 @@ def _requested_facts(module):
 
 
 def _get_junction(module, blade):
+    """Return the junction object, or None when it does not exist.
+
+    The array answers a lookup of a missing junction, including a name in
+    an unknown realm, with 200 and no items, so any other status is a
+    failed read (an unknown fleet context, authentication, a transient
+    fault ...) and fails the task instead of masquerading as "absent",
+    which would let state=absent report ok and state=present attempt a
+    create.
+    """
     res = blade.get_file_system_junctions(
         names=[module.params["name"]], **_context_kwargs(module)
     )
-    if res.status_code == 200:
-        items = list(res.items)
-        if items:
-            return items[0]
-    return None
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to read file system junction {0}. Error: {1}".format(
+                module.params["name"], get_error_message(res)
+            )
+        )
+    items = list(res.items)
+    return items[0] if items else None
 
 
 def _check_realms(module):

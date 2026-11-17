@@ -110,8 +110,49 @@ options:
     description:
       - Promote/demote a filesystem.
       - Can only demote the file-system if it is in a replica-link relationship.
+      - A filesystem that is C(demoting) in a planned failover cannot be
+        promoted directly; use I(abort_quiesce) to cancel the failover.
     required: false
     type: bool
+  quiesce:
+    description:
+      - Planned failover control, used together with I(promote) set to C(false).
+      - When C(true), a promoted filesystem starts a planned failover. It moves
+        to C(demoting) while the data not yet replicated is sent to the target
+        and becomes C(demoted) once replication completes. The module returns
+        as soon as the array accepts the request; follow the promotion status
+        with M(everpure.flashblade.purefb_info).
+      - When C(false), a C(demoting) filesystem skips the remaining replication
+        and is demoted immediately. Data not yet replicated is lost, so
+        I(discard_snaps) must also be C(true). On a promoted filesystem
+        C(false) is the same as omitting I(quiesce).
+      - When omitted, I(promote) set to C(false) requests a regular demotion
+        without a planned failover, as in earlier releases.
+      - Requires Purity//FB 4.8.4+ (REST API 2.28+) on both the source and the
+        target FlashBlade, and a replica link that does not fan out. The array
+        refuses a planned failover while a replication transfer is in progress,
+        and refuses to destroy the filesystem or delete its replica link while
+        it is C(demoting).
+      - The array takes a snapshot named C(<filesystem>.quiesce.<timestamp>) on
+        the source. It keeps the longest retention of the snapshot policies on
+        the replica link, or has to be removed manually when the link has none.
+    required: false
+    type: bool
+    version_added: "1.30.0"
+  abort_quiesce:
+    description:
+      - Cancel a planned failover, used together with I(promote) set to C(true).
+      - On the source, a C(demoting) filesystem returns to C(promoted). On the
+        target, whose replica link is C(quiescing), the target is promoted and
+        the source rolls back to C(promoted). Any in-progress data transfer is
+        cancelled.
+      - Nothing is sent, and no change is reported, when no planned failover is
+        in progress. A regular promotion is never sent with this option.
+      - Requires Purity//FB 4.8.4+ (REST API 2.28+).
+    required: false
+    type: bool
+    default: false
+    version_added: "1.30.0"
   fastremove:
     description:
       - Define whether the fast remove directory is enabled for the filesystem.
@@ -141,6 +182,8 @@ options:
   policy:
     description:
       - Filesystem policy to assign to or remove from a filesystem.
+      - A WORM data policy cannot be attached this way, use I(worm_policy)
+        when creating the filesystem.
     required: false
     type: str
   policy_state:
@@ -150,6 +193,35 @@ options:
     default: present
     type: str
     choices: [ "absent", "present" ]
+  worm_policy:
+    description:
+      - Name of the WORM data policy to attach when the filesystem is created.
+        Snapshot and other filesystem policies are attached with I(policy).
+      - A WORM data policy can only be attached at creation time and cannot be
+        changed or removed afterwards. The module fails if an existing
+        filesystem has a different WORM data policy, or none.
+      - The array only creates a WORM filesystem in C(retention-based)
+        eradication mode, so I(eradication_mode) defaults to that value when
+        this option is set.
+      - Requires Purity//FB REST API 2.15 or later.
+    type: str
+    version_added: "1.30.0"
+  eradication_mode:
+    description:
+      - Eradication mode of the filesystem.
+      - C(permission-based) allows a destroyed filesystem to be eradicated
+        based on user permissions.
+      - C(retention-based) prevents eradication while any file in the
+        filesystem is locked or retained. The array requires it for a WORM
+        filesystem and refuses it without I(worm_policy).
+      - Can only be set at creation time and cannot be changed afterwards.
+        The module fails if an existing filesystem has a different mode.
+        When not set the array default (C(permission-based)) applies, except
+        that a filesystem created with I(worm_policy) uses C(retention-based).
+      - Requires Purity//FB REST API 2.15 or later.
+    type: str
+    choices: [ permission-based, retention-based ]
+    version_added: "1.30.0"
   delete_link:
     description:
       - Define if the filesystem can be deleted even if it has a replica link
@@ -159,6 +231,8 @@ options:
   discard_snaps:
     description:
       - Allow a filesystem to be demoted.
+      - Also required to skip a planned failover, that is I(quiesce) set to
+        C(false) on a C(demoting) filesystem.
     required: false
     default: false
     type: bool
@@ -237,14 +311,22 @@ options:
     version_added: "1.22.0"
   cancel_in_progress:
     description:
-    - Whether to cancel any existing storage class transitons that are in progress
-      if the file system is requested to changed to another storage class
+    - Whether to cancel any existing storage class transitions that are in progress
+      if the file system is requested to change to another storage class.
+    - Only takes effect together with a I(storage_class) that differs from
+      the file system's current storage class.
     type: bool
     default: false
     version_added: "1.22.0"
   storage_class:
     description:
-    - Name of storage class in Fusion fleet file system is associated with
+    - Name of the storage class the file system is associated with.
+    - Only FlashBlade platforms with storage classes accept this option.
+      Elsewhere the array rejects the change and the module fails with
+      the array error. Check mode reports a pending change on such
+      platforms because the array only rejects the request when it is sent.
+    - When omitted, or when the file system already has the requested
+      storage class, no storage class change is sent.
     type: str
     version_added: "1.22.0"
   context:
@@ -273,6 +355,16 @@ EXAMPLES = """
   everpure.flashblade.purefb_fs:
     name: foo
     size: 1T
+    state: present
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Create a WORM-protected filesystem using WORM data policy worm1
+  everpure.flashblade.purefb_fs:
+    name: compliance-fs
+    size: 1T
+    worm_policy: worm1
+    eradication_mode: retention-based
     state: present
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
@@ -331,6 +423,31 @@ EXAMPLES = """
   everpure.flashblade.purefb_fs:
     name: foo
     promote: false
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Start a planned failover of filesystem foo (quiesce, then demote)
+  everpure.flashblade.purefb_fs:
+    name: foo
+    promote: false
+    quiesce: true
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Skip the remaining replication and demote filesystem foo now
+  everpure.flashblade.purefb_fs:
+    name: foo
+    promote: false
+    quiesce: false
+    discard_snaps: true
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Abort the planned failover of filesystem foo
+  everpure.flashblade.purefb_fs:
+    name: foo
+    promote: true
+    abort_quiesce: true
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
@@ -400,6 +517,7 @@ try:
         Reference,
         Smb,
         FileSystemPost,
+        FileSystemEradicationConfig,
         Nfs,
         SmbPost,
         Http,
@@ -428,8 +546,10 @@ EXPORT_POLICY_API_VERSION = "2.3"
 SMB_POLICY_API_VERSION = "2.10"
 CA_API_VERSION = "2.12"
 GOWNER_API_VERSION = "2.13"
+WORM_API_VERSION = "2.15"
 CONTEXT_API_VERSION = "2.17"
 REALM_API_VERSION = "2.19"
+QUIESCE_API_VERSION = "2.28"
 
 
 def _item_count(res):
@@ -447,6 +567,82 @@ def _item_count(res):
         return len(list(res.items))
     except TypeError:
         return 0
+
+
+def _failover_action(module, blade, fsys, fs_name):
+    """Classify a planned-failover request.
+
+    Returns the FileSystemPatch field to send ("quiesce", "skip_quiesce" or
+    "abort_quiesce"), "noop" when the planned failover is already in the
+    requested state, or None when the request belongs to the regular
+    promote/demote path. The caller has checked that promote is set and that
+    the array supports planned failover.
+    """
+    status = fsys.promotion_status
+    if module.params["promote"]:
+        if not module.params.get("abort_quiesce"):
+            return None
+        if status == "demoting":
+            return "abort_quiesce"
+        # A demoted target only shows the failover on its inbound link.
+        if status == "demoted" and _link_quiescing(module, blade, fs_name):
+            return "abort_quiesce"
+        return "noop"
+    quiesce = module.params.get("quiesce")
+    if quiesce is None:
+        return None
+    if quiesce:
+        return "quiesce" if status == "promoted" else "noop"
+    if status == "demoting":
+        return "skip_quiesce"
+    return None
+
+
+def _link_quiescing(module, blade, fs_name):
+    """Return True when a replica link of the filesystem is quiescing."""
+    kwargs = {"local_file_system_names": [fs_name]}
+    if module.params["context"]:
+        kwargs["context_names"] = [module.params["context"]]
+    res = blade.get_file_system_replica_links(**kwargs)
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to get replica links for filesystem {0}. Error: {1}".format(
+                fs_name, get_error_message(res)
+            )
+        )
+    links = list(res.items)
+    return any(getattr(link, "status", None) == "quiescing" for link in links)
+
+
+def _patch_failover(module, blade, fs_name, action):
+    """Send the dedicated planned-failover PATCH for ``action``.
+
+    The three controls are FileSystemPatch body fields that modify a
+    promotion-state request: the array refuses each flag unless the same
+    body carries requested_promotion_state (demoted for quiesce and
+    skip_quiesce, promoted for abort_quiesce). The PATCH is sent on its own
+    so that no other attribute rides along with a failover request.
+    """
+    body = {action: True}
+    if action == "abort_quiesce":
+        body["requested_promotion_state"] = "promoted"
+    else:
+        body["requested_promotion_state"] = "demoted"
+    kwargs = {"names": [fs_name], "file_system": FileSystemPatch(**body)}
+    if action == "skip_quiesce":
+        # Skipping discards the data not yet replicated; the array only
+        # accepts that with discard_non_snapshotted_data, and refuses the
+        # same flag on a quiesce request.
+        kwargs["discard_non_snapshotted_data"] = True
+    if module.params["context"]:
+        kwargs["context_names"] = [module.params["context"]]
+    res = blade.patch_file_systems(**kwargs)
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Planned failover ({0}) failed for filesystem {1}. Error: {2}".format(
+                action, fs_name, get_error_message(res)
+            )
+        )
 
 
 def create_fs(module, blade):
@@ -569,6 +765,18 @@ def create_fs(module, blade):
             )
 
         # Build FileSystemPost object
+        fs_kwargs = {}
+        eradication_mode = module.params.get("eradication_mode")
+        if module.params.get("worm_policy") and not eradication_mode:
+            # The array refuses to create a filesystem with a WORM data policy
+            # in any other eradication mode.
+            eradication_mode = "retention-based"
+        if eradication_mode:
+            # eradication_config is accepted on POST only (FileSystemPatch has
+            # no such field), so it is set here and never patched afterwards.
+            fs_kwargs["eradication_config"] = FileSystemEradicationConfig(
+                eradication_mode=eradication_mode
+            )
         fs_obj = FileSystemPost(
             provisioned=size,
             fast_remove_directory_enabled=bool(module.params["fastremove"]),
@@ -583,6 +791,7 @@ def create_fs(module, blade):
             ),
             default_user_quota=user_quota,
             default_group_quota=group_quota,
+            **fs_kwargs
         )
         # Construct filesystem name - if realm provided, prepend realm::
         fs_name = module.params["name"]
@@ -601,6 +810,11 @@ def create_fs(module, blade):
             and module.params["context"]
         ):
             post_kwargs["context_names"] = [module.params["context"]]
+
+        # A WORM data policy can only be attached on POST /file-systems; the
+        # snapshot policy below is still attached after creation as before.
+        if module.params.get("worm_policy"):
+            post_kwargs["policy_names"] = [module.params["worm_policy"]]
 
         # Add default_exports=[""] for realm filesystems (empty string)
         if realm_name:
@@ -820,6 +1034,58 @@ def create_fs(module, blade):
     module.exit_json(changed=changed)
 
 
+def _check_create_only_options(module, blade, fsys, api_version):
+    """Refuse a worm_policy or eradication_mode that differs from the
+    existing filesystem ``fsys`` (the object main() already fetched).
+
+    Both are accepted on POST /file-systems only: FileSystemPatch has no
+    eradication_config and a WORM data policy cannot be attached to or
+    detached from an existing filesystem. Runs before any PATCH so a
+    mismatch fails the task without touching the filesystem; matching
+    values are a no-op so a replayed create task stays idempotent.
+    """
+    worm_policy = module.params.get("worm_policy")
+    eradication_mode = module.params.get("eradication_mode")
+    if not worm_policy and not eradication_mode:
+        return
+    fs_name = fsys.name
+    if eradication_mode:
+        current_mode = getattr(
+            getattr(fsys, "eradication_config", None), "eradication_mode", None
+        )
+        if current_mode != eradication_mode:
+            module.fail_json(
+                msg="Filesystem {0} has eradication_mode {1}. The eradication "
+                "mode can only be set when the filesystem is created.".format(
+                    fs_name, current_mode
+                )
+            )
+    if worm_policy:
+        member_kwargs = {"member_names": [fs_name]}
+        if (
+            LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
+            and module.params["context"]
+        ):
+            member_kwargs["context_names"] = [module.params["context"]]
+        res = blade.get_file_systems_worm_data_policies(**member_kwargs)
+        if res.status_code != 200:
+            module.fail_json(
+                msg="Failed to get WORM data policy of filesystem {0}. "
+                "Error: {1}".format(fs_name, get_error_message(res))
+            )
+        attached = [
+            getattr(getattr(item, "policy", None), "name", None)
+            for item in list(res.items)
+        ]
+        if worm_policy not in attached:
+            module.fail_json(
+                msg="Filesystem {0} has WORM data policy {1}. A WORM data policy "
+                "can only be attached when the filesystem is created.".format(
+                    fs_name, ", ".join(name for name in attached if name) or "none"
+                )
+            )
+
+
 def modify_fs(module, blade):
     """Modify Filesystem"""
     changed = False
@@ -1019,8 +1285,23 @@ def modify_fs(module, blade):
         ):
             new_fsys["writable"] = module.params["writable"]
             mod_fs = True
+    failover = None
     if module.params["promote"] is not None:
+        failover = _failover_action(module, blade, fsys, fs_name)
+    if failover == "skip_quiesce" and not module.params["discard_snaps"]:
+        module.fail_json(
+            msg="Filesystem {0} is demoting. Skipping the planned failover "
+            "discards the data not yet replicated; set discard_snaps=true "
+            "to confirm.".format(fs_name)
+        )
+    if module.params["promote"] is not None and failover is None:
         if module.params["promote"] and fsys.promotion_status != "promoted":
+            if fsys.promotion_status == "demoting":
+                module.fail_json(
+                    msg="Filesystem {0} is demoting in a planned failover and "
+                    "cannot be promoted directly. Use abort_quiesce=true to "
+                    "cancel the failover.".format(fs_name)
+                )
             new_fsys["requested_promotion_state"] = "promoted"
             mod_fs = True
         if not module.params["promote"] and fsys.promotion_status == "promoted":
@@ -1133,6 +1414,10 @@ def modify_fs(module, blade):
                         fs_name, get_error_message(res)
                     )
                 )
+    if failover in ("quiesce", "skip_quiesce", "abort_quiesce"):
+        changed = True
+        if not module.check_mode:
+            _patch_failover(module, blade, fs_name, failover)
     if (
         LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
         and module.params["context"]
@@ -1388,20 +1673,36 @@ def modify_fs(module, blade):
         LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
         and module.params["storage_class"]
     ):
-        if module.params["storage_class"] != current_fs.storage_class:
+        # The array reports storage_class as an object, so only its name is
+        # comparable. Platforms without storage classes return the object
+        # with no name and reject any storage class PATCH, so the PATCH is
+        # only sent when the requested class differs from the current one.
+        current_sc = getattr(getattr(current_fs, "storage_class", None), "name", None)
+        if module.params["storage_class"] != current_sc:
             change_sc = True
-        sc_patch = {
-            "names": [fs_name],
-            "file_system": FileSystemPatch(
-                storage_class=StorageClassInfo(name=module.params["storage_class"])
-            ),
-            "cancel_in_progress_storage_class_transition": module.params[
-                "cancel_in_progress"
-            ],
-        }
-        if module.params["context"]:
-            sc_patch["context_names"] = [module.params["context"]]
-        res = blade.patch_file_systems(**sc_patch)
+            if not module.check_mode:
+                sc_patch = {
+                    "names": [fs_name],
+                    "file_system": FileSystemPatch(
+                        storage_class=StorageClassInfo(
+                            name=module.params["storage_class"]
+                        )
+                    ),
+                    "cancel_in_progress_storage_class_transition": module.params[
+                        "cancel_in_progress"
+                    ],
+                }
+                if module.params["context"]:
+                    sc_patch["context_names"] = [module.params["context"]]
+                res = blade.patch_file_systems(**sc_patch)
+                if res.status_code != 200:
+                    module.fail_json(
+                        msg="Failed to modify storage class for "
+                        "filesystem {0}. Error: {1}".format(
+                            fs_name,
+                            get_error_message(res),
+                        )
+                    )
 
     module.exit_json(
         changed=(
@@ -1534,6 +1835,8 @@ def main():
             snapshot=dict(type="bool"),
             writable=dict(type="bool"),
             promote=dict(type="bool"),
+            quiesce=dict(type="bool"),
+            abort_quiesce=dict(type="bool", default=False),
             fastremove=dict(type="bool"),
             hard_limit=dict(type="bool"),
             user_quota=dict(type="str"),
@@ -1546,6 +1849,10 @@ def main():
                 choices=["creator", "parent-directory"], default="creator"
             ),
             policy_state=dict(default="present", choices=["present", "absent"]),
+            worm_policy=dict(type="str"),
+            eradication_mode=dict(
+                type="str", choices=["permission-based", "retention-based"]
+            ),
             state=dict(default="present", choices=["present", "absent"]),
             delete_link=dict(default=False, type="bool"),
             discard_snaps=dict(default=False, type="bool"),
@@ -1573,6 +1880,27 @@ def main():
     state = module.params["state"]
     blade = get_system(module)
     api_version = get_rest_api_version(blade)
+    if module.params.get("quiesce") is not None or module.params.get("abort_quiesce"):
+        # Planned failover controls: gate and validate before any write.
+        if LooseVersion(QUIESCE_API_VERSION) > LooseVersion(api_version):
+            module.fail_json(
+                msg="Planned failover (quiesce, abort_quiesce) requires "
+                "Purity//FB 4.8.4+ (REST API {0}+)".format(QUIESCE_API_VERSION)
+            )
+        if (
+            module.params.get("quiesce") is not None
+            and module.params["promote"] is not False
+        ):
+            module.fail_json(msg="quiesce is only valid with promote=false")
+        if module.params.get("abort_quiesce") and not module.params["promote"]:
+            module.fail_json(msg="abort_quiesce is only valid with promote=true")
+    if (
+        module.params.get("worm_policy") or module.params.get("eradication_mode")
+    ) and LooseVersion(WORM_API_VERSION) > LooseVersion(api_version):
+        module.fail_json(
+            msg="worm_policy and eradication_mode require Purity//FB REST API "
+            "{0} or later".format(WORM_API_VERSION)
+        )
     if (
         LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
         and not module.params["context"]
@@ -1609,6 +1937,7 @@ def main():
     if state == "present" and not fsys:
         create_fs(module, blade)
     elif state == "present" and fsys:
+        _check_create_only_options(module, blade, fsys, api_version)
         modify_fs(module, blade)
     elif state == "absent" and fsys and not fsys.destroyed:
         delete_fs(module, blade)

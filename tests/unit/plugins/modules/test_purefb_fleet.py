@@ -950,3 +950,133 @@ class TestFleetMemberNameMain:
         assert calls[0][1] == {"member_names": ["array2"]}
         assert calls[1][1] == {"member_names": ["array3"], "unreachable": True}
         module.exit_json.assert_called_once_with(changed=True)
+
+
+class TestFleetDeleteMain:
+    """main() flows for state=absent without member_url or member_name"""
+
+    def test_delete_fleet(self):
+        blade = Mock()
+        blade.get_fleets.return_value = _response([_fleet("fleet1")])
+        blade.delete_fleets.return_value = _response([])
+        module = _run_main(_base_params(state="absent", name="fleet1"), blade)
+        blade.delete_fleets.assert_called_once_with(names=["fleet1"])
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_delete_fleet_check_mode_does_not_delete(self):
+        blade = Mock()
+        blade.get_fleets.return_value = _response([_fleet("fleet1")])
+        module = _run_main(
+            _base_params(state="absent", name="fleet1"), blade, check_mode=True
+        )
+        blade.delete_fleets.assert_not_called()
+        blade.delete_fleets_members.assert_not_called()
+        module.fail_json.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_delete_fleet_api_error(self):
+        blade = Mock()
+        blade.get_fleets.return_value = _response([_fleet("fleet1")])
+        blade.delete_fleets.return_value = _response([], status_code=400)
+        module = _run_main(_base_params(state="absent", name="fleet1"), blade)
+        module.fail_json.assert_called_once()
+        assert "Fleet fleet1 deletion failed" in module.fail_json.call_args[1]["msg"]
+
+    def test_delete_without_fleet_is_idempotent(self):
+        blade = Mock()
+        blade.get_fleets.return_value = _response([])
+        for check_mode in [False, True]:
+            module = _run_main(
+                _base_params(state="absent", name="fleet1"),
+                blade,
+                check_mode=check_mode,
+            )
+            blade.delete_fleets.assert_not_called()
+            module.exit_json.assert_called_once_with(changed=False)
+
+
+class TestFleetRenameMain:
+    """main() flows for state=present with rename"""
+
+    @patch(MODULE + ".FleetPatch")
+    def test_rename_fleet_resolves_local_fleet(self, mock_patch):
+        blade = Mock()
+        blade.get_fleets.return_value = _response([_fleet("fleet1")])
+        blade.patch_fleets.return_value = _response([])
+        module = _run_main(_base_params(rename="fleet2"), blade)
+        mock_patch.assert_called_once_with(name="fleet2")
+        blade.patch_fleets.assert_called_once_with(
+            names=["fleet1"], fleet=mock_patch.return_value
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    @patch(MODULE + ".FleetPatch")
+    def test_rename_fleet_honours_matching_name(self, mock_patch):
+        blade = Mock()
+        blade.get_fleets.return_value = _response([_fleet("fleet1")])
+        blade.patch_fleets.return_value = _response([])
+        module = _run_main(_base_params(name="fleet1", rename="fleet2"), blade)
+        blade.patch_fleets.assert_called_once_with(
+            names=["fleet1"], fleet=mock_patch.return_value
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    @patch(MODULE + ".FleetPatch")
+    def test_rename_fleet_skips_remote_fleets(self, mock_patch):
+        blade = Mock()
+        blade.get_fleets.return_value = _response(
+            [_fleet("remote", is_local=False), _fleet("fleet1")]
+        )
+        blade.patch_fleets.return_value = _response([])
+        module = _run_main(_base_params(rename="fleet2"), blade)
+        blade.patch_fleets.assert_called_once_with(
+            names=["fleet1"], fleet=mock_patch.return_value
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_rename_fleet_same_name_is_idempotent(self):
+        blade = Mock()
+        blade.get_fleets.return_value = _response([_fleet("fleet1")])
+        module = _run_main(_base_params(rename="fleet1"), blade)
+        blade.patch_fleets.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+    def test_rename_fleet_check_mode(self):
+        blade = Mock()
+        blade.get_fleets.return_value = _response([_fleet("fleet1")])
+        module = _run_main(_base_params(rename="fleet2"), blade, check_mode=True)
+        blade.patch_fleets.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_rename_without_fleet_fails_cleanly(self):
+        blade = Mock()
+        blade.get_fleets.return_value = _response([])
+        module = _run_main(_base_params(rename="fleet2"), blade)
+        blade.patch_fleets.assert_not_called()
+        module.fail_json.assert_called_once()
+        assert "not a member of a fleet" in module.fail_json.call_args[1]["msg"]
+
+    def test_rename_fleet_name_mismatch_fails(self):
+        blade = Mock()
+        blade.get_fleets.return_value = _response([_fleet("fleet1")])
+        module = _run_main(_base_params(name="other", rename="fleet2"), blade)
+        blade.patch_fleets.assert_not_called()
+        module.fail_json.assert_called_once()
+        assert "member of fleet fleet1" in module.fail_json.call_args[1]["msg"]
+
+    def test_rename_fleet_read_error(self):
+        blade = Mock()
+        blade.get_fleets.return_value = _response([], status_code=400)
+        module = _run_main(_base_params(rename="fleet2"), blade)
+        blade.patch_fleets.assert_not_called()
+        module.fail_json.assert_called_once()
+        assert "Failed to read fleets" in module.fail_json.call_args[1]["msg"]
+
+    @patch(MODULE + ".FleetPatch")
+    def test_rename_fleet_api_error(self, mock_patch):
+        blade = Mock()
+        blade.get_fleets.return_value = _response([_fleet("fleet1")])
+        blade.patch_fleets.return_value = _response([], status_code=400)
+        module = _run_main(_base_params(rename="fleet2"), blade)
+        module.fail_json.assert_called_once()
+        assert "Fleet rename failed" in module.fail_json.call_args[1]["msg"]

@@ -333,16 +333,17 @@ def delete_fleet(module, blade):
     """Delete the fleet.
 
     Only works when the current array is the only remaining
-    memebr of the fleet'
+    member of the fleet.
     """
     changed = True
-    res = blade.delete_fleets(names=[module.params["name"]])
-    if res.status_code != 200:
-        module.fail_json(
-            msg="Fleet {0} deletion failed. Error: {1}".format(
-                module.params["name"], get_error_message(res)
+    if not module.check_mode:
+        res = blade.delete_fleets(names=[module.params["name"]])
+        if res.status_code != 200:
+            module.fail_json(
+                msg="Fleet {0} deletion failed. Error: {1}".format(
+                    module.params["name"], get_error_message(res)
+                )
             )
-        )
     module.exit_json(changed=changed)
 
 
@@ -503,7 +504,7 @@ def _current_fleet_name(module, blade):
     if not fleets:
         module.fail_json(
             msg="This array is not a member of a fleet. "
-            "Create one with state=create before adding members."
+            "Create one with state=create first."
         )
     if module.params["name"] and module.params["name"] not in fleets:
         module.fail_json(
@@ -728,14 +729,14 @@ def delete_fleet_members_by_name(module, blade):
 
 
 def rename_fleet(module, blade):
-    """Rename the fleet"""
+    """Rename the fleet this array belongs to"""
     changed = False
-    fleet = list(blade.get_fleets().items)[0].name
+    fleet = _current_fleet_name(module, blade)
     if module.params["rename"] != fleet:
         changed = True
         if not module.check_mode:
             res = blade.patch_fleets(
-                names=[module.params["name"]],
+                names=[fleet],
                 fleet=FleetPatch(name=module.params["rename"]),
             )
             if res.status_code != 200:

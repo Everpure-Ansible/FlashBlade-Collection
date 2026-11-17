@@ -21,6 +21,10 @@ version_added: '1.20.0'
 short_description: Manage FlashBlade servers
 description:
 - Add, update or delete FlashBlade servers
+- Deleting a server also deletes the NFS directory service created with it.
+  A local directory service attached to the server, including one created
+  through I(create_local_directory_service), outlives the server and is
+  removed with M(everpure.flashblade.purefb_local_ds).
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
@@ -31,7 +35,7 @@ options:
     required: true
   state:
     description:
-    - Define whether the Object Store Virtual Host should be added or deleted
+    - Define whether the server should be added or deleted
     default: present
     choices: [ absent, present ]
     type: str
@@ -47,12 +51,29 @@ options:
     elements: str
   local_directory_service:
     description:
-    - The local directory service configuration to be used for this server
+    - Name of an existing local directory service to associate with this server
     - Set to an empty string (C("")) to clear a previously assigned local directory
       service. This only applies on update; on create an empty string is treated the
       same as omitting the parameter.
+    - Mutually exclusive with I(create_local_directory_service).
     - Only valid with REST 2.24 or higher
     type: str
+  create_local_directory_service:
+    description:
+    - Name of a local directory service for the array to create and associate
+      with this server.
+    - Only applies when the server is created. On an existing server the module
+      checks that this is the local directory service attached and fails otherwise,
+      since the array cannot create and attach one after the fact. Create it with
+      M(everpure.flashblade.purefb_local_ds) and attach it with
+      I(local_directory_service) instead.
+    - The local directory service created this way is not deleted with the server.
+      Remove it with M(everpure.flashblade.purefb_local_ds) after the server is gone.
+    - Mutually exclusive with I(local_directory_service).
+    - An empty string (C("")) is treated the same as omitting the parameter.
+    - Only valid with REST 2.24 or higher
+    type: str
+    version_added: '1.30.0'
 extends_documentation_fragment:
 - everpure.flashblade.everpure.fb
 """
@@ -62,6 +83,13 @@ EXAMPLES = r"""
   everpure.flashblade.purefb_server:
     name: myserver
     dns: mydns
+    fb_url: 10.10.10.2
+    api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
+
+- name: Add server and create its own local directory service
+  everpure.flashblade.purefb_server:
+    name: myserver
+    create_local_directory_service: myserver_local
     fb_url: 10.10.10.2
     api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
 
@@ -127,6 +155,25 @@ def update_server(module, blade):
     """Update server object"""
     changed = False
     server_info = list(blade.get_servers(names=[module.params["name"]]).items)[0]
+    if module.params["create_local_directory_service"]:
+        # create_local_directory_service is a create-time parameter; the array
+        # cannot create and attach an LDS to a server that already exists.
+        # Accept a matching attachment as idempotent, otherwise fail rather
+        # than silently hiding the drift.
+        current_lds = getattr(
+            getattr(server_info, "local_directory_service", None), "name", None
+        )
+        if current_lds != module.params["create_local_directory_service"]:
+            module.fail_json(
+                msg="Server {0} already exists and its local directory service "
+                "is {1}, not {2}. A local directory service can only be created "
+                "with the server; create it with purefb_local_ds and attach it "
+                "with local_directory_service instead.".format(
+                    module.params["name"],
+                    current_lds or "not set",
+                    module.params["create_local_directory_service"],
+                )
+            )
     if module.params["dns"] is not None:
         dns_list = server_info.dns
         current_dns = []
@@ -220,10 +267,17 @@ def add_server(module, blade):
                 name=module.params["local_directory_service"]
             )
         server = ServerPost(**server_kwargs)
+        post_kwargs = {}
+        if module.params["create_local_directory_service"]:
+            # query parameter, never also set ServerPost.local_directory_service
+            post_kwargs["create_local_directory_service"] = module.params[
+                "create_local_directory_service"
+            ]
         res = blade.post_servers(
             names=[module.params["name"]],
             server=server,
             create_ds=module.params["name"] + "_nfs",
+            **post_kwargs
         )
         if res.status_code != 200:
             module.fail_json(
@@ -244,10 +298,19 @@ def main():
             dns=dict(type="list", elements="str"),
             directory_service=dict(type="list", elements="str"),
             local_directory_service=dict(type="str"),
+            create_local_directory_service=dict(type="str"),
         )
     )
 
-    module = AnsibleModule(argument_spec, supports_check_mode=True)
+    # The API refuses these two together: one names an existing local
+    # directory service to attach, the other one to create with the server
+    mutually_exclusive = [["local_directory_service", "create_local_directory_service"]]
+
+    module = AnsibleModule(
+        argument_spec,
+        mutually_exclusive=mutually_exclusive,
+        supports_check_mode=True,
+    )
     if not HAS_PYPURECLIENT:
         module.fail_json(msg="py-pure-client sdk is required for this module")
     blade = get_system(module)
@@ -257,13 +320,22 @@ def main():
             msg="FlashBlade REST version not supported. "
             "Minimum version required: {0}".format(MIN_REQUIRED_API_VERSION)
         )
-    if module.params["local_directory_service"] is not None and LooseVersion(
-        LOCAL_DS_API_VERSION
-    ) > LooseVersion(api_version):
+    # local_directory_service treats "" as a request to clear the LDS on
+    # update, so any given value needs the 2.24 API. For
+    # create_local_directory_service "" is the same as omitting it, as in
+    # add_server and update_server, so only a name trips the gate.
+    lds_options_given = []
+    if module.params["local_directory_service"] is not None:
+        lds_options_given.append("local_directory_service")
+    if module.params["create_local_directory_service"]:
+        lds_options_given.append("create_local_directory_service")
+    if lds_options_given and LooseVersion(LOCAL_DS_API_VERSION) > LooseVersion(
+        api_version
+    ):
         module.fail_json(
             msg="FlashBlade REST version {0} does not support "
-            "local_directory_service (requires {1} or higher).".format(
-                api_version, LOCAL_DS_API_VERSION
+            "{1} (requires {2} or higher).".format(
+                api_version, lds_options_given[0], LOCAL_DS_API_VERSION
             )
         )
     state = module.params["state"]

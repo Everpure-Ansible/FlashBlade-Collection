@@ -124,6 +124,7 @@ SMTP_ENCRYPT_API_VERSION = "2.15"
 WORM_API_VERSION = "2.15"
 SERVERS_API_VERSION = "2.16"
 PASSWORD_POLICY_API_VERSION = "2.16"
+MAINTENANCE_API_VERSION = "2.16"
 FLEET_API_VERSION = "2.17"
 TLS_API_VERSION = "2.17"
 REALMS_API_VERSION = "2.19"
@@ -141,6 +142,26 @@ def _bytes_to_human(bytes_number):
             bytes_number = bytes_number / 1024
         return str(round(double_bytes, 2)) + " " + labels[i]
     return None
+
+
+def _maintenance_window_list(blade):
+    """Return the open maintenance window as a one-item list, or []"""
+    windows = []
+    res = blade.get_maintenance_windows()
+    if res.status_code == 200:
+        for window in list(res.items):
+            windows.append(
+                {
+                    "name": window.name,
+                    "created": datetime.fromtimestamp(
+                        int(window.created) / 1000
+                    ).strftime("%Y-%m-%d %H:%M:%S"),
+                    "expires": datetime.fromtimestamp(
+                        int(window.expires) / 1000
+                    ).strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+    return windows
 
 
 def generate_default_dict(blade):
@@ -260,6 +281,8 @@ def generate_default_dict(blade):
     }
     if LooseVersion(RA_DURATION_API_VERSION) <= LooseVersion(api_version):
         default_info["remote_assist"]["ra_duration"] = ra_info.remote_assist_duration
+    if LooseVersion(MAINTENANCE_API_VERSION) <= LooseVersion(api_version):
+        default_info["maintenance_window"] = _maintenance_window_list(blade)
     return default_info
 
 

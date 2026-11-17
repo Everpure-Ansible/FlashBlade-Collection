@@ -179,9 +179,6 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
     get_error_message,
     get_rest_api_version,
 )
-from ansible_collections.everpure.flashblade.plugins.module_utils.common import (
-    get_error_message,
-)
 
 PUBLIC_API_VERSION = "2.12"
 CONTEXT_API_VERSION = "2.17"

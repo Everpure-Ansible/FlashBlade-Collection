@@ -2260,6 +2260,12 @@ def generate_servers_dict(blade):
             ),
             "dns": [dns.name for dns in server.dns],
             "directory_services": [ds.name for ds in server.directory_services],
+            # local_directory_service arrived in REST 2.24 and realms in 2.19;
+            # older arrays return servers without either field
+            "local_directory_service": getattr(
+                getattr(server, "local_directory_service", None), "name", None
+            ),
+            "realms": [realm.name for realm in (getattr(server, "realms", None) or [])],
         }
     return servers_info
 

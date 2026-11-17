@@ -105,6 +105,7 @@ from plugins.modules.purefb_info import (
     generate_oidc_idps_dict,
     generate_quota_settings_dict,
     generate_support_dict,
+    generate_servers_dict,
 )
 from plugins.module_utils.version import LooseVersion as RealLooseVersion
 from plugins.modules.purefb_info import (
@@ -2535,6 +2536,65 @@ class TestPurefbInfo:
         assert result["fs1"]["status_detail"] is None
         assert result["fs1"]["remote_fs"] == "peer:fs1"
         assert result["fs1"]["policies"] == ["daily"]
+
+    def test_generate_servers_dict_reports_lds_and_realms(self):
+        """Servers report their local directory service and realms. Servers
+        from arrays older than REST 2.24 (no local_directory_service) or 2.19
+        (no realms) report null and an empty list."""
+        dns = Mock(spec=["name"])
+        dns.name = "management"
+        nfs_ds = Mock(spec=["name"])
+        nfs_ds.name = "srv1_nfs"
+        lds = Mock(spec=["name"])
+        lds.name = "srv1_local"
+        realm = Mock(spec=["name"])
+        realm.name = "realm1"
+
+        server_fields = [
+            "name",
+            "created",
+            "dns",
+            "directory_services",
+            "local_directory_service",
+            "realms",
+        ]
+        with_lds = Mock(spec=server_fields)
+        with_lds.name = "srv1"
+        with_lds.created = 1700000000000
+        with_lds.dns = [dns]
+        with_lds.directory_services = [nfs_ds]
+        with_lds.local_directory_service = lds
+        with_lds.realms = [realm]
+
+        # a current array returns an unattached server with the field null
+        unattached = Mock(spec=server_fields)
+        unattached.name = "_array_server"
+        unattached.created = 0
+        unattached.dns = [dns]
+        unattached.directory_services = [nfs_ds]
+        unattached.local_directory_service = None
+        unattached.realms = []
+
+        # an older array returns servers without either field
+        old = Mock(spec=["name", "created", "dns", "directory_services"])
+        old.name = "old"
+        old.created = 0
+        old.dns = [dns]
+        old.directory_services = [nfs_ds]
+
+        mock_blade = Mock()
+        mock_blade.get_servers.return_value.items = [with_lds, unattached, old]
+
+        result = generate_servers_dict(mock_blade)
+
+        assert result["srv1"]["dns"] == ["management"]
+        assert result["srv1"]["directory_services"] == ["srv1_nfs"]
+        assert result["srv1"]["local_directory_service"] == "srv1_local"
+        assert result["srv1"]["realms"] == ["realm1"]
+        assert result["_array_server"]["local_directory_service"] is None
+        assert result["_array_server"]["realms"] == []
+        assert result["old"]["local_directory_service"] is None
+        assert result["old"]["realms"] == []
 
     @patch("plugins.modules.purefb_info.LooseVersion")
     @patch("plugins.modules.purefb_info.generate_fleet_dict")

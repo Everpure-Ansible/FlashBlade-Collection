@@ -99,6 +99,7 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_admin - configure Everpure FlashBlade Global Admin settings
 - purefb_alert - manage alert email settings on a FlashBlade
 - purefb_apiclient - manage API clients for FlashBlade
+- purefb_audits - list FlashBlade audit trail records
 - purefb_banner - manage FlashBlade login banner
 - purefb_bladename - manage FlashBlade name
 - purefb_bucket - manage S3 buckets on a FlashBlade
@@ -126,7 +127,8 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_local_ds - manage FlashBlade Local Directory Services
 - purefb_local_group - manage local groups in a FlashBlade Local Directory Service
 - purefb_local_user - manage local users in a FlashBlade Local Directory Service
-- purefb_messages - list FlashBlade alert messages
+- purefb_maintenance - manage the FlashBlade maintenance window
+- purefb_messages - list, flag and unflag FlashBlade alert messages
 - purefb_mgmt_auth_policy - manage FlashBlade management authentication policies and their members
 - purefb_mgmt_policy - manage FlashBlade management access policies and their rules
 - purefb_mgmt_role - manage FlashBlade custom management roles, permissions, and policy attachment
@@ -148,10 +150,13 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_s3user - manage the object atore users on a FlashBlade
 - purefb_saml - manage FlashBlade SAML2 service and identity providers
 - purefb_server - manage FlashBlade servers
+- purefb_sessions - list the management login sessions on a FlashBlade
 - purefb_smtp - manage SMTP settings on a FlashBlade
 - purefb_snap - manage filesystem snapshots on a FlashBlade
 - purefb_snmp_agent - modify the FlashBlade SNMP Agent
 - purefb_snmp_mgr - manage SNMP Managers on a FlashBlade
+- purefb_software_patch - install Purity//FB software patches on a FlashBlade
+- purefb_ssh_ca_policy - manage FlashBlade SSH Certificate Authority policies and their members
 - purefb_subnet - manage network subnets on a FlashBlade
 - purefb_syslog - manage FlashBlade syslog server configuration
 - purefb_target - manage remote S3-capable targets for a FlashBlade

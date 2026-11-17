@@ -701,6 +701,19 @@ def generate_network_dict(blade):
             subnet_name = subnet.get("name")
         else:
             subnet_name = getattr(subnet, "name", None)
+        # realms (REST 2.19) and rdma_enabled (REST 2.28) are absent from
+        # the interface model on older arrays
+        realms = getattr(port, "realms", None) or []
+        if not isinstance(realms, list):
+            realms = []
+        realm_names = [
+            (
+                realm.get("name")
+                if isinstance(realm, dict)
+                else getattr(realm, "name", None)
+            )
+            for realm in realms
+        ]
         net_info[int_name] = {
             "type": getattr(port, "type", None),
             "mtu": getattr(port, "mtu", None),
@@ -713,6 +726,8 @@ def generate_network_dict(blade):
             "attached_servers": attached_names,
             "subnet": subnet_name,
             "enabled": port.enabled,
+            "rdma_enabled": getattr(port, "rdma_enabled", None),
+            "realms": realm_names,
         }
     return net_info
 

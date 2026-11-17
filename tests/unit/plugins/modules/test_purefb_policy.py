@@ -8,6 +8,7 @@ from __future__ import absolute_import, division, print_function
 __metaclass__ = type
 
 import sys
+from collections import defaultdict
 from unittest.mock import Mock, MagicMock, patch
 
 import pytest
@@ -47,11 +48,19 @@ sys.modules[
 ] = MagicMock()
 
 from plugins.modules.purefb_policy import (
+    _check_worm_autocommit_version,
+    _OS_ACCESS_ACTIONS_FALLBACK,
+    _check_os_actions,
     _nfs_rule,
     _share_rule_patch,
     _share_rule_perms,
+    _worm_autocommit_config,
+    _worm_autocommit_params,
+    _valid_os_actions,
     copy_policy,
+    main,
     create_network_access_policy,
+    create_worm_data_policy,
     delete_network_access_policy,
     delete_smb_share_policy,
     rename_smb_share_policy,
@@ -61,7 +70,17 @@ from plugins.modules.purefb_policy import (
     update_os_policy,
     update_smb_share_policy,
     update_snap_policy,
+    update_worm_data_policy,
 )
+from plugins.module_utils.version import LooseVersion as RealLooseVersion
+
+# The WORM tests compare real millisecond values and real REST versions, so
+# they use the collection's own helpers instead of the module_utils mocks.
+from plugins.module_utils.time_utils import (
+    TimeConversionError as _RealTimeConversionError,
+    time_to_milliseconds as _real_ttm,
+)
+from plugins.module_utils.version import LooseVersion as _RealLooseVersion
 
 
 def _existing_rule(access="root-squash"):
@@ -683,7 +702,8 @@ class TestUpdateSnapPolicy:
 class TestRenameSnapPolicy:
     """Snapshot policy rename must carry the new name on the wire and must be
     checked afterwards: Purity//FB 4.6.4 (REST 2.21) answers 200 to
-    {"name": ...} on PATCH /policies and keeps the old name."""
+    {"name": ...} on PATCH /policies and keeps the old name, while 4.8.8
+    (REST 2.30) rejects the PATCH outright."""
 
     @patch("plugins.modules.purefb_policy.LooseVersion")
     def test_rename_sends_name_in_policy_body(self, mock_loose_version):
@@ -734,6 +754,38 @@ class TestRenameSnapPolicy:
         msg = module.fail_json.call_args[1]["msg"]
         assert "kept the old name" in msg
         assert "does not support renaming snapshot policies" in msg
+        module.exit_json.assert_not_called()
+
+    @patch(
+        "plugins.modules.purefb_policy.get_error_message",
+        return_value="Missing or invalid parameter.",
+    )
+    @patch("plugins.modules.purefb_policy.LooseVersion")
+    def test_rename_rejected_by_array_fails_clearly(
+        self, mock_loose_version, _get_error_message
+    ):
+        """Purity//FB 4.8.8 (REST 2.30) answers 400 "Missing or invalid
+        parameter" to the rename PATCH. The module must still say that
+        snapshot policies cannot be renamed, not just echo the array."""
+        import plugins.modules.purefb_policy as pol
+
+        pol.Policy.reset_mock()
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+        module = _snap_module()
+        module.params["rename"] = "weekly_snap_policy"
+        blade = _snap_blade(_snap_rule())
+        rejected = Mock()
+        rejected.status_code = 400
+        blade.patch_policies.return_value = rejected
+
+        with pytest.raises(SystemExit):
+            rename_snap_policy(module, blade)
+
+        blade.patch_policies.assert_called_once()
+        blade.get_policies.assert_not_called()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "does not support renaming snapshot policies" in msg
+        assert "Missing or invalid parameter" in msg
         module.exit_json.assert_not_called()
 
     @patch("plugins.modules.purefb_policy.LooseVersion")
@@ -1596,3 +1648,759 @@ class TestCopyPolicy:
 
         blade.post_nfs_export_policies.assert_not_called()
         module.exit_json.assert_called_once_with(changed=True)
+
+
+# ---------------------------------------------------------------------------
+# WORM data policies: commit_mode and the autocommit configuration (REST 2.29)
+# ---------------------------------------------------------------------------
+
+
+def _as_dict(**kwargs):
+    """Stand-in for an SDK model: the body is kept as a plain dict so the
+    tests can assert exactly which fields were sent."""
+    return dict(kwargs)
+
+
+def worm_env(version="2.30"):
+    """Patch the SDK models to dicts and use the real version/time helpers."""
+
+    def decorator(fn):
+        for target, new in (
+            ("WormAutocommitConfig", _as_dict),
+            ("WormDataPolicy", _as_dict),
+            ("time_to_milliseconds", _real_ttm),
+            ("TimeConversionError", _RealTimeConversionError),
+            ("LooseVersion", _RealLooseVersion),
+            ("get_rest_api_version", lambda blade: version),
+        ):
+            fn = patch("plugins.modules.purefb_policy." + target, new=new)(fn)
+        return fn
+
+    return decorator
+
+
+WORM_PARAMS = {
+    "name": "worm_pol",
+    "policy_type": "worm",
+    "state": "present",
+    "enabled": True,
+    "context": "",
+    "rename": None,
+    "before_rule": None,
+    "target": None,
+    "min_retention": "1m",
+    "max_retention": "1d",
+    "default_retention": "1h",
+    "retention_lock": None,
+    "commit_mode": None,
+    "autocommit_delay_on": None,
+    "autocommit_delay_period": None,
+}
+
+LEGACY_BODY = {
+    "enabled": True,
+    "retention_lock": None,
+    "min_retention": 60000,
+    "max_retention": 86400000,
+    "default_retention": 3600000,
+}
+
+
+def _worm_module(**overrides):
+    module = Mock()
+    module.check_mode = False
+    module.params = dict(WORM_PARAMS)
+    module.params.update(overrides)
+    module.fail_json = Mock(side_effect=SystemExit("fail_json called"))
+    module.exit_json = Mock()
+    return module
+
+
+def _worm_policy(
+    commit_mode="manual",
+    delay_on="last_modification",
+    delay_period=86400000,
+    legacy=False,
+):
+    """A WORM policy as the SDK returns it (retentions in milliseconds).
+
+    legacy=True models a policy read from an array below REST 2.29, which has
+    neither commit_mode nor autocommit_config."""
+    attrs = [
+        "enabled",
+        "mode",
+        "min_retention",
+        "max_retention",
+        "default_retention",
+        "retention_lock",
+    ]
+    if not legacy:
+        attrs += ["commit_mode", "autocommit_config"]
+    policy = Mock(spec=attrs)
+    policy.enabled = True
+    policy.mode = "compliance"
+    policy.min_retention = 60000
+    policy.max_retention = 86400000
+    policy.default_retention = 3600000
+    policy.retention_lock = "unlocked"
+    if not legacy:
+        policy.commit_mode = commit_mode
+        policy.autocommit_config = Mock(spec=["delay_on", "delay_period"])
+        policy.autocommit_config.delay_on = delay_on
+        policy.autocommit_config.delay_period = delay_period
+    return policy
+
+
+def _worm_blade(policy=None):
+    """A blade whose WORM policy lookup returns I(policy), or an error
+    response without items (the SDK shape for a missing policy)."""
+    blade = Mock()
+    blade.get_versions.return_value.items = ["2.30"]
+    blade.get_fleets.return_value.status_code = 400
+    ok = Mock()
+    ok.status_code = 200
+    if policy is None:
+        missing = Mock(spec=["status_code"])
+        missing.status_code = 400
+        blade.get_worm_data_policies.return_value = missing
+    else:
+        found = Mock()
+        found.status_code = 200
+        found.items = [policy]
+        blade.get_worm_data_policies.return_value = found
+    blade.post_worm_data_policies.return_value = ok
+    blade.patch_worm_data_policies.return_value = ok
+    blade.delete_worm_data_policies.return_value = ok
+    return blade
+
+
+class TestWormAutocommitHelpers:
+    @worm_env()
+    def test_config_is_none_when_nothing_is_set(self):
+        assert _worm_autocommit_config(None, None) is None
+
+    @worm_env()
+    def test_config_carries_only_the_set_fields(self):
+        assert _worm_autocommit_config(None, 7200000) == {"delay_period": 7200000}
+        assert _worm_autocommit_config("creation", None) == {"delay_on": "creation"}
+
+    @worm_env()
+    def test_params_convert_the_period_and_keep_zero(self):
+        assert _worm_autocommit_params(
+            _worm_module(commit_mode="autocommit", autocommit_delay_period="2h")
+        ) == ("autocommit", None, 7200000)
+        assert _worm_autocommit_params(_worm_module(autocommit_delay_period="0s")) == (
+            None,
+            None,
+            0,
+        )
+        assert _worm_autocommit_params(_worm_module()) == (None, None, None)
+
+    @worm_env()
+    def test_params_fail_on_a_malformed_period(self):
+        for period in ("1y", "2 hours", "abc"):
+            module = _worm_module(autocommit_delay_period=period)
+
+            with pytest.raises(SystemExit):
+                _worm_autocommit_params(module)
+            msg = module.fail_json.call_args[1]["msg"]
+            assert period in msg
+            assert "autocommit_delay_period" in msg
+
+    @worm_env()
+    def test_gate_fails_below_2_29_when_an_option_is_set(self):
+        module = _worm_module(autocommit_delay_period="2h")
+
+        with pytest.raises(SystemExit):
+            _check_worm_autocommit_version(module, "2.28")
+        assert "2.29" in module.fail_json.call_args[1]["msg"]
+
+    @worm_env()
+    def test_gate_passes_below_2_29_when_no_option_is_set(self):
+        module = _worm_module()
+
+        _check_worm_autocommit_version(module, "2.28")
+
+        module.fail_json.assert_not_called()
+
+    @worm_env()
+    def test_gate_passes_at_2_29(self):
+        module = _worm_module(commit_mode="hybrid")
+
+        _check_worm_autocommit_version(module, "2.29")
+
+        module.fail_json.assert_not_called()
+
+
+class TestCreateWormPolicy:
+    @worm_env()
+    def test_body_without_autocommit_options_is_unchanged(self):
+        module = _worm_module()
+        blade = _worm_blade()
+
+        create_worm_data_policy(module, blade)
+
+        call = blade.post_worm_data_policies.call_args[1]
+        assert call["names"] == ["worm_pol"]
+        assert "context_names" not in call
+        # the array requires retention_lock on creation; unlocked is the default
+        assert call["policy"] == dict(
+            LEGACY_BODY, mode="compliance", retention_lock="unlocked"
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    @worm_env()
+    def test_retention_lock_is_passed_through(self):
+        module = _worm_module(retention_lock="locked")
+        blade = _worm_blade()
+
+        create_worm_data_policy(module, blade)
+
+        policy = blade.post_worm_data_policies.call_args[1]["policy"]
+        assert policy["retention_lock"] == "locked"
+
+    @worm_env()
+    def test_autocommit_options_are_sent(self):
+        module = _worm_module(
+            commit_mode="autocommit",
+            autocommit_delay_on="creation",
+            autocommit_delay_period="2h",
+        )
+        blade = _worm_blade()
+
+        create_worm_data_policy(module, blade)
+
+        policy = blade.post_worm_data_policies.call_args[1]["policy"]
+        assert policy["commit_mode"] == "autocommit"
+        assert policy["autocommit_config"] == {
+            "delay_on": "creation",
+            "delay_period": 7200000,
+        }
+        module.exit_json.assert_called_once_with(changed=True)
+
+    @worm_env()
+    def test_only_delay_period_sends_a_partial_config(self):
+        module = _worm_module(autocommit_delay_period="2h")
+        blade = _worm_blade()
+
+        create_worm_data_policy(module, blade)
+
+        policy = blade.post_worm_data_policies.call_args[1]["policy"]
+        assert "commit_mode" not in policy
+        assert policy["autocommit_config"] == {"delay_period": 7200000}
+
+    @worm_env()
+    def test_check_mode_posts_nothing(self):
+        module = _worm_module(commit_mode="autocommit")
+        module.check_mode = True
+        blade = _worm_blade()
+
+        create_worm_data_policy(module, blade)
+
+        blade.post_worm_data_policies.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    @worm_env()
+    def test_context_is_sent_when_set(self):
+        module = _worm_module(context="fb-member")
+        blade = _worm_blade()
+
+        create_worm_data_policy(module, blade)
+
+        call = blade.post_worm_data_policies.call_args[1]
+        assert call["context_names"] == ["fb-member"]
+
+    @worm_env()
+    def test_api_error_fails_with_the_array_message(self):
+        module = _worm_module(commit_mode="autocommit")
+        blade = _worm_blade()
+        blade.post_worm_data_policies.return_value.status_code = 400
+
+        with pytest.raises(SystemExit):
+            create_worm_data_policy(module, blade)
+        assert "Failed to create" in module.fail_json.call_args[1]["msg"]
+        module.exit_json.assert_not_called()
+
+
+class TestUpdateWormPolicy:
+    @worm_env()
+    def test_same_values_make_no_patch(self):
+        module = _worm_module(
+            commit_mode="autocommit",
+            autocommit_delay_on="creation",
+            autocommit_delay_period="2h",
+        )
+        blade = _worm_blade(
+            _worm_policy(
+                commit_mode="autocommit", delay_on="creation", delay_period=7200000
+            )
+        )
+
+        update_worm_data_policy(module, blade)
+
+        blade.patch_worm_data_policies.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+    @worm_env()
+    def test_unset_options_never_patch(self):
+        """A task without the new options leaves an autocommit policy alone."""
+        module = _worm_module()
+        blade = _worm_blade(
+            _worm_policy(
+                commit_mode="autocommit", delay_on="creation", delay_period=7200000
+            )
+        )
+
+        update_worm_data_policy(module, blade)
+
+        blade.patch_worm_data_policies.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+    @worm_env()
+    def test_delay_period_change_sends_the_whole_config(self):
+        module = _worm_module(autocommit_delay_period="4h")
+        blade = _worm_blade(
+            _worm_policy(
+                commit_mode="autocommit", delay_on="creation", delay_period=7200000
+            )
+        )
+
+        update_worm_data_policy(module, blade)
+
+        call = blade.patch_worm_data_policies.call_args[1]
+        assert call["names"] == ["worm_pol"]
+        assert "context_names" not in call
+        assert call["policy"] == dict(
+            LEGACY_BODY,
+            retention_lock="unlocked",
+            autocommit_config={"delay_on": "creation", "delay_period": 14400000},
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    @worm_env()
+    def test_delay_on_change_keeps_the_current_period(self):
+        module = _worm_module(autocommit_delay_on="creation")
+        blade = _worm_blade(_worm_policy())
+
+        update_worm_data_policy(module, blade)
+
+        policy = blade.patch_worm_data_policies.call_args[1]["policy"]
+        assert policy["autocommit_config"] == {
+            "delay_on": "creation",
+            "delay_period": 86400000,
+        }
+        assert "commit_mode" not in policy
+
+    @worm_env()
+    def test_commit_mode_change_sends_only_commit_mode(self):
+        module = _worm_module(commit_mode="hybrid")
+        blade = _worm_blade(_worm_policy())
+
+        update_worm_data_policy(module, blade)
+
+        policy = blade.patch_worm_data_policies.call_args[1]["policy"]
+        assert policy["commit_mode"] == "hybrid"
+        assert "autocommit_config" not in policy
+        module.exit_json.assert_called_once_with(changed=True)
+
+    @worm_env()
+    def test_legacy_policy_gets_a_legacy_body(self):
+        """A policy from an array below REST 2.29 has no autocommit attributes;
+        a retention change must still work and send no new fields."""
+        module = _worm_module(default_retention="2h")
+        blade = _worm_blade(_worm_policy(legacy=True))
+
+        update_worm_data_policy(module, blade)
+
+        policy = blade.patch_worm_data_policies.call_args[1]["policy"]
+        assert policy == dict(
+            LEGACY_BODY, retention_lock="unlocked", default_retention=7200000
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    @worm_env()
+    def test_check_mode_reports_the_change_without_a_patch(self):
+        module = _worm_module(commit_mode="hybrid")
+        module.check_mode = True
+        blade = _worm_blade(_worm_policy())
+
+        update_worm_data_policy(module, blade)
+
+        blade.patch_worm_data_policies.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    @worm_env()
+    def test_context_is_sent_on_read_and_patch(self):
+        module = _worm_module(commit_mode="hybrid", context="fb-member")
+        blade = _worm_blade(_worm_policy())
+
+        update_worm_data_policy(module, blade)
+
+        assert blade.get_worm_data_policies.call_args[1]["context_names"] == [
+            "fb-member"
+        ]
+        assert blade.patch_worm_data_policies.call_args[1]["context_names"] == [
+            "fb-member"
+        ]
+
+    @worm_env()
+    def test_api_error_fails_with_the_array_message(self):
+        module = _worm_module(commit_mode="hybrid")
+        blade = _worm_blade(_worm_policy())
+        blade.patch_worm_data_policies.return_value.status_code = 400
+
+        with pytest.raises(SystemExit):
+            update_worm_data_policy(module, blade)
+        assert "Failed to update" in module.fail_json.call_args[1]["msg"]
+        module.exit_json.assert_not_called()
+
+
+class TestCopyWormPolicy:
+    @worm_env()
+    def test_copy_carries_commit_mode_and_autocommit(self):
+        module = _copy_module(policy_type="worm")
+        blade = _worm_blade()
+        source = _worm_policy(
+            commit_mode="autocommit", delay_on="creation", delay_period=7200000
+        )
+
+        copy_policy(module, blade, source)
+
+        call = blade.post_worm_data_policies.call_args[1]
+        assert call["names"] == ["pol_copy"]
+        assert call["policy"] == dict(
+            LEGACY_BODY,
+            mode="compliance",
+            retention_lock="unlocked",
+            commit_mode="autocommit",
+            autocommit_config={"delay_on": "creation", "delay_period": 7200000},
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    @worm_env()
+    def test_copy_of_a_legacy_source_sends_no_autocommit(self):
+        module = _copy_module(policy_type="worm")
+        blade = _worm_blade()
+
+        copy_policy(module, blade, _worm_policy(legacy=True))
+
+        policy = blade.post_worm_data_policies.call_args[1]["policy"]
+        assert policy == dict(LEGACY_BODY, mode="compliance", retention_lock="unlocked")
+
+
+class TestWormMainDispatch:
+    """main() gates the autocommit options at REST 2.29 and no longer looks
+    up WORM policy rules (an SDK method that does not exist)."""
+
+    def _run(self, version, module, blade):
+        import plugins.modules.purefb_policy as pol
+
+        with patch("plugins.modules.purefb_policy.AnsibleModule") as ansible_module:
+            ansible_module.return_value = module
+            with patch("plugins.modules.purefb_policy.get_system", return_value=blade):
+                with patch("plugins.modules.purefb_policy.HAS_PYTZ", True):
+                    with patch("plugins.modules.purefb_policy.HAS_PYPURECLIENT", True):
+                        with patch(
+                            "plugins.modules.purefb_policy.get_rest_api_version",
+                            return_value=version,
+                        ):
+                            with patch(
+                                "plugins.modules.purefb_policy.LooseVersion",
+                                new=_RealLooseVersion,
+                            ):
+                                pol.main()
+
+    @patch("plugins.modules.purefb_policy.create_worm_data_policy")
+    def test_autocommit_option_is_rejected_below_2_29(self, mock_create):
+        module = _worm_module(commit_mode="autocommit")
+        blade = _worm_blade()
+
+        with pytest.raises(SystemExit):
+            self._run("2.28", module, blade)
+        assert "2.29" in module.fail_json.call_args[1]["msg"]
+        mock_create.assert_not_called()
+
+    @patch("plugins.modules.purefb_policy.create_worm_data_policy")
+    def test_autocommit_option_is_accepted_at_2_29(self, mock_create):
+        module = _worm_module(commit_mode="autocommit")
+        blade = _worm_blade()
+
+        self._run("2.29", module, blade)
+
+        mock_create.assert_called_once_with(module, blade)
+        module.fail_json.assert_not_called()
+
+    @patch("plugins.modules.purefb_policy.create_worm_data_policy")
+    def test_legacy_task_still_creates_below_2_29(self, mock_create):
+        module = _worm_module()
+        blade = _worm_blade()
+
+        self._run("2.28", module, blade)
+
+        mock_create.assert_called_once_with(module, blade)
+        module.fail_json.assert_not_called()
+
+    @patch("plugins.modules.purefb_policy.update_worm_data_policy")
+    def test_existing_policy_with_before_rule_updates_without_rule_lookup(
+        self, mock_update
+    ):
+        module = _worm_module(before_rule=1)
+        blade = _worm_blade(_worm_policy())
+
+        self._run("2.30", module, blade)
+
+        mock_update.assert_called_once_with(module, blade)
+        assert not blade.get_worm_data_policies_rules.called
+        module.fail_json.assert_not_called()
+
+
+# A cut-down array catalogue (GET /object-store-access-policy-actions).
+_CATALOGUE = ["s3:*", "s3:GetObject", "s3:PutObjectTagging", "s3:GetBucketPolicy"]
+
+# Actions Purity//FB 4.8.8 publishes that the old static choices list lacked.
+_NEWER_ACTIONS = [
+    "s3:DeleteObjectTagging",
+    "s3:DeleteObjectVersionTagging",
+    "s3:GetBucketCORS",
+    "s3:GetBucketPolicy",
+    "s3:GetBucketPolicyStatus",
+    "s3:GetBucketPublicAccessBlock",
+    "s3:PutObjectTagging",
+    "s3:PutObjectVersionTagging",
+]
+
+
+def _actions_module(actions, context=""):
+    """Build a mock AnsibleModule for an access policy task with the given actions."""
+    module = Mock()
+    module.check_mode = False
+    module.params = defaultdict(
+        lambda: None,
+        {
+            "state": "present",
+            "policy_type": "access",
+            "name": "ospol",
+            "account": "acc",
+            "rule": "rule1",
+            "actions": actions,
+            "object_resources": ["*"],
+            "ignore_enforcement": True,
+            "context": context,
+        },
+    )
+    module.fail_json = Mock(side_effect=SystemExit("fail_json called"))
+    module.exit_json = Mock(side_effect=SystemExit("exit_json called"))
+    return module
+
+
+def _actions_blade(names=None, status=200):
+    """Build a mock blade whose action catalogue holds the given names."""
+    blade = Mock()
+    res = Mock()
+    res.status_code = status
+    items = []
+    for name in names or []:
+        action = Mock()
+        action.name = name
+        items.append(action)
+    res.items = items
+    blade.get_object_store_access_policy_actions.return_value = res
+    return blade
+
+
+@patch("plugins.modules.purefb_policy.LooseVersion", RealLooseVersion)
+class TestOsPolicyActions:
+    """Rule actions are validated against the array's catalogue, not a frozen list."""
+
+    def test_actions_in_the_array_catalogue_are_accepted(self):
+        module = _actions_module(["s3:PutObjectTagging", "s3:GetBucketPolicy"])
+        blade = _actions_blade(_CATALOGUE)
+
+        _check_os_actions(module, blade, "2.30")
+
+        module.fail_json.assert_not_called()
+        module.warn.assert_not_called()
+        blade.get_object_store_access_policy_actions.assert_called_once_with()
+
+    def test_unknown_actions_are_named(self):
+        module = _actions_module(["s3:PutObjectTagging", "s3:Bogus", "s3:Nope"])
+        blade = _actions_blade(_CATALOGUE)
+
+        with pytest.raises(SystemExit):
+            _check_os_actions(module, blade, "2.30")
+
+        msg = module.fail_json.call_args[1]["msg"]
+        assert msg.startswith(
+            "Unknown object store access policy action(s): s3:Bogus, s3:Nope. "
+        )
+        assert "Valid actions: s3:*, s3:GetBucketPolicy, s3:GetObject" in msg
+
+    def test_catalogue_error_falls_back_to_the_built_in_list(self):
+        """The built-in list knows the object tagging and bucket policy actions."""
+        module = _actions_module(["s3:PutObjectTagging", "s3:GetBucketCORS"])
+        blade = _actions_blade(status=400)
+
+        _check_os_actions(module, blade, "2.30")
+
+        module.fail_json.assert_not_called()
+        module.warn.assert_called_once()
+        warning = module.warn.call_args[0][0]
+        assert warning.startswith(
+            "Could not read the array's access policy action list, "
+            "validating against the collection's built-in list. Error: "
+        )
+
+    def test_built_in_list_still_rejects_unknown_actions(self):
+        module = _actions_module(["s3:GetObject", "s3:Bogus"])
+        blade = _actions_blade(status=400)
+
+        with pytest.raises(SystemExit):
+            _check_os_actions(module, blade, "2.30")
+
+        assert "s3:Bogus" in module.fail_json.call_args[1]["msg"]
+
+    def test_empty_catalogue_falls_back_to_the_built_in_list(self):
+        module = _actions_module(["s3:GetObject"])
+        blade = _actions_blade([])
+
+        valid = _valid_os_actions(module, blade, "2.30")
+
+        assert valid == list(_OS_ACCESS_ACTIONS_FALLBACK)
+        module.warn.assert_called_once()
+        assert module.warn.call_args[0][0].endswith(
+            "built-in list. The array returned an empty list."
+        )
+
+    def test_below_rest_2_2_never_asks_the_array(self):
+        module = _actions_module(["s3:GetObject"])
+        blade = _actions_blade(_CATALOGUE)
+
+        _check_os_actions(module, blade, "2.1")
+
+        blade.get_object_store_access_policy_actions.assert_not_called()
+        module.fail_json.assert_not_called()
+        module.warn.assert_not_called()
+
+    def test_no_actions_means_no_lookup(self):
+        module = _actions_module(None)
+        blade = _actions_blade(_CATALOGUE)
+
+        _check_os_actions(module, blade, "2.30")
+
+        blade.get_object_store_access_policy_actions.assert_not_called()
+        module.fail_json.assert_not_called()
+
+    def test_fleet_context_is_sent_with_the_lookup(self):
+        module = _actions_module(["s3:GetObject"], context="array-b")
+        blade = _actions_blade(_CATALOGUE)
+
+        _check_os_actions(module, blade, "2.30")
+
+        blade.get_object_store_access_policy_actions.assert_called_once_with(
+            context_names=["array-b"]
+        )
+
+    def test_context_is_not_sent_below_rest_2_17(self):
+        module = _actions_module(["s3:GetObject"], context="array-b")
+        blade = _actions_blade(_CATALOGUE)
+
+        _check_os_actions(module, blade, "2.16")
+
+        blade.get_object_store_access_policy_actions.assert_called_once_with()
+
+    @pytest.mark.parametrize("action", _NEWER_ACTIONS)
+    def test_built_in_list_knows_the_newer_actions(self, action):
+        assert action in _OS_ACCESS_ACTIONS_FALLBACK
+
+
+@patch("plugins.modules.purefb_policy.LooseVersion", RealLooseVersion)
+@patch("plugins.modules.purefb_policy.HAS_PYTZ", True)
+@patch("plugins.modules.purefb_policy.HAS_PYPURECLIENT", True)
+@patch("plugins.modules.purefb_policy.get_rest_api_version", return_value="2.30")
+@patch("plugins.modules.purefb_policy.purefb_argument_spec", return_value={})
+@patch("plugins.modules.purefb_policy.get_system")
+@patch("plugins.modules.purefb_policy.AnsibleModule")
+class TestOsPolicyMainActions:
+    """main() asks the array about the actions before any rule write."""
+
+    @staticmethod
+    def _blade(policy_exists):
+        blade = _actions_blade(_CATALOGUE)
+        blade.get_fleets.return_value.status_code = 400
+        if policy_exists:
+            blade.get_object_store_access_policies.return_value.items = [Mock()]
+        else:
+            # A missing policy is an ErrorResponse: no ``items`` at all.
+            missing = Mock(spec=["status_code"])
+            missing.status_code = 400
+            blade.get_object_store_access_policies.return_value = missing
+        return blade
+
+    def test_argspec_has_no_static_action_choices(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version
+    ):
+        module = _actions_module(["s3:PutObjectTagging"])
+        mock_ansible_module.return_value = module
+        blade = self._blade(policy_exists=True)
+        blade.get_object_store_access_policies_rules.return_value.status_code = 400
+        blade.post_object_store_access_policies_rules.return_value.status_code = 200
+        mock_get_system.return_value = blade
+
+        with pytest.raises(SystemExit, match="exit_json"):
+            main()
+
+        spec = mock_ansible_module.call_args[0][0]
+        assert spec["actions"] == {"type": "list", "elements": "str"}
+        blade.get_object_store_access_policy_actions.assert_called_once()
+        blade.post_object_store_access_policies_rules.assert_called_once()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_unknown_action_fails_before_any_write_on_update(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version
+    ):
+        module = _actions_module(["s3:Bogus"])
+        mock_ansible_module.return_value = module
+        blade = self._blade(policy_exists=True)
+        mock_get_system.return_value = blade
+
+        with pytest.raises(SystemExit, match="fail_json"):
+            main()
+
+        assert "s3:Bogus" in module.fail_json.call_args[1]["msg"]
+        blade.post_object_store_access_policies_rules.assert_not_called()
+        blade.patch_object_store_access_policies_rules.assert_not_called()
+
+    def test_unknown_action_fails_before_the_policy_is_created(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version
+    ):
+        module = _actions_module(["s3:Bogus"])
+        mock_ansible_module.return_value = module
+        blade = self._blade(policy_exists=False)
+        mock_get_system.return_value = blade
+
+        with pytest.raises(SystemExit, match="fail_json"):
+            main()
+
+        blade.post_object_store_access_policies.assert_not_called()
+        blade.post_object_store_access_policies_rules.assert_not_called()
+
+    def test_delete_does_not_consult_the_catalogue(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version
+    ):
+        module = _actions_module(["s3:Bogus"])
+        module.params["state"] = "absent"
+        module.params["rule"] = None
+        module.params["force_delete"] = False
+        mock_ansible_module.return_value = module
+        blade = self._blade(policy_exists=True)
+        blade.get_object_store_access_policies_object_store_users.return_value.items = (
+            []
+        )
+        blade.delete_object_store_access_policies.return_value.status_code = 200
+        mock_get_system.return_value = blade
+
+        with pytest.raises(SystemExit, match="exit_json"):
+            main()
+
+        blade.get_object_store_access_policy_actions.assert_not_called()
+        blade.delete_object_store_access_policies.assert_called_once()

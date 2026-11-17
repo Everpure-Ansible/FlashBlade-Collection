@@ -1,0 +1,7 @@
+bugfixes:
+  - purefb_bucket_replica - no longer refuses every change to an unhealthy replica link. A pause and a
+    rerun of the link's current settings are passed through, and only a resume, a different credential
+    or a cascading change wait for a healthy link; the refusal names the blocked change.
+  - purefb_bucket_replica - when the array refuses to update an unhealthy link (it answers only
+    ``Unexpected error.`` for a link whose set-up has not completed) the failure now carries the link's
+    status details.

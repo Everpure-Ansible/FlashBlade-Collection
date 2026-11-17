@@ -1543,7 +1543,14 @@ def generate_object_store_accounts_dict(blade):
     return account_info
 
 
-def generate_fs_dict(blade, exports=None):
+def generate_fs_dict(blade, exports=None, worm_policies=None):
+    """Return the per-filesystem dict.
+
+    ``exports`` is the array-wide File System Exports list (REST 2.16+) and
+    ``worm_policies`` maps filesystem name to its WORM data policy (REST
+    2.15+, from generate_fs_worm_policies_dict). main() passes None for
+    either when the array is too old and the matching keys are left out.
+    """
     fs_info = {}
     by_fs = {}
     for e in exports or []:
@@ -1603,6 +1610,15 @@ def generate_fs_dict(blade, exports=None):
         }
         if exports is not None:
             fs_info[share]["file_system_exports"] = by_fs.get(share, [])
+        if worm_policies is not None:
+            # eradication_config is on the filesystem from REST 2.15; the WORM
+            # data policy only shows through GET file-systems/worm-data-policies
+            fs_info[share]["eradication_mode"] = getattr(
+                getattr(fsystem, "eradication_config", None),
+                "eradication_mode",
+                None,
+            )
+            fs_info[share]["worm_policy"] = worm_policies.get(share)
 
         # Group quotas
         for group_quota in blade.get_quotas_groups(file_system_names=[share]).items:
@@ -1625,6 +1641,22 @@ def generate_fs_dict(blade, exports=None):
             }
 
     return fs_info
+
+
+def generate_fs_worm_policies_dict(blade):
+    """Map each filesystem name to the WORM data policy attached to it.
+
+    Requires REST API 2.15+ (WORM_API_VERSION); callers gate on the version
+    before invoking. Filesystems without a WORM data policy are absent.
+    """
+    worm_policies = {}
+    for member in blade.get_file_systems_worm_data_policies().items:
+        fs_name = getattr(getattr(member, "member", None), "name", None)
+        if fs_name and fs_name not in worm_policies:
+            worm_policies[fs_name] = getattr(
+                getattr(member, "policy", None), "name", None
+            )
+    return worm_policies
 
 
 def generate_drives_dict(blade):
@@ -1788,7 +1820,10 @@ def main():
         if LooseVersion(SERVERS_API_VERSION) <= LooseVersion(api_version):
             exports_list = generate_file_system_exports_dict(blade)
             info["file_system_exports"] = exports_list
-        info["filesystems"] = generate_fs_dict(blade, exports_list)
+        worm_policies = None
+        if LooseVersion(WORM_API_VERSION) <= LooseVersion(api_version):
+            worm_policies = generate_fs_worm_policies_dict(blade)
+        info["filesystems"] = generate_fs_dict(blade, exports_list, worm_policies)
     if "admins" in subset or "all" in subset:
         info["admins"] = generate_admin_dict(blade)
     if "snapshots" in subset or "all" in subset:

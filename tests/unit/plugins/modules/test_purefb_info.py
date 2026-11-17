@@ -79,6 +79,7 @@ from plugins.modules.purefb_info import (
     generate_password_policies_dict,
     generate_file_system_exports_dict,
     generate_fs_dict,
+    generate_fs_worm_policies_dict,
     generate_array_conn_dict,
     generate_bucket_access_policies_dict,
     generate_lag_dict,
@@ -96,6 +97,7 @@ from plugins.modules.purefb_info import (
     generate_resource_accesses_dict,
     generate_file_repl_dict,
 )
+from plugins.module_utils.version import LooseVersion as RealLooseVersion
 
 
 class TestPurefbInfo:
@@ -1645,3 +1647,178 @@ class TestPurefbInfo:
         call_args = mock_module.exit_json.call_args[1]
         assert call_args["purefb_info"]["fleet"] == {"fleet1": {"members": {}}}
         assert "policies" not in call_args["purefb_info"]
+
+    # ==== filesystems: eradication_mode and worm_policy (REST 2.15) ====
+
+    def _fs_for_worm(self, name, eradication_mode=None):
+        """FileSystem mock with the fields generate_fs_dict reads directly.
+        eradication_config is None (array omitted it) unless a mode is given."""
+        fsys = Mock()
+        fsys.name = name
+        fsys.fast_remove_directory_enabled = False
+        fsys.snapshot_directory_enabled = False
+        fsys.provisioned = 1073741824
+        fsys.destroyed = False
+        fsys.nfs = None
+        fsys.smb = None
+        fsys.multi_protocol = None
+        fsys.hard_limit_enabled = False
+        fsys.promotion_status = "promoted"
+        fsys.requested_promotion_state = "promoted"
+        fsys.writable = True
+        fsys.source = None
+        fsys.location = None
+        fsys.default_group_quota = 0
+        fsys.default_user_quota = 0
+        fsys.http = Mock(enabled=False)
+        if eradication_mode is None:
+            fsys.eradication_config = None
+        else:
+            fsys.eradication_config = Mock(eradication_mode=eradication_mode)
+        return fsys
+
+    def test_generate_fs_worm_policies_dict_maps_filesystem_to_policy(self):
+        """GET file-systems/worm-data-policies lists one member per attached
+        WORM data policy; the helper keys them by filesystem name."""
+        mock_blade = Mock()
+        member = Mock()
+        member.member = Mock()
+        member.member.name = "fs1"
+        member.policy = Mock()
+        member.policy.name = "worm1"
+        mock_blade.get_file_systems_worm_data_policies.return_value.items = [member]
+
+        result = generate_fs_worm_policies_dict(mock_blade)
+
+        assert result == {"fs1": "worm1"}
+        mock_blade.get_file_systems_worm_data_policies.assert_called_once_with()
+
+    def test_generate_fs_worm_policies_dict_without_members_is_empty(self):
+        """No WORM filesystem on the array gives an empty map, not None, so
+        generate_fs_dict still adds the keys with worm_policy None."""
+        mock_blade = Mock()
+        mock_blade.get_file_systems_worm_data_policies.return_value.items = []
+
+        assert generate_fs_worm_policies_dict(mock_blade) == {}
+
+    def test_generate_fs_dict_reports_eradication_mode_and_worm_policy(self):
+        """With a membership map every filesystem reports its eradication
+        mode and the attached WORM data policy, None when it has none."""
+        mock_blade = Mock()
+        mock_blade.get_file_systems.return_value.items = [
+            self._fs_for_worm("fs1", "retention-based"),
+            self._fs_for_worm("fs2", "permission-based"),
+        ]
+        mock_blade.get_quotas_groups.return_value.items = []
+        mock_blade.get_quotas_users.return_value.items = []
+
+        result = generate_fs_dict(mock_blade, worm_policies={"fs1": "worm1"})
+
+        assert result["fs1"]["eradication_mode"] == "retention-based"
+        assert result["fs1"]["worm_policy"] == "worm1"
+        assert result["fs2"]["eradication_mode"] == "permission-based"
+        assert result["fs2"]["worm_policy"] is None
+        # no exports list was given, so the REST 2.16 key stays absent
+        assert "file_system_exports" not in result["fs1"]
+
+    def test_generate_fs_dict_missing_eradication_config_reports_none(self):
+        """A filesystem whose eradication_config the array omits reports
+        eradication_mode None instead of raising."""
+        mock_blade = Mock()
+        mock_blade.get_file_systems.return_value.items = [self._fs_for_worm("fs1")]
+        mock_blade.get_quotas_groups.return_value.items = []
+        mock_blade.get_quotas_users.return_value.items = []
+
+        result = generate_fs_dict(mock_blade, worm_policies={})
+
+        assert result["fs1"]["eradication_mode"] is None
+        assert result["fs1"]["worm_policy"] is None
+
+    def test_generate_fs_dict_without_worm_support_omits_the_keys(self):
+        """Before REST 2.15 main() passes no membership map and both keys are
+        left out, like file_system_exports before REST 2.16."""
+        mock_blade = Mock()
+        mock_blade.get_file_systems.return_value.items = [
+            self._fs_for_worm("fs1", "retention-based")
+        ]
+        mock_blade.get_quotas_groups.return_value.items = []
+        mock_blade.get_quotas_users.return_value.items = []
+
+        result = generate_fs_dict(mock_blade)
+
+        assert "eradication_mode" not in result["fs1"]
+        assert "worm_policy" not in result["fs1"]
+        assert "file_system_exports" not in result["fs1"]
+
+    @patch("plugins.modules.purefb_info.generate_fs_worm_policies_dict")
+    @patch("plugins.modules.purefb_info.generate_file_system_exports_dict")
+    @patch("plugins.modules.purefb_info.generate_fs_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_info.get_rest_api_version",
+        Mock(return_value="2.30"),
+    )
+    def test_main_filesystems_subset_passes_worm_policies_from_rest_2_15(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_fs,
+        mock_generate_exports,
+        mock_generate_worm,
+    ):
+        """On REST 2.15+ main() reads the WORM memberships once and hands
+        them to generate_fs_dict together with the exports list."""
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["filesystems"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        mock_generate_exports.return_value = []
+        mock_generate_worm.return_value = {"fs1": "worm1"}
+        mock_generate_fs.return_value = {"fs1": {"worm_policy": "worm1"}}
+
+        main()
+
+        mock_generate_worm.assert_called_once_with(mock_blade)
+        mock_generate_fs.assert_called_once_with(mock_blade, [], {"fs1": "worm1"})
+        call_args = mock_module.exit_json.call_args[1]
+        assert call_args["purefb_info"]["filesystems"]["fs1"]["worm_policy"] == "worm1"
+
+    @patch("plugins.modules.purefb_info.generate_fs_worm_policies_dict")
+    @patch("plugins.modules.purefb_info.generate_file_system_exports_dict")
+    @patch("plugins.modules.purefb_info.generate_fs_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_info.get_rest_api_version",
+        Mock(return_value="2.14"),
+    )
+    def test_main_filesystems_subset_skips_worm_policies_before_rest_2_15(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_fs,
+        mock_generate_exports,
+        mock_generate_worm,
+    ):
+        """Before REST 2.15 the worm-data-policies endpoint is never called
+        and generate_fs_dict gets None for both optional inputs."""
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["filesystems"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        mock_generate_fs.return_value = {}
+
+        main()
+
+        mock_generate_worm.assert_not_called()
+        mock_generate_exports.assert_not_called()
+        mock_generate_fs.assert_called_once_with(mock_blade, None, None)
+        call_args = mock_module.exit_json.call_args[1]
+        assert "file_system_exports" not in call_args["purefb_info"]

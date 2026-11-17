@@ -10,7 +10,8 @@ __metaclass__ = type
 import sys
 import multiprocessing
 import ctypes
-from unittest.mock import Mock, patch, MagicMock
+from types import SimpleNamespace
+from unittest.mock import ANY, Mock, patch, MagicMock
 
 # Mock multiprocessing context for Windows
 if sys.platform == "win32":
@@ -95,6 +96,19 @@ from plugins.modules.purefb_info import (
     generate_realms_dict,
     generate_resource_accesses_dict,
     generate_file_repl_dict,
+    generate_admin_cache_dict,
+    generate_management_access_policies_dict,
+    generate_management_access_roles_dict,
+    generate_management_authentication_policies_dict,
+    generate_rapid_data_locking_dict,
+    generate_certificate_uses_dict,
+    generate_remote_arrays_dict,
+    generate_tgroups_dict,
+    generate_presets_dict,
+    generate_workloads_dict,
+    generate_storage_class_members_dict,
+    generate_realm_connections_dict,
+    generate_remote_realms_dict,
 )
 
 
@@ -227,6 +241,7 @@ class TestPurefbInfo:
         assert "performance" in call_args["purefb_info"]
         assert call_args["purefb_info"]["performance"] == mock_perf_info
 
+    @patch("plugins.modules.purefb_info.LooseVersion")
     @patch("plugins.modules.purefb_info.generate_config_dict")
     @patch("plugins.modules.purefb_info.generate_capacity_dict")
     @patch("plugins.modules.purefb_info.generate_network_dict")
@@ -241,6 +256,7 @@ class TestPurefbInfo:
         mock_generate_network,
         mock_generate_capacity,
         mock_generate_config,
+        mock_loose_version,
     ):
         """Test main with multiple subsets"""
         # Setup mocks
@@ -254,6 +270,8 @@ class TestPurefbInfo:
         mock_version.version = "2.0.0"
         mock_blade.get_versions.return_value.items = [mock_version]
         mock_get_system.return_value = mock_blade
+        # the config subset carries a version-gated key; gates OFF here
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
 
         mock_config_info = {"dns": {}}
         mock_capacity_info = {"total": 1000}
@@ -1645,3 +1663,1060 @@ class TestPurefbInfo:
         call_args = mock_module.exit_json.call_args[1]
         assert call_args["purefb_info"]["fleet"] == {"fleet1": {"members": {}}}
         assert "policies" not in call_args["purefb_info"]
+
+    # ------------------------------------------------------------------
+    # security and identity read-back
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ref(name, resource_type=None):
+        ref = Mock(spec=["name", "resource_type"])
+        ref.name = name
+        ref.resource_type = resource_type
+        return ref
+
+    @staticmethod
+    def _response(items, status_code=200):
+        res = Mock(spec=["status_code", "items"])
+        res.status_code = status_code
+        res.items = items
+        return res
+
+    def test_generate_admin_cache_dict_reads_policies_and_null_role(self):
+        """Cached admins report their policies; role is null for a custom
+        policy; the cache is read without a refresh."""
+        entry = Mock(
+            spec=[
+                "name",
+                "authorization_model",
+                "management_access_policies",
+                "role",
+                "time",
+            ]
+        )
+        entry.name = "svc-ansible"
+        entry.authorization_model = "dynamic"
+        entry.management_access_policies = [
+            self._ref("ops_admin", "management-access-policies")
+        ]
+        entry.role = None
+        entry.time = 1700000000000
+        mock_blade = Mock()
+        mock_blade.get_admins_cache.return_value = self._response([entry])
+
+        result = generate_admin_cache_dict(mock_blade)
+
+        mock_blade.get_admins_cache.assert_called_once_with()
+        assert result["svc-ansible"]["authorization_model"] == "dynamic"
+        assert result["svc-ansible"]["management_access_policies"] == ["ops_admin"]
+        assert result["svc-ansible"]["role"] is None
+        assert result["svc-ansible"]["time"] is not None
+
+    def test_generate_admin_cache_dict_returns_empty_on_error(self):
+        mock_blade = Mock()
+        mock_blade.get_admins_cache.return_value = self._response([], 400)
+
+        assert generate_admin_cache_dict(mock_blade) == {}
+
+    def test_generate_management_access_policies_dict_reports_rules_and_members(
+        self,
+    ):
+        """Policies carry their rules in order and the members that use them;
+        a member of an unknown policy is ignored."""
+        rule = Mock(spec=["name", "index", "role", "scope"])
+        rule.name = "readonly.1"
+        rule.index = 1
+        rule.role = self._ref("viewer", "management-access-policies/roles")
+        rule.scope = self._ref("array1", "arrays")
+        policy = Mock(
+            spec=[
+                "name",
+                "enabled",
+                "is_local",
+                "location",
+                "aggregation_strategy",
+                "realms",
+                "rules",
+            ]
+        )
+        policy.name = "readonly"
+        policy.enabled = True
+        policy.is_local = True
+        policy.location = self._ref("array1", "arrays")
+        policy.aggregation_strategy = "least-common-permission"
+        policy.realms = []
+        policy.rules = [rule]
+        member = Mock(spec=["member", "policy"])
+        member.member = self._ref("pureuser", "admins")
+        member.policy = self._ref("readonly", "management-access-policies")
+        stray = Mock(spec=["member", "policy"])
+        stray.member = self._ref("test", "directory-services/roles")
+        stray.policy = self._ref("gone", "management-access-policies")
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies.return_value = self._response(
+            [policy]
+        )
+        mock_blade.get_management_access_policies_members.return_value = self._response(
+            [member, stray]
+        )
+
+        result = generate_management_access_policies_dict(mock_blade)
+
+        assert result["readonly"]["enabled"] is True
+        assert result["readonly"]["location"] == "array1"
+        assert result["readonly"]["aggregation_strategy"] == "least-common-permission"
+        assert result["readonly"]["realms"] == []
+        assert result["readonly"]["rules"] == [
+            {
+                "name": "readonly.1",
+                "index": 1,
+                "role": "viewer",
+                "scope": "array1",
+                "scope_type": "arrays",
+            }
+        ]
+        assert result["readonly"]["members"] == [
+            {"name": "pureuser", "resource_type": "admins"}
+        ]
+
+    def test_generate_management_access_policies_dict_tolerates_member_error(self):
+        policy = Mock(
+            spec=[
+                "name",
+                "enabled",
+                "is_local",
+                "location",
+                "aggregation_strategy",
+                "realms",
+                "rules",
+            ]
+        )
+        policy.name = "readonly"
+        policy.enabled = True
+        policy.is_local = True
+        policy.location = None
+        policy.aggregation_strategy = None
+        policy.realms = None
+        policy.rules = None
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies.return_value = self._response(
+            [policy]
+        )
+        mock_blade.get_management_access_policies_members.return_value = self._response(
+            [], 400
+        )
+
+        result = generate_management_access_policies_dict(mock_blade)
+
+        assert result["readonly"]["rules"] == []
+        assert result["readonly"]["members"] == []
+        assert result["readonly"]["location"] is None
+
+    def test_generate_management_access_roles_dict(self):
+        role = Mock(spec=["name", "description", "pure_defined"])
+        role.name = "admin"
+        role.description = "Grants full administrative rights within a scope."
+        role.pure_defined = True
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_roles.return_value = self._response(
+            [role]
+        )
+
+        result = generate_management_access_roles_dict(mock_blade)
+
+        assert result == {
+            "admin": {
+                "description": "Grants full administrative rights within a scope.",
+                "pure_defined": True,
+            }
+        }
+
+    def test_generate_management_authentication_policies_dict(self):
+        """The SSH methods and the arrays the policy applies to are reported;
+        a policy without an SSH section gives empty method lists."""
+        ssh = Mock(spec=["allowed_methods", "required_methods"])
+        ssh.allowed_methods = ["default"]
+        ssh.required_methods = None
+        policy = Mock(spec=["name", "enabled", "is_local", "location", "realms", "ssh"])
+        policy.name = "default-authentication-policy"
+        policy.enabled = True
+        policy.is_local = True
+        policy.location = self._ref("array1", "arrays")
+        policy.realms = [self._ref("realm1", "realms")]
+        policy.ssh = ssh
+        bare = Mock(spec=["name", "enabled", "is_local", "location", "realms", "ssh"])
+        bare.name = "bare"
+        bare.enabled = False
+        bare.is_local = True
+        bare.location = None
+        bare.realms = None
+        bare.ssh = None
+        member = Mock(spec=["member", "policy"])
+        member.member = self._ref("array1", "arrays")
+        member.policy = self._ref(
+            "default-authentication-policy", "management-authentication-policies"
+        )
+        mock_blade = Mock()
+        mock_blade.get_management_authentication_policies.return_value = self._response(
+            [policy, bare]
+        )
+        mock_blade.get_management_authentication_policies_members.return_value = (
+            self._response([member])
+        )
+
+        result = generate_management_authentication_policies_dict(mock_blade)
+
+        assert result["default-authentication-policy"]["ssh"] == {
+            "allowed_methods": ["default"],
+            "required_methods": [],
+        }
+        assert result["default-authentication-policy"]["realms"] == ["realm1"]
+        assert result["default-authentication-policy"]["members"] == [
+            {"name": "array1", "resource_type": "arrays"}
+        ]
+        assert result["bare"]["ssh"] == {"allowed_methods": [], "required_methods": []}
+        assert result["bare"]["members"] == []
+
+    def test_generate_rapid_data_locking_dict(self):
+        rdl = Mock(spec=["enabled", "kmip_server"])
+        rdl.enabled = False
+        rdl.kmip_server = self._ref(None)
+        mock_blade = Mock()
+        mock_blade.get_rapid_data_locking.return_value = self._response([rdl])
+
+        assert generate_rapid_data_locking_dict(mock_blade) == {
+            "enabled": False,
+            "kmip_server": None,
+        }
+
+    def test_generate_rapid_data_locking_dict_empty_on_error_or_no_items(self):
+        mock_blade = Mock()
+        mock_blade.get_rapid_data_locking.return_value = self._response([], 400)
+        assert generate_rapid_data_locking_dict(mock_blade) == {}
+        mock_blade.get_rapid_data_locking.return_value = self._response([])
+        assert generate_rapid_data_locking_dict(mock_blade) == {}
+
+    def test_generate_certificate_uses_dict_groups_uses_per_certificate(self):
+        use1 = Mock(spec=["name", "resource_type", "remote"])
+        use1.name = "default-tls-policy"
+        use1.resource_type = "tls-policies"
+        use1.remote = self._ref(None)
+        use2 = Mock(spec=["name", "resource_type", "remote"])
+        use2.name = "management"
+        use2.resource_type = "syslog-servers/settings"
+        use2.remote = None
+        item1 = Mock(spec=["name", "group", "use"])
+        item1.name = "global"
+        item1.group = self._ref(None)
+        item1.use = use1
+        item2 = Mock(spec=["name", "group", "use"])
+        item2.name = "global"
+        item2.group = self._ref("ca-group", "certificate-groups")
+        item2.use = use2
+        mock_blade = Mock()
+        mock_blade.get_certificates_uses.return_value = self._response([item1, item2])
+
+        result = generate_certificate_uses_dict(mock_blade)
+
+        assert result == {
+            "global": [
+                {
+                    "name": "default-tls-policy",
+                    "resource_type": "tls-policies",
+                    "remote": None,
+                    "group": None,
+                },
+                {
+                    "name": "management",
+                    "resource_type": "syslog-servers/settings",
+                    "remote": None,
+                    "group": "ca-group",
+                },
+            ]
+        }
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_rapid_data_locking_dict")
+    @patch("plugins.modules.purefb_info.generate_certificate_uses_dict")
+    @patch("plugins.modules.purefb_info.generate_admin_cache_dict")
+    @patch("plugins.modules.purefb_info.generate_config_dict")
+    @patch("plugins.modules.purefb_info.generate_admin_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_admins_and_config_add_cache_uses_and_rdl(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_admin,
+        mock_generate_config,
+        mock_admin_cache,
+        mock_certificate_uses,
+        mock_rdl,
+        mock_loose_version,
+    ):
+        """admins gains admin_cache; config gains certificate_uses and, with
+        the KMIP gate open, rapid_data_locking next to its existing keys."""
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["admins", "config"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+        mock_generate_admin.return_value = {"pureuser": {}}
+        mock_generate_config.return_value = {"dns": {}}
+        mock_admin_cache.return_value = {"svc-ansible": {}}
+        mock_certificate_uses.return_value = {"global": []}
+        mock_rdl.return_value = {"enabled": False, "kmip_server": None}
+
+        main()
+
+        info = mock_module.exit_json.call_args[1]["purefb_info"]
+        assert info["admins"] == {"pureuser": {}}
+        assert info["admin_cache"] == {"svc-ansible": {}}
+        assert info["config"] == {
+            "dns": {},
+            "certificate_uses": {"global": []},
+            "rapid_data_locking": {"enabled": False, "kmip_server": None},
+        }
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_policies_subset_adds_management_policies(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["policies"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+        generators = {
+            name: Mock(return_value={})
+            for name in (
+                "generate_all_policies_dict",
+                "generate_policies_dict",
+                "generate_object_store_access_policies_dict",
+                "generate_bucket_access_policies_dict",
+                "generate_bucket_cross_object_policies_dict",
+                "generate_nfs_export_policies_dict",
+                "generate_smb_client_policies_dict",
+                "generate_smb_share_policies_dict",
+                "generate_network_access_policies_dict",
+                "generate_worm_data_policies_dict",
+                "generate_password_policies_dict",
+                "generate_fleet_dict",
+                "generate_tls_policies_dict",
+                "generate_s3_export_policies_dict",
+            )
+        }
+        generators["generate_management_access_policies_dict"] = Mock(
+            return_value={"readonly": {}}
+        )
+        generators["generate_management_authentication_policies_dict"] = Mock(
+            return_value={"default-authentication-policy": {}}
+        )
+        generators["generate_management_access_roles_dict"] = Mock(
+            return_value={"admin": {}}
+        )
+
+        with patch.multiple("plugins.modules.purefb_info", **generators):
+            main()
+
+        info = mock_module.exit_json.call_args[1]["purefb_info"]
+        assert info["management_access_policies"] == {"readonly": {}}
+        assert info["management_authentication_policies"] == {
+            "default-authentication-policy": {}
+        }
+        assert info["management_access_roles"] == {"admin": {}}
+        for name in (
+            "generate_management_access_policies_dict",
+            "generate_management_authentication_policies_dict",
+            "generate_management_access_roles_dict",
+        ):
+            generators[name].assert_called_once_with(mock_blade)
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_new_keys_absent_below_their_versions(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        """With every version gate closed none of the gated keys appear and
+        none of the gated getters is called; the ungated ones still are."""
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["policies", "fleet", "realms"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+        generators = {
+            name: Mock(return_value={})
+            for name in (
+                "generate_all_policies_dict",
+                "generate_policies_dict",
+                "generate_object_store_access_policies_dict",
+                "generate_nfs_export_policies_dict",
+                "generate_management_access_policies_dict",
+                "generate_management_authentication_policies_dict",
+                "generate_management_access_roles_dict",
+                "generate_remote_arrays_dict",
+                "generate_presets_dict",
+                "generate_workloads_dict",
+                "generate_tgroups_dict",
+                "generate_storage_class_members_dict",
+                "generate_realm_connections_dict",
+                "generate_remote_realms_dict",
+            )
+        }
+
+        with patch.multiple("plugins.modules.purefb_info", **generators):
+            main()
+
+        info = mock_module.exit_json.call_args[1]["purefb_info"]
+        for key in (
+            "management_access_policies",
+            "management_authentication_policies",
+            "management_access_roles",
+            "fleet",
+            "presets",
+            "workloads",
+            "tgroups",
+            "storage_class_members",
+            "realm_connections",
+            "remote_realms",
+        ):
+            assert key not in info
+        for name in (
+            "generate_management_access_policies_dict",
+            "generate_remote_arrays_dict",
+            "generate_presets_dict",
+            "generate_workloads_dict",
+            "generate_tgroups_dict",
+            "generate_storage_class_members_dict",
+            "generate_realm_connections_dict",
+            "generate_remote_realms_dict",
+        ):
+            generators[name].assert_not_called()
+        generators["generate_all_policies_dict"].assert_called_once_with(mock_blade)
+
+    # ------------------------------------------------------------------
+    # fleet read-back
+    # ------------------------------------------------------------------
+
+    def test_generate_remote_arrays_dict_requires_current_fleet_only(self):
+        array = Mock(
+            spec=[
+                "name",
+                "os",
+                "version",
+                "model",
+                "api_versions",
+                "is_local",
+                "topology_group",
+            ]
+        )
+        array.name = "array1"
+        array.os = "Purity//FB"
+        array.version = "4.8.8"
+        array.model = "FlashBlade//S200"
+        array.api_versions = ["2.29", "2.30"]
+        array.is_local = True
+        array.topology_group = self._ref("tg1", "topology-groups")
+        mock_blade = Mock()
+        mock_blade.get_remote_arrays.return_value = self._response([array])
+
+        result = generate_remote_arrays_dict(mock_blade)
+
+        mock_blade.get_remote_arrays.assert_called_once_with(current_fleet_only=True)
+        assert result == {
+            "array1": {
+                "os": "Purity//FB",
+                "version": "4.8.8",
+                "model": "FlashBlade//S200",
+                "api_versions": ["2.29", "2.30"],
+                "is_local": True,
+                "topology_group": "tg1",
+            }
+        }
+
+    def test_generate_remote_arrays_dict_empty_on_error(self):
+        mock_blade = Mock()
+        mock_blade.get_remote_arrays.return_value = self._response([], 400)
+        assert generate_remote_arrays_dict(mock_blade) == {}
+
+    def test_generate_tgroups_dict_routes_members_by_type(self):
+        """Array members and nested groups land in their own lists; members
+        of an unknown group or without a name are skipped."""
+        parent = Mock(spec=["name", "context", "parent_topology_group"])
+        parent.name = "parent"
+        parent.context = self._ref("fleet1", "fleets")
+        parent.parent_topology_group = self._ref(None)
+        child = Mock(spec=["name", "context", "parent_topology_group"])
+        child.name = "child"
+        child.context = self._ref("fleet1", "fleets")
+        child.parent_topology_group = self._ref("parent", "topology-groups")
+
+        def member(group, name, resource_type, status="joined"):
+            item = Mock(spec=["topology_group", "member", "status", "status_details"])
+            item.topology_group = self._ref(group, "topology-groups")
+            item.member = self._ref(name, resource_type)
+            item.status = status
+            item.status_details = None
+            return item
+
+        mock_blade = Mock()
+        mock_blade.get_topology_groups.return_value = self._response([parent, child])
+        mock_blade.get_topology_groups_members.return_value = self._response(
+            [
+                member("parent", "child", "topology-groups"),
+                member("child", "array1", "remote-arrays"),
+                member("gone", "array2", "remote-arrays"),
+                member("child", None, "remote-arrays"),
+            ]
+        )
+
+        result = generate_tgroups_dict(mock_blade)
+
+        mock_blade.get_topology_groups_members.assert_called_once_with()
+        assert result["parent"]["parent_topology_group"] is None
+        assert result["parent"]["context"] == "fleet1"
+        assert result["parent"]["tgroups"] == [
+            {"name": "child", "status": "joined", "status_details": None}
+        ]
+        assert result["parent"]["arrays"] == []
+        assert result["child"]["parent_topology_group"] == "parent"
+        assert result["child"]["arrays"] == [
+            {"name": "array1", "status": "joined", "status_details": None}
+        ]
+        assert result["child"]["tgroups"] == []
+
+    def test_generate_tgroups_dict_skips_members_without_groups(self):
+        mock_blade = Mock()
+        mock_blade.get_topology_groups.return_value = self._response([])
+
+        assert generate_tgroups_dict(mock_blade) == {}
+        mock_blade.get_topology_groups_members.assert_not_called()
+
+    def test_generate_presets_dict_collates_sections_by_name(self):
+        """Parameters carry the constraints of their own type; every
+        configuration list is keyed by name; export configurations are
+        split by protocol; a preset without a name is skipped."""
+        param = SimpleNamespace(
+            name="size",
+            type="integer",
+            metadata=SimpleNamespace(
+                description="Capacity", display_name="Size", subtype="size"
+            ),
+            constraints=SimpleNamespace(
+                integer=SimpleNamespace(min=1, max=10), string=None
+            ),
+        )
+        free_text = SimpleNamespace(
+            name="owner", type="string", metadata=None, constraints=None
+        )
+        placement = SimpleNamespace(
+            name="place1",
+            storage_class=SimpleNamespace(
+                name="flashblade-s200", resource_type="storage-classes"
+            ),
+            targets=[],
+            qos_configurations=["qos1"],
+        )
+        directory = SimpleNamespace(
+            name="dir1", path=SimpleNamespace(value="/"), count="1"
+        )
+        exports = SimpleNamespace(
+            nfs=[SimpleNamespace(name="nfs1", rules=[])], smb=None, smb_share=[]
+        )
+        preset = SimpleNamespace(
+            name="fleet1:preset1",
+            description="File preset",
+            workload_type="File",
+            revision=2,
+            context=SimpleNamespace(name="fleet1", resource_type="fleets"),
+            platform_features=["file"],
+            parameters=[param, free_text],
+            bucket_configurations=None,
+            directory_configurations=[directory],
+            volume_configurations=None,
+            placement_configurations=[placement],
+            qos_configurations=[],
+            quota_configurations=[],
+            snapshot_configurations=[],
+            lifecycle_configurations=[],
+            periodic_replication_configurations=[],
+            export_configurations=exports,
+            workload_tags=[
+                SimpleNamespace(
+                    key="env", value="prod", namespace="default", copyable=None
+                )
+            ],
+        )
+        nameless = SimpleNamespace(name=None)
+        mock_blade = Mock()
+        mock_blade.get_presets_workload.return_value = self._response(
+            [preset, nameless]
+        )
+
+        result = generate_presets_dict(mock_blade)
+
+        assert list(result) == ["fleet1:preset1"]
+        info = result["fleet1:preset1"]
+        assert info["workload_type"] == "File"
+        assert info["revision"] == 2
+        assert info["context"] == "fleet1"
+        assert info["platform_features"] == ["file"]
+        assert info["parameters"]["size"] == {
+            "type": "integer",
+            "description": "Capacity",
+            "display_name": "Size",
+            "subtype": "size",
+            "constraints": {"min": 1, "max": 10},
+        }
+        assert info["parameters"]["owner"]["constraints"] == {}
+        assert info["parameters"]["owner"]["description"] is None
+        assert info["placement_configurations"]["place1"]["storage_class"] == {
+            "name": "flashblade-s200",
+            "resource_type": "storage-classes",
+        }
+        assert info["directory_configurations"]["dir1"]["path"] == {"value": "/"}
+        assert info["bucket_configurations"] == {}
+        assert info["volume_configurations"] == {}
+        assert info["export_configurations"] == {
+            "nfs": {"nfs1": {"name": "nfs1", "rules": []}},
+            "smb": {},
+            "smb_share": {},
+        }
+        assert info["workload_tags"] == [
+            {"key": "env", "value": "prod", "namespace": "default", "copyable": None}
+        ]
+
+    def test_generate_presets_dict_empty_on_error(self):
+        mock_blade = Mock()
+        mock_blade.get_presets_workload.return_value = self._response([], 400)
+        assert generate_presets_dict(mock_blade) == {}
+
+    def _workload(self, name="wl1", space=None, destroyed=False):
+        preset = Mock(spec=["name", "revision"])
+        preset.name = "fleet1:preset1"
+        preset.revision = 2
+        workload = Mock(
+            spec=[
+                "name",
+                "context",
+                "preset",
+                "status",
+                "status_details",
+                "created",
+                "destroyed",
+                "time_remaining",
+                "space",
+            ]
+        )
+        workload.name = name
+        workload.context = self._ref("array1", "arrays")
+        workload.preset = preset
+        workload.status = "ready"
+        workload.status_details = None
+        workload.created = 1700000000000
+        workload.destroyed = destroyed
+        workload.time_remaining = None
+        workload.space = space
+        return workload
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_workloads_dict_reads_tags_space_and_performance(
+        self, mock_loose_version
+    ):
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+        workload = self._workload(space=SimpleNamespace(total_used=10, virtual=20))
+        tag = Mock(spec=["resource", "key", "value", "namespace", "copyable"])
+        tag.resource = self._ref("wl1")
+        tag.key = "env"
+        tag.value = "prod"
+        tag.namespace = "default"
+        tag.copyable = True
+        stray_tag = Mock(spec=["resource", "key", "value", "namespace", "copyable"])
+        stray_tag.resource = self._ref("other")
+        perf = Mock(spec=["name", "reads_per_sec", "writes_per_sec", "time"])
+        perf.name = "wl1"
+        perf.reads_per_sec = 5
+        perf.writes_per_sec = 7
+        perf.time = 1700000000000
+        mock_blade = Mock()
+        mock_blade.get_workloads.return_value = self._response([workload])
+        mock_blade.get_workloads_tags.return_value = self._response([tag, stray_tag])
+        mock_blade.get_workloads_performance.return_value = self._response([perf])
+
+        result = generate_workloads_dict(mock_blade, "2.30")
+
+        mock_blade.get_workloads_performance.assert_called_once_with(names=["wl1"])
+        info = result["wl1"]
+        assert info["preset"] == "fleet1:preset1"
+        assert info["preset_revision"] == 2
+        assert info["context"] == "array1"
+        assert info["status"] == "ready"
+        assert info["status_details"] == []
+        assert info["created"] is not None
+        assert info["destroyed"] is False
+        assert info["tags"] == [
+            {"key": "env", "value": "prod", "namespace": "default", "copyable": True}
+        ]
+        assert info["space"] == {"total_used": 10, "virtual": 20}
+        assert info["performance"]["reads_per_sec"] == 5
+        assert info["performance"]["writes_per_sec"] == 7
+        assert info["performance"]["bytes_per_op"] is None
+        assert len(info["performance"]) == 12
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_workloads_dict_skips_performance_below_2_30(
+        self, mock_loose_version
+    ):
+        mock_loose_version.return_value.__le__ = Mock(return_value=False)
+        mock_blade = Mock()
+        mock_blade.get_workloads.return_value = self._response([self._workload()])
+        mock_blade.get_workloads_tags.return_value = self._response([], 400)
+
+        result = generate_workloads_dict(mock_blade, "2.23")
+
+        mock_blade.get_workloads_performance.assert_not_called()
+        assert result["wl1"]["performance"] is None
+        assert result["wl1"]["space"] is None
+        assert result["wl1"]["tags"] == []
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_workloads_dict_no_workloads_makes_no_further_calls(
+        self, mock_loose_version
+    ):
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+        mock_blade = Mock()
+        mock_blade.get_workloads.return_value = self._response([])
+
+        assert generate_workloads_dict(mock_blade, "2.30") == {}
+        mock_blade.get_workloads_tags.assert_not_called()
+        mock_blade.get_workloads_performance.assert_not_called()
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_workloads_dict_requests_performance_for_live_workloads_only(
+        self, mock_loose_version
+    ):
+        """A destroyed workload is reported but never named in the
+        performance request, so it cannot blank the others' metrics."""
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+        perf = Mock(spec=["name", "reads_per_sec"])
+        perf.name = "wl1"
+        perf.reads_per_sec = 3
+        mock_blade = Mock()
+        mock_blade.get_workloads.return_value = self._response(
+            [self._workload(), self._workload(name="wl2", destroyed=True)]
+        )
+        mock_blade.get_workloads_tags.return_value = self._response([])
+        mock_blade.get_workloads_performance.return_value = self._response([perf])
+
+        result = generate_workloads_dict(mock_blade, "2.30")
+
+        mock_blade.get_workloads_performance.assert_called_once_with(names=["wl1"])
+        assert result["wl1"]["performance"]["reads_per_sec"] == 3
+        assert result["wl2"]["destroyed"] is True
+        assert result["wl2"]["performance"] is None
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    def test_generate_workloads_dict_all_destroyed_skips_performance(
+        self, mock_loose_version
+    ):
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+        mock_blade = Mock()
+        mock_blade.get_workloads.return_value = self._response(
+            [self._workload(destroyed=True)]
+        )
+        mock_blade.get_workloads_tags.return_value = self._response([])
+
+        result = generate_workloads_dict(mock_blade, "2.30")
+
+        mock_blade.get_workloads_performance.assert_not_called()
+        assert result["wl1"]["performance"] is None
+
+    def test_generate_storage_class_members_dict(self):
+        item = Mock(spec=["member", "storage_class"])
+        item.member = self._ref("array1", "remote-arrays")
+        item.storage_class = self._ref("flashblade-s200", "storage-classes")
+        nameless = Mock(spec=["member", "storage_class"])
+        nameless.member = self._ref(None)
+        nameless.storage_class = self._ref("flashblade-s200", "storage-classes")
+        mock_blade = Mock()
+        mock_blade.get_storage_classes_members.return_value = self._response(
+            [item, nameless]
+        )
+
+        assert generate_storage_class_members_dict(mock_blade) == {
+            "array1": "flashblade-s200"
+        }
+
+    def test_generate_realm_connections_dict_keys_local_then_remote(self):
+        def connection(local, remote, status):
+            item = Mock(spec=["local_realm", "remote_realm", "status"])
+            item.local_realm = self._ref(local, "realms")
+            item.remote_realm = self._ref(remote, "realms")
+            item.status = status
+            return item
+
+        mock_blade = Mock()
+        mock_blade.get_realm_connections.return_value = self._response(
+            [
+                connection("realm1", "remote1", "CONNECTED"),
+                connection("realm1", "remote2", "CONNECTING"),
+                connection(None, "remote3", "UNREACHABLE"),
+            ]
+        )
+
+        assert generate_realm_connections_dict(mock_blade) == {
+            "realm1": {
+                "remote1": {"status": "CONNECTED"},
+                "remote2": {"status": "CONNECTING"},
+            }
+        }
+
+    def test_generate_remote_realms_dict(self):
+        realm = Mock(spec=["name", "arrays"])
+        realm.name = "remote1"
+        realm.arrays = [self._ref("peer", "arrays")]
+        bare = Mock(spec=["name", "arrays"])
+        bare.name = "remote2"
+        bare.arrays = None
+        mock_blade = Mock()
+        mock_blade.get_remote_realms.return_value = self._response([realm, bare])
+
+        assert generate_remote_realms_dict(mock_blade) == {
+            "remote1": {"arrays": ["peer"]},
+            "remote2": {"arrays": []},
+        }
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_storage_class_members_dict")
+    @patch("plugins.modules.purefb_info.generate_tgroups_dict")
+    @patch("plugins.modules.purefb_info.generate_workloads_dict")
+    @patch("plugins.modules.purefb_info.generate_presets_dict")
+    @patch("plugins.modules.purefb_info.generate_remote_arrays_dict")
+    @patch("plugins.modules.purefb_info.generate_fleet_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_fleet_subset_enriches_members_and_adds_fleet_views(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_fleet,
+        mock_remote_arrays,
+        mock_presets,
+        mock_workloads,
+        mock_tgroups,
+        mock_storage_class,
+        mock_loose_version,
+    ):
+        """Fleet members gain the remote-array detail the array reports for
+        them; a member the array does not describe is left as it was."""
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["fleet"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+        mock_generate_fleet.return_value = {
+            "fleet1": {
+                "members": {
+                    "array1": {"status": "joined", "status_details": None},
+                    "array2": {"status": "joining", "status_details": None},
+                }
+            }
+        }
+        mock_remote_arrays.return_value = {
+            "array1": {
+                "os": "Purity//FB",
+                "version": "4.8.8",
+                "model": "FlashBlade//S200",
+                "api_versions": ["2.30"],
+                "is_local": True,
+                "topology_group": None,
+            }
+        }
+        mock_presets.return_value = {}
+        mock_workloads.return_value = {}
+        mock_tgroups.return_value = {}
+        mock_storage_class.return_value = {"array1": "flashblade-s200"}
+
+        main()
+
+        info = mock_module.exit_json.call_args[1]["purefb_info"]
+        mock_generate_fleet.assert_called_once_with(mock_blade)
+        mock_workloads.assert_called_once_with(mock_blade, ANY)
+        assert info["fleet"]["fleet1"]["members"]["array1"] == {
+            "status": "joined",
+            "status_details": None,
+            "os": "Purity//FB",
+            "version": "4.8.8",
+            "model": "FlashBlade//S200",
+            "api_versions": ["2.30"],
+            "is_local": True,
+            "topology_group": None,
+        }
+        assert info["fleet"]["fleet1"]["members"]["array2"] == {
+            "status": "joining",
+            "status_details": None,
+        }
+        assert info["presets"] == {}
+        assert info["workloads"] == {}
+        assert info["tgroups"] == {}
+        assert info["storage_class_members"] == {"array1": "flashblade-s200"}
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_storage_class_members_dict")
+    @patch("plugins.modules.purefb_info.generate_tgroups_dict")
+    @patch("plugins.modules.purefb_info.generate_workloads_dict")
+    @patch("plugins.modules.purefb_info.generate_presets_dict")
+    @patch("plugins.modules.purefb_info.generate_remote_arrays_dict")
+    @patch("plugins.modules.purefb_info.generate_fleet_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_fleet_subset_without_fleet_skips_remote_arrays(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_fleet,
+        mock_remote_arrays,
+        mock_presets,
+        mock_workloads,
+        mock_tgroups,
+        mock_storage_class,
+        mock_loose_version,
+    ):
+        """An array that is not in a fleet is not asked about remote arrays;
+        the fleet views are still produced."""
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["fleet"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+        mock_generate_fleet.return_value = {}
+        mock_presets.return_value = {}
+        mock_workloads.return_value = {}
+        mock_tgroups.return_value = {}
+        mock_storage_class.return_value = {"array1": "flashblade-s200"}
+
+        main()
+
+        info = mock_module.exit_json.call_args[1]["purefb_info"]
+        mock_remote_arrays.assert_not_called()
+        assert info["fleet"] == {}
+        assert info["presets"] == {}
+        assert info["storage_class_members"] == {"array1": "flashblade-s200"}
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_policies_subset_fleet_members_are_enriched(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        """The fleet key built by the policies subset has the same shape as
+        the one built by the fleet subset; the fleet-only views stay out."""
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["policies"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+        generators = {
+            name: Mock(return_value={})
+            for name in (
+                "generate_all_policies_dict",
+                "generate_policies_dict",
+                "generate_object_store_access_policies_dict",
+                "generate_bucket_access_policies_dict",
+                "generate_bucket_cross_object_policies_dict",
+                "generate_nfs_export_policies_dict",
+                "generate_smb_client_policies_dict",
+                "generate_smb_share_policies_dict",
+                "generate_network_access_policies_dict",
+                "generate_worm_data_policies_dict",
+                "generate_password_policies_dict",
+                "generate_tls_policies_dict",
+                "generate_s3_export_policies_dict",
+                "generate_management_access_policies_dict",
+                "generate_management_authentication_policies_dict",
+                "generate_management_access_roles_dict",
+                "generate_presets_dict",
+                "generate_workloads_dict",
+                "generate_tgroups_dict",
+                "generate_storage_class_members_dict",
+            )
+        }
+        generators["generate_fleet_dict"] = Mock(
+            return_value={"fleet1": {"members": {"array1": {"status": "joined"}}}}
+        )
+        generators["generate_remote_arrays_dict"] = Mock(
+            return_value={"array1": {"os": "Purity//FB", "version": "4.8.8"}}
+        )
+
+        with patch.multiple("plugins.modules.purefb_info", **generators):
+            main()
+
+        info = mock_module.exit_json.call_args[1]["purefb_info"]
+        generators["generate_remote_arrays_dict"].assert_called_once_with(mock_blade)
+        assert info["fleet"]["fleet1"]["members"]["array1"] == {
+            "status": "joined",
+            "os": "Purity//FB",
+            "version": "4.8.8",
+        }
+        for name in (
+            "generate_presets_dict",
+            "generate_workloads_dict",
+            "generate_tgroups_dict",
+            "generate_storage_class_members_dict",
+        ):
+            generators[name].assert_not_called()
+        for key in ("presets", "workloads", "tgroups", "storage_class_members"):
+            assert key not in info
+
+    @patch("plugins.modules.purefb_info.LooseVersion")
+    @patch("plugins.modules.purefb_info.generate_remote_realms_dict")
+    @patch("plugins.modules.purefb_info.generate_realm_connections_dict")
+    @patch("plugins.modules.purefb_info.generate_resource_accesses_dict")
+    @patch("plugins.modules.purefb_info.generate_realms_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    def test_main_realms_subset_adds_connections_and_remote_realms(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_realms,
+        mock_resource_accesses,
+        mock_connections,
+        mock_remote_realms,
+        mock_loose_version,
+    ):
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["realms"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+        mock_generate_realms.return_value = {"realm1": {}}
+        mock_resource_accesses.return_value = {}
+        mock_connections.return_value = {"realm1": {"remote1": {"status": "CONNECTED"}}}
+        mock_remote_realms.return_value = {"remote1": {"arrays": ["peer"]}}
+
+        main()
+
+        info = mock_module.exit_json.call_args[1]["purefb_info"]
+        assert info["realms"] == {"realm1": {}}
+        assert info["realm_connections"] == {
+            "realm1": {"remote1": {"status": "CONNECTED"}}
+        }
+        assert info["remote_realms"] == {"remote1": {"arrays": ["peer"]}}

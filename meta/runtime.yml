@@ -51,6 +51,7 @@ action_groups:
     - purefb_quota_settings
     - purefb_ra
     - purefb_realm
+    - purefb_realm_connection
     - purefb_remote_cred
     - purefb_resource_access
     - purefb_s3_export_policy

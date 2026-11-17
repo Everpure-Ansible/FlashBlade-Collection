@@ -46,65 +46,39 @@ options:
   rule:
     description:
     - Name of the rule in the Bucket Policy
-    - Required if I(state) is I(present)
+    - Required if I(state) is C(present)
     type: str
   effect:
     description:
     - Allow S3 requests that match all of the I(actions) item selected.
       Rules are additive.
-    - The FlashBlade REST API only supports I(allow) for bucket access
-      policy rules. I(deny) is kept as a choice for backwards compatibility
+    - The FlashBlade REST API only supports C(allow) for bucket access
+      policy rules. C(deny) is kept as a choice for backwards compatibility
       but is rejected with an error, because the array would silently store
-      the rule as I(allow).
+      the rule as C(allow).
     type: str
     default: allow
     choices: [ allow, deny ]
   actions:
     description:
-    - List of permissions to grant.
-    - System-wide policy rules cannot be deleted or modified
-    - The FlashBlade REST API currently only supports I(s3:GetObject) in a
-      bucket access policy rule. A list that also contains other actions is
-      accepted by the array but stored as I(s3:GetObject) alone, and a list
-      without I(s3:GetObject) is rejected by the array. When the stored rule
+    - List of permissions to grant, for example C(s3:GetObject).
+    - Actions are validated against the list the array publishes
+      (GET /object-store-access-policy-actions, REST 2.2 and later), so an
+      action introduced by a later Purity//FB release is accepted without a
+      collection update. The task fails naming any action the array does
+      not know. The collection's built-in list is used only when the array
+      cannot be asked.
+    - Which of the published actions a bucket access policy rule may hold is
+      decided by the array. The FlashBlade REST API currently only supports
+      C(s3:GetObject) in a bucket access policy rule. A list without it is
+      refused by the array, and a list that also contains other actions is
+      accepted but stored as C(s3:GetObject) alone. When the stored rule
       differs from the request the module fails and reports what the array
       kept, rather than replacing the rule on every run.
+    - System-wide policy rules cannot be deleted or modified
     type: list
     elements: str
     default: [ "s3:GetObject" ]
-    choices:
-      - s3:*
-      - s3:AbortMultipartUpload
-      - s3:BypassGovernanceRetention
-      - s3:CreateBucket
-      - s3:DeleteBucket
-      - s3:DeleteObject
-      - s3:DeleteObjectVersion
-      - s3:ExtendSafemodeRetentionPeriod
-      - s3:GetBucketAcl
-      - s3:GetBucketLocation
-      - s3:GetBucketVersioning
-      - s3:GetLifecycleConfiguration
-      - s3:GetObject
-      - s3:GetObjectAcl
-      - s3:GetObjectLegalHold
-      - s3:GetObjectLockConfiguration
-      - s3:GetObjectRetention
-      - s3:GetObjectTagging
-      - s3:GetObjectVersion
-      - s3:GetObjectVersionTagging
-      - s3:ListAllMyBuckets
-      - s3:ListBucket
-      - s3:ListBucketMultipartUploads
-      - s3:ListBucketVersions
-      - s3:ListMultipartUploadParts
-      - s3:PutBucketVersioning
-      - s3:PutLifecycleConfiguration
-      - s3:PutObject
-      - s3:PutObjectLegalHold
-      - s3:PutObjectLockConfiguration
-      - s3:PutObjectRetention
-      - s3:ResolveSafemodeConflicts
   methods:
     description:
     - A list of HTTP methods that are permitted for cross-origin requests to access a bucket.
@@ -144,6 +118,11 @@ options:
     description:
     - Defines if the rule will apply to all object store users
       regardless of their origin or principal.
+    - A rule for all principals is a public bucket policy. The array refuses
+      it while the bucket or its object store account blocks new public
+      policies, which is the default for new buckets and accounts. See the
+      I(block_new_public_policies) option of M(everpure.flashblade.purefb_bucket)
+      and M(everpure.flashblade.purefb_s3acc).
     type: bool
     default: true
   context:
@@ -160,21 +139,21 @@ extends_documentation_fragment:
 
 EXAMPLES = r"""
 - name: Create a bucket access policy rule for bucket bar
-  everpure.flashblade.purefb_bucket_policy:
+  everpure.flashblade.purefb_bucket_access:
     rule: foo
     name: bar
     policy_type: access
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
 - name: Create a CORS policy rule for bucket bar
-  everpure.flashblade.purefb_bucket_policy:
+  everpure.flashblade.purefb_bucket_access:
     rule: foo
     name: bar
     policy_type: cors
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
 - name: Delete bucket policy rule foo from bucket bar
-  everpure.flashblade.purefb_bucket_policy:
+  everpure.flashblade.purefb_bucket_access:
     rule: foo
     name: bar
     policy_type: access
@@ -182,7 +161,7 @@ EXAMPLES = r"""
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
 - name: Delete all bucket policy rules from bucket bar
-  everpure.flashblade.purefb_bucket_policy:
+  everpure.flashblade.purefb_bucket_access:
     name: bar
     policy_type: access
     state: absent
@@ -219,6 +198,55 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
 
 MIN_API_VERSION = "2.12"
 CONTEXT_API_VERSION = "2.17"
+# GET /object-store-access-policy-actions lists the rule actions the array
+# knows. It grows with Purity//FB releases, so `actions` is validated against
+# it rather than against a list frozen in the collection. Which of these a
+# bucket access policy rule may hold is decided by the array when the rule
+# is posted.
+OS_ACTIONS_API_VERSION = "2.2"
+# Used only when the array cannot be asked for its own catalogue.
+_ACCESS_ACTIONS_FALLBACK = (
+    "s3:*",
+    "s3:AbortMultipartUpload",
+    "s3:BypassGovernanceRetention",
+    "s3:CreateBucket",
+    "s3:DeleteBucket",
+    "s3:DeleteObject",
+    "s3:DeleteObjectTagging",
+    "s3:DeleteObjectVersion",
+    "s3:DeleteObjectVersionTagging",
+    "s3:ExtendSafemodeRetentionPeriod",
+    "s3:GetBucketAcl",
+    "s3:GetBucketCORS",
+    "s3:GetBucketLocation",
+    "s3:GetBucketPolicy",
+    "s3:GetBucketPolicyStatus",
+    "s3:GetBucketPublicAccessBlock",
+    "s3:GetBucketVersioning",
+    "s3:GetLifecycleConfiguration",
+    "s3:GetObject",
+    "s3:GetObjectAcl",
+    "s3:GetObjectLegalHold",
+    "s3:GetObjectLockConfiguration",
+    "s3:GetObjectRetention",
+    "s3:GetObjectTagging",
+    "s3:GetObjectVersion",
+    "s3:GetObjectVersionTagging",
+    "s3:ListAllMyBuckets",
+    "s3:ListBucket",
+    "s3:ListBucketMultipartUploads",
+    "s3:ListBucketVersions",
+    "s3:ListMultipartUploadParts",
+    "s3:PutBucketVersioning",
+    "s3:PutLifecycleConfiguration",
+    "s3:PutObject",
+    "s3:PutObjectLegalHold",
+    "s3:PutObjectLockConfiguration",
+    "s3:PutObjectRetention",
+    "s3:PutObjectTagging",
+    "s3:PutObjectVersionTagging",
+    "s3:ResolveSafemodeConflicts",
+)
 
 
 def _context_kwargs(module, api_version):
@@ -229,6 +257,45 @@ def _context_kwargs(module, api_version):
     ):
         return {"context_names": [module.params["context"]]}
     return {}
+
+
+def _valid_actions(module, blade, api_version):
+    """Return the access policy rule actions this array knows.
+
+    The array's catalogue is authoritative; the built-in list is used only
+    when the catalogue cannot be read.
+    """
+    # MIN_API_VERSION already guarantees the endpoint; the gate is kept for
+    # parity with purefb_policy so the helper can be shared later.
+    if LooseVersion(OS_ACTIONS_API_VERSION) <= LooseVersion(api_version):
+        res = blade.get_object_store_access_policy_actions(
+            **_context_kwargs(module, api_version)
+        )
+        if res.status_code == 200:
+            names = [action.name for action in res.items]
+            if names:
+                return names
+            reason = "The array returned an empty list."
+        else:
+            reason = "Error: {0}".format(get_error_message(res))
+        module.warn(
+            "Could not read the array's access policy action list, "
+            "validating against the collection's built-in list. {0}".format(reason)
+        )
+    return list(_ACCESS_ACTIONS_FALLBACK)
+
+
+def _check_actions(module, blade, api_version):
+    """Fail, naming every unknown action, unless all requested actions are valid."""
+    if not module.params["actions"]:
+        return
+    valid = _valid_actions(module, blade, api_version)
+    unknown = [action for action in module.params["actions"] if action not in valid]
+    if unknown:
+        module.fail_json(
+            msg="Unknown bucket access policy action(s): {0}. "
+            "Valid actions: {1}".format(", ".join(unknown), ", ".join(sorted(valid)))
+        )
 
 
 def _access_rule_matches(module, rule):
@@ -670,45 +737,7 @@ def main():
             principals=dict(type="bool", default="True"),
             origins=dict(type="list", elements="str", default=["*"]),
             headers=dict(type="list", elements="str", default=["*"]),
-            actions=dict(
-                type="list",
-                elements="str",
-                default="s3:GetObject",
-                choices=[
-                    "s3:*",
-                    "s3:AbortMultipartUpload",
-                    "s3:BypassGovernanceRetention",
-                    "s3:CreateBucket",
-                    "s3:DeleteBucket",
-                    "s3:DeleteObject",
-                    "s3:DeleteObjectVersion",
-                    "s3:ExtendSafemodeRetentionPeriod",
-                    "s3:GetBucketAcl",
-                    "s3:GetBucketLocation",
-                    "s3:GetBucketVersioning",
-                    "s3:GetLifecycleConfiguration",
-                    "s3:GetObject",
-                    "s3:GetObjectAcl",
-                    "s3:GetObjectLegalHold",
-                    "s3:GetObjectLockConfiguration",
-                    "s3:GetObjectRetention",
-                    "s3:GetObjectTagging",
-                    "s3:GetObjectVersion",
-                    "s3:GetObjectVersionTagging",
-                    "s3:ListAllMyBuckets",
-                    "s3:ListBucket",
-                    "s3:ListBucketMultipartUploads",
-                    "s3:ListBucketVersions",
-                    "s3:ListMultipartUploadParts",
-                    "s3:PutBucketVersioning",
-                    "s3:PutLifecycleConfiguration",
-                    "s3:PutObject",
-                    "s3:PutObjectLegalHold",
-                    "s3:PutObjectLockConfiguration",
-                    "s3:PutObjectRetention",
-                    "s3:ResolveSafemodeConflicts",
-                ],
-            ),
+            actions=dict(type="list", elements="str", default=["s3:GetObject"]),
         )
     )
 
@@ -769,6 +798,9 @@ def main():
                 module.params["name"]
             )
         )
+    if state == "present" and module.params["policy_type"] == "access":
+        # Ask the array which actions it knows before anything is written.
+        _check_actions(module, blade, api_version)
     if module.params["policy_type"] == "access":
         if state == "present":
             create_access_policy(module, blade)

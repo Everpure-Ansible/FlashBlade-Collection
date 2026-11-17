@@ -147,6 +147,7 @@ All modules are idempotent with the exception of modules that change or set pass
 - purefb_s3user - manage the object atore users on a FlashBlade
 - purefb_saml - manage FlashBlade SAML2 service and identity providers
 - purefb_server - manage FlashBlade servers
+- purefb_sessions - list the management login sessions on a FlashBlade
 - purefb_smtp - manage SMTP settings on a FlashBlade
 - purefb_snap - manage filesystem snapshots on a FlashBlade
 - purefb_snmp_agent - modify the FlashBlade SNMP Agent

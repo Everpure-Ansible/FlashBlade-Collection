@@ -54,6 +54,7 @@ action_groups:
     - purefb_s3user
     - purefb_saml
     - purefb_server
+    - purefb_sessions
     - purefb_smtp
     - purefb_snap
     - purefb_snmp_agent

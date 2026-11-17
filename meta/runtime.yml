@@ -6,6 +6,7 @@ action_groups:
     - purefb_admin
     - purefb_alert
     - purefb_apiclient
+    - purefb_audits
     - purefb_banner
     - purefb_bladename
     - purefb_bucket

@@ -347,6 +347,26 @@ def generate_perf_dict(blade):
     return perf_info
 
 
+def generate_quota_settings_dict(blade):
+    """Legacy user and group quota notification settings (/quotas/settings).
+
+    Keyed by the settings object name (a single object named management).
+    The array omits contact from the response while it is unset.
+    """
+    quota_settings = {}
+    res = blade.get_quotas_settings()
+    if res.status_code != 200:
+        return quota_settings
+    for settings in list(res.items):
+        quota_settings[settings.name] = {
+            "contact": getattr(settings, "contact", None),
+            "direct_notifications_enabled": getattr(
+                settings, "direct_notifications_enabled", None
+            ),
+        }
+    return quota_settings
+
+
 def generate_config_dict(blade):
     config_info = {}
     api_version = get_rest_api_version(blade)
@@ -374,6 +394,7 @@ def generate_config_dict(blade):
             "sender_domain": getattr(config, "sender_domain", None),
             "encryption_mode": getattr(config, "encryption_mode", None),
         }
+    config_info["quota_settings"] = generate_quota_settings_dict(blade)
     alert_config = list(blade.get_alert_watchers().items)
     config_info["alert_watchers"] = {}
     for config in alert_config:

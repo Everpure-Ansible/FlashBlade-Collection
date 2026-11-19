@@ -1,0 +1,8 @@
+bugfixes:
+  - purefb_snap - ``state=present`` and ``state=restore`` reported success without doing anything
+    when the filesystem did not exist or was not visible to the identity in use, such as a bare
+    name used by an administrator limited to a realm. They now fail, in check mode as well, and
+    ``state=absent`` still reports no change.
+  - purefb_snap - a read the array refuses is reported with the array's message instead of being
+    taken to mean that the filesystem or snapshot does not exist, and the array connections are
+    read only when ``target`` is given.

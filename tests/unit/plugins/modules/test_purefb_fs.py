@@ -6643,3 +6643,54 @@ class TestPurefbFs:
             assert lookups == []
             assert mock_blade.mock_calls == []
             mock_module.exit_json.assert_not_called()
+
+    def test_main_realm_short_name_ignores_a_namesake_in_another_realm(self):
+        """The short name also exists outside every realm and in another
+        realm, but not in the realm of the task: state=present creates it
+        in that realm and state=absent has nothing to delete. Neither
+        namesake is read or written."""
+        for state, written in (("present", {self.REALM_FS}), ("absent", set())):
+            found = self._namesakes(array_level={"provisioned": 2 * self.GIB})
+            found["other-realm::prod-fs"] = self._existing_fs(
+                name="other-realm::prod-fs", provisioned=3 * self.GIB
+            )
+            mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(
+                self._realm_params(state=state, size="1G"), found
+            )
+
+            assert set(lookups) == {self.REALM_FS}
+            assert set(self._written_names(mock_blade)) == written
+            mock_module.fail_json.assert_not_called()
+            mock_module.exit_json.assert_called_once_with(changed=state == "present")
+
+    def test_main_realm_short_name_check_mode_change_writes_nothing(self):
+        """Both names exist and the request differs from the realm
+        filesystem but not from the namesake: check mode reports the change
+        a real run makes and sends nothing."""
+        found = self._namesakes(
+            array_level={"provisioned": 2 * self.GIB},
+            in_realm={"provisioned": self.GIB},
+        )
+        mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(
+            self._realm_params(size="2G"), found, check_mode=True
+        )
+
+        assert set(lookups) == {self.REALM_FS}
+        assert self._written_names(mock_blade) == []
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_main_realm_short_name_absent_check_mode_writes_nothing(self):
+        """The namesake outside the realm is destroyed, the realm filesystem
+        is live: state=absent in check mode reports the destroy a real run
+        makes, with and without eradicate, and sends nothing."""
+        for eradicate in (False, True):
+            found = self._namesakes(array_level={"destroyed": True}, in_realm={})
+            mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(
+                self._realm_params(state="absent", eradicate=eradicate),
+                found,
+                check_mode=True,
+            )
+
+            assert set(lookups) == {self.REALM_FS}
+            assert self._written_names(mock_blade) == []
+            mock_module.exit_json.assert_called_once_with(changed=True)

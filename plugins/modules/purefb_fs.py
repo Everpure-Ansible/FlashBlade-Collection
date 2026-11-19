@@ -30,8 +30,8 @@ options:
       - Filesystem Name.
       - A filesystem in a realm is named C(realm::name). Give that name, or
         give the short name together with I(realm).
-      - Without I(realm) the name is used as it is given, so a short name is
-        never looked up inside a realm.
+      - Without I(realm) the name is sent to the array as it is given. The
+        module never adds a realm to it.
     required: true
     type: str
   state:

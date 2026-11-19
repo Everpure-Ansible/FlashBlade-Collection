@@ -10252,10 +10252,10 @@ class TestPurefbInfoDirectoryServices:
         assert config["local_directory_services"] == {}
 
     def test_rows_of_a_service_that_is_not_listed_are_left_out(self):
-        """An administrator limited to a realm lists the local directory
-        service of its realm only, yet the array shows it the users, groups
-        and memberships of every other one: they belong to no entry, those
-        of the array-level namesake included."""
+        """Users, groups and memberships are attributed by the id of their
+        local directory service: a row whose service is not in the listing
+        belongs to no entry, the rows of a namesake outside the realm
+        included."""
         client = self._lds_client(
             get_directory_services_local_directory_services=_listing(
                 [_lds_row("realm1::lds1", LDS_REALM_ID, "realm1::srv1", "realm1")]

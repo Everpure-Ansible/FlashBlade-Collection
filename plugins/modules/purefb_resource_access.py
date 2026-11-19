@@ -87,7 +87,8 @@ notes:
   Purity//FB 4.8 refuses that read with C(Operation not permitted) for an
   administrator whose management access is limited to a realm. With
   I(state=absent) and in check mode the module then fails with the error of
-  the array; with I(state=present) it still sends the create request.
+  the array; with I(state=present) it still sends the create request, which
+  Purity//FB 4.8 refuses for such an administrator as well.
 extends_documentation_fragment:
 - everpure.flashblade.everpure.fb
 """

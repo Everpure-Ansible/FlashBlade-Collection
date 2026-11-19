@@ -1,0 +1,17 @@
+bugfixes:
+  - purefb_export - a file system in a realm with a server outside of that realm, the default
+    ``_array_server`` included, is now refused before any request and in check mode. Before, check
+    mode reported a create that the array refuses, and ``state=absent`` or ``rename`` reported no
+    change while the export in the realm stayed as it was.
+  - purefb_export - creating an NFS export without ``export_policy`` now fails with a clear
+    message, in check mode as well, instead of asking the array for a policy named ``None``.
+  - purefb_export - the file system and the policies of a task are looked up before a change is
+    reported, so check mode fails for one that does not exist, as a real run does. Policy names
+    are compared without regard to case, and the refusal of a policy from another realm now says
+    how a policy that the export can use is named.
+  - purefb_export - a read that the array does not answer is reported with the error of the array
+    instead of being taken for an export or a server that does not exist.
+  - purefb_export - a ``name`` or ``rename`` with a realm prefix is refused before any request,
+    as an export name is never realm-qualified.
+  - purefb_export - documentation describes exports of a file system in a realm and has an
+    example for one.

@@ -1665,3 +1665,105 @@ class TestAddressedByTheStoredName:
         except SystemExit:
             pass
         mock_delete.assert_called_once_with(module, blade, "tenant1::vip1")
+
+
+@patch(MODULE_PATH + ".get_error_message", _message)
+@patch(MODULE_PATH + ".NetworkInterfacePatch")
+@patch(MODULE_PATH + ".get_iface")
+class TestServerOnAnEgressOnlyInterface:
+    """The array refuses a server on an egress-only interface
+    ("Egress-only network interfaces cannot have a server specified."), so
+    a task that leaves services out is judged by the service of the
+    interface."""
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_attach_with_services_left_out_is_refused(
+        self, mock_get, mock_patch, check_mode
+    ):
+        mock_get.return_value = _iface(
+            attached=None, services=["egress-only"], rdma=False
+        )
+        module = _module(attached_server="fred")
+        module.check_mode = check_mode
+        blade = _server_blade("fred")
+        _run(modify_iface, module, blade)
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "vip1 is an egress-only interface" in msg
+        assert "services to data" in msg
+        assert "fred" in msg
+        blade.get_servers.assert_not_called()
+        blade.patch_network_interfaces.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_attach_in_a_realm_with_services_left_out_is_refused(
+        self, mock_get, mock_patch, check_mode
+    ):
+        """The last step of a realm bring-up without services data."""
+        mock_get.return_value = _realm_iface(attached=None, services=["egress-only"])
+        module = _module(name="tenant1::vip1", attached_server="srv1")
+        module.check_mode = check_mode
+        blade = _server_blade("tenant1::srv1")
+        _run(modify_iface, module, blade)
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "tenant1::vip1 is an egress-only interface" in msg
+        assert "tenant1::srv1" in msg
+        blade.patch_network_interfaces.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    def test_other_changes_are_not_sent_with_the_refused_server(
+        self, mock_get, mock_patch
+    ):
+        mock_get.return_value = _iface(
+            address="10.0.0.9", attached=None, services=["egress-only"], rdma=False
+        )
+        module = _module(address="10.0.0.10", attached_server="fred")
+        blade = _server_blade("fred")
+        _run(modify_iface, module, blade)
+        module.fail_json.assert_called_once()
+        blade.patch_network_interfaces.assert_not_called()
+
+    @pytest.mark.parametrize("server", [None, ""])
+    def test_no_server_on_an_egress_only_interface_is_unchanged(
+        self, mock_get, mock_patch, server
+    ):
+        mock_get.return_value = _iface(
+            attached=None, services=["egress-only"], rdma=False
+        )
+        module = _module(attached_server=server)
+        blade = _blade()
+        _run(modify_iface, module, blade)
+        module.fail_json.assert_not_called()
+        blade.patch_network_interfaces.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+    def test_switch_to_data_with_the_server_is_sent(self, mock_get, mock_patch):
+        """Naming the data service in the same task is the way to attach."""
+        mock_get.return_value = _iface(
+            attached=None, services=["egress-only"], rdma=False
+        )
+        module = _module(services="data", attached_server="fred")
+        blade = _server_blade("fred")
+        _run(modify_iface, module, blade)
+        module.fail_json.assert_not_called()
+        mock_patch.assert_called_once_with(
+            services=["data"], attached_servers=[{"name": "fred"}]
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_named_server_on_an_sts_interface_is_left_to_the_array(
+        self, mock_get, mock_patch
+    ):
+        """With services left out the array accepts a named server on an
+        existing sts interface, so the request is sent."""
+        mock_get.return_value = _iface(
+            attached="_array_server", services=["sts"], rdma=False
+        )
+        module = _module(attached_server="fred")
+        blade = _server_blade("fred")
+        _run(modify_iface, module, blade)
+        module.fail_json.assert_not_called()
+        mock_patch.assert_called_once_with(attached_servers=[{"name": "fred"}])
+        module.exit_json.assert_called_once_with(changed=True)

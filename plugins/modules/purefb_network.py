@@ -94,6 +94,8 @@ options:
           C(server-1) is the same server there. A server of another realm,
           and a server of a realm on an array-level interface, is refused.
         - Only 1 server per Network Interface.
+        - An C(egress-only) interface cannot have a server. To attach one
+          to such an interface, set I(services) to C(data) in the same task.
         - Set to an empty string to detach the interface from its server.
           The array keeps the default C(_array_server) on C(data) and C(sts)
           interfaces, so an empty string on those is the same as
@@ -555,6 +557,17 @@ def modify_iface(module, blade):
             patch["attached_servers"] = [{"name": wanted_server}]
         else:
             patch["attached_servers"] = []
+
+    # The array refuses a server on an egress-only interface. main() checks
+    # the pair when the task names the service. With services left out the
+    # service of the interface decides, as it does for rdma_enabled above,
+    # so the pair is refused here instead of being reported as a change.
+    if patch.get("attached_servers") and "egress-only" in wanted_services:
+        module.fail_json(
+            msg="Interface {0} is an egress-only interface, which cannot have "
+            "an attached server: set services to data in the same task to "
+            "attach {1}.".format(iface.name, wanted_server)
+        )
 
     # A data interface in a realm has no default server to fall back on, so
     # a task that detaches one, or switches one to data without a server, is

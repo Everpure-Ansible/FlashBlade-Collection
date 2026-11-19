@@ -46,6 +46,19 @@ options:
       end with a letter or digit, and include at least one letter.
     - When the file systems are realm-scoped the junction name must carry
       the same realm prefix, for example C(realm1::junction1).
+    - A junction name is unique across the array and all of its realms,
+      whatever the realm prefix. C(realm1::junction1) cannot be created
+      while C(junction1) or C(realm2::junction1) exists.
+    - Check mode reports this conflict only when the other junction is
+      visible to the user. A user who is limited to a realm does not see
+      the junctions outside that realm.
+    - The array does not distinguish upper and lower case when it looks up
+      a junction, a file system or a realm, and names are compared the
+      same way. A name spelled in another case than the array stores it is
+      the same object. A real run returns the spelling the array stores.
+    - The realm prefix in the name of a new junction is the exception. The
+      array accepts it only in the spelling it stores for the realm, and
+      check mode does not predict that refusal.
     type: str
     required: true
   state:
@@ -57,12 +70,18 @@ options:
   origin_fs:
     description:
     - Name of the origin file system that holds the junction directory.
+    - For a file system in a realm use the realm-qualified name, for
+      example C(realm1::fs1). The junction and both file systems must be
+      in the same realm, or all three at array level.
     - Required when I(state=present).
     type: str
   destination_fs:
     description:
     - Name of the destination file system whose root is mounted at the
       junction directory.
+    - For a file system in a realm use the realm-qualified name, for
+      example C(realm1::fs2). The junction and both file systems must be
+      in the same realm, or all three at array level.
     - Required when I(state=present).
     type: str
   path:
@@ -125,6 +144,15 @@ EXAMPLES = r"""
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
+- name: Create a junction between two file systems of the realm realm1
+  everpure.flashblade.purefb_fs_junction:
+    name: realm1::projects-alpha
+    origin_fs: realm1::projects
+    destination_fs: realm1::alpha
+    path: /alpha
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
 - name: Move a junction to a different directory (delete and re-create)
   everpure.flashblade.purefb_fs_junction:
     name: projects-alpha
@@ -148,19 +176,26 @@ junction:
   description:
   - Details of the junction after the operation. In check mode the
     requested values are returned and I(status) is C(null).
+  - For a junction in a realm the junction name and both file system names
+    are realm-qualified, for example C(realm1::projects), in check mode and
+    in a real run alike.
   returned: when I(state=present)
   type: dict
   contains:
     name:
-      description: Name of the junction.
+      description: Name of the junction, with its realm prefix when it is in a realm.
       type: str
       sample: projects-alpha
     origin_fs:
-      description: Origin file system that holds the junction directory.
+      description:
+      - Origin file system that holds the junction directory.
+      - Realm-qualified when the junction is in a realm.
       type: str
       sample: projects
     destination_fs:
-      description: Destination file system mounted at the junction directory.
+      description:
+      - Destination file system mounted at the junction directory.
+      - Realm-qualified when the junction is in a realm.
       type: str
       sample: alpha
     path:
@@ -184,6 +219,7 @@ except ImportError:
     HAS_PYPURECLIENT = False
 
 
+import re
 from ansible.module_utils.basic import AnsibleModule
 from ansible_collections.everpure.flashblade.plugins.module_utils.purefb import (
     get_system,
@@ -225,37 +261,66 @@ def _realm(name):
     return ""
 
 
-def _same_fs(array_name, requested):
-    """Compare a file system name reported by the array with the request.
+def _leaf(name):
+    """Return a name without its realm prefix."""
+    return name.split("::", 1)[-1]
 
-    The junction and both file systems are validated to share one realm
-    before this is called, so a reference the array reports without the
-    realm prefix still matches the realm-scoped name of the request.
+
+def _same_name(first, second):
+    """Compare two names as the array does, without regard to case."""
+    return first.lower() == second.lower()
+
+
+def _qualify(fs_name, realm):
+    """Return a file system name with the realm prefix of its junction.
+
+    The array reports the file systems of a junction in a realm without the
+    realm prefix, where they read as the array-level file systems of the
+    same names. Both are always in the realm of the junction.
     """
-    if array_name == requested:
-        return True
-    if array_name is None or requested is None:
-        return False
-    return array_name.split("::", 1)[-1] == requested.split("::", 1)[-1]
+    if fs_name and realm and "::" not in fs_name:
+        return "{0}::{1}".format(realm, fs_name)
+    return fs_name
+
+
+def _same_fs(current, requested):
+    """Compare a file system of an existing junction with the requested one.
+
+    Both are in the realm of the junction: the request is validated to
+    carry the realm prefix of the junction name, and the junction was found
+    by that name. The names are therefore compared without the prefix.
+
+    The array resolves a name in any case to the same object and returns
+    the spelling it stores, so the comparison ignores case. A file system
+    that the request spells in another case is not drift, and recreate
+    does not delete and re-create the junction for it.
+    """
+    if current is None or requested is None:
+        return current == requested
+    return _same_name(_leaf(current), _leaf(requested))
 
 
 def _junction_facts(junction):
+    name = getattr(junction, "name", None)
+    realm = _realm(name)
     return {
-        "name": getattr(junction, "name", None),
-        "origin_fs": getattr(
-            getattr(junction, "origin_file_system", None), "name", None
+        "name": name,
+        "origin_fs": _qualify(
+            getattr(getattr(junction, "origin_file_system", None), "name", None),
+            realm,
         ),
-        "destination_fs": getattr(
-            getattr(junction, "destination_file_system", None), "name", None
+        "destination_fs": _qualify(
+            getattr(getattr(junction, "destination_file_system", None), "name", None),
+            realm,
         ),
         "path": getattr(junction, "junction_origin_path", None),
         "status": getattr(junction, "status", None),
     }
 
 
-def _requested_facts(module):
+def _requested_facts(module, name=None):
     return {
-        "name": module.params["name"],
+        "name": name or module.params["name"],
         "origin_fs": module.params["origin_fs"],
         "destination_fs": module.params["destination_fs"],
         "path": _norm_path(module.params["path"]),
@@ -293,17 +358,22 @@ def _check_realms(module):
     realm, but a bare junction name on realm-scoped file systems is rejected
     with a message about the file system realms not matching, which hides
     the real cause.
+
+    The array finds a realm under a prefix in any case, so prefixes that
+    differ only in case name the same realm and are not refused here. The
+    one spelling the array does refuse, in the name of a new junction, is
+    explained when it refuses it.
     """
     origin_realm = _realm(module.params["origin_fs"])
     destination_realm = _realm(module.params["destination_fs"])
-    if origin_realm != destination_realm:
+    if not _same_name(origin_realm, destination_realm):
         module.fail_json(
             msg=(
                 "Origin file system {0} and destination file system {1} "
                 "must be in the same realm."
             ).format(module.params["origin_fs"], module.params["destination_fs"])
         )
-    if _realm(module.params["name"]) != origin_realm:
+    if not _same_name(_realm(module.params["name"]), origin_realm):
         if origin_realm:
             module.fail_json(
                 msg=(
@@ -323,10 +393,112 @@ def _check_realms(module):
         )
 
 
-def _post_junction(module, blade, use_existing_directory, recreating=False):
-    """Create the junction and return the array's view of it."""
+def _name_holders(module, blade):
+    """Return the names of the junctions that use the requested leaf name.
+
+    A junction name is unique across the array and all of its realms: j1,
+    realm1::j1 and realm2::j1 exclude each other, and the array refuses the
+    create with "already exists" although the requested name is not in use.
+    A caller that is limited to a realm sees only the junctions of that
+    realm. Returns None when the lookup fails, which leaves the array as
+    the only judge of the request. The same applies to a name with a
+    character that no junction name can hold: a filter has no escape for
+    a quote, and a wildcard would match the names of other junctions.
+    """
+    leaf = _leaf(module.params["name"])
+    if not re.match(r"[A-Za-z0-9_-]+\Z", leaf):
+        return None
+    res = blade.get_file_system_junctions(
+        filter="name='{0}' or name='*::{0}'".format(leaf), **_context_kwargs(module)
+    )
+    if res.status_code != 200:
+        return None
+    return [item.name for item in res.items]
+
+
+def _stored_realm(module, blade):
+    """Return the realm of the origin file system as the array spells it.
+
+    The array finds a file system under a realm prefix in any case, but it
+    accepts the realm prefix of a new junction name only in the spelling
+    it stores. Returns None when the file system cannot be read.
+    """
+    res = blade.get_file_systems(
+        names=[module.params["origin_fs"]], **_context_kwargs(module)
+    )
+    if res.status_code != 200:
+        return None
+    items = list(res.items)
+    return _realm(items[0].name) if items else None
+
+
+def _name_taken_msg(module, holder):
+    return (
+        "File system junction {0} cannot be created because junction {1} "
+        "already uses the name {2}. A junction name must be unique across "
+        "the array and all of its realms."
+    ).format(module.params["name"], holder, _leaf(holder))
+
+
+def _name_refused(error):
+    """Return True when the array refused a create because the name is taken.
+
+    The refusals about the junction directory also say "already exists",
+    but they name the path.
+    """
+    text = str(error).lower()
+    return "already exists" in text and "path" not in text
+
+
+def _create_error(module, blade, error):
+    """Return the failure message for a create that the array refused.
+
+    The module's own lookup found the name unused, so when the array says
+    that the name is taken the junction that holds it is in another scope.
+    A refusal about the realms of a request whose realm prefixes agree is
+    explained when the array stores the realm in another case than the
+    junction name spells it. Every other refusal is relayed as it is.
+    """
+    name = module.params["name"]
+    plain = "Failed to create file system junction {0}. Error: {1}".format(name, error)
+    if _name_refused(error):
+        holders = _name_holders(module, blade)
+        if holders is None or any(_same_name(name, holder) for holder in holders):
+            return plain
+        if holders:
+            return _name_taken_msg(module, holders[0])
+        return (
+            "Failed to create file system junction {0}. Error: {1}. No "
+            "junction named {2} is visible to this user, so the name is in "
+            "use in another realm or at array level. A junction name must be "
+            "unique across the array and all of its realms."
+        ).format(name, str(error).rstrip("."), _leaf(name))
+    realm = _realm(name)
+    if realm and "realm" in str(error).lower():
+        # The realm prefixes of the request agree, so a refusal about the
+        # realms is about the spelling of the prefix of the junction name.
+        stored = _stored_realm(module, blade)
+        if stored and stored != realm and _same_name(stored, realm):
+            return (
+                "Failed to create file system junction {0}. Error: {1}. The "
+                "array stores the realm as {2} and accepts only that spelling "
+                "in the name of a new junction: use {2}::{3}."
+            ).format(name, str(error).rstrip("."), stored, _leaf(name))
+    return plain
+
+
+def _post_junction(module, blade, use_existing_directory, recreate_as=None):
+    """Create the junction and return the array's view of it.
+
+    ``recreate_as`` is the name of the junction that was just deleted, as
+    the array stored it. The junction is re-created under that name: the
+    array accepts the realm prefix of a new junction name only in the
+    spelling it stores, so a request that found the junction under another
+    spelling would delete it and then be refused the re-create.
+    """
+    name = recreate_as or module.params["name"]
     res = blade.post_file_system_junctions(
-        names=[module.params["name"]],
+        names=[name],
         origin_file_system_names=[module.params["origin_fs"]],
         file_system_junction=FileSystemJunction(
             destination_file_system=Reference(name=module.params["destination_fs"]),
@@ -336,28 +508,28 @@ def _post_junction(module, blade, use_existing_directory, recreating=False):
         **_context_kwargs(module)
     )
     if res.status_code != 200:
-        if recreating:
-            text = (
-                "File system junction {0} was deleted but re-creating it "
-                "failed. Error: {1}"
+        error = get_error_message(res)
+        if recreate_as:
+            module.fail_json(
+                msg=(
+                    "File system junction {0} was deleted but re-creating it "
+                    "failed. Error: {1}"
+                ).format(name, error)
             )
-        else:
-            text = "Failed to create file system junction {0}. Error: {1}"
-        module.fail_json(msg=text.format(module.params["name"], get_error_message(res)))
+        module.fail_json(msg=_create_error(module, blade, error))
     items = list(res.items)
     if items:
         return _junction_facts(items[0])
-    return _requested_facts(module)
+    return _requested_facts(module, name)
 
 
-def _delete_junction(module, blade):
-    res = blade.delete_file_system_junctions(
-        names=[module.params["name"]], **_context_kwargs(module)
-    )
+def _delete_junction(module, blade, name):
+    """Delete the junction under the name the array stores for it."""
+    res = blade.delete_file_system_junctions(names=[name], **_context_kwargs(module))
     if res.status_code != 200:
         module.fail_json(
             msg="Failed to delete file system junction {0}. Error: {1}".format(
-                module.params["name"], get_error_message(res)
+                name, get_error_message(res)
             )
         )
 
@@ -365,7 +537,12 @@ def _delete_junction(module, blade):
 def create_junction(module, blade):
     changed = True
     facts = _requested_facts(module)
-    if not module.check_mode:
+    if module.check_mode:
+        # Predict the refusal of a name that another scope already uses.
+        for holder in _name_holders(module, blade) or []:
+            if not _same_name(holder, module.params["name"]):
+                module.fail_json(msg=_name_taken_msg(module, holder))
+    else:
         facts = _post_junction(module, blade, module.params["use_existing_directory"])
     module.exit_json(changed=changed, junction=facts)
 
@@ -402,24 +579,27 @@ def update_junction(module, blade, junction):
             ).format(module.params["name"], ", ".join(drift))
         )
     changed = True
-    facts = _requested_facts(module)
+    stored_name = current["name"] or module.params["name"]
+    facts = _requested_facts(module, stored_name)
     if not module.check_mode:
-        _delete_junction(module, blade)
+        _delete_junction(module, blade, stored_name)
         # Deleting a junction leaves its directory behind, so a re-create on
         # the same origin and path must build on that existing directory.
         facts = _post_junction(
             module,
             blade,
             module.params["use_existing_directory"] or (same_origin and same_path),
-            recreating=True,
+            recreate_as=stored_name,
         )
     module.exit_json(changed=changed, junction=facts)
 
 
-def delete_junction(module, blade):
+def delete_junction(module, blade, junction):
     changed = True
     if not module.check_mode:
-        _delete_junction(module, blade)
+        _delete_junction(
+            module, blade, getattr(junction, "name", None) or module.params["name"]
+        )
     module.exit_json(changed=changed)
 
 
@@ -461,7 +641,7 @@ def main():
 
     if state == "absent":
         if junction:
-            delete_junction(module, blade)
+            delete_junction(module, blade, junction)
         module.exit_json(changed=False)
 
     _check_realms(module)

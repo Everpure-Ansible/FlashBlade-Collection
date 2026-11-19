@@ -1,0 +1,4 @@
+bugfixes:
+  - purefb_server - refuse to delete a server while an object store virtual host is attached to it
+    (REST 2.20 or higher), as a virtual host must stay attached to at least one object store server.
+    The message names the virtual hosts to detach or delete first.

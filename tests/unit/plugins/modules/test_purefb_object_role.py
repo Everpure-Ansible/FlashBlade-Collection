@@ -1244,3 +1244,47 @@ class TestRealmChecks:
 
         blade.post_object_store_roles_object_store_access_policies.assert_called_once()
         assert module.exit_json.call_args[1]["changed"] is True
+
+    # ---------------- added in review ----------------
+
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_qualified_role_name_fails_before_the_login(self, check_mode, state):
+        """get_system() logs in, which is the first request to the array: the
+        role name is refused before it."""
+        module = _module(check_mode=check_mode, state=state, name="realm1::analytics")
+        with ExitStack() as stack:
+            stack.enter_context(patch(MODULE + ".AnsibleModule", return_value=module))
+            login = stack.enter_context(patch(MODULE + ".get_system"))
+            version = stack.enter_context(patch(MODULE + ".get_rest_api_version"))
+            stack.enter_context(patch(MODULE + ".HAS_PYPURECLIENT", True))
+            with pytest.raises(SystemExit):
+                main()
+
+        login.assert_not_called()
+        version.assert_not_called()
+        module.exit_json.assert_not_called()
+        assert "Invalid role name " in module.fail_json.call_args[1]["msg"]
+
+    @pytest.mark.parametrize("given", [RACCOUNT, "REALM1::ACME"])
+    def test_without_ids_the_spelling_of_the_array_is_compared_without_case(
+        self, given
+    ):
+        """No IDs, and the array spells the account with capitals in both
+        references: it is still the role's own account."""
+        module = _module(account=given, access_policies=[given + "/reports"])
+        blade = _blade(role=_role(account=RACCOUNT), ids=False)
+        account = _account(given, ids=False)
+        account.name = "Realm1::Acme"
+        blade.get_object_store_accounts.side_effect = None
+        blade.get_object_store_accounts.return_value = _response(200, [account])
+        policy = _policy(given + "/reports", ids=False)
+        policy.account.name = "Realm1::Acme"
+        blade.get_object_store_access_policies.side_effect = None
+        blade.get_object_store_access_policies.return_value = _response(200, [policy])
+
+        _run_main(module, blade)
+
+        module.fail_json.assert_not_called()
+        blade.post_object_store_roles_object_store_access_policies.assert_called_once()
+        assert module.exit_json.call_args[1]["changed"] is True

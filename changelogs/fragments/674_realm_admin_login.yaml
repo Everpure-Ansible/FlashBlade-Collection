@@ -1,0 +1,4 @@
+bugfixes:
+  - all modules - an identity that may not read ``GET /hardware``, such as an administrator whose
+    access is scoped to a realm, can now log in. A refused login or an unreachable FlashBlade
+    fails with a clear message instead of a traceback.

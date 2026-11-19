@@ -24,6 +24,12 @@ description:
 - Nameservers provided will overwrite any existing nameservers.
 - Nameservers may be DNS over HTTPS endpoints validated by a CA certificate
   or certificate group. This requires REST API 2.25 (Purity//FB 4.8.0) or higher.
+- A DNS configuration in a realm is named C(realm::name). Its I(source),
+  I(ca_certificate) and I(ca_certificate_group) are objects of the same
+  realm and carry the same prefix.
+- An array-level DNS configuration can be shared with a realm using
+  M(everpure.flashblade.purefb_resource_access). It keeps its name, without
+  a realm prefix.
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
@@ -31,6 +37,12 @@ options:
     description:
     - Name of the DNS configuration.
     - Default value only supported for management service
+    - A configuration in a realm is named C(realm::name). It supports only
+      the C(data) service and needs a I(source) when it is created.
+    - A name without a realm prefix is an array-level configuration. A
+      realm-scoped administrator must use the realm-qualified name; a bare
+      name is not placed in, or resolved to, the administrator's realm.
+    - The array matches names without regard to case, and so does the module.
     default: management
     type: str
   state:
@@ -60,6 +72,8 @@ options:
     - Only valid when every nameserver is an C(https://) endpoint. The array
       drops the reference when the nameservers revert to IP addresses.
     - Mutually exclusive with I(ca_certificate_group).
+    - A configuration in a realm takes a certificate of the same realm,
+      named C(realm::name).
     - Requires REST API 2.25 (Purity//FB 4.8.0) or higher.
     type: str
     version_added: '1.30.0'
@@ -69,18 +83,28 @@ options:
     - Only valid when every nameserver is an C(https://) endpoint. The array
       drops the reference when the nameservers revert to IP addresses.
     - Mutually exclusive with I(ca_certificate).
+    - A configuration in a realm takes a certificate group of the same
+      realm, named C(realm::name).
     - Requires REST API 2.25 (Purity//FB 4.8.0) or higher.
     type: str
     version_added: '1.30.0'
   source:
     description:
     - A virtual network interface (vip)
-    - The network interfaces must have a I(service) value of I(data)
+    - The network interface of an array-level configuration must have a
+      I(service) value of I(data).
+    - A configuration and its source must be in the same realm, or both at
+      array level. A configuration in a realm takes a network interface of
+      that realm, named C(realm::name), normally the C(egress-only) interface
+      of the realm.
+    - A configuration in a realm needs a source when it is created and
+      cannot give it up, so an empty string is refused for it.
     type: str
   service:
     description:
     - The service utilizing the DNS configuration.
     - Only aplicable when creating a new DNS configuration.
+    - A configuration in a realm supports only C(data).
     type: str
     choices: [ management, data ]
     default: data
@@ -143,6 +167,16 @@ EXAMPLES = r"""
     nameservers:
       - https://192.0.2.53/dns-query
     ca_certificate: doh-ca
+    fb_url: 10.10.10.2
+    api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+
+- name: Create a DNS configuration in realm realm-1 using the realm's egress-only interface
+  everpure.flashblade.purefb_dns:
+    name: realm-1::dns
+    domain: everpuredata.com
+    nameservers:
+      - 8.8.8.8
+    source: realm-1::egress
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
 """
@@ -259,24 +293,133 @@ def _fail_if_ca_without_https(module, ca_param, nameservers):
         )
 
 
+def _realm_of(name):
+    """Realm of a realm::name name, empty for an array-level name."""
+    return (name or "").rpartition("::")[0]
+
+
+def _same_name(left, right):
+    """True when the array takes both names as one: it ignores their case."""
+    return (left or "").lower() == (right or "").lower()
+
+
+def _find_config(configs, name):
+    """The configuration the array holds under this name, or None."""
+    for config in configs:
+        if _same_name(config.name, name):
+            return config
+    return None
+
+
+def _check_realm_references(module):
+    """Fail on a reference the array refuses for the realm of the configuration.
+
+    A configuration is in a realm when it is named realm::name. The array
+    refuses a source outside the realm of the configuration, in either
+    direction ("DNS configuration and it's source must be in the same
+    realm."), and for a configuration in a realm a certificate or certificate
+    group from outside it ("DNS cannot be changed/created with certificate
+    or certificate group from a different realm."). The names carry the
+    realm, so this is settled before any request and check mode agrees with
+    a real run.
+    """
+    name = module.params["name"]
+    realm = _realm_of(name)
+    source = module.params["source"]
+    if source and not _same_name(_realm_of(source), realm):
+        if realm:
+            module.fail_json(
+                msg="Source {0} is not in realm {1}. DNS configuration {2} "
+                "takes a network interface of its own realm, named "
+                "{1}::<interface>.".format(source, realm, name)
+            )
+        module.fail_json(
+            msg="Source {0} is in a realm. DNS configuration {1} is not in a "
+            "realm and takes a network interface that is not in one "
+            "either.".format(source, name)
+        )
+    ca_param = _ca_param(module)
+    if realm and ca_param and not _same_name(_realm_of(module.params[ca_param]), realm):
+        module.fail_json(
+            msg="{0} {1} is not in realm {2}. DNS configuration {3} takes a "
+            "certificate or certificate group of its own realm, named "
+            "{2}::<name>.".format(ca_param, module.params[ca_param], realm, name)
+        )
+
+
+def _check_realm_source(module, exists):
+    """Fail when a configuration in a realm would have no source.
+
+    The array refuses to create a configuration in a realm without a source
+    ("DNS configuration must have a source when created inside realm.") or
+    with another service than data ("Invalid DNS service value. Valid value
+    is 'data'."). An existing one is therefore never asked to give its
+    source up. Refused in check mode as well.
+    """
+    name = module.params["name"]
+    realm = _realm_of(name)
+    if not realm:
+        return
+    if exists:
+        if module.params["source"] == "":
+            module.fail_json(
+                msg="DNS configuration {0} is in a realm and cannot be left "
+                "without a source. Name the network interface of realm {1} "
+                "that replaces the current one.".format(name, realm)
+            )
+        return
+    if module.params["service"] != "data":
+        module.fail_json(
+            msg="DNS configuration {0} is in a realm, where only the data "
+            "service is supported.".format(name)
+        )
+    if not module.params["source"]:
+        module.fail_json(
+            msg="DNS configuration {0} is in a realm and needs a source when "
+            "it is created: a network interface of realm {1}, named "
+            "{1}::<interface>.".format(name, realm)
+        )
+
+
+def _fail_reference(module, res, label, kind, name):
+    """Fail on a referenced object the array did not return.
+
+    Only "does not exist" means the object is absent, which for an identity
+    whose access is limited to a realm also covers an object outside that
+    realm. Any other answer is reported as the array gave it.
+    """
+    reason = get_error_message(res)
+    if "does not exist" in reason.lower():
+        module.fail_json(
+            msg="{0} {1} does not exist or is not visible to this identity. "
+            "An object in a realm is named realm::name.".format(label, name)
+        )
+    module.fail_json(
+        msg="Failed to read {0} {1}. Error: {2}".format(kind, name, reason)
+    )
+
+
 def _check_certificate(module, blade, param):
-    """Fail unless the named certificate or certificate group exists."""
+    """Fail unless the named certificate or certificate group can be read."""
     name = module.params[param]
     if not name:
         return
     if param == "ca_certificate_group":
         res = blade.get_certificate_groups(names=[name])
-        kind = "Certificate group"
+        label = "Certificate group"
     else:
         res = blade.get_certificates(names=[name])
-        kind = "Certificate"
+        label = "Certificate"
     if res.status_code != 200:
-        module.fail_json(msg="{0} {1} does not exist.".format(kind, name))
+        _fail_reference(module, res, label, label.lower(), name)
 
 
-def _get_source(module, blade):
-    res = blade.get_network_interfaces(names=[module.params["source"]])
-    return bool(res.status_code == 200)
+def _check_source(module, blade):
+    """Fail unless the source network interface can be read."""
+    name = module.params["source"]
+    res = blade.get_network_interfaces(names=[name])
+    if res.status_code != 200:
+        _fail_reference(module, res, "Specified VIP", "network interface", name)
 
 
 # REST version at which get_dns, post_dns, patch_dns and delete_dns accept
@@ -345,7 +488,14 @@ def update_multi_dns(module, blade):
     """Update a DNS configuration"""
     changed = False
     ctx = _context_kwargs(module)
-    current_dns = list(blade.get_dns(names=[module.params["name"]], **ctx).items)[0]
+    res = blade.get_dns(names=[module.params["name"]], **ctx)
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to read DNS configuration {0}. Error: {1}".format(
+                module.params["name"], get_error_message(res)
+            )
+        )
+    current_dns = list(res.items)[0]
     domain = current_dns.domain
     nameservers = current_dns.nameservers
     if module.params["domain"] and current_dns.domain != module.params["domain"]:
@@ -359,9 +509,10 @@ def update_multi_dns(module, blade):
     current_source = ""
     if current_dns.sources:
         current_source = getattr(current_dns.sources[0], "name", "") or ""
-    if (
-        module.params["source"] is not None
-        and current_source != module.params["source"]
+    # The array matches a reference without regard to case and keeps the
+    # spelling it stored, so a different case is not a change.
+    if module.params["source"] is not None and not _same_name(
+        current_source, module.params["source"]
     ):
         changed = True
     # The array rejects a CA reference unless every nameserver is https://,
@@ -374,7 +525,9 @@ def update_multi_dns(module, blade):
     if ca_param:
         _fail_if_ca_without_https(module, ca_param, nameservers)
         wanted = module.params[ca_param]
-        if wanted != _reference_name(current_dns, REFERENCE_PARAMS[ca_param]):
+        if not _same_name(
+            wanted, _reference_name(current_dns, REFERENCE_PARAMS[ca_param])
+        ):
             changed = True
         ca_reference = (REFERENCE_PARAMS[ca_param], wanted)
     elif _all_https(nameservers):
@@ -501,6 +654,8 @@ def main():
             )
         if nameservers:
             _fail_if_ca_without_https(module, ca_param, nameservers)
+        if LooseVersion(NON_MGMT_DNS) <= LooseVersion(api_version):
+            _check_realm_references(module)
         if ca_param:
             _check_certificate(module, blade, ca_param)
 
@@ -512,21 +667,18 @@ def main():
                     get_error_message(res)
                 )
             )
-        configs = list(res.items)
-        exists = False
-        for config in configs:
-            if config.name == module.params["name"]:
-                exists = True
+        current = _find_config(list(res.items), module.params["name"])
+        exists = current is not None
+        if exists:
+            # The array matches names without regard to case and returns the
+            # spelling it stored, which is the one used from here on.
+            module.params["name"] = current.name
+        if state == "present":
+            _check_realm_source(module, exists)
         # get_network_interfaces takes no context and interface names belong
         # to the fleet member, so the source check only runs locally.
-        if (
-            module.params["source"]
-            and not module.params["context"]
-            and not _get_source(module, blade)
-        ):
-            module.fail_json(
-                msg="Specified VIP {0} does not exist.".format(module.params["source"])
-            )
+        if module.params["source"] and not module.params["context"]:
+            _check_source(module, blade)
         if state == "present" and exists:
             update_multi_dns(module, blade)
         elif state == "present" and not exists:

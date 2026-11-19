@@ -7342,6 +7342,65 @@ class TestPurefbInfoSpace:
         assert entry["available_provisioned_space"] is None
         assert "total_used_space" not in entry
 
+    # ---------------- namesakes ----------------
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_info.get_rest_api_version",
+        Mock(return_value="2.30"),
+    )
+    def test_namesakes_keep_their_own_figures(self):
+        """The same leaf name at array level and in two realms gives three
+        entries, each with the figures of its own object."""
+        names = ("same", "realm1::same", "realm2::same")
+        spaces = {
+            name: dict(self.BUCKET, virtual=1000 * step, total_used=100 * step)
+            for step, name in enumerate(names, start=1)
+        }
+
+        file_systems = generate_fs_dict(
+            self._fs_blade(
+                [
+                    self._file_system(name, self._space(self.SPACE_2_16, spaces[name]))
+                    for name in names
+                ]
+            )
+        )
+        buckets = generate_bucket_dict(
+            self._bucket_blade(
+                [
+                    self._bucket(
+                        name,
+                        name.replace("same", "acct"),
+                        self._space(self.SPACE_2_16, spaces[name]),
+                    )
+                    for name in names
+                ]
+            ),
+            "2.30",
+        )
+        accounts = generate_object_store_accounts_dict(
+            self._account_blade(
+                [
+                    SimpleNamespace(
+                        name=name,
+                        object_count=3,
+                        space=self._space(self.SPACE_2_16, spaces[name]),
+                    )
+                    for name in names
+                ]
+            ),
+            "2.30",
+        )
+
+        for entries in (file_systems, buckets, accounts):
+            assert sorted(entries) == sorted(names)
+            for step, name in enumerate(names, start=1):
+                assert entries[name]["virtual_space"] == 1000 * step, name
+                assert entries[name]["total_used_space"] == 100 * step, name
+        assert buckets["same"]["account_name"] == "acct"
+        assert buckets["realm2::same"]["account_name"] == "realm2::acct"
+
     # ---------------- main ----------------
 
     @patch("plugins.modules.purefb_info.generate_object_store_virtual_hosts_dict")

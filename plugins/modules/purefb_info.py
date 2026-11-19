@@ -139,7 +139,9 @@ options:
         report C(array_wide), true when the policy applies to the array
         as a whole. Every policy entry reports C(realms), the names of
         the realms the policy belongs to, which is empty for an
-        array-level policy.
+        array-level policy. The file systems of a WORM data policy in a
+        realm are reported as C(realm::filesystem), in
+        C(worm_data_policies) and in C(members).
       - The C(minimum) subset key C(network_access_protocol) holds the
         name of the array network access policy and is misspelt. Use
         C(network_access_policy) instead; the misspelt key is kept for
@@ -485,6 +487,33 @@ def _policy_name_of(reference, names_by_id):
     return getattr(reference, "name", None)
 
 
+def _attachment_key(reference):
+    """Key of the file system of an attachment row: its id, or its name for
+    a row that carries no id"""
+    reference_id = getattr(reference, "id", None)
+    if isinstance(reference_id, str) and reference_id:
+        return reference_id
+    return getattr(reference, "name", None)
+
+
+def _attached_policy(attachments, fsystem):
+    """Name of the policy attached to ``fsystem``, from a map of attachments
+
+    The array can list the file system of an attachment by its bare name
+    although it lives in a realm, and an array-level file system may hold
+    that same name. The map is therefore keyed by file system id; a map
+    keyed by name is read by name. The policy of a file system in a realm
+    is in that realm.
+    """
+    fs_id = getattr(fsystem, "id", None)
+    policy_name = None
+    if isinstance(fs_id, str) and fs_id:
+        policy_name = attachments.get(fs_id)
+    if policy_name is None:
+        policy_name = attachments.get(fsystem.name)
+    return _realm_qualified(policy_name, fsystem.name)
+
+
 # What the array answers to a read the identity in use may not make. An
 # administrator whose access is limited to a realm gets it for every
 # array-wide read (hardware, array space and performance, support, ...).
@@ -590,6 +619,55 @@ def _guard_reads(module, blade):
         method = getattr(blade, name, None) if name.startswith("get_") else None
         if callable(method):
             setattr(blade, name, guarded(name, method))
+
+
+# What the array answers to a listing of object store users, roles or
+# policy members that would cover more than one query may name: "Querying
+# is only supported for a maximum of ten users or ten policies per query."
+QUERY_TOO_WIDE_MESSAGE = "per query"
+# Members or policies one such query may name
+MEMBERSHIP_QUERY_SIZE = 10
+
+
+def _query_too_wide(response):
+    """True when the array refused a listing for covering too much"""
+    if not _read_failed(response):
+        return False
+    messages = _error_messages(response)
+    return bool(messages) and all(
+        QUERY_TOO_WIDE_MESSAGE in message.lower() for message in messages
+    )
+
+
+def _named_object_gone(response):
+    """True when a read failed because what it names no longer exists"""
+    messages = _error_messages(response)
+    return bool(messages) and all(
+        "does not exist" in message.lower() for message in messages
+    )
+
+
+def _listing_in_tens(read, key, values, strict=True):
+    """Rows of a membership listing, read for ten values of ``key`` at a time
+
+    For a listing the array refuses to give in one query. One value that no
+    longer exists fails the query of its ten, which are then read one by
+    one; a policy or member removed since it was listed is skipped. Any
+    other failed read is passed on, or skipped when ``strict`` is false.
+    """
+    rows = []
+    for start in range(0, len(values), MEMBERSHIP_QUERY_SIZE):
+        chunk = values[start : start + MEMBERSHIP_QUERY_SIZE]
+        res = read(**{key: chunk})
+        if not _read_failed(res):
+            rows.extend(res.items)
+            continue
+        for value in chunk:
+            res = read(**{key: [value]})
+            if _read_failed(res) and (_named_object_gone(res) or not strict):
+                continue
+            rows.extend(res.items)
+    return rows
 
 
 def _first_item(response):
@@ -2058,8 +2136,29 @@ def generate_policies_dict(blade):
     return policies_info
 
 
+def _policy_member_rows(blade, policies):
+    """Every row of GET policies-all/members
+
+    One query returns the members of every policy, unless the array holds
+    more object store users or roles than one query may cover; the members
+    are then read for ten policies at a time.
+    """
+    res = blade.get_policies_all_members()
+    if not _query_too_wide(res):
+        return list(res.items)
+    return _listing_in_tens(
+        blade.get_policies_all_members,
+        "policy_ids",
+        [
+            policy.id
+            for policy in policies
+            if isinstance(getattr(policy, "id", None), str)
+        ],
+    )
+
+
 def _policy_members_by_name(blade, policies):
-    """Map policy name -> members from one GET policies-all/members call.
+    """Map policy name -> members from GET policies-all/members.
 
     The endpoint covers every policy type (snapshot, access, telemetry,
     network, TLS ...) in a single response. Rows are attributed by policy
@@ -2069,7 +2168,7 @@ def _policy_members_by_name(blade, policies):
     """
     names_by_id = {policy.id: policy.name for policy in policies}
     members = {}
-    for row in blade.get_policies_all_members().items:
+    for row in _policy_member_rows(blade, policies):
         policy_ref = getattr(row, "policy", None)
         policy_name = names_by_id.get(
             getattr(policy_ref, "id", None), getattr(policy_ref, "name", None)
@@ -2079,6 +2178,10 @@ def _policy_members_by_name(blade, policies):
             "name": getattr(member_ref, "name", None),
             "resource_type": getattr(member_ref, "resource_type", None),
         }
+        if member["resource_type"] == "file-systems":
+            # the array lists the file system of a WORM data policy in a
+            # realm by its bare name
+            member["name"] = _realm_qualified(member["name"], policy_name)
         if member["resource_type"] == "file-system-replica-links":
             link = getattr(row, "link", None)
             member["link"] = {
@@ -2505,6 +2608,8 @@ def generate_network_access_policies_dict(blade):
 
 def generate_worm_data_policies_dict(blade):
     policies_info = {}
+    # attachments are matched to their policy by its id
+    names_by_id = {}
     api_version = get_rest_api_version(blade)
     has_autocommit = LooseVersion(WORM_AUTOCOMMIT_API_VERSION) <= LooseVersion(
         api_version
@@ -2522,6 +2627,8 @@ def generate_worm_data_policies_dict(blade):
             "realms": _realm_names(policy),
             "members": [],
         }
+        if isinstance(getattr(policy, "id", None), str):
+            names_by_id[policy.id] = policy.name
         if has_autocommit:
             # commit_mode and the autocommit configuration exist from REST
             # 2.29; delay_period is in milliseconds like the retentions.
@@ -2535,10 +2642,15 @@ def generate_worm_data_policies_dict(blade):
             }
 
     for member in blade.get_worm_data_policies_members().items:
-        policy_name = getattr(getattr(member, "policy", None), "name", None)
+        policy_name = _policy_name_of(getattr(member, "policy", None), names_by_id)
         if policy_name in policies_info:
+            # the array lists the file system of a policy in a realm by its
+            # bare name; it is in the realm of the policy
             policies_info[policy_name]["members"].append(
-                getattr(getattr(member, "member", None), "name", None)
+                _realm_qualified(
+                    getattr(getattr(member, "member", None), "name", None),
+                    policy_name,
+                )
             )
 
     return policies_info
@@ -2975,11 +3087,21 @@ def generate_object_store_roles_dict(blade):
             "access_policies": [],
         }
     links = blade.get_object_store_roles_object_store_access_policies()
+    rows = []
     if links.status_code == 200:
-        for link in list(links.items):
-            role_name = getattr(getattr(link, "member", None), "name", None)
-            if role_name in roles_info:
-                roles_info[role_name]["access_policies"].append(link.policy.name)
+        rows = list(links.items)
+    elif _query_too_wide(links):
+        # the array lists the policies of at most ten roles in one query
+        rows = _listing_in_tens(
+            blade.get_object_store_roles_object_store_access_policies,
+            "member_names",
+            list(roles_info),
+            strict=False,
+        )
+    for link in rows:
+        role_name = getattr(getattr(link, "member", None), "name", None)
+        if role_name in roles_info:
+            roles_info[role_name]["access_policies"].append(link.policy.name)
     return roles_info
 
 
@@ -2988,8 +3110,9 @@ def generate_fs_dict(blade, exports=None, api_version=None, worm_policies=None):
 
     ``exports`` is the array-wide File System Exports list (REST 2.16+),
     ``api_version`` enables the quota-policy view (REST 2.25+) and
-    ``worm_policies`` maps filesystem name to its WORM data policy (REST
-    2.15+, from generate_fs_worm_policies_dict). main() passes None for any
+    ``worm_policies`` maps a filesystem, by id or by name, to its WORM data
+    policy (REST 2.15+, from generate_fs_worm_policies_dict). main() passes
+    None for any
     of them when the array is too old and the matching keys are left out.
     """
     fs_info = {}
@@ -3003,9 +3126,9 @@ def generate_fs_dict(blade, exports=None, api_version=None, worm_policies=None):
         res = blade.get_file_systems_user_group_quota_policies()
         if res.status_code == 200:
             for attached in res.items:
-                member_name = getattr(getattr(attached, "member", None), "name", None)
-                if member_name:
-                    attached_policies[member_name] = getattr(
+                key = _attachment_key(getattr(attached, "member", None))
+                if key:
+                    attached_policies[key] = getattr(
                         getattr(attached, "policy", None), "name", None
                     )
     by_fs = {}
@@ -3094,11 +3217,13 @@ def generate_fs_dict(blade, exports=None, api_version=None, worm_policies=None):
                 "eradication_mode",
                 None,
             )
-            fs_info[share]["worm_policy"] = worm_policies.get(share)
+            fs_info[share]["worm_policy"] = _attached_policy(worm_policies, fsystem)
 
         if quota_view:
             # attached user-group quota policy and the usage it limits
-            fs_info[share]["quota_policy"] = attached_policies.get(share)
+            fs_info[share]["quota_policy"] = _attached_policy(
+                attached_policies, fsystem
+            )
             fs_info[share]["policy_quotas"] = {"users": [], "groups": []}
             res = blade.get_file_systems_users(file_system_names=[share])
             if res.status_code == 200:
@@ -3137,18 +3262,19 @@ def generate_fs_dict(blade, exports=None, api_version=None, worm_policies=None):
 
 
 def generate_fs_worm_policies_dict(blade):
-    """Map each filesystem name to the WORM data policy attached to it.
+    """Map each filesystem to the WORM data policy attached to it.
 
-    Requires REST API 2.15+ (WORM_API_VERSION); callers gate on the version
-    before invoking. Filesystems without a WORM data policy are absent.
+    The array lists a filesystem in a realm by its bare name here, so the
+    map is keyed by filesystem id, and by name only for a row without an
+    id; _attached_policy() reads it. Requires REST API 2.15+
+    (WORM_API_VERSION); callers gate on the version before invoking.
+    Filesystems without a WORM data policy are absent.
     """
     worm_policies = {}
     for member in blade.get_file_systems_worm_data_policies().items:
-        fs_name = getattr(getattr(member, "member", None), "name", None)
-        if fs_name and fs_name not in worm_policies:
-            worm_policies[fs_name] = getattr(
-                getattr(member, "policy", None), "name", None
-            )
+        key = _attachment_key(getattr(member, "member", None))
+        if key and key not in worm_policies:
+            worm_policies[key] = getattr(getattr(member, "policy", None), "name", None)
     return worm_policies
 
 

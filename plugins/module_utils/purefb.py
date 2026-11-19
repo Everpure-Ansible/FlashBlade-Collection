@@ -79,6 +79,30 @@ def _login_error(target, exc):
     return "Failed to log in to FlashBlade {0}. Error: {1}".format(target, detail)
 
 
+def _session_error(target, response):
+    """Describe a login whose access token the FlashBlade does not accept.
+
+    Args:
+        target: FlashBlade management address the login was attempted on
+        response: Answer of the array to the first request of the session
+
+    Returns:
+        str: Failure message with the HTTP status of the answer and, when
+        the array gave one, its message
+    """
+    errors = getattr(response, "errors", None) or []
+    detail = getattr(errors[0], "message", None) if errors else None
+    return (
+        "Failed to log in to FlashBlade {0}. Error: the array issued an access "
+        "token but refuses the requests made with it (HTTP {1}{2}). Check that "
+        "the user the identity token names exists on the array.".format(
+            target,
+            response.status_code,
+            ": {0}".format(detail) if detail else "",
+        )
+    )
+
+
 def get_system(module):
     """Get authenticated FlashBlade client connection.
 
@@ -117,11 +141,16 @@ def get_system(module):
         Modes 2 and 3 require a matching API Client registered on the array
         (see the purefb_apiclient module).
         The SDK logs in while it creates the client and raises when the
-        login is refused, so a client that was created is authenticated.
-        No request is sent afterwards to verify the login: no endpoint is
-        readable by every identity (an administrator whose access is scoped
-        to a realm is refused GET /hardware, a custom role may be refused
-        GET /arrays), and such a refusal is not an authentication failure.
+        login is refused. For an API token that is the whole login and no
+        request follows it. The token exchange of modes 2 and 3 does not
+        check the user the identity token names, so for these modes one
+        request (GET /arrays) follows: the array answers it with 401 or 403
+        when it does not accept the access token, and only that is a failed
+        login. Any other answer means the identity is logged in. No endpoint
+        is readable by every identity (an administrator whose access is
+        scoped to a realm is refused GET /hardware, a custom role may be
+        refused GET /arrays, both with 400), and such a refusal is not an
+        authentication failure.
     """
     if not HAS_PYPURECLIENT:
         module.fail_json(msg="pypureclient SDK not installed.")
@@ -187,6 +216,17 @@ def get_system(module):
         system = flashblade.Client(**credentials, **common)
     except Exception as exc:
         module.fail_json(msg=_login_error(target, exc))
+    if "api_token" not in credentials:
+        # The array issues an access token to an API client for any user
+        # name and then answers the requests made for a user it does not
+        # know with 403 and no message. A request an identity may not make
+        # is answered with 400, so only 401 and 403 mean nobody is logged in.
+        try:
+            session = system.get_arrays()
+        except Exception as exc:
+            module.fail_json(msg=_login_error(target, exc))
+        if session.status_code in (401, 403):
+            module.fail_json(msg=_session_error(target, session))
     return system
 
 

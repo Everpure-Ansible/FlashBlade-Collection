@@ -1,0 +1,14 @@
+bugfixes:
+  - purefb_resource_access - failure messages now name the scope type and name and the resource
+    type and name. A refused share of a realm-qualified resource name adds that an array-level
+    resource is shared under its own name.
+  - purefb_resource_access - a read of the resource accesses that the array refuses is no longer
+    taken to mean that nothing is shared. ``state=absent`` and check mode now fail with the error
+    of the array, which Purity//FB sends to an administrator whose access is limited to a realm,
+    instead of reporting no change.
+  - purefb_resource_access - an existing resource access is now found when ``resource_name``
+    differs from the name on the array only by case; names are unique on the array whatever
+    their case. Before, ``state=absent`` reported no change and left the share in place, and
+    ``state=present`` asked the array to create a share that already existed.
+  - purefb_resource_access - documentation lists ``sso/oidc/idps`` (OIDC identity providers) among
+    the resources that can be shared with a realm and has an example for it.

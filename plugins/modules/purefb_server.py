@@ -25,6 +25,16 @@ description:
   A local directory service attached to the server, including one created
   through I(create_local_directory_service), outlives the server and is
   removed with M(everpure.flashblade.purefb_local_ds).
+- A server is not deleted while an object store virtual host is attached to
+  it. A virtual host must stay attached to at least one object store server
+  (Everpure support guidance for Purity//FB), so the delete is refused, in
+  check mode as well, and the virtual hosts are named. Where the server is
+  the only one attached to a virtual host, attach another server to that
+  virtual host or delete the virtual host first. Then detach the server from
+  every virtual host with M(everpure.flashblade.purefb_virtualhost) and
+  delete it. The delete is also refused when the virtual hosts, or the
+  servers attached to them, cannot be read. Applies from Purity//FB 4.6.3
+  (REST 2.20), where virtual hosts have attached servers.
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
@@ -93,6 +103,14 @@ EXAMPLES = r"""
     fb_url: 10.10.10.2
     api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
 
+- name: Detach the server from a virtual host that keeps another server
+  everpure.flashblade.purefb_virtualhost:
+    name: acme-s3
+    servers:
+      - otherserver
+    fb_url: 10.10.10.2
+    api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
+
 - name: Delete server
   everpure.flashblade.purefb_server:
     name: myserver
@@ -132,11 +150,120 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.version import
 
 MIN_REQUIRED_API_VERSION = "2.16"
 LOCAL_DS_API_VERSION = "2.24"
+VHOST_SERVERS_API_VERSION = "2.20"
+WILDCARD_SERVER = "*"
 
 
-def delete_server(module, blade):
-    """Delete server object"""
+_UNSET = object()
+
+
+def _field(obj, key, default=None):
+    """Return a field of an SDK object or of a plain dict"""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _reference_keys(ref):
+    """Return the name and ID of a server or of a server reference"""
+    return _field(ref, "name"), _field(ref, "id")
+
+
+def _virtual_hosts_of_server(module, blade, servers):
+    """Return the names of the object store virtual hosts attached to the
+    servers the delete addresses: those with no other server attached, and
+    those that are attached to other servers as well.
+
+    The delete is only sent once it is known that no virtual host is
+    attached, so the module stops when the virtual hosts or their attached
+    servers cannot be read, and an attached server that cannot be identified
+    counts as one of the servers to delete. The wildcard * is not a server
+    and never counts as another one.
+
+    ``servers`` is every server the lookup of the name returned. Server
+    names are not case sensitive and a name holding a comma matches more
+    than one server, so each of them is compared, by ID and by name.
+    """
+    name = module.params["name"]
+    res = blade.get_object_store_virtual_hosts()
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Server {0} was not deleted: failed to list the object store "
+            "virtual hosts to check that none is attached to it. "
+            "Error: {1}".format(name, get_error_message(res))
+        )
+    names = set([name.lower()])
+    ids = set()
+    for server in servers:
+        server_name, server_id = _reference_keys(server)
+        if server_name:
+            names.add(str(server_name).lower())
+        if server_id:
+            ids.add(server_id)
+    sole = []
+    shared = []
+    unknown = []
+    for vhost in list(res.items):
+        refs = _field(vhost, "attached_servers", _UNSET)
+        if refs is _UNSET:
+            # The client speaks a REST version without attached servers
+            unknown.append(str(_field(vhost, "name")))
+            continue
+        attached = False
+        others = False
+        for ref in refs or []:
+            ref_name, ref_id = _reference_keys(ref)
+            if ref_id is not None and ref_id in ids:
+                attached = True
+            elif ref_name is not None and str(ref_name).lower() in names:
+                attached = True
+            elif ref_name is None and (ref_id is None or not ids):
+                attached = True
+            elif ref_name != WILDCARD_SERVER:
+                others = True
+        if attached:
+            (shared if others else sole).append(str(_field(vhost, "name")))
+    if unknown:
+        module.fail_json(
+            msg="Server {0} was not deleted: the servers attached to the "
+            "object store virtual hosts {1} are not reported to this client, "
+            "so it cannot be checked that none of them is attached to the "
+            "server. Use a py-pure-client release that supports REST {2} or "
+            "higher.".format(
+                name, ", ".join(sorted(unknown)), VHOST_SERVERS_API_VERSION
+            )
+        )
+    return sorted(sole), sorted(shared)
+
+
+def delete_server(module, blade, api_version, servers):
+    """Delete server object, unless a virtual host is attached to it"""
     changed = True
+    if LooseVersion(VHOST_SERVERS_API_VERSION) <= LooseVersion(api_version):
+        # Neither the delete nor any change to a virtual host is sent while
+        # a virtual host is attached to the server, whatever the array would
+        # do with the attachment.
+        sole, shared = _virtual_hosts_of_server(module, blade, servers)
+        if sole or shared:
+            msg = (
+                "Server {0} was not deleted because it is attached to object "
+                "store virtual hosts. A virtual host must stay attached to at "
+                "least one object store server (Everpure support guidance "
+                "for Purity//FB).".format(module.params["name"])
+            )
+            if sole:
+                msg += (
+                    " It is the only server attached to {0}: attach another "
+                    "server to each of these virtual hosts and detach this "
+                    "one, or delete them, first.".format(", ".join(sole))
+                )
+            if shared:
+                msg += (
+                    " It is attached along with other servers to {0}: detach "
+                    "it from each of these virtual hosts with "
+                    "purefb_virtualhost first.".format(", ".join(shared))
+                )
+            module.fail_json(msg=msg)
     if not module.check_mode:
         res = blade.delete_servers(
             names=[module.params["name"]], cascade_delete="directory-services"
@@ -340,14 +467,15 @@ def main():
         )
     state = module.params["state"]
 
-    exists = bool(blade.get_servers(names=[module.params["name"]]).status_code == 200)
+    res = blade.get_servers(names=[module.params["name"]])
+    exists = bool(res.status_code == 200)
 
     if not exists and state == "present":
         add_server(module, blade)
     elif exists and state == "present":
         update_server(module, blade)
     elif exists and state == "absent":
-        delete_server(module, blade)
+        delete_server(module, blade, api_version, list(res.items))
 
     module.exit_json(changed=False)
 

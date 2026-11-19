@@ -52,10 +52,18 @@ notes:
   offers no rename. To change a policy name, create a new policy and move
   the members to it.
 - When I(state=absent), configuration and membership options are ignored.
+- SSH CA policies and their members, the admins and the array, are
+  array-level objects. Only the signing authority can live in a realm, see
+  I(signing_authority).
+- The array resolves the names of policies, signing authorities and admins
+  without regard to case, so a name written in a different case from the one
+  stored on the array is not a change.
 options:
   name:
     description:
     - Name of the SSH CA policy.
+    - SSH CA policies are array-level objects. The array refuses a policy
+      name in the C(realm::name) form.
     type: str
     required: true
   state:
@@ -74,6 +82,8 @@ options:
     description:
     - Name of the public key or certificate on the array that signs the
       user SSH certificates accepted by this policy.
+    - A certificate that lives in a realm is named C(realm::certificate).
+      Public keys are array-level objects and have no realm form.
     - Required when creating a policy. Omit to leave unchanged on an
       existing policy.
     type: str
@@ -137,6 +147,14 @@ EXAMPLES = r"""
     static_authorized_principals:
       - storage-ops
       - oncall
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Create a policy signed by a certificate that lives in a realm
+  everpure.flashblade.purefb_ssh_ca_policy:
+    name: tenant-ssh-ca
+    signing_authority: realm1::corp-ssh-ca
+    signing_authority_type: certificate
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
@@ -253,8 +271,14 @@ def _validate_admins(module):
     admins = module.params["admins"]
     if not admins:
         return
-    if len(set(admins)) != len(admins):
-        module.fail_json(msg="Duplicate admin name in admins")
+    # The array resolves admin names without regard to case.
+    if len(set(admin.lower() for admin in admins)) != len(admins):
+        module.fail_json(
+            msg=(
+                "Duplicate admin name in admins. Admin names are compared "
+                "without regard to case."
+            )
+        )
     for admin in admins:
         if not admin:
             module.fail_json(msg="admins may not contain an empty name")
@@ -351,14 +375,24 @@ def _desired_member_changes(module, blade, current):
     to_remove = set()
 
     if module.params["admins"] is not None:
-        desired = set(("admin", admin) for admin in module.params["admins"])
+        # The array resolves admin names without regard to case and reports
+        # the stored spelling, so the two sides are matched on lowered names.
+        # An admin to attach keeps the spelling of the task, an admin to
+        # detach the spelling of the array.
+        desired = set(admin.lower() for admin in module.params["admins"])
         current_admins = set(member for member in current if member[0] == "admin")
-        to_add |= desired - current_admins
+        attached = set(member[1].lower() for member in current_admins)
+        to_add |= set(
+            ("admin", admin)
+            for admin in module.params["admins"]
+            if admin.lower() not in attached
+        )
         to_remove |= set(
             member
-            for member in current_admins - desired
+            for member in current_admins
+            if member[1].lower() not in desired
             # Never detach exempt accounts, even if the array reports them.
-            if member[1].lower() not in PROTECTED_ADMINS
+            and member[1].lower() not in PROTECTED_ADMINS
         )
 
     if module.params["array"] is not None:
@@ -492,13 +526,20 @@ def _signer_reference(module, resource_type):
 
 
 def _signer_changed(module, existing):
-    """Whether the desired signing authority differs from the current one."""
-    if module.params["signing_authority"] is None:
+    """Whether the desired signing authority differs from the current one.
+
+    The array resolves the name of a public key or certificate, with or
+    without a realm prefix, without regard to case and reports the stored
+    spelling, so the names are compared the same way.
+    """
+    desired = module.params["signing_authority"]
+    if desired is None:
         return False
     current = getattr(existing, "signing_authority", None)
-    return getattr(current, "name", None) != module.params[
-        "signing_authority"
-    ] or getattr(current, "resource_type", None) != _signer_resource_type(
+    current_name = getattr(current, "name", None)
+    if current_name is None or current_name.lower() != desired.lower():
+        return True
+    return getattr(current, "resource_type", None) != _signer_resource_type(
         module, existing
     )
 

@@ -48,18 +48,59 @@ HAS_PYPURECLIENT = True
 try:
     from pypureclient import flashblade
 except ImportError:
-    PYPURECLIENT = False
+    HAS_PYPURECLIENT = False
 
 from os import environ
 import platform
 
-from ansible_collections.everpure.flashblade.plugins.module_utils.common import (
-    get_error_message,
-)
-
 VERSION = "1.5"
 USER_AGENT_BASE = "Ansible"
 API_AGENT_VERSION = "1.5"
+
+
+def _login_error(target, exc):
+    """Describe why no client could be created for the FlashBlade.
+
+    Args:
+        target: FlashBlade management address the login was attempted on
+        exc: Exception raised while the SDK created the client
+
+    Returns:
+        str: Failure message that tells an unreachable or wrong address
+        (a urllib3 transport error) apart from a login the array or the
+        SDK refused. An error whose text does not name it (any but the
+        PureError of the SDK) is reported with its type
+    """
+    if HAS_URLLIB3 and isinstance(exc, urllib3.exceptions.HTTPError):
+        return "Failed to connect to FlashBlade {0}. Error: {1}".format(target, exc)
+    detail = str(exc)
+    if not detail.startswith(type(exc).__name__):
+        detail = "{0}: {1}".format(type(exc).__name__, detail)
+    return "Failed to log in to FlashBlade {0}. Error: {1}".format(target, detail)
+
+
+def _session_error(target, response):
+    """Describe a login whose access token the FlashBlade does not accept.
+
+    Args:
+        target: FlashBlade management address the login was attempted on
+        response: Answer of the array to the first request of the session
+
+    Returns:
+        str: Failure message with the HTTP status of the answer and, when
+        the array gave one, its message
+    """
+    errors = getattr(response, "errors", None) or []
+    detail = getattr(errors[0], "message", None) if errors else None
+    return (
+        "Failed to log in to FlashBlade {0}. Error: the array issued an access "
+        "token but refuses the requests made with it (HTTP {1}{2}). Check that "
+        "the user the identity token names exists on the array.".format(
+            target,
+            response.status_code,
+            ": {0}".format(detail) if detail else "",
+        )
+    )
 
 
 def get_system(module):
@@ -78,7 +119,9 @@ def get_system(module):
         flashblade.Client: Authenticated FlashBlade client object
 
     Raises:
-        AnsibleModule.fail_json: If authentication fails or pypureclient is not installed
+        AnsibleModule.fail_json: If pypureclient is not installed, no complete
+            set of credentials is given, the FlashBlade cannot be reached or
+            the login is refused
 
     Environment Variables:
         PUREFB_URL: FlashBlade URL (alternative to fb_url parameter)
@@ -97,6 +140,17 @@ def get_system(module):
              the SDK signs the JWT locally before exchange.
         Modes 2 and 3 require a matching API Client registered on the array
         (see the purefb_apiclient module).
+        The SDK logs in while it creates the client and raises when the
+        login is refused. For an API token that is the whole login and no
+        request follows it. The token exchange of modes 2 and 3 does not
+        check the user the identity token names, so for these modes one
+        request (GET /arrays) follows: the array answers it with 401 or 403
+        when it does not accept the access token, and only that is a failed
+        login. Any other answer means the identity is logged in. No endpoint
+        is readable by every identity (an administrator whose access is
+        scoped to a realm is refused GET /hardware, a custom role may be
+        refused GET /arrays, both with 400), and such a refusal is not an
+        authentication failure.
     """
     if not HAS_PYPURECLIENT:
         module.fail_json(msg="pypureclient SDK not installed.")
@@ -135,19 +189,18 @@ def get_system(module):
     common = {"target": target, "user_agent": user_agent}
 
     if target and api:
-        system = flashblade.Client(api_token=api, **common)
+        credentials = {"api_token": api}
     elif target and id_token:
-        system = flashblade.Client(id_token=id_token, **common)
+        credentials = {"id_token": id_token}
     elif target and private_key_file and client_id and key_id and issuer and username:
-        system = flashblade.Client(
-            private_key_file=private_key_file,
-            private_key_password=private_key_password,
-            client_id=client_id,
-            key_id=key_id,
-            issuer=issuer,
-            username=username,
-            **common,
-        )
+        credentials = {
+            "private_key_file": private_key_file,
+            "private_key_password": private_key_password,
+            "client_id": client_id,
+            "key_id": key_id,
+            "issuer": issuer,
+            "username": username,
+        }
     else:
         module.fail_json(
             msg="You must set PUREFB_URL and PUREFB_API environment variables "
@@ -156,13 +209,24 @@ def get_system(module):
             "client_id, key_id, issuer and username (or the matching PUREFB_* "
             "environment variables)."
         )
-    res = system.get_hardware()
-    if res.status_code != 200:
-        module.fail_json(
-            msg="Pure Storage FlashBlade authentication failed. Error: {0}".format(
-                get_error_message(res)
-            )
-        )
+    # Creating the client is the login. The SDK raises its own PureError for
+    # a refused login, ValueError when it shares no REST version with the
+    # array and lets urllib3 errors through for an unreachable address.
+    try:
+        system = flashblade.Client(**credentials, **common)
+    except Exception as exc:
+        module.fail_json(msg=_login_error(target, exc))
+    if "api_token" not in credentials:
+        # The array issues an access token to an API client for any user
+        # name and then answers the requests made for a user it does not
+        # know with 403 and no message. A request an identity may not make
+        # is answered with 400, so only 401 and 403 mean nobody is logged in.
+        try:
+            session = system.get_arrays()
+        except Exception as exc:
+            module.fail_json(msg=_login_error(target, exc))
+        if session.status_code in (401, 403):
+            module.fail_json(msg=_session_error(target, session))
     return system
 
 

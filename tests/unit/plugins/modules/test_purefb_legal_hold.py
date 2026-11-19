@@ -72,12 +72,17 @@ sys.modules["ansible_collections.everpure.flashblade.plugins.module_utils.versio
 
 from plugins.modules.purefb_legal_hold import (
     main,
+    _check_realm,
     _get_hold,
     _get_held_entities,
     _get_entity,
+    _leaf_name,
     _norm_path,
     _hold_dict,
     _entity_dict,
+    _realm_of,
+    _same_name,
+    _same_scope,
 )
 
 
@@ -1141,13 +1146,13 @@ class TestPurefbLegalHoldMain:
     @patch("plugins.modules.purefb_legal_hold.HAS_PYPURECLIENT", True)
     def test_name_too_long(self, mock_ansible_module, mock_get_system, mock_loose):
         mock_loose.return_value.__gt__ = Mock(return_value=False)
-        module = _module(_base_params(name="h" * 65))
+        module = _module(_base_params(name="h" * 64))
         mock_ansible_module.return_value = module
 
         _run()
 
         module.fail_json.assert_called_once()
-        assert "64 characters" in module.fail_json.call_args[1]["msg"]
+        assert "63 characters" in module.fail_json.call_args[1]["msg"]
         mock_get_system.assert_not_called()
 
     @patch("plugins.modules.purefb_legal_hold.LooseVersion")
@@ -1158,13 +1163,13 @@ class TestPurefbLegalHoldMain:
         self, mock_ansible_module, mock_get_system, mock_loose
     ):
         mock_loose.return_value.__gt__ = Mock(return_value=False)
-        module = _module(_base_params(description="d" * 129))
+        module = _module(_base_params(description="d" * 128))
         mock_ansible_module.return_value = module
 
         _run()
 
         module.fail_json.assert_called_once()
-        assert "128 characters" in module.fail_json.call_args[1]["msg"]
+        assert "127 characters" in module.fail_json.call_args[1]["msg"]
         mock_get_system.assert_not_called()
 
     @patch("plugins.modules.purefb_legal_hold.LooseVersion")
@@ -1218,3 +1223,732 @@ class TestPurefbLegalHoldMain:
         kwargs = mock_ansible_module.call_args[1]
         assert kwargs["supports_check_mode"] is True
         assert kwargs["required_together"] == [["file_system", "path"]]
+
+
+# ---------------- realm-qualified names ----------------
+
+LONG_LEAF = "h" * 63
+REALM_HOLD = "realm1::case-42"
+REALM_FS = "realm1::evidence"
+SCOPE_MSG = "must be in the same realm, or both outside a realm"
+# (hold as given, file system as given, file system as the array reports it)
+CASE_PAIRS = [
+    ("case-42", "EVIDENCE", "evidence"),
+    (REALM_HOLD, "REALM1::evidence", REALM_FS),
+    (REALM_HOLD, "realm1::Evidence", REALM_FS),
+    ("REALM1::CASE-42", REALM_FS, REALM_FS),
+]
+
+
+def _realm(name="realm1", destroyed=False):
+    realm = Mock(spec=["name", "destroyed"])
+    realm.name = name
+    realm.destroyed = destroyed
+    return realm
+
+
+def _run_main(params, blade, check_mode=False, loose_gt=None):
+    """Run main() against a mocked array; return the module and get_system mocks."""
+    module = _module(params, check_mode=check_mode)
+    get_system = Mock(return_value=blade)
+    loose = MagicMock()
+    loose.return_value.__gt__ = loose_gt or Mock(return_value=False)
+    with patch.multiple(
+        "plugins.modules.purefb_legal_hold",
+        AnsibleModule=Mock(return_value=module),
+        get_system=get_system,
+        LooseVersion=loose,
+        LegalHold=MagicMock(),
+        HAS_PYPURECLIENT=True,
+    ):
+        _run()
+    return module, get_system
+
+
+def _check_realm_with(name, realms_response, loose_gt=False):
+    """Call _check_realm for a hold name; return the module and blade mocks."""
+    module = Mock()
+    module.fail_json = Mock(side_effect=SystemExit)
+    module.params = _base_params(name=name)
+    blade = Mock()
+    blade.get_realms.return_value = realms_response
+    with patch("plugins.modules.purefb_legal_hold.LooseVersion") as loose:
+        loose.return_value.__gt__ = Mock(return_value=loose_gt)
+        try:
+            _check_realm(module, blade, "2.30")
+        except SystemExit:
+            pass
+    return module, blade
+
+
+class TestPurefbLegalHoldRealmHelpers:
+    """Helpers that split and validate realm::name."""
+
+    def test_realm_of(self):
+        assert _realm_of("realm1::case-42") == "realm1"
+        assert _realm_of("realm1::evidence") == "realm1"
+        assert _realm_of("case-42") is None
+        assert _realm_of(None) is None
+        # the array reads the realm from the first part of a longer name
+        assert _realm_of("realm1::other::case-42") == "realm1"
+
+    def test_leaf_name(self):
+        assert _leaf_name("realm1::case-42") == "case-42"
+        assert _leaf_name("case-42") == "case-42"
+        assert _leaf_name("realm1::" + LONG_LEAF) == LONG_LEAF
+        # the array reads the name from the last part of a longer name
+        assert _leaf_name("realm1::other::case-42") == "case-42"
+
+    def test_same_scope(self):
+        assert _same_scope("realm1::case-42", "realm1::evidence") is True
+        assert _same_scope("case-42", "evidence") is True
+        assert _same_scope("realm1::case-42", "evidence") is False
+        assert _same_scope("case-42", "realm1::evidence") is False
+        assert _same_scope("realm1::case-42", "realm2::evidence") is False
+
+    def test_same_scope_ignores_the_case_of_the_realm(self):
+        # the array ignores the case of realm names
+        assert _same_scope("REALM1::case-42", "realm1::evidence") is True
+
+    def test_same_name_ignores_case(self):
+        assert _same_name("evidence", "EVIDENCE") is True
+        assert _same_name("realm1::evidence", "REALM1::Evidence") is True
+        assert _same_name("evidence", "evidence2") is False
+        assert _same_name(None, "evidence") is False
+
+    def test_get_entity_ignores_the_case_of_the_file_system(self):
+        # the array reports the file system as it was created, whatever
+        # the case of the name in the request
+        module = Mock()
+        module.params = _base_params(
+            name=REALM_HOLD, file_system="REALM1::Evidence", path="/case-42"
+        )
+        wanted = _entity(file_system=REALM_FS, path="/case-42")
+        blade = Mock()
+        blade.get_legal_holds_held_entities.return_value = _response(200, [wanted])
+
+        assert _get_entity(module, blade) is wanted
+
+    def test_get_entity_keeps_namesakes_apart(self):
+        # same file system name outside the realm and inside it
+        module = Mock()
+        module.params = _base_params(file_system="evidence", path="/case-42")
+        namesake = _entity(file_system=REALM_FS, path="/case-42")
+        blade = Mock()
+        blade.get_legal_holds_held_entities.return_value = _response(200, [namesake])
+
+        assert _get_entity(module, blade) is None
+
+    def test_check_realm_passes_for_a_live_realm(self):
+        module, blade = _check_realm_with(REALM_HOLD, _response(200, [_realm()]))
+
+        blade.get_realms.assert_called_once_with(names=["realm1"])
+        module.fail_json.assert_not_called()
+
+    def test_check_realm_fails_for_a_missing_realm(self):
+        with patch(
+            "plugins.modules.purefb_legal_hold.get_error_message",
+            return_value="Realm does not exist.",
+        ):
+            module, blade = _check_realm_with("zznorealm::case-42", _response(400))
+
+        blade.get_realms.assert_called_once_with(names=["zznorealm"])
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert (
+            "Legal hold zznorealm::case-42 cannot be created in realm zznorealm" in msg
+        )
+        assert "Realm does not exist." in msg
+
+    def test_check_realm_fails_for_a_realm_the_user_cannot_see(self):
+        # a realm administrator reading another realm gets an empty list
+        module, blade = _check_realm_with(REALM_HOLD, _response(200, []))
+
+        module.fail_json.assert_called_once()
+        assert "Realm does not exist." in module.fail_json.call_args[1]["msg"]
+
+    def test_check_realm_fails_for_a_destroyed_realm(self):
+        module, blade = _check_realm_with(
+            REALM_HOLD, _response(200, [_realm(destroyed=True)])
+        )
+
+        module.fail_json.assert_called_once()
+        assert "Realm has been destroyed." in module.fail_json.call_args[1]["msg"]
+
+    def test_check_realm_leaves_other_answers_to_the_array(self):
+        module, blade = _check_realm_with(REALM_HOLD, _response(403))
+
+        blade.get_realms.assert_called_once_with(names=["realm1"])
+        module.fail_json.assert_not_called()
+
+    def test_check_realm_skips_a_name_outside_a_realm(self):
+        module, blade = _check_realm_with("case-42", _response(400))
+
+        blade.get_realms.assert_not_called()
+        module.fail_json.assert_not_called()
+
+    def test_check_realm_skips_rest_versions_without_realms(self):
+        module, blade = _check_realm_with(REALM_HOLD, _response(400), loose_gt=True)
+
+        blade.get_realms.assert_not_called()
+        module.fail_json.assert_not_called()
+
+
+class TestPurefbLegalHoldRealmMain:
+    """main() flows with realm-qualified names."""
+
+    # ---------------- name and description limits ----------------
+
+    def test_name_length_counts_the_leaf_only(self):
+        names = [
+            "rzaudit::" + "h" * 56,  # 65 characters in all
+            "realm1::" + LONG_LEAF,  # 71 characters in all
+            "r" * 63 + "::" + LONG_LEAF,  # 128 characters in all
+        ]
+        for name in names:
+            blade = _blade(hold=None)
+
+            module, get_system = _run_main(_base_params(name=name), blade)
+
+            module.fail_json.assert_not_called()
+            blade.post_legal_holds.assert_called_once()
+            assert blade.post_legal_holds.call_args[1]["names"] == [name]
+            assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_leaf_name_too_long_in_a_realm(self):
+        module, get_system = _run_main(
+            _base_params(name="realm1::" + "h" * 64), _blade(hold=None)
+        )
+
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "63 characters" in msg
+        assert "realm prefix" in msg
+        get_system.assert_not_called()
+
+    def test_empty_leaf_name_refused(self):
+        # the array takes realm1:: for a hold named after the realm
+        for name in ("", "realm1::", "::"):
+            for check_mode in (False, True):
+                blade = _blade(hold=None)
+
+                module, get_system = _run_main(
+                    _base_params(name=name), blade, check_mode=check_mode
+                )
+
+                module.fail_json.assert_called_once()
+                msg = module.fail_json.call_args[1]["msg"]
+                assert "1 to 63 characters" in msg
+                assert "realm prefix" in msg
+                module.exit_json.assert_not_called()
+                get_system.assert_not_called()
+                blade.post_legal_holds.assert_not_called()
+
+    def test_one_character_leaf_name_is_sent(self):
+        for name in ("h", "realm1::h"):
+            blade = _blade(hold=None)
+
+            module, get_system = _run_main(_base_params(name=name), blade)
+
+            module.fail_json.assert_not_called()
+            assert blade.post_legal_holds.call_args[1]["names"] == [name]
+
+    def test_array_level_name_of_63_characters_is_sent(self):
+        blade = _blade(hold=None)
+
+        module, get_system = _run_main(_base_params(name=LONG_LEAF), blade)
+
+        module.fail_json.assert_not_called()
+        blade.post_legal_holds.assert_called_once()
+        assert blade.post_legal_holds.call_args[1]["names"] == [LONG_LEAF]
+
+    def test_description_of_127_characters_is_sent(self):
+        blade = _blade(hold=_hold(name=REALM_HOLD, description="old"))
+
+        module, get_system = _run_main(
+            _base_params(name=REALM_HOLD, description="d" * 127), blade
+        )
+
+        module.fail_json.assert_not_called()
+        blade.patch_legal_holds.assert_called_once()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_update_realm_hold_with_longest_leaf(self):
+        name = "realm1::" + LONG_LEAF
+        blade = _blade(hold=_hold(name=name, description="old"))
+
+        module, get_system = _run_main(
+            _base_params(name=name, description="new"), blade
+        )
+
+        module.fail_json.assert_not_called()
+        blade.patch_legal_holds.assert_called_once()
+        assert blade.patch_legal_holds.call_args[1]["names"] == [name]
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_delete_realm_hold_with_longest_leaf(self):
+        name = "realm1::" + LONG_LEAF
+        blade = _blade(hold=_hold(name=name))
+
+        module, get_system = _run_main(_base_params(name=name, state="absent"), blade)
+
+        module.fail_json.assert_not_called()
+        blade.delete_legal_holds.assert_called_once_with(names=[name])
+        module.exit_json.assert_called_once_with(changed=True)
+
+    # ---------------- hold and file system in the same realm ----------------
+
+    def test_apply_in_the_same_realm(self):
+        name = "realm1::" + LONG_LEAF
+        blade = _blade(hold=_hold(name=name))
+
+        module, get_system = _run_main(
+            _base_params(name=name, file_system=REALM_FS, path="/case-42"), blade
+        )
+
+        module.fail_json.assert_not_called()
+        blade.get_file_systems.assert_called_once_with(names=[REALM_FS])
+        blade.post_legal_holds_held_entities.assert_called_once_with(
+            names=[name],
+            file_system_names=[REALM_FS],
+            paths=["/case-42"],
+            recursive=False,
+        )
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_apply_in_the_same_realm_is_idempotent(self):
+        # the array reports the held file system under its realm::name
+        blade = _blade(
+            hold=_hold(name=REALM_HOLD),
+            entities=[_entity(file_system=REALM_FS, path="/case-42")],
+        )
+
+        module, get_system = _run_main(
+            _base_params(name=REALM_HOLD, file_system=REALM_FS, path="/case-42"),
+            blade,
+        )
+
+        module.fail_json.assert_not_called()
+        blade.post_legal_holds_held_entities.assert_not_called()
+        result = module.exit_json.call_args[1]
+        assert result["changed"] is False
+        assert result["held_entities"][0]["file_system"] == REALM_FS
+
+    def test_release_in_the_same_realm(self):
+        blade = _blade(
+            hold=_hold(name=REALM_HOLD),
+            entities=[_entity(file_system=REALM_FS, path="/case-42")],
+        )
+
+        module, get_system = _run_main(
+            _base_params(
+                name=REALM_HOLD, file_system=REALM_FS, path="/case-42", release=True
+            ),
+            blade,
+        )
+
+        module.fail_json.assert_not_called()
+        blade.patch_legal_holds_held_entities.assert_called_once_with(
+            names=[REALM_HOLD],
+            file_system_names=[REALM_FS],
+            paths=["/case-42"],
+            released=True,
+            recursive=False,
+        )
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    # ---------------- names in another case than the array reports ----------------
+
+    def test_apply_is_idempotent_whatever_the_case_of_the_names(self):
+        for name, given, stored in CASE_PAIRS:
+            for check_mode in (False, True):
+                blade = _blade(
+                    hold=_hold(name=name.lower()),
+                    entities=[_entity(file_system=stored, path="/case-42")],
+                )
+
+                module, get_system = _run_main(
+                    _base_params(name=name, file_system=given, path="/case-42"),
+                    blade,
+                    check_mode=check_mode,
+                )
+
+                module.fail_json.assert_not_called()
+                blade.post_legal_holds_held_entities.assert_not_called()
+                result = module.exit_json.call_args[1]
+                assert result["changed"] is False
+                assert result["held_entities"][0]["file_system"] == stored
+
+    def test_release_finds_the_path_whatever_the_case_of_the_names(self):
+        for name, given, stored in CASE_PAIRS:
+            for how in ({"release": True}, {"state": "absent"}):
+                blade = _blade(
+                    hold=_hold(name=name.lower()),
+                    entities=[_entity(file_system=stored, path="/case-42")],
+                )
+
+                module, get_system = _run_main(
+                    _base_params(name=name, file_system=given, path="/case-42", **how),
+                    blade,
+                )
+
+                module.fail_json.assert_not_called()
+                blade.patch_legal_holds_held_entities.assert_called_once_with(
+                    names=[name],
+                    file_system_names=[given],
+                    paths=["/case-42"],
+                    released=True,
+                    recursive=False,
+                )
+                assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_check_mode_release_whatever_the_case_of_the_names(self):
+        for name, given, stored in CASE_PAIRS:
+            blade = _blade(
+                hold=_hold(name=name.lower()),
+                entities=[_entity(file_system=stored, path="/case-42")],
+            )
+
+            module, get_system = _run_main(
+                _base_params(
+                    name=name, file_system=given, path="/case-42", release=True
+                ),
+                blade,
+                check_mode=True,
+            )
+
+            module.fail_json.assert_not_called()
+            blade.patch_legal_holds_held_entities.assert_not_called()
+            assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_the_case_of_the_path_still_matters(self):
+        blade = _blade(
+            hold=_hold(), entities=[_entity(file_system="evidence", path="/Case-42")]
+        )
+
+        module, get_system = _run_main(
+            _base_params(file_system="evidence", path="/case-42", release=True),
+            blade,
+        )
+
+        module.fail_json.assert_not_called()
+        blade.patch_legal_holds_held_entities.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    # ---------------- hold and file system in different scopes ----------------
+
+    def test_apply_realm_hold_to_array_file_system_refused(self):
+        blade = _blade(hold=_hold(name=REALM_HOLD))
+
+        module, get_system = _run_main(
+            _base_params(name=REALM_HOLD, file_system="evidence", path="/"), blade
+        )
+
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Legal hold realm1::case-42 (in realm realm1)" in msg
+        assert "file system evidence (outside a realm)" in msg
+        assert SCOPE_MSG in msg
+        get_system.assert_not_called()
+        blade.post_legal_holds_held_entities.assert_not_called()
+
+    def test_apply_array_hold_to_realm_file_system_refused(self):
+        blade = _blade(hold=_hold())
+
+        module, get_system = _run_main(
+            _base_params(file_system=REALM_FS, path="/"), blade
+        )
+
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Legal hold case-42 (outside a realm)" in msg
+        assert "file system realm1::evidence (in realm realm1)" in msg
+        assert SCOPE_MSG in msg
+        get_system.assert_not_called()
+        blade.post_legal_holds_held_entities.assert_not_called()
+
+    def test_apply_across_two_realms_refused(self):
+        blade = _blade(hold=_hold(name=REALM_HOLD))
+
+        module, get_system = _run_main(
+            _base_params(name=REALM_HOLD, file_system="realm2::evidence", path="/"),
+            blade,
+        )
+
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "(in realm realm1)" in msg
+        assert "(in realm realm2)" in msg
+        assert SCOPE_MSG in msg
+        get_system.assert_not_called()
+
+    def test_scope_mismatch_refused_in_check_mode(self):
+        pairs = [
+            (REALM_HOLD, "evidence"),
+            ("case-42", REALM_FS),
+            (REALM_HOLD, "realm2::evidence"),
+        ]
+        for name, file_system in pairs:
+            # the hold exists, or would be created by the apply
+            for hold in (_hold(name=name), None):
+                blade = _blade(hold=hold)
+
+                module, get_system = _run_main(
+                    _base_params(name=name, file_system=file_system, path="/"),
+                    blade,
+                    check_mode=True,
+                )
+
+                module.fail_json.assert_called_once()
+                assert SCOPE_MSG in module.fail_json.call_args[1]["msg"]
+                module.exit_json.assert_not_called()
+                get_system.assert_not_called()
+
+    def test_scope_mismatch_never_creates_the_hold(self):
+        blade = _blade(hold=None)
+
+        module, get_system = _run_main(
+            _base_params(name=REALM_HOLD, file_system="evidence", path="/"), blade
+        )
+
+        module.fail_json.assert_called_once()
+        assert SCOPE_MSG in module.fail_json.call_args[1]["msg"]
+        blade.post_legal_holds.assert_not_called()
+        blade.post_legal_holds_held_entities.assert_not_called()
+
+    def test_release_scope_mismatch_refused(self):
+        blade = _blade(hold=_hold(name=REALM_HOLD))
+
+        module, get_system = _run_main(
+            _base_params(
+                name=REALM_HOLD, file_system="evidence", path="/", release=True
+            ),
+            blade,
+        )
+
+        module.fail_json.assert_called_once()
+        assert SCOPE_MSG in module.fail_json.call_args[1]["msg"]
+        module.exit_json.assert_not_called()
+        get_system.assert_not_called()
+        blade.patch_legal_holds_held_entities.assert_not_called()
+
+    def test_state_absent_with_path_scope_mismatch_refused(self):
+        blade = _blade(hold=_hold())
+
+        module, get_system = _run_main(
+            _base_params(file_system=REALM_FS, path="/", state="absent"), blade
+        )
+
+        module.fail_json.assert_called_once()
+        assert SCOPE_MSG in module.fail_json.call_args[1]["msg"]
+        module.exit_json.assert_not_called()
+        get_system.assert_not_called()
+        blade.delete_legal_holds.assert_not_called()
+
+    def test_scope_is_not_checked_without_a_path(self):
+        blade = _blade(hold=_hold(name=REALM_HOLD))
+
+        module, get_system = _run_main(_base_params(name=REALM_HOLD), blade)
+
+        module.fail_json.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    # ---------------- check mode create in a realm ----------------
+
+    def test_create_in_a_realm_sends_the_create_without_a_realm_lookup(self):
+        blade = _blade(hold=None)
+        blade.get_realms.return_value = _response(400)
+
+        module, get_system = _run_main(_base_params(name=REALM_HOLD), blade)
+
+        blade.get_realms.assert_not_called()
+        module.fail_json.assert_not_called()
+        blade.post_legal_holds.assert_called_once()
+        assert blade.post_legal_holds.call_args[1]["names"] == [REALM_HOLD]
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_create_in_a_missing_realm_relays_the_array_answer(self):
+        blade = _blade(hold=None)
+        blade.post_legal_holds.return_value = _response(400)
+
+        with patch(
+            "plugins.modules.purefb_legal_hold.get_error_message",
+            return_value="Realm does not exist.",
+        ):
+            module, get_system = _run_main(
+                _base_params(name="zznorealm::case-42"), blade
+            )
+
+        blade.get_realms.assert_not_called()
+        module.fail_json.assert_called_once()
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Failed to create legal hold zznorealm::case-42. "
+            "Error: Realm does not exist."
+        )
+        module.exit_json.assert_not_called()
+
+    def test_check_mode_create_in_a_live_realm(self):
+        blade = _blade(hold=None)
+        blade.get_realms.return_value = _response(200, [_realm()])
+
+        module, get_system = _run_main(
+            _base_params(name=REALM_HOLD), blade, check_mode=True
+        )
+
+        blade.get_realms.assert_called_once_with(names=["realm1"])
+        module.fail_json.assert_not_called()
+        blade.post_legal_holds.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_check_mode_create_in_a_missing_realm_fails(self):
+        blade = _blade(hold=None)
+        blade.get_realms.return_value = _response(400)
+
+        with patch(
+            "plugins.modules.purefb_legal_hold.get_error_message",
+            return_value="Realm does not exist.",
+        ):
+            module, get_system = _run_main(
+                _base_params(name="zznorealm::case-42"), blade, check_mode=True
+            )
+
+        blade.get_realms.assert_called_once_with(names=["zznorealm"])
+        module.fail_json.assert_called_once()
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Legal hold zznorealm::case-42 cannot be created in realm zznorealm. "
+            "Error: Realm does not exist."
+        )
+        module.exit_json.assert_not_called()
+        blade.post_legal_holds.assert_not_called()
+
+    def test_check_mode_create_in_a_destroyed_realm_fails(self):
+        blade = _blade(hold=None)
+        blade.get_realms.return_value = _response(200, [_realm(destroyed=True)])
+
+        module, get_system = _run_main(
+            _base_params(name=REALM_HOLD), blade, check_mode=True
+        )
+
+        module.fail_json.assert_called_once()
+        assert "Realm has been destroyed." in module.fail_json.call_args[1]["msg"]
+        module.exit_json.assert_not_called()
+        blade.post_legal_holds.assert_not_called()
+
+    def test_check_mode_create_in_a_realm_the_user_cannot_see_fails(self):
+        blade = _blade(hold=None)
+        blade.get_realms.return_value = _response(200, [])
+
+        module, get_system = _run_main(
+            _base_params(name=REALM_HOLD), blade, check_mode=True
+        )
+
+        module.fail_json.assert_called_once()
+        assert "Realm does not exist." in module.fail_json.call_args[1]["msg"]
+        module.exit_json.assert_not_called()
+
+    def test_check_mode_create_is_not_blocked_when_the_realm_cannot_be_read(self):
+        blade = _blade(hold=None)
+        blade.get_realms.return_value = _response(403)
+
+        module, get_system = _run_main(
+            _base_params(name=REALM_HOLD), blade, check_mode=True
+        )
+
+        blade.get_realms.assert_called_once_with(names=["realm1"])
+        module.fail_json.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_check_mode_create_skips_the_realm_lookup_before_rest_2_19(self):
+        blade = _blade(hold=None)
+        blade.get_realms.return_value = _response(400)
+
+        # first comparison is the module's minimum version, second the realm gate
+        module, get_system = _run_main(
+            _base_params(name=REALM_HOLD),
+            blade,
+            check_mode=True,
+            loose_gt=Mock(side_effect=[False, True]),
+        )
+
+        blade.get_realms.assert_not_called()
+        module.fail_json.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_check_mode_create_outside_a_realm_skips_the_realm_lookup(self):
+        blade = _blade(hold=None)
+        blade.get_realms.return_value = _response(400)
+
+        module, get_system = _run_main(_base_params(), blade, check_mode=True)
+
+        blade.get_realms.assert_not_called()
+        module.fail_json.assert_not_called()
+        blade.post_legal_holds.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_check_mode_update_of_a_realm_hold_skips_the_realm_lookup(self):
+        blade = _blade(hold=_hold(name=REALM_HOLD, description="old"))
+        blade.get_realms.return_value = _response(400)
+
+        module, get_system = _run_main(
+            _base_params(name=REALM_HOLD, description="new"), blade, check_mode=True
+        )
+
+        blade.get_realms.assert_not_called()
+        module.fail_json.assert_not_called()
+        blade.patch_legal_holds.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_check_mode_apply_of_a_new_realm_hold_reads_the_realm(self):
+        blade = _blade(hold=None)
+        blade.get_realms.return_value = _response(200, [_realm()])
+
+        module, get_system = _run_main(
+            _base_params(name=REALM_HOLD, file_system=REALM_FS, path="/case-42"),
+            blade,
+            check_mode=True,
+        )
+
+        blade.get_file_systems.assert_called_once_with(names=[REALM_FS])
+        blade.get_realms.assert_called_once_with(names=["realm1"])
+        module.fail_json.assert_not_called()
+        blade.post_legal_holds.assert_not_called()
+        blade.post_legal_holds_held_entities.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_check_mode_apply_in_a_missing_realm_fails_on_the_file_system(self):
+        # a file system named in a realm that does not exist cannot be read,
+        # in check mode and in a real run alike
+        for check_mode in (True, False):
+            blade = _blade(hold=None)
+            blade.get_file_systems.return_value = _response(400)
+            blade.get_realms.return_value = _response(400)
+
+            module, get_system = _run_main(
+                _base_params(
+                    name="zznorealm::case-42",
+                    file_system="zznorealm::evidence",
+                    path="/",
+                ),
+                blade,
+                check_mode=check_mode,
+            )
+
+            module.fail_json.assert_called_once()
+            assert "Failed to read file system" in module.fail_json.call_args[1]["msg"]
+            blade.get_realms.assert_not_called()
+            blade.post_legal_holds.assert_not_called()
+            module.exit_json.assert_not_called()
+
+    def test_release_of_a_missing_realm_hold_skips_the_realm_lookup(self):
+        blade = _blade(hold=None)
+        blade.get_realms.return_value = _response(400)
+
+        module, get_system = _run_main(
+            _base_params(name=REALM_HOLD, file_system=REALM_FS, path="/", release=True),
+            blade,
+            check_mode=True,
+        )
+
+        blade.get_realms.assert_not_called()
+        module.fail_json.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)

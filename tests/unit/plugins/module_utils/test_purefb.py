@@ -7,8 +7,12 @@ from __future__ import absolute_import, division, print_function
 
 __metaclass__ = type
 
+import importlib.util
+import json
 import sys
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock, call, patch, MagicMock
+
+import pytest
 
 # Mock external dependencies before importing purefb
 sys.modules["pypureclient"] = MagicMock()
@@ -16,7 +20,104 @@ sys.modules["pypureclient.flashblade"] = MagicMock()
 sys.modules["urllib3"] = MagicMock()
 sys.modules["distro"] = MagicMock()
 
+from plugins.module_utils import purefb
 from plugins.module_utils.purefb import get_system, purefb_argument_spec
+
+API_TOKEN = {"api_token": "T-11111111-2222-3333-4444-555555555555"}
+ID_TOKEN = {"api_token": None, "id_token": "eyJhbGciOiJSUzI1NiJ9.payload.sig"}
+PRIVATE_KEY = {
+    "api_token": None,
+    "id_token": None,
+    "private_key_file": "/run/secrets/aap.pem",
+    "private_key_password": None,
+    "username": "realm-svc",
+    "client_id": "cid-123",
+    "key_id": "kid-456",
+    "issuer": "AAP",
+}
+AUTH_MODES = pytest.mark.parametrize(
+    "credentials",
+    [API_TOKEN, ID_TOKEN, PRIVATE_KEY],
+    ids=["api_token", "id_token", "private_key"],
+)
+API_CLIENT_MODES = pytest.mark.parametrize(
+    "credentials", [ID_TOKEN, PRIVATE_KEY], ids=["id_token", "private_key"]
+)
+
+# The reason py-pure-client gives when Client() is refused by the array: the
+# session login of an API token and the token exchange of an API client.
+REFUSED_API_TOKEN = (
+    'Failed to retrieve session token with error: {"error":[{"code": 401, '
+    '"path": "/api/login", "message": "Authentication failed: Invalid API '
+    'token."}]} (401)'
+)
+REFUSED_API_CLIENT = (
+    "Could not retrieve a new access token: (403)\nReason: \n"
+    "HTTP response headers: HTTPHeaderDict({'Server': 'nginx'})\n"
+    'HTTP response body: {"error":"invalid_issuer","error_description":'
+    '"Invalid issuer: Unknown Issuer: %s"}\n'
+)
+REFUSED_LOGINS = pytest.mark.parametrize(
+    "credentials, reason, detail",
+    [
+        (API_TOKEN, REFUSED_API_TOKEN, "Authentication failed: Invalid API token."),
+        (ID_TOKEN, REFUSED_API_CLIENT % "null", "Unknown Issuer: null"),
+        (PRIVATE_KEY, REFUSED_API_CLIENT % "AAP", "Unknown Issuer: AAP"),
+    ],
+    ids=["api_token", "id_token", "private_key"],
+)
+
+
+class PureError(Exception):
+    """pypureclient.PureError, which is mocked in this file: same name and text."""
+
+    def __init__(self, reason=None):
+        self.reason = reason
+        super().__init__()
+
+    def __str__(self):
+        return "PureError: {0}".format(self.reason)
+
+
+class FakeHTTPError(Exception):
+    """Stands in for urllib3.exceptions.HTTPError, which is mocked in this file."""
+
+
+def login_module(credentials):
+    """Mock module that asks for a login with the given credentials."""
+    module = Mock()
+    module.params = {"fb_url": "flashblade.example.com", "disable_warnings": False}
+    module.params.update(credentials)
+    module.fail_json.side_effect = SystemExit("fail_json called")
+    return module
+
+
+def answered():
+    """The answer of the array to a request the identity may make."""
+    response = Mock()
+    response.status_code = 200
+    return response
+
+
+def refused(message):
+    """The answer of the array to a request the identity may not make."""
+    response = Mock()
+    response.status_code = 400
+    error = Mock()
+    error.message = message
+    response.errors = [error]
+    return response
+
+
+def unaccepted(status, message=None):
+    """The answer of the array to an access token it does not accept."""
+    response = Mock()
+    response.status_code = status
+    error = Mock()
+    error.message = message
+    error.context = None
+    response.errors = [error]
+    return response
 
 
 class TestPurefbArgumentSpec:
@@ -107,9 +208,6 @@ class TestGetSystem:
         assert call_kwargs["target"] == "https://flashblade.example.com"
         assert call_kwargs["api_token"] == "test-token-123"
         assert "user_agent" in call_kwargs
-
-        # Verify hardware check was called
-        mock_client.get_hardware.assert_called_once()
 
         # Verify result is the client
         assert result == mock_client
@@ -204,41 +302,6 @@ class TestGetSystem:
         mock_module.fail_json.assert_called_once()
         call_args = mock_module.fail_json.call_args[1]
         assert "pypureclient SDK not installed" in call_args["msg"]
-
-    @patch("plugins.module_utils.purefb.flashblade.Client")
-    @patch("plugins.module_utils.purefb.HAS_PYPURECLIENT", True)
-    def test_authentication_failure(self, mock_client_class):
-        """Test that authentication failure is handled."""
-        # Setup mock module
-        mock_module = Mock()
-        mock_module.params = {
-            "fb_url": "https://flashblade.example.com",
-            "api_token": "invalid-token",
-            "disable_warnings": False,
-        }
-        # Make fail_json raise an exception to stop execution
-        mock_module.fail_json.side_effect = SystemExit("fail_json called")
-
-        # Setup mock FlashBlade client with auth failure
-        mock_client = Mock()
-        mock_response = Mock()
-        mock_response.status_code = 401
-        mock_error = Mock()
-        mock_error.message = "Invalid API token"
-        mock_response.errors = [mock_error]
-        mock_client.get_hardware.return_value = mock_response
-        mock_client_class.return_value = mock_client
-
-        # Call function - should fail
-        try:
-            get_system(mock_module)
-        except SystemExit:
-            pass
-
-        # Verify fail_json was called with auth error
-        mock_module.fail_json.assert_called_once()
-        call_args = mock_module.fail_json.call_args[1]
-        assert "authentication failed" in call_args["msg"].lower()
 
     @patch("plugins.module_utils.purefb.urllib3.disable_warnings")
     @patch("plugins.module_utils.purefb.flashblade.Client")
@@ -391,3 +454,344 @@ class TestGetSystem:
 
         mock_module.fail_json.assert_called_once()
         mock_client_class.assert_not_called()
+
+
+@patch("plugins.module_utils.purefb.urllib3.exceptions.HTTPError", FakeHTTPError)
+@patch("plugins.module_utils.purefb.HAS_URLLIB3", True)
+@patch("plugins.module_utils.purefb.HAS_PYPURECLIENT", True)
+@patch("plugins.module_utils.purefb.environ")
+@patch("plugins.module_utils.purefb.flashblade.Client")
+class TestGetSystemLogin:
+    """The login is the creation of the client, for every kind of identity."""
+
+    @AUTH_MODES
+    def test_array_admin_is_logged_in(
+        self, mock_client_class, mock_environ, credentials
+    ):
+        """An array administrator gets the client."""
+        mock_environ.get.return_value = None
+        mock_module = login_module(credentials)
+        mock_client = Mock()
+        mock_client.get_hardware.return_value = answered()
+        mock_client.get_arrays.return_value = answered()
+        mock_client_class.return_value = mock_client
+
+        result = get_system(mock_module)
+
+        assert result == mock_client
+        mock_client_class.assert_called_once()
+        mock_module.fail_json.assert_not_called()
+
+    def test_api_token_login_sends_no_request(self, mock_client_class, mock_environ):
+        """The array checks an API token at the login, nothing is read."""
+        mock_environ.get.return_value = None
+        mock_module = login_module(API_TOKEN)
+        mock_client = Mock()
+        mock_client.get_arrays.return_value = unaccepted(403)
+        mock_client_class.return_value = mock_client
+
+        result = get_system(mock_module)
+
+        assert result == mock_client
+        assert mock_client.mock_calls == []
+        mock_module.fail_json.assert_not_called()
+
+    @API_CLIENT_MODES
+    def test_api_client_login_sends_one_request(
+        self, mock_client_class, mock_environ, credentials
+    ):
+        """The token exchange does not say whether the array knows the user."""
+        mock_environ.get.return_value = None
+        mock_module = login_module(credentials)
+        mock_client = Mock()
+        mock_client.get_arrays.return_value = answered()
+        mock_client_class.return_value = mock_client
+
+        result = get_system(mock_module)
+
+        assert result == mock_client
+        assert mock_client.mock_calls == [call.get_arrays()]
+        mock_module.fail_json.assert_not_called()
+
+    @API_CLIENT_MODES
+    @pytest.mark.parametrize("status", [401, 403])
+    def test_access_token_the_array_does_not_accept(
+        self, mock_client_class, mock_environ, credentials, status
+    ):
+        """An access token for a user the array does not know is refused."""
+        mock_environ.get.return_value = None
+        mock_module = login_module(credentials)
+        mock_client = Mock()
+        mock_client.get_arrays.return_value = unaccepted(status)
+        mock_client_class.return_value = mock_client
+
+        with pytest.raises(SystemExit):
+            get_system(mock_module)
+
+        mock_module.fail_json.assert_called_once()
+        assert mock_module.fail_json.call_args[1]["msg"] == (
+            "Failed to log in to FlashBlade flashblade.example.com. Error: the "
+            "array issued an access token but refuses the requests made with it "
+            "(HTTP {0}). Check that the user the identity token names exists on "
+            "the array.".format(status)
+        )
+
+    @API_CLIENT_MODES
+    def test_unaccepted_access_token_with_a_message(
+        self, mock_client_class, mock_environ, credentials
+    ):
+        """The message of the array is reported when the SDK passes one on."""
+        mock_environ.get.return_value = None
+        mock_module = login_module(credentials)
+        mock_client = Mock()
+        mock_client.get_arrays.return_value = unaccepted(403, "Access Denied")
+        mock_client_class.return_value = mock_client
+
+        with pytest.raises(SystemExit):
+            get_system(mock_module)
+
+        msg = mock_module.fail_json.call_args[1]["msg"]
+        assert msg.startswith("Failed to log in to FlashBlade flashblade.example.com. ")
+        assert "(HTTP 403: Access Denied)" in msg
+
+    @API_CLIENT_MODES
+    def test_session_check_that_cannot_be_sent_fails_cleanly(
+        self, mock_client_class, mock_environ, credentials
+    ):
+        """An error of the request after the login is not a traceback."""
+        mock_environ.get.return_value = None
+        mock_module = login_module(credentials)
+        mock_client = Mock()
+        mock_client.get_arrays.side_effect = FakeHTTPError("Read timed out.")
+        mock_client_class.return_value = mock_client
+
+        with pytest.raises(SystemExit):
+            get_system(mock_module)
+
+        mock_module.fail_json.assert_called_once()
+        assert mock_module.fail_json.call_args[1]["msg"] == (
+            "Failed to connect to FlashBlade flashblade.example.com. "
+            "Error: Read timed out."
+        )
+
+    @AUTH_MODES
+    def test_realm_scoped_identity_is_logged_in(
+        self, mock_client_class, mock_environ, credentials
+    ):
+        """An administrator scoped to a realm may not read the hardware."""
+        mock_environ.get.return_value = None
+        mock_module = login_module(credentials)
+        mock_client = Mock()
+        mock_client.get_hardware.return_value = refused("Operation not permitted.")
+        mock_client.get_arrays.return_value = answered()
+        mock_client_class.return_value = mock_client
+
+        result = get_system(mock_module)
+
+        assert result == mock_client
+        mock_client.get_hardware.assert_not_called()
+        assert mock_client.get_arrays.call_count == (
+            0 if "api_token" in credentials and credentials["api_token"] else 1
+        )
+        mock_module.fail_json.assert_not_called()
+
+    @AUTH_MODES
+    def test_custom_role_identity_is_logged_in(
+        self, mock_client_class, mock_environ, credentials
+    ):
+        """A custom role may grant neither the hardware nor the array."""
+        mock_environ.get.return_value = None
+        mock_module = login_module(credentials)
+        mock_client = Mock()
+        mock_client.get_hardware.return_value = refused(
+            "Operation not permitted. Authorization for 'get' on "
+            "'purestorage.com/api/v2/hardware' is required."
+        )
+        mock_client.get_arrays.return_value = refused(
+            "Operation not permitted. Authorization for 'get' on "
+            "'purestorage.com/api/v2/arrays' is required."
+        )
+        mock_client_class.return_value = mock_client
+
+        result = get_system(mock_module)
+
+        assert result == mock_client
+        mock_client.get_hardware.assert_not_called()
+        assert mock_client.get_arrays.call_count == (
+            0 if "api_token" in credentials and credentials["api_token"] else 1
+        )
+        mock_module.fail_json.assert_not_called()
+
+    @REFUSED_LOGINS
+    def test_refused_login_fails_cleanly(
+        self, mock_client_class, mock_environ, credentials, reason, detail
+    ):
+        """The SDK raises while it creates the client for bad credentials."""
+        mock_environ.get.return_value = None
+        mock_module = login_module(credentials)
+        mock_client_class.side_effect = PureError(reason)
+
+        with pytest.raises(SystemExit):
+            get_system(mock_module)
+
+        mock_module.fail_json.assert_called_once()
+        msg = mock_module.fail_json.call_args[1]["msg"]
+        assert msg.startswith(
+            "Failed to log in to FlashBlade flashblade.example.com. "
+            "Error: PureError: "
+        )
+        assert detail in msg
+        assert "PureError: PureError" not in msg
+        assert "Failed to connect" not in msg
+
+    @AUTH_MODES
+    def test_unreachable_array_fails_cleanly(
+        self, mock_client_class, mock_environ, credentials
+    ):
+        """urllib3 errors escape the SDK for a wrong or unreachable address."""
+        mock_environ.get.return_value = None
+        mock_module = login_module(credentials)
+        mock_client_class.side_effect = FakeHTTPError(
+            "HTTPSConnectionPool(host='flashblade.example.com', port=443): "
+            "Max retries exceeded with url: /api/api_version"
+        )
+
+        with pytest.raises(SystemExit):
+            get_system(mock_module)
+
+        mock_module.fail_json.assert_called_once()
+        msg = mock_module.fail_json.call_args[1]["msg"]
+        assert msg.startswith(
+            "Failed to connect to FlashBlade flashblade.example.com. Error: "
+        )
+        assert "Max retries exceeded" in msg
+        assert "log in" not in msg
+
+    def test_no_common_rest_version_fails_cleanly(
+        self, mock_client_class, mock_environ
+    ):
+        """The SDK raises ValueError when it shares no REST version."""
+        mock_environ.get.return_value = None
+        mock_module = login_module(API_TOKEN)
+        mock_client_class.side_effect = ValueError(
+            "No compatible REST version found between the client SDK and "
+            "the target array."
+        )
+
+        with pytest.raises(SystemExit):
+            get_system(mock_module)
+
+        mock_module.fail_json.assert_called_once()
+        msg = mock_module.fail_json.call_args[1]["msg"]
+        assert msg.startswith(
+            "Failed to log in to FlashBlade flashblade.example.com. "
+            "Error: ValueError: No compatible REST version"
+        )
+
+    @API_CLIENT_MODES
+    def test_unwritable_token_cache_fails_cleanly(
+        self, mock_client_class, mock_environ, credentials
+    ):
+        """The SDK saves the access token of an API client to a file."""
+        mock_environ.get.return_value = None
+        mock_module = login_module(credentials)
+        mock_client_class.side_effect = PermissionError(
+            13, "Permission denied", "oauth21.0token.access_token"
+        )
+
+        with pytest.raises(SystemExit):
+            get_system(mock_module)
+
+        mock_module.fail_json.assert_called_once()
+        msg = mock_module.fail_json.call_args[1]["msg"]
+        assert msg == (
+            "Failed to log in to FlashBlade flashblade.example.com. Error: "
+            "PermissionError: [Errno 13] Permission denied: "
+            "'oauth21.0token.access_token'"
+        )
+
+    def test_connection_error_without_urllib3(self, mock_client_class, mock_environ):
+        """Without urllib3 every failure is reported as a failed login."""
+        mock_environ.get.return_value = None
+        mock_module = login_module(API_TOKEN)
+        mock_client_class.side_effect = FakeHTTPError("connection refused")
+
+        with patch("plugins.module_utils.purefb.HAS_URLLIB3", False):
+            with pytest.raises(SystemExit):
+                get_system(mock_module)
+
+        msg = mock_module.fail_json.call_args[1]["msg"]
+        assert msg == (
+            "Failed to log in to FlashBlade flashblade.example.com. "
+            "Error: FakeHTTPError: connection refused"
+        )
+
+    @pytest.mark.parametrize(
+        "error, detail",
+        [
+            (
+                json.JSONDecodeError("Expecting value", "<html></html>", 0),
+                "JSONDecodeError: Expecting value: line 1 column 1 (char 0)",
+            ),
+            (KeyError("x-auth-token"), "KeyError: 'x-auth-token'"),
+            (
+                AttributeError("module 'jwt' has no attribute 'encode'"),
+                "AttributeError: module 'jwt' has no attribute 'encode'",
+            ),
+        ],
+        ids=["not_json", "no_session_token", "wrong_jwt_package"],
+    )
+    def test_error_that_does_not_name_itself_is_named(
+        self, mock_client_class, mock_environ, error, detail
+    ):
+        """Only the PureError of the SDK says in its text what it is."""
+        mock_environ.get.return_value = None
+        mock_module = login_module(API_TOKEN)
+        mock_client_class.side_effect = error
+
+        with pytest.raises(SystemExit):
+            get_system(mock_module)
+
+        mock_module.fail_json.assert_called_once()
+        assert mock_module.fail_json.call_args[1]["msg"] == (
+            "Failed to log in to FlashBlade flashblade.example.com. Error: " + detail
+        )
+
+    def test_missing_credentials_are_not_a_login_failure(
+        self, mock_client_class, mock_environ
+    ):
+        """No login is attempted without a complete set of credentials."""
+        mock_environ.get.return_value = None
+        mock_module = login_module({"api_token": None})
+
+        with pytest.raises(SystemExit):
+            get_system(mock_module)
+
+        mock_client_class.assert_not_called()
+        mock_module.fail_json.assert_called_once()
+        assert "PUREFB_URL" in mock_module.fail_json.call_args[1]["msg"]
+
+
+class TestImportGuard:
+    """The module must load, and say so, when the SDK is missing."""
+
+    def test_missing_sdk_is_reported(self):
+        """A failed SDK import clears the flag get_system() checks."""
+        spec = importlib.util.spec_from_file_location(
+            "purefb_without_sdk", purefb.__file__
+        )
+        module_copy = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {"pypureclient": None}):
+            spec.loader.exec_module(module_copy)
+
+        assert module_copy.HAS_PYPURECLIENT is False
+
+        mock_module = login_module(API_TOKEN)
+        with pytest.raises(SystemExit):
+            module_copy.get_system(mock_module)
+
+        mock_module.fail_json.assert_called_once()
+        assert (
+            "pypureclient SDK not installed"
+            in mock_module.fail_json.call_args[1]["msg"]
+        )

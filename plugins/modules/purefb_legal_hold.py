@@ -32,13 +32,21 @@ description:
 - A legal hold that is still applied to one or more paths cannot be
   deleted. The module refuses the delete and lists the held paths; release
   them first.
+- A legal hold in a realm is named C(realm::name). It can only be applied
+  to a file system in the same realm, and a legal hold outside a realm only
+  to a file system outside a realm. Realms require FlashBlade REST API
+  version 2.19 or later.
+- The array ignores the case of legal hold, file system and realm names,
+  and so does the module.
 - Requires FlashBlade REST API version 2.17 or later (Purity//FB 4.5.6+).
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
   name:
     description:
-    - Name of the legal hold. Maximum 64 characters.
+    - Name of the legal hold, 1 to 63 characters.
+    - To manage a legal hold in a realm use C(realm::name). The realm prefix
+      does not count towards the 63 characters.
     type: str
     required: true
   state:
@@ -51,13 +59,16 @@ options:
     choices: [ absent, present ]
   description:
     description:
-    - Description of the legal hold. Maximum 128 characters.
+    - Description of the legal hold. Maximum 127 printable ASCII characters.
     - When omitted on an existing hold the description is left unchanged.
     - Ignored when releasing the hold from a path.
     type: str
   file_system:
     description:
     - Name of the file system containing I(path).
+    - For a file system in a realm use C(realm::name). The legal hold and the
+      file system must be in the same realm, or both outside a realm. Any
+      other pair is refused before anything is read or written.
     - Must be given together with I(path).
     - The file system must already exist. It is checked before anything is
       read or written, so an unknown name fails with a clear message and a
@@ -123,6 +134,15 @@ EXAMPLES = r"""
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
+- name: Create a legal hold in a realm and apply it to a file system of that realm
+  everpure.flashblade.purefb_legal_hold:
+    name: realm1::case-42
+    file_system: realm1::evidence
+    path: /case-42
+    recursive: true
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
 - name: Delete the legal hold (fails while any path is still held)
   everpure.flashblade.purefb_legal_hold:
     name: case-42
@@ -138,7 +158,7 @@ legal_hold:
   type: dict
   contains:
     name:
-      description: Name of the legal hold.
+      description: Name of the legal hold, C(realm::name) for a legal hold in a realm.
       type: str
     description:
       description: Description of the legal hold.
@@ -158,7 +178,7 @@ held_entities:
   elements: dict
   contains:
     file_system:
-      description: Name of the file system containing the path.
+      description: Name of the file system containing the path, C(realm::name) for a file system in a realm.
       type: str
     path:
       description: Held path inside the file system.
@@ -192,8 +212,46 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.version import
 )
 
 MIN_REQUIRED_API_VERSION = "2.17"
-MAX_NAME_LENGTH = 64
-MAX_DESCRIPTION_LENGTH = 128
+REALM_API_VERSION = "2.19"
+MAX_NAME_LENGTH = 63
+MAX_DESCRIPTION_LENGTH = 127
+
+
+def _realm_of(name):
+    """Return the realm of a realm::name, or None for a name outside a realm."""
+    if name and "::" in name:
+        return name.split("::")[0]
+    return None
+
+
+def _leaf_name(name):
+    """Return a name without its realm prefix."""
+    return name.rsplit("::", 1)[-1]
+
+
+def _same_name(first, second):
+    """True when the array takes both names for the same object.
+
+    The array ignores the case of names and reports each one as it was
+    created.
+    """
+    return (first or "").lower() == (second or "").lower()
+
+
+def _same_scope(name, file_system):
+    """True when both names are in the same realm, or both outside a realm."""
+    realm = _realm_of(name)
+    fs_realm = _realm_of(file_system)
+    if realm is None or fs_realm is None:
+        return realm is fs_realm
+    return _same_name(realm, fs_realm)
+
+
+def _scope_text(name):
+    realm = _realm_of(name)
+    if realm is None:
+        return "outside a realm"
+    return "in realm {0}".format(realm)
 
 
 def _norm_path(path):
@@ -251,12 +309,16 @@ def _get_held_entities(module, blade, file_system=None, path=None):
 
 
 def _get_entity(module, blade):
-    """Return the held entity for the requested file_system/path, or None."""
+    """Return the held entity for the requested file_system/path, or None.
+
+    The array reports the file system under the name it was created with,
+    whatever the case of the name in the request.
+    """
     file_system = module.params["file_system"]
     path = module.params["path"]
     for entity in _get_held_entities(module, blade, file_system, path):
         fs_name = getattr(getattr(entity, "file_system", None), "name", None)
-        if fs_name == file_system and _norm_path(
+        if _same_name(fs_name, file_system) and _norm_path(
             getattr(entity, "path", None)
         ) == _norm_path(path):
             return entity
@@ -278,6 +340,39 @@ def _check_file_system(module, blade):
                 file_system, module.params["name"], get_error_message(res)
             )
         )
+
+
+def _check_realm(module, blade, api_version):
+    """Fail a check mode run that would create a hold in an unusable realm.
+
+    The array refuses to create a legal hold in a realm that does not exist
+    or has been destroyed. A real run gets that answer from the create
+    itself; check mode sends nothing, so it reads the realm instead of
+    reporting a change the real run cannot make. Only a definite answer
+    fails the module.
+    """
+    name = module.params["name"]
+    realm = _realm_of(name)
+    if not realm or LooseVersion(REALM_API_VERSION) > LooseVersion(api_version):
+        return
+    res = blade.get_realms(names=[realm])
+    if res.status_code == 400:
+        reason = get_error_message(res)
+    elif res.status_code == 200:
+        items = list(res.items)
+        if not items:
+            reason = "Realm does not exist."
+        elif getattr(items[0], "destroyed", False):
+            reason = "Realm has been destroyed."
+        else:
+            return
+    else:
+        return
+    module.fail_json(
+        msg="Legal hold {0} cannot be created in realm {1}. Error: {2}".format(
+            name, realm, reason
+        )
+    )
 
 
 def _hold_dict(hold):
@@ -311,11 +406,13 @@ def _exit(module, blade, changed):
     module.exit_json(**result)
 
 
-def ensure_hold(module, blade, hold):
+def ensure_hold(module, blade, hold, api_version):
     """Create the hold, or update its description. Returns True when changed."""
     description = module.params["description"]
     if hold is None:
-        if not module.check_mode:
+        if module.check_mode:
+            _check_realm(module, blade, api_version)
+        else:
             if description is not None:
                 body = LegalHold(description=description)
             else:
@@ -375,7 +472,7 @@ def delete_hold(module, blade):
     module.exit_json(changed=changed)
 
 
-def apply_entity(module, blade, hold):
+def apply_entity(module, blade, hold, api_version):
     """Apply the hold to file_system/path, creating the hold when needed.
 
     A path whose previous release is still in progress counts as not held
@@ -383,7 +480,7 @@ def apply_entity(module, blade, hold):
     file system has already been validated by main(), so a rejected apply
     never leaves a freshly created hold behind.
     """
-    changed = ensure_hold(module, blade, hold)
+    changed = ensure_hold(module, blade, hold, api_version)
     entity = None
     if hold is not None:
         entity = _get_entity(module, blade)
@@ -459,11 +556,13 @@ def main():
     if not HAS_PYPURECLIENT:
         module.fail_json(msg="py-pure-client sdk is required for this module")
 
-    if len(module.params["name"]) > MAX_NAME_LENGTH:
+    name = module.params["name"]
+    if not 1 <= len(_leaf_name(name)) <= MAX_NAME_LENGTH:
         module.fail_json(
-            msg="Legal hold name must be {0} characters or fewer".format(
-                MAX_NAME_LENGTH
-            )
+            msg=(
+                "Legal hold name must be 1 to {0} characters, not counting "
+                "a realm prefix"
+            ).format(MAX_NAME_LENGTH)
         )
     description = module.params["description"]
     if description is not None and len(description) > MAX_DESCRIPTION_LENGTH:
@@ -480,6 +579,15 @@ def main():
     if path:
         path = _norm_path(path)
         module.params["path"] = path
+        file_system = module.params["file_system"]
+        if not _same_scope(name, file_system):
+            module.fail_json(
+                msg=(
+                    "Legal hold {0} ({1}) and file system {2} ({3}) must be in "
+                    "the same realm, or both outside a realm. Use the "
+                    "realm::name form for both names or for neither."
+                ).format(name, _scope_text(name), file_system, _scope_text(file_system))
+            )
 
     blade = get_system(module)
     api_version = get_rest_api_version(blade)
@@ -501,9 +609,9 @@ def main():
         if state == "absent" or module.params["release"]:
             release_entity(module, blade, hold)
         else:
-            apply_entity(module, blade, hold)
+            apply_entity(module, blade, hold, api_version)
     elif state == "present":
-        _exit(module, blade, ensure_hold(module, blade, hold))
+        _exit(module, blade, ensure_hold(module, blade, hold, api_version))
     elif hold is not None:
         delete_hold(module, blade)
     else:

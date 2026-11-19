@@ -6,6 +6,9 @@ bugfixes:
     ``realm::filesystem``, and ``quota_policies`` and ``eviction_policies`` match rules and file
     systems to their policy by policy ID, so a realm policy and an array-level policy of the same
     name no longer mix.
+  - purefb_info - ``worm_data_policies`` reports the file systems of a WORM data policy in a realm
+    as ``realm::filesystem`` instead of by their bare name, which is also the name of an
+    array-level file system.
 minor_changes:
   - purefb_info - every policy entry of the ``policies`` subset reports ``realms``, and the
     ``realms`` subset adds ``realm_connection_keys`` with the creation and expiry time of each

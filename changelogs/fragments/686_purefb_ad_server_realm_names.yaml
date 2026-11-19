@@ -10,3 +10,5 @@ bugfixes:
     account, ``state=test`` and ``state=rotate`` fail when the account does not exist, and a
     join onto a missing server or without ``domain``, ``username`` and ``password`` is refused
     before the join is sent, in check mode too.
+  - purefb_ad - an empty ``name`` is refused before any request. With ``server`` it was
+    sent as an account named after the server.

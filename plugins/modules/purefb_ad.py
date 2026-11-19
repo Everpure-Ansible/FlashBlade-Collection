@@ -36,8 +36,9 @@ options:
     - Either the plain account name, with I(server) naming the server when it
       is not the default one, or the full name C(server::account) or
       C(realm::server::account).
-    - A realm-scoped administrator must use the realm-qualified name; a bare
-      name is not placed in, or resolved to, the administrator's realm.
+    - A realm-scoped administrator must name a server of its realm, in the
+      full name or in I(server); a plain name on its own is not placed in,
+      or resolved to, the administrator's realm.
     type: str
     required: true
   existing:
@@ -435,10 +436,18 @@ def _account_name(module, api_version):
     A name that already carries a server has to agree with the option, and
     the default server adds nothing. Names are compared without regard to
     case, as the array does. Servers need REST 2.16; before that the option
-    is not used.
+    is not used. A name without an account part is refused: behind a server
+    it would read as an account that does not exist and go on to a join.
     """
     name = module.params["name"]
     server = module.params["server"]
+    if not _leaf(name).strip():
+        module.fail_json(
+            msg=(
+                "name '{0}' holds no account name. Use account, "
+                "server::account or realm::server::account."
+            ).format(name)
+        )
     if not server or LooseVersion(SERVERS_API_VERSION) > LooseVersion(api_version):
         return name
     named_server = _server_of(name)

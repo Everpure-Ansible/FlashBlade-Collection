@@ -1438,6 +1438,68 @@ class TestServerAndRealmAccounts:
         )
         blade.post_active_directory.assert_not_called()
 
+    @pytest.mark.parametrize("state", ["present", "absent", "test", "rotate"])
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize(
+        "name, server",
+        [
+            ("", None),
+            ("", "srv1"),
+            ("", "realm1::srv1"),
+            ("srv1::", None),
+            ("realm1::srv1::", "realm1::srv1"),
+            ("  ", "srv1"),
+        ],
+    )
+    def test_name_without_an_account_fails_before_any_request(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_version,
+        name,
+        server,
+        check_mode,
+        state,
+    ):
+        """An empty name behind a server is not an account that is missing."""
+        module, blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_version,
+            _join_params(name=name, server=server, state=state),
+            check_mode=check_mode,
+        )
+        self._run()
+        module.fail_json.assert_called_once_with(
+            msg=(
+                "name '{0}' holds no account name. Use account, "
+                "server::account or realm::server::account."
+            ).format(name)
+        )
+        module.exit_json.assert_not_called()
+        blade.get_active_directory.assert_not_called()
+        blade.get_servers.assert_not_called()
+        blade.post_active_directory.assert_not_called()
+        blade.delete_active_directory.assert_not_called()
+        blade.post_keytabs.assert_not_called()
+
+    def test_empty_name_is_refused_before_rest_2_16(
+        self, mock_ansible_module, mock_get_system, mock_version
+    ):
+        """The server option is not used there, the name still has to be one."""
+        module, blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_version,
+            _join_params(name="", server="srv1"),
+            api_version="2.15",
+        )
+        self._run()
+        module.fail_json.assert_called_once()
+        assert "holds no account name" in module.fail_json.call_args[1]["msg"]
+        blade.get_active_directory.assert_not_called()
+        blade.post_active_directory.assert_not_called()
+
 
 class TestOptionalImport:
     """An SDK without ActiveDirectoryTestPatch must still load the module."""

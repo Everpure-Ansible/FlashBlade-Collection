@@ -1,0 +1,9 @@
+bugfixes:
+  - purefb_userpolicy - a policy name the array cannot resolve (a policy that does not exist, or a
+    policy of an account in a realm named without ``realm::account/``) no longer ends in a traceback
+    after the policies listed before it were attached. Every policy is checked before the first
+    write and the task fails with a message; a read the array refuses is reported with its message.
+  - purefb_userpolicy - check mode reports what a run changes instead of always reporting unchanged,
+    and a policy of another account is refused before anything is written, in check mode too.
+  - purefb_userpolicy - ``policy_list`` holds the policies of the user once each, also when nothing
+    changed.

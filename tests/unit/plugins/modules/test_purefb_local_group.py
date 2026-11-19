@@ -12,6 +12,8 @@ import multiprocessing
 import ctypes
 from unittest.mock import Mock, patch, MagicMock
 
+import pytest
+
 # Mock multiprocessing context for Windows
 if sys.platform == "win32":
     original_get_context = multiprocessing.get_context
@@ -74,7 +76,9 @@ from plugins.modules.purefb_local_group import (
     main,
     _get_group,
     _get_current_user_members,
+    _missing,
     _reconcile_user_members,
+    _same_group,
 )
 
 
@@ -92,6 +96,17 @@ def _base_params(**overrides):
     }
     params.update(overrides)
     return params
+
+
+def _found_lds(blade):
+    """Let the read of the local directory service find it."""
+    lds = Mock()
+    lds.name = "myserver_local"
+    response = Mock()
+    response.status_code = 200
+    response.items = [lds]
+    blade.get_directory_services_local_directory_services.return_value = response
+    return blade
 
 
 class TestPurefbLocalGroup:
@@ -300,7 +315,7 @@ class TestPurefbLocalGroup:
         module.check_mode = False
         mock_ansible_module.return_value = module
 
-        blade = Mock()
+        blade = _found_lds(Mock())
         blade.get_versions.return_value.items = ["2.24"]
         mock_get_system.return_value = blade
 
@@ -349,7 +364,7 @@ class TestPurefbLocalGroup:
         module.check_mode = True
         mock_ansible_module.return_value = module
 
-        blade = Mock()
+        blade = _found_lds(Mock())
         blade.get_versions.return_value.items = ["2.24"]
         mock_get_system.return_value = blade
 
@@ -382,7 +397,7 @@ class TestPurefbLocalGroup:
         module.check_mode = False
         mock_ansible_module.return_value = module
 
-        blade = Mock()
+        blade = _found_lds(Mock())
         blade.get_versions.return_value.items = ["2.24"]
         mock_get_system.return_value = blade
 
@@ -421,7 +436,7 @@ class TestPurefbLocalGroup:
         module.check_mode = False
         mock_ansible_module.return_value = module
 
-        blade = Mock()
+        blade = _found_lds(Mock())
         blade.get_versions.return_value.items = ["2.24"]
         mock_get_system.return_value = blade
 
@@ -465,7 +480,7 @@ class TestPurefbLocalGroup:
         module.check_mode = False
         mock_ansible_module.return_value = module
 
-        blade = Mock()
+        blade = _found_lds(Mock())
         blade.get_versions.return_value.items = ["2.24"]
         mock_get_system.return_value = blade
 
@@ -505,7 +520,7 @@ class TestPurefbLocalGroup:
         module.check_mode = False
         mock_ansible_module.return_value = module
 
-        blade = Mock()
+        blade = _found_lds(Mock())
         blade.get_versions.return_value.items = ["2.24"]
         mock_get_system.return_value = blade
 
@@ -556,7 +571,7 @@ class TestPurefbLocalGroup:
         module.check_mode = False
         mock_ansible_module.return_value = module
 
-        blade = Mock()
+        blade = _found_lds(Mock())
         blade.get_versions.return_value.items = ["2.24"]
         mock_get_system.return_value = blade
 
@@ -605,7 +620,7 @@ class TestPurefbLocalGroup:
         module.check_mode = False
         mock_ansible_module.return_value = module
 
-        blade = Mock()
+        blade = _found_lds(Mock())
         blade.get_versions.return_value.items = ["2.24"]
         mock_get_system.return_value = blade
 
@@ -645,7 +660,7 @@ class TestPurefbLocalGroup:
         module.check_mode = False
         mock_ansible_module.return_value = module
 
-        blade = Mock()
+        blade = _found_lds(Mock())
         blade.get_versions.return_value.items = ["2.24"]
         mock_get_system.return_value = blade
 
@@ -696,7 +711,7 @@ class TestPurefbLocalGroup:
         module.check_mode = False
         mock_ansible_module.return_value = module
 
-        blade = Mock()
+        blade = _found_lds(Mock())
         blade.get_versions.return_value.items = ["2.24"]
         mock_get_system.return_value = blade
 
@@ -745,7 +760,7 @@ class TestPurefbLocalGroup:
         module.check_mode = False
         mock_ansible_module.return_value = module
 
-        blade = Mock()
+        blade = _found_lds(Mock())
         blade.get_versions.return_value.items = ["2.24"]
         mock_get_system.return_value = blade
 
@@ -799,7 +814,7 @@ class TestPurefbLocalGroup:
         module.check_mode = False
         mock_ansible_module.return_value = module
 
-        blade = Mock()
+        blade = _found_lds(Mock())
         blade.get_versions.return_value.items = ["2.24"]
         mock_get_system.return_value = blade
 
@@ -837,7 +852,7 @@ class TestPurefbLocalGroup:
         module.check_mode = False
         mock_ansible_module.return_value = module
 
-        blade = Mock()
+        blade = _found_lds(Mock())
         blade.get_versions.return_value.items = ["2.24"]
         mock_get_system.return_value = blade
 
@@ -871,7 +886,7 @@ class TestPurefbLocalGroup:
         module.check_mode = False
         mock_ansible_module.return_value = module
 
-        blade = Mock()
+        blade = _found_lds(Mock())
         blade.get_versions.return_value.items = ["2.24"]
         mock_get_system.return_value = blade
 
@@ -925,7 +940,7 @@ class TestPurefbLocalGroup:
         module.check_mode = False
         mock_ansible_module.return_value = module
 
-        blade = Mock()
+        blade = _found_lds(Mock())
         blade.get_versions.return_value.items = ["2.17", "2.18", "2.19"]
         mock_get_system.return_value = blade
 
@@ -960,3 +975,516 @@ class TestPurefbLocalGroup:
 
         module.fail_json.assert_called_once()
         assert "py-pure-client" in module.fail_json.call_args[1]["msg"]
+
+
+# ---------------------------------------------------------------------------
+# The LDS is read first, the group names carry no realm, and a rename that an
+# earlier run applied is not applied again. The mocks answer as the array
+# does: a local directory service that is not there (or that the caller may
+# not manage) answers 400 "Local directory service does not exist.", a group
+# that is not there 400 "Local group was not found.", names match without
+# regard to case and come back in the stored spelling, and the group list
+# also returns the groups of an LDS the caller cannot read.
+# ---------------------------------------------------------------------------
+
+MOD = "plugins.modules.purefb_local_group"
+LDS_MISSING = "Local directory service does not exist."
+GROUP_MISSING = "Local group was not found."
+WRITES = (
+    "post_directory_services_local_groups",
+    "patch_directory_services_local_groups",
+    "delete_directory_services_local_groups",
+    "post_directory_services_local_groups_members",
+    "delete_directory_services_local_groups_members",
+)
+
+
+def _version(value):
+    return tuple(int(part) for part in str(value).split("."))
+
+
+def _message(res):
+    """Stand-in for get_error_message, which lives in the mocked module_utils."""
+    return res.errors[0].message
+
+
+def _response(items=None):
+    res = Mock()
+    res.status_code = 200
+    res.items = items if items is not None else []
+    res.errors = []
+    return res
+
+
+def _error(message, status_code=400):
+    res = Mock()
+    res.status_code = status_code
+    error = Mock(spec=["message"])
+    error.message = message
+    res.errors = [error]
+    return res
+
+
+def _reference(name):
+    ref = Mock(spec=["name"])
+    ref.name = name
+    return ref
+
+
+def _lds(name):
+    """A local directory service as the array returns it."""
+    item = Mock(spec=["name", "domain", "realms", "server"])
+    item.name = name
+    item.domain = name.rpartition("::")[2]
+    realm = name.rpartition("::")[0]
+    item.realms = [_reference(realm)] if realm else []
+    item.server = None
+    return item
+
+
+def _group(name, lds="myserver_local", gid=6001, email=None, built_in=False):
+    """A local group as the array returns it: the name carries no realm."""
+    item = Mock(
+        spec=[
+            "name",
+            "gid",
+            "email",
+            "sid",
+            "built_in",
+            "local_directory_service",
+            "realms",
+        ]
+    )
+    item.name = name
+    item.gid = gid
+    item.email = email
+    item.sid = "S-1-5-21-517968436-696578107-1734940895-{0}".format(gid)
+    item.built_in = built_in
+    item.local_directory_service = _reference(lds)
+    realm = lds.rpartition("::")[0]
+    item.realms = [_reference(realm)] if realm else []
+    return item
+
+
+def _array(lds="myserver_local", groups=(), lds_answer=None, group_answer=None):
+    """A client for an array with one LDS and the groups given.
+
+    ``lds=None`` is an LDS the array does not show to the caller; its groups
+    are listed all the same.
+    """
+    blade = Mock()
+    blade.get_fleets.return_value = _response([])
+
+    def read_lds(names, **kwargs):
+        if lds_answer is not None:
+            return lds_answer
+        if lds and names[0].lower() == lds.lower():
+            return _response([_lds(lds)])
+        return _error(LDS_MISSING)
+
+    def read_groups(names, **kwargs):
+        if group_answer is not None:
+            return group_answer
+        for group in groups:
+            if group.name.lower() == names[0].lower():
+                return _response([group])
+        return _error(GROUP_MISSING)
+
+    blade.get_directory_services_local_directory_services.side_effect = read_lds
+    blade.get_directory_services_local_groups.side_effect = read_groups
+    blade.get_directory_services_local_groups_members.return_value = _response([])
+    for method in WRITES:
+        getattr(blade, method).return_value = _response()
+    return blade
+
+
+def _run(blade, check_mode=False, **overrides):
+    """Run main() against the client and return the module mock."""
+    module = Mock()
+    module.params = _base_params(**overrides)
+    module.check_mode = check_mode
+    module.exit_json = Mock(side_effect=SystemExit)
+    module.fail_json = Mock(side_effect=SystemExit)
+    with patch(MOD + ".AnsibleModule", return_value=module), patch(
+        MOD + ".get_system", return_value=blade
+    ), patch(MOD + ".get_rest_api_version", return_value="2.30"), patch(
+        MOD + ".LooseVersion", side_effect=_version
+    ), patch(
+        MOD + ".get_error_message", side_effect=_message
+    ), patch(
+        MOD + ".LocalGroupPost", side_effect=lambda **kwargs: kwargs
+    ), patch(
+        MOD + ".LocalGroupPatch", side_effect=lambda **kwargs: kwargs
+    ), patch(
+        MOD + ".HAS_PYPURECLIENT", True
+    ):
+        try:
+            main()
+        except SystemExit:
+            pass
+    return module
+
+
+def _failed(module):
+    """Return the failure message of a run that has to fail."""
+    assert module.fail_json.called, "no failure, exit_json{0}".format(
+        module.exit_json.call_args
+    )
+    module.exit_json.assert_not_called()
+    return module.fail_json.call_args[1]["msg"]
+
+
+def _changed(module):
+    """Return the changed value of a run that has to succeed."""
+    assert not module.fail_json.called, "failed: {0}".format(module.fail_json.call_args)
+    return module.exit_json.call_args[1]["changed"]
+
+
+def _no_write(blade):
+    for method in WRITES:
+        getattr(blade, method).assert_not_called()
+
+
+class TestLocalDirectoryServiceLookup:
+    """The LDS is read before any group is looked up in it"""
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_create_in_missing_lds_fails_in_both_modes(self, check_mode):
+        blade = _array(lds=None)
+        module = _run(
+            blade,
+            check_mode=check_mode,
+            local_directory_service="realm1::nolds",
+        )
+        msg = _failed(module)
+        assert "Local directory service realm1::nolds does not exist" in msg
+        assert "realm::name" in msg
+        _no_write(blade)
+        blade.get_directory_services_local_groups.assert_not_called()
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_update_of_a_listed_group_of_an_unmanageable_lds_fails(self, check_mode):
+        """The array lists the group although it hides the LDS from the caller"""
+        blade = _array(lds=None, groups=[_group("developers", lds="tenant_local")])
+        module = _run(
+            blade,
+            check_mode=check_mode,
+            local_directory_service="tenant_local",
+            gid=7999,
+        )
+        assert "Local directory service tenant_local does not exist" in _failed(module)
+        _no_write(blade)
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_absent_in_an_unmanageable_lds_reports_no_change(self, check_mode):
+        blade = _array(lds=None, groups=[_group("developers", lds="realm2::lds")])
+        module = _run(
+            blade,
+            check_mode=check_mode,
+            local_directory_service="realm2::lds",
+            state="absent",
+            force=True,
+        )
+        assert _changed(module) is False
+        msg = module.exit_json.call_args[1]["msg"]
+        assert "Local directory service realm2::lds does not exist" in msg
+        assert "realm::name" in msg
+        _no_write(blade)
+        blade.get_directory_services_local_groups_members.assert_not_called()
+
+    def test_empty_lds_list_reads_as_missing(self):
+        blade = _array(lds_answer=_response([]))
+        module = _run(blade, check_mode=True)
+        assert "Local directory service myserver_local does not exist" in _failed(
+            module
+        )
+        _no_write(blade)
+
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    def test_refused_lds_read_is_reported_with_the_array_message(self, state):
+        refusal = (
+            "Operation not permitted. Authorization for 'read' on "
+            "'directory-services' is required."
+        )
+        blade = _array(lds_answer=_error(refusal, 403))
+        module = _run(blade, check_mode=True, state=state)
+        msg = _failed(module)
+        assert msg.startswith("Failed to read local directory service myserver_local.")
+        assert refusal in msg
+        _no_write(blade)
+        blade.get_directory_services_local_groups.assert_not_called()
+
+    def test_group_of_a_realm_lds_is_created_under_its_bare_name(self):
+        blade = _array(lds="realm1::tenant_local")
+        module = _run(
+            blade,
+            local_directory_service="realm1::tenant_local",
+            gid=6001,
+        )
+        assert _changed(module) is True
+        blade.get_directory_services_local_directory_services.assert_called_once_with(
+            names=["realm1::tenant_local"]
+        )
+        blade.get_directory_services_local_groups.assert_called_once_with(
+            names=["developers"],
+            filter="local_directory_service.name='realm1::tenant_local'",
+        )
+        blade.post_directory_services_local_groups.assert_called_once_with(
+            names=["developers"],
+            local_directory_service_names=["realm1::tenant_local"],
+            local_group={"gid": 6001},
+        )
+
+    def test_group_of_a_realm_lds_is_idempotent_beside_a_namesake(self):
+        """Only the group of the named LDS counts, whatever else has the name"""
+        blade = _array(
+            lds="realm1::tenant_local",
+            groups=[_group("developers", lds="realm1::tenant_local", gid=6001)],
+        )
+        module = _run(
+            blade,
+            local_directory_service="realm1::tenant_local",
+            gid=6001,
+        )
+        assert _changed(module) is False
+        _no_write(blade)
+
+    def test_lds_read_carries_the_fleet_context(self):
+        blade = _array()
+        blade.get_fleets.return_value = _response([_reference("fleet1")])
+        blade.get_arrays.return_value = _response([_reference("array1")])
+        module = _run(blade, check_mode=True)
+        assert _changed(module) is True
+        blade.get_directory_services_local_directory_services.assert_called_once_with(
+            names=["myserver_local"], context_names=["array1"]
+        )
+
+    def test_array_level_lds_keeps_working(self):
+        blade = _array(groups=[_group("developers", gid=6001)])
+        module = _run(blade, gid=7001, email="devs@example.com")
+        assert _changed(module) is True
+        blade.patch_directory_services_local_groups.assert_called_once_with(
+            names=["developers"],
+            local_directory_service_names=["myserver_local"],
+            local_group={"email": "devs@example.com", "gid": 7001},
+        )
+
+
+class TestGroupRead:
+    """A group read that fails is not taken for a group that is absent"""
+
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    def test_refused_group_read_is_reported_with_the_array_message(self, state):
+        blade = _array(group_answer=_error("Operation not permitted.", 403))
+        module = _run(blade, check_mode=True, state=state)
+        msg = _failed(module)
+        assert msg.startswith(
+            "Failed to read local group developers of local directory service "
+            "myserver_local."
+        )
+        assert "Operation not permitted." in msg
+        _no_write(blade)
+
+    def test_group_not_found_reads_as_absent(self):
+        blade = _array()
+        assert _changed(_run(blade, state="absent")) is False
+        assert _changed(_run(blade)) is True
+        blade.post_directory_services_local_groups.assert_called_once()
+
+    def test_get_group_reads_the_name_it_is_given(self):
+        module = Mock()
+        module.params = {"name": "developers", "context": ""}
+        blade = _array(groups=[_group("devs")])
+        with patch(MOD + ".get_error_message", side_effect=_message):
+            assert _get_group(module, blade, "myserver_local", "devs").name == "devs"
+            assert _get_group(module, blade, "myserver_local") is None
+        assert blade.get_directory_services_local_groups.call_args_list[0][1] == {
+            "names": ["devs"],
+            "filter": "local_directory_service.name='myserver_local'",
+        }
+
+    def test_missing_matches_the_two_answers_of_the_array_only(self):
+        with patch(MOD + ".get_error_message", side_effect=_message):
+            assert _missing(_error(LDS_MISSING)) is True
+            assert _missing(_error(GROUP_MISSING)) is True
+            assert _missing(_error("Operation not permitted.")) is False
+            assert _missing(_error("Unexpected error.", 500)) is False
+
+
+class TestGroupNames:
+    """A group name takes no realm prefix"""
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    def test_realm_prefix_in_name_is_refused(self, state, check_mode):
+        blade = _array(lds="realm1::tenant_local")
+        module = _run(
+            blade,
+            check_mode=check_mode,
+            state=state,
+            name="realm1::developers",
+            local_directory_service="realm1::tenant_local",
+        )
+        msg = _failed(module)
+        assert "name realm1::developers is not valid" in msg
+        assert "realm::name in local_directory_service" in msg
+        _no_write(blade)
+        blade.get_directory_services_local_directory_services.assert_not_called()
+        blade.get_directory_services_local_groups.assert_not_called()
+
+    def test_realm_prefix_in_new_name_is_refused(self):
+        blade = _array(
+            lds="realm1::tenant_local",
+            groups=[_group("developers", lds="realm1::tenant_local")],
+        )
+        module = _run(
+            blade,
+            check_mode=True,
+            new_name="realm1::devs",
+            local_directory_service="realm1::tenant_local",
+        )
+        assert "new_name realm1::devs is not valid" in _failed(module)
+        _no_write(blade)
+
+    def test_new_name_is_not_looked_at_for_absent(self):
+        blade = _array(groups=[_group("developers")])
+        module = _run(blade, state="absent", new_name="realm1::devs")
+        assert _changed(module) is True
+        blade.delete_directory_services_local_groups.assert_called_once_with(
+            names=["developers"], local_directory_service_names=["myserver_local"]
+        )
+
+
+class TestRenameIdempotency:
+    """The rename task run again carries on with the renamed group"""
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_second_run_of_a_rename_changes_nothing(self, check_mode):
+        blade = _array(groups=[_group("devs")])
+        module = _run(blade, check_mode=check_mode, new_name="devs")
+        assert _changed(module) is False
+        _no_write(blade)
+        assert [
+            call[1]["names"]
+            for call in blade.get_directory_services_local_groups.call_args_list
+        ] == [["developers"], ["devs"]]
+
+    def test_second_run_in_a_realm_lds_changes_nothing(self):
+        blade = _array(
+            lds="realm1::tenant_local",
+            groups=[_group("devs", lds="realm1::tenant_local")],
+        )
+        module = _run(
+            blade,
+            new_name="devs",
+            local_directory_service="realm1::tenant_local",
+        )
+        assert _changed(module) is False
+        _no_write(blade)
+
+    def test_second_run_applies_the_other_options_to_the_renamed_group(self):
+        blade = _array(groups=[_group("Devs", gid=6001)])
+        module = _run(blade, new_name="devs", gid=7001)
+        assert _changed(module) is True
+        blade.post_directory_services_local_groups.assert_not_called()
+        blade.patch_directory_services_local_groups.assert_called_once_with(
+            names=["Devs"],
+            local_directory_service_names=["myserver_local"],
+            local_group={"gid": 7001},
+        )
+
+    def test_second_run_reconciles_the_members_of_the_renamed_group(self):
+        blade = _array(groups=[_group("devs")])
+        module = _run(blade, new_name="devs", local_users=["alice"])
+        assert _changed(module) is True
+        blade.post_directory_services_local_groups.assert_not_called()
+        blade.patch_directory_services_local_groups.assert_not_called()
+        blade.get_directory_services_local_groups_members.assert_called_once_with(
+            group_names=["devs"],
+            filter="local_directory_service.name='myserver_local'",
+            member_types=["User"],
+        )
+        members = blade.post_directory_services_local_groups_members.call_args[1]
+        assert members["group_names"] == ["devs"]
+        assert members["local_directory_service_names"] == ["myserver_local"]
+
+    def test_first_run_renames(self):
+        blade = _array(groups=[_group("developers")])
+        module = _run(blade, new_name="devs")
+        assert _changed(module) is True
+        blade.patch_directory_services_local_groups.assert_called_once_with(
+            names=["developers"],
+            local_directory_service_names=["myserver_local"],
+            local_group={"name": "devs"},
+        )
+
+    def test_first_run_in_check_mode_sends_nothing(self):
+        blade = _array(groups=[_group("developers")])
+        module = _run(blade, check_mode=True, new_name="devs")
+        assert _changed(module) is True
+        _no_write(blade)
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_two_different_groups_are_refused(self, check_mode):
+        blade = _array(
+            groups=[_group("developers", gid=6001), _group("devs", gid=6002)]
+        )
+        module = _run(blade, check_mode=check_mode, new_name="devs", gid=7001)
+        assert "target name already exists" in _failed(module)
+        _no_write(blade)
+
+    def test_a_built_in_group_is_not_taken_for_the_renamed_group(self):
+        blade = _array(groups=[_group("Guests", gid=546, built_in=True)])
+        module = _run(blade, new_name="Guests", local_users=["alice"])
+        msg = _failed(module)
+        assert "developers does not exist" in msg
+        assert "Guests is a built-in group" in msg
+        _no_write(blade)
+
+    def test_group_that_does_not_exist_yet_is_created_as_name(self):
+        blade = _array()
+        module = _run(blade, new_name="devs", gid=6001)
+        assert _changed(module) is True
+        blade.post_directory_services_local_groups.assert_called_once_with(
+            names=["developers"],
+            local_directory_service_names=["myserver_local"],
+            local_group={"gid": 6001},
+        )
+        blade.patch_directory_services_local_groups.assert_not_called()
+
+    def test_absent_does_not_follow_the_new_name(self):
+        """state=absent acts on name alone and leaves the renamed group"""
+        blade = _array(groups=[_group("devs")])
+        module = _run(blade, state="absent", new_name="devs", force=True)
+        assert _changed(module) is False
+        _no_write(blade)
+        blade.get_directory_services_local_groups.assert_called_once_with(
+            names=["developers"],
+            filter="local_directory_service.name='myserver_local'",
+        )
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_new_name_in_another_case_is_refused(self, check_mode):
+        """The array answers "Local group with specified name already exists." """
+        blade = _array(groups=[_group("developers")])
+        module = _run(blade, check_mode=check_mode, new_name="Developers", gid=7001)
+        msg = _failed(module)
+        assert "differs from the name of the group only in case" in msg
+        _no_write(blade)
+
+    def test_group_that_carries_the_new_name_already_is_left_alone(self):
+        """Both names are the one group, stored in the spelling of new_name"""
+        blade = _array(groups=[_group("Devs")])
+        module = _run(blade, name="devs", new_name="Devs")
+        assert _changed(module) is False
+        _no_write(blade)
+
+    def test_same_group_by_sid_then_by_name(self):
+        first = _group("devs", gid=6001)
+        second = _group("DEVS", gid=6001)
+        other = _group("devs", gid=6002)
+        assert _same_group(first, second) is True
+        assert _same_group(first, other) is False
+        first.sid = None
+        assert _same_group(first, second) is True
+        assert _same_group(first, _group("developers")) is False

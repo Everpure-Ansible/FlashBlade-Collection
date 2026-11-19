@@ -33,6 +33,11 @@ options:
   name:
     description:
     - The name of the source filesystem.
+    - For a filesystem in a realm use C(realm::name); the snapshot is then
+      C(realm::name.suffix). The same name without the realm is a different
+      filesystem at the array level.
+    - A realm-scoped administrator must use the realm-qualified name; a bare
+      name is not placed in, or resolved to, the administrator's realm.
     required: true
     type: str
   suffix:
@@ -46,6 +51,8 @@ options:
     - Define whether the filesystem snapshot should exist or not.
     - I(restore) overwrites filesystem I(name) with the snapshot's data.
     - I(copy) creates the new filesystem I(target_fs) from the snapshot.
+    - I(present), I(restore) and I(copy) fail when filesystem I(name) does
+      not exist. I(absent) reports no change.
     choices: [ absent, present, restore, copy ]
     default: present
     type: str
@@ -59,7 +66,11 @@ options:
   target_fs:
     description:
     - Name of the new filesystem to create from the snapshot with
-      I(state=copy). May be realm-qualified as C(realm::name).
+      I(state=copy).
+    - The new filesystem must be in the same realm as I(name), so it is
+      C(realm::name) for a source in a realm and a name without a realm
+      for an array-level source. Any other name is refused, in check mode
+      as well.
     - The copy is created with the settings the array assigns to a
       filesystem copy, which is an unlimited size with its protocols
       disabled and no exports; enable access with
@@ -148,6 +159,14 @@ EXAMPLES = r"""
     api_token: e31060a7-21fc-e277-6240-25983c6c4592
     state: present
 
+- name: Create snapshot tenant1::foo.ansible of filesystem foo in realm tenant1
+  everpure.flashblade.purefb_snap:
+    name: tenant1::foo
+    suffix: ansible
+    fb_url: 10.10.10.2
+    api_token: e31060a7-21fc-e277-6240-25983c6c4592
+    state: present
+
 - name: Create immeadiate snapshot foo.ansible to connected FB bar
   everpure.flashblade.purefb_snap:
     name: foo
@@ -194,6 +213,15 @@ EXAMPLES = r"""
     name: foo
     suffix: ansible
     target_fs: foo_copy
+    fb_url: 10.10.10.2
+    api_token: e31060a7-21fc-e277-6240-25983c6c4592
+    state: copy
+
+- name: Create writable filesystem tenant1::foo_copy from snapshot tenant1::foo.ansible
+  everpure.flashblade.purefb_snap:
+    name: tenant1::foo
+    suffix: ansible
+    target_fs: tenant1::foo_copy
     fb_url: 10.10.10.2
     api_token: e31060a7-21fc-e277-6240-25983c6c4592
     state: copy
@@ -248,7 +276,6 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.version import
 )
 from ansible_collections.everpure.flashblade.plugins.module_utils.common import (
     get_error_message,
-    get_filesystem,
     get_rest_api_version,
 )
 
@@ -268,6 +295,91 @@ except ImportError:
 SNAP_NOW_API = "2.10"
 CONTEXT_API_VERSION = "2.17"
 COPY_API_VERSION = "2.25"
+
+
+def _realm_of(name):
+    """Return the realm of a realm::name name, empty for an array-level name."""
+    return name.rpartition("::")[0]
+
+
+def _context_kwargs(module, blade):
+    """Return context_names kwargs when a fleet context applies."""
+    if (
+        LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(get_rest_api_version(blade))
+        and module.params["context"]
+    ):
+        return {"context_names": [module.params["context"]]}
+    return {}
+
+
+def _first_item(module, res, what):
+    """Return the first item of a read, or None when the object is absent.
+
+    Only the array's answer that the object does not exist means absent. Any
+    other answer that is not a success, such as a read the array refuses to
+    the identity in use, fails the task with the array's message.
+    """
+    if res.status_code == 200:
+        items = list(res.items)
+        return items[0] if items else None
+    error = get_error_message(res)
+    if "does not exist" in str(error).lower():
+        return None
+    module.fail_json(msg="Failed to get {0}. Error: {1}".format(what, error))
+    return None
+
+
+def _get_filesystem(module, blade):
+    """Return the filesystem named by name, or None when it does not exist"""
+    res = blade.get_file_systems(
+        names=[module.params["name"]], **_context_kwargs(module, blade)
+    )
+    return _first_item(module, res, "filesystem {0}".format(module.params["name"]))
+
+
+def _check_copy_scope(module):
+    """Refuse a copy whose target is not in the realm of its source.
+
+    The array creates the copy of a filesystem only in the realm of that
+    filesystem, and outside of any realm for an array-level filesystem. The
+    names decide it, so the request is refused in check mode as well.
+    """
+    name = module.params["name"]
+    target_name = module.params["target_fs"]
+    realm = _realm_of(name)
+    if _realm_of(target_name).lower() == realm.lower():
+        return
+    if realm:
+        where = "in realm {0}, named {0}::<name>".format(realm)
+    else:
+        where = "outside of any realm, named without a realm"
+    module.fail_json(
+        msg="target_fs {0} must be in the same realm as the source filesystem "
+        "{1}. A copy of {1} can only be created {2}.".format(target_name, name, where)
+    )
+
+
+def _is_copy_of(target, filesystem, name):
+    """Return True when the filesystem target is a copy of filesystem.
+
+    The array reports the source of a copy by its name without the realm,
+    which filesystems of that name in other realms and at the array level
+    share, and in the letter case it was created with. The ID of the source
+    is exact, so it decides. Where the array reports no ID the full name of
+    the source is compared, then its name.
+    """
+    source = getattr(target, "source", None)
+    source_id = getattr(source, "id", None)
+    filesystem_id = getattr(filesystem, "id", None)
+    if source_id and filesystem_id:
+        return source_id == filesystem_id
+    display_name = getattr(source, "display_name", None)
+    if display_name:
+        return display_name.lower() == name.lower()
+    source_name = getattr(source, "name", None)
+    if not source_name:
+        return False
+    return source_name.lower() in (name.lower(), name.rpartition("::")[2].lower())
 
 
 def get_latest_fssnapshot(module, blade):
@@ -307,48 +419,19 @@ def get_latest_fssnapshot(module, blade):
 
 def get_fssnapshot(module, blade):
     """Return Snapshot or None"""
-    api_version = get_rest_api_version(blade)
-    if (
-        LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-        and module.params["context"]
-    ):
-        res = blade.get_file_system_snapshots(
-            names_or_owner_names=[
-                module.params["name"] + "." + module.params["suffix"]
-            ],
-            context_names=[module.params["context"]],
-        )
-    else:
-        res = blade.get_file_system_snapshots(
-            names_or_owner_names=[
-                module.params["name"] + "." + module.params["suffix"]
-            ],
-        )
-    if res.status_code == 200:
-        items = list(res.items)
-        if items:
-            return items[0]
-    return None
+    snapname = module.params["name"] + "." + module.params["suffix"]
+    res = blade.get_file_system_snapshots(
+        names_or_owner_names=[snapname], **_context_kwargs(module, blade)
+    )
+    return _first_item(module, res, "snapshot {0}".format(snapname))
 
 
 def get_target_filesystem(module, blade):
     """Return the filesystem named by target_fs, or None"""
-    api_version = get_rest_api_version(blade)
-    if (
-        LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-        and module.params["context"]
-    ):
-        res = blade.get_file_systems(
-            names=[module.params["target_fs"]],
-            context_names=[module.params["context"]],
-        )
-    else:
-        res = blade.get_file_systems(names=[module.params["target_fs"]])
-    if res.status_code == 200:
-        items = list(res.items)
-        if items:
-            return items[0]
-    return None
+    res = blade.get_file_systems(
+        names=[module.params["target_fs"]], **_context_kwargs(module, blade)
+    )
+    return _first_item(module, res, "filesystem {0}".format(module.params["target_fs"]))
 
 
 def create_snapshot(module, blade):
@@ -358,26 +441,24 @@ def create_snapshot(module, blade):
     # Special case as we have changed 'target' to be a string not a list of one string
     # so this provides backwards compatability
     # target = module.params["target"].replace("[", "").replace("'", "").replace("]", "")
-    blade_exists = False
-    if (
-        LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-        and module.params["context"]
-    ):
-        connected_blades = list(
-            blade.get_array_connections(context_names=[module.params["context"]]).items
-        )
-    else:
-        connected_blades = list(blade.get_array_connections().items)
-    for rem_blade in connected_blades:
-        if (
-            module.params["target"]
-            and module.params["target"] == rem_blade.remote.name
-            and rem_blade.status == "connected"
-        ):
-            blade_exists = True
-            break
-    if module.params["target"] and not blade_exists:
-        module.fail_json(msg="Selected target is not a correctly connected system")
+    if module.params["target"]:
+        # The array connections are only needed to check a target
+        blade_exists = False
+        res = blade.get_array_connections(**_context_kwargs(module, blade))
+        if res.status_code != 200:
+            module.fail_json(
+                msg="Failed to get the array connections to check target {0}. "
+                "Error: {1}".format(module.params["target"], get_error_message(res))
+            )
+        for rem_blade in list(res.items):
+            if (
+                module.params["target"] == rem_blade.remote.name
+                and rem_blade.status == "connected"
+            ):
+                blade_exists = True
+                break
+        if not blade_exists:
+            module.fail_json(msg="Selected target is not a correctly connected system")
     changed = True
     if not module.check_mode:
         if module.params["target"]:
@@ -508,6 +589,7 @@ def copy_snapshot(module, blade, filesystem, snap=None):
                 module.params["name"]
             )
         )
+    _check_copy_scope(module)
     if module.params["suffix_given"]:
         snapname = module.params["name"] + "." + module.params["suffix"]
         if snap is None:
@@ -560,9 +642,7 @@ def copy_snapshot(module, blade, filesystem, snap=None):
                 promotion_status = getattr(items[0], "promotion_status", None)
     else:
         name = module.params["name"]
-        source_name = getattr(getattr(target, "source", None), "name", None)
-        # A realm-scoped source may read back as realm::name or as name
-        is_copy = source_name in (name, name.split("::")[-1])
+        is_copy = _is_copy_of(target, filesystem, name)
         if target.destroyed and is_copy:
             module.fail_json(
                 msg="Filesystem {0} exists but is destroyed. "
@@ -833,13 +913,25 @@ def main():
                 COPY_API_VERSION
             )
         )
-    filesystem = get_filesystem(module, blade)
+    # state=absent acts on the snapshot alone
+    filesystem = None
+    if state != "absent":
+        filesystem = _get_filesystem(module, blade)
     snap = get_fssnapshot(module, blade)
     if (
         module.params["detach_policies"] is not None
         or module.params["detach_all_policies"]
     ):
         detach_snapshot_policies(module, blade, snap)
+    if state in ("present", "restore") and not filesystem:
+        # Also a filesystem the identity in use cannot see, such as one named
+        # without its realm by a realm-scoped administrator
+        module.fail_json(
+            msg="Filesystem {0} does not exist, cannot {1}.".format(
+                module.params["name"],
+                "restore it" if state == "restore" else "create a snapshot of it",
+            )
+        )
     if state == "present" and filesystem and not filesystem.destroyed and not snap:
         create_snapshot(module, blade)
     elif (
@@ -859,8 +951,6 @@ def main():
     ):
         recover_snapshot(module, blade)
     elif state == "present" and filesystem and filesystem.destroyed:
-        update_snapshot(module, blade)
-    elif state == "present" and not filesystem:
         update_snapshot(module, blade)
     elif state == "restore" and filesystem:
         restore_snapshot(module, blade, snap)

@@ -8683,3 +8683,510 @@ class TestPurefbInfoRefusedReads:
         mixed = _refused()
         mixed.errors.append(_Row(message="Unexpected error.", context=None))
         assert not refused(mixed)
+
+
+# Attachments of a policy to a file system in a realm, as Purity//FB 4.8.8
+# lists them: GET /worm-data-policies/members and GET
+# /file-systems/worm-data-policies name the file system of a realm policy
+# bare ("fs1" under policy "realm1::keep"), with the id of the realm file
+# system. An array-level file system of the same name has its own row.
+
+FS_REALM_ID = "55555555-5555-4555-8555-555555555555"
+FS_ARRAY_ID = "66666666-6666-4666-8666-666666666666"
+
+
+def _array_admin_client(**overrides):
+    """An array every read of which is served, empty unless overridden"""
+    reads = {name: _listing() for name in _module_reads()}
+    reads.update(overrides)
+    return _fake_client(reads)
+
+
+def _file_system_with_id(name, fs_id):
+    row = _file_system_row(name)
+    row.id = fs_id
+    return row
+
+
+def _worm_policy_row(name, policy_id, realm=None):
+    return _Row(
+        name=name,
+        id=policy_id,
+        is_local=True,
+        enabled=True,
+        mode="compliance",
+        retention_lock="unlocked",
+        default_retention=3600000,
+        min_retention=60000,
+        max_retention=86400000,
+        policy_type="worm",
+        location=_ref("fb1"),
+        realms=[_ref(realm, resource_type="realms")] if realm else [],
+    )
+
+
+def _worm_attachment_rows():
+    return [
+        _Row(
+            policy=_ref("realm1::keep", REALM_ID, "worm-data-policies"),
+            member=_ref("fs1", FS_REALM_ID, "file-systems"),
+        ),
+        _Row(
+            policy=_ref("keep", ARRAY_ID, "worm-data-policies"),
+            member=_ref("fs1", FS_ARRAY_ID, "file-systems"),
+        ),
+    ]
+
+
+def _worm_policy_rows():
+    return [
+        _worm_policy_row("realm1::keep", REALM_ID, "realm1"),
+        _worm_policy_row("keep", ARRAY_ID),
+    ]
+
+
+class TestPurefbInfoRealmAttachments:
+    """A file system in a realm and an array-level one of the same name
+    each report their own policy, and each policy its own file system"""
+
+    def _worm_policies(self, rows):
+        blade = Mock()
+        blade.get_worm_data_policies.return_value = _listing(_worm_policy_rows())
+        blade.get_worm_data_policies_members.return_value = _listing(rows)
+        with patch.multiple(
+            purefb_info_module,
+            get_rest_api_version=Mock(return_value="2.30"),
+            LooseVersion=_Version,
+        ):
+            return generate_worm_data_policies_dict(blade)
+
+    def test_worm_policy_in_a_realm_lists_realm_file_systems(self):
+        result = self._worm_policies(_worm_attachment_rows())
+
+        assert result["realm1::keep"]["members"] == ["realm1::fs1"]
+        assert result["realm1::keep"]["realms"] == ["realm1"]
+        assert result["keep"]["members"] == ["fs1"]
+        assert result["keep"]["realms"] == []
+
+    def test_worm_members_are_matched_by_policy_id(self):
+        """A row that names the policy of a realm bare belongs to the realm
+        policy, not to the array-level policy of that name; a row of a
+        policy that is not listed is dropped."""
+        result = self._worm_policies(
+            [
+                _Row(policy=_ref("keep", REALM_ID), member=_ref("fs1", FS_REALM_ID)),
+                _Row(policy=_ref("keep", OTHER_ID), member=_ref("fs2")),
+            ]
+        )
+
+        assert result["realm1::keep"]["members"] == ["realm1::fs1"]
+        assert result["keep"]["members"] == []
+
+    def test_fs_worm_policies_are_keyed_by_file_system_id(self):
+        blade = Mock()
+        blade.get_file_systems_worm_data_policies.return_value = _listing(
+            _worm_attachment_rows()
+        )
+
+        assert generate_fs_worm_policies_dict(blade) == {
+            FS_REALM_ID: "realm1::keep",
+            FS_ARRAY_ID: "keep",
+        }
+
+    def test_file_systems_report_their_own_worm_policy(self):
+        """main(), filesystems subset: the bare name the array lists must
+        not hand the realm policy to the array-level file system."""
+        client = _array_admin_client(
+            get_file_systems=_listing(
+                [
+                    _file_system_with_id("realm1::fs1", FS_REALM_ID),
+                    _file_system_with_id("fs1", FS_ARRAY_ID),
+                    _file_system_with_id("fs2", OTHER_ID),
+                ]
+            ),
+            get_file_systems_worm_data_policies=_listing(_worm_attachment_rows()),
+        )
+
+        filesystems = _run_main(client, "filesystems")[1]["filesystems"]
+
+        assert filesystems["realm1::fs1"]["worm_policy"] == "realm1::keep"
+        assert filesystems["fs1"]["worm_policy"] == "keep"
+        assert filesystems["fs2"]["worm_policy"] is None
+
+    def test_file_systems_report_their_own_quota_policy(self):
+        """The array can list the attachment of a realm quota policy under
+        bare names. It belongs to the realm file system and names the realm
+        policy; the array-level file system of that name has none."""
+        client = _array_admin_client(
+            get_file_systems=_listing(
+                [
+                    _file_system_with_id("realm1::fs1", FS_REALM_ID),
+                    _file_system_with_id("fs1", FS_ARRAY_ID),
+                    _file_system_with_id("realm1::fs2", OTHER_ID),
+                ]
+            ),
+            get_file_systems_user_group_quota_policies=_listing(
+                [
+                    _Row(
+                        policy=_ref("gold", REALM_ID),
+                        member=_ref("fs1", FS_REALM_ID),
+                    ),
+                    _Row(
+                        policy=_ref("realm1::silver", ARRAY_ID),
+                        member=_ref("realm1::fs2", OTHER_ID),
+                    ),
+                ]
+            ),
+        )
+
+        filesystems = _run_main(client, "filesystems")[1]["filesystems"]
+
+        assert filesystems["realm1::fs1"]["quota_policy"] == "realm1::gold"
+        assert filesystems["fs1"]["quota_policy"] is None
+        assert filesystems["realm1::fs2"]["quota_policy"] == "realm1::silver"
+
+    def test_policies_subset_qualifies_file_systems_of_a_realm_worm_policy(self):
+        """main(), policies subset: worm_data_policies and the members of
+        the policies view name the realm file system."""
+        client = _array_admin_client(
+            get_worm_data_policies=_listing(_worm_policy_rows()),
+            get_worm_data_policies_members=_listing(_worm_attachment_rows()),
+            get_policies_all=_listing(_worm_policy_rows()),
+            get_policies_all_members=_listing(_worm_attachment_rows()),
+        )
+
+        info = _run_main(client, "policies")[1]
+
+        assert info["worm_data_policies"]["realm1::keep"]["members"] == ["realm1::fs1"]
+        assert info["worm_data_policies"]["keep"]["members"] == ["fs1"]
+        assert info["policies"]["realm1::keep"]["members"] == [
+            {"name": "realm1::fs1", "resource_type": "file-systems"}
+        ]
+        assert info["policies"]["keep"]["members"] == [
+            {"name": "fs1", "resource_type": "file-systems"}
+        ]
+
+    def test_policies_view_qualifies_file_system_members_only(self):
+        policies = [_worm_policy_row("realm1::keep", REALM_ID, "realm1")]
+        blade = Mock()
+        blade.get_policies_all_members.return_value = _listing(
+            [
+                _Row(
+                    policy=_ref("realm1::keep", REALM_ID),
+                    member=_ref("realm1::fs2", OTHER_ID, "file-systems"),
+                ),
+                _Row(
+                    policy=_ref("realm1::keep", REALM_ID),
+                    member=_ref("realm1", None, "realms"),
+                ),
+                _Row(
+                    policy=_ref("realm1::keep", REALM_ID),
+                    member=_ref("eth0", None, "network-interfaces"),
+                ),
+            ]
+        )
+
+        members = purefb_info_module._policy_members_by_name(blade, policies)
+
+        assert members == {
+            "realm1::keep": [
+                {"name": "realm1::fs2", "resource_type": "file-systems"},
+                {"name": "realm1", "resource_type": "realms"},
+                {"name": "eth0", "resource_type": "network-interfaces"},
+            ]
+        }
+
+    def test_attached_policy(self):
+        attached = purefb_info_module._attached_policy
+        realm_fs = _file_system_with_id("realm1::fs1", FS_REALM_ID)
+        array_fs = _file_system_with_id("fs1", FS_ARRAY_ID)
+        by_id = {FS_REALM_ID: "realm1::keep", FS_ARRAY_ID: "keep"}
+        assert attached(by_id, realm_fs) == "realm1::keep"
+        assert attached(by_id, array_fs) == "keep"
+        # the policy of a file system in a realm is in that realm
+        assert attached({FS_REALM_ID: "keep"}, realm_fs) == "realm1::keep"
+        # a map keyed by name is read by name, and a bare name is not the
+        # file system in the realm
+        assert attached({"fs1": "keep"}, array_fs) == "keep"
+        assert attached({"fs1": "keep"}, realm_fs) is None
+        assert attached({"realm1::fs1": "realm1::keep"}, realm_fs) == "realm1::keep"
+        assert attached({}, array_fs) is None
+        # a file system the SDK returns without an id is read by name
+        assert attached({"fs1": "keep"}, _Row(name="fs1")) == "keep"
+
+    def test_attachment_key(self):
+        key = purefb_info_module._attachment_key
+        assert key(_ref("fs1", FS_REALM_ID)) == FS_REALM_ID
+        assert key(_ref("fs1")) == "fs1"
+        assert key(_ref("fs1", "")) == "fs1"
+        assert key(None) is None
+
+
+# GET /policies-all/members on Purity//FB 4.8.8: the listing of every policy
+# at once is refused (HTTP 400) once the array holds more than about ten
+# object store users with an access policy; a query that names at most ten
+# policies is served.
+
+MEMBERS_QUERY_REFUSED = (
+    "Querying is only supported for a maximum of ten users or ten policies per query."
+)
+
+
+def _policy_id(index):
+    return "00000000-0000-4000-8000-{0:012d}".format(index)
+
+
+def _listed_policy(index):
+    return _Row(
+        name="policy{0}".format(index),
+        id=_policy_id(index),
+        enabled=True,
+        is_local=True,
+        location=_ref("fb1"),
+        policy_type="object-store-access",
+        realms=[],
+    )
+
+
+def _member_of(index):
+    return _Row(
+        policy=_ref("policy{0}".format(index), _policy_id(index)),
+        member=_ref("acc/user{0}".format(index), None, "object-store-users"),
+    )
+
+
+def _members_served_ten_at_a_time(gone=(), broken=()):
+    """GET policies-all/members as the array answers it with many users"""
+
+    def read(policy_ids=None, **kwargs):
+        if policy_ids is None or len(policy_ids) > 10:
+            return _SdkError(400, MEMBERS_QUERY_REFUSED)
+        if any(policy_id in broken for policy_id in policy_ids):
+            return _SdkError(500, "Unexpected error.")
+        if any(policy_id in gone for policy_id in policy_ids):
+            return _SdkError(400, "Policy does not exist.")
+        return _listing(
+            [
+                _member_of(index)
+                for index in range(1, 24)
+                if _policy_id(index) in policy_ids
+            ]
+        )
+
+    return read
+
+
+class TestPurefbInfoPolicyMembers:
+    """The members of the policies view when the array refuses to list the
+    members of every policy in one query"""
+
+    POLICIES = [_listed_policy(index) for index in range(1, 24)]
+
+    def _client(self, **kwargs):
+        return _array_admin_client(
+            get_policies_all=_listing(self.POLICIES),
+            get_policies_all_members=_members_served_ten_at_a_time(**kwargs),
+        )
+
+    @staticmethod
+    def _member_queries(client):
+        return [
+            call[1].get("policy_ids")
+            for call in client.calls
+            if call[0] == "get_policies_all_members"
+        ]
+
+    def test_members_are_read_ten_policies_at_a_time(self):
+        """main(), policies subset: no traceback, every policy keeps its
+        member, and no query names more than ten policies."""
+        client = self._client()
+
+        info = _run_main(client, "policies")[1]
+
+        assert len(info["policies"]) == 23
+        for index in range(1, 24):
+            assert info["policies"]["policy{0}".format(index)]["members"] == [
+                {
+                    "name": "acc/user{0}".format(index),
+                    "resource_type": "object-store-users",
+                }
+            ]
+        ids = [policy.id for policy in self.POLICIES]
+        assert self._member_queries(client) == [None, ids[:10], ids[10:20], ids[20:]]
+
+    def test_all_subset_is_gathered_when_the_full_listing_is_refused(self):
+        info = _run_main(self._client(), "all")[1]
+
+        assert info["policies"]["policy23"]["members"][0]["name"] == "acc/user23"
+
+    def test_one_query_when_the_array_serves_the_full_listing(self):
+        client = _array_admin_client(
+            get_policies_all=_listing(self.POLICIES),
+            get_policies_all_members=_listing([_member_of(1), _member_of(23)]),
+        )
+
+        info = _run_main(client, "policies")[1]
+
+        assert info["policies"]["policy1"]["members"][0]["name"] == "acc/user1"
+        assert info["policies"]["policy2"]["members"] == []
+        assert self._member_queries(client) == [None]
+
+    def test_policy_removed_while_reading_is_skipped(self):
+        """A policy deleted after it was listed fails the query of its ten;
+        the others of that query are read one by one."""
+        client = self._client(gone=(_policy_id(12),))
+
+        info = _run_main(client, "policies")[1]
+
+        assert info["policies"]["policy12"]["members"] == []
+        for index in (1, 10, 11, 13, 20, 21, 23):
+            assert info["policies"]["policy{0}".format(index)]["members"] == [
+                {
+                    "name": "acc/user{0}".format(index),
+                    "resource_type": "object-store-users",
+                }
+            ]
+        ids = [policy.id for policy in self.POLICIES]
+        assert self._member_queries(client) == (
+            [None, ids[:10], ids[10:20]] + [[one] for one in ids[10:20]] + [ids[20:]]
+        )
+
+    def test_another_failure_is_not_taken_for_an_empty_listing(self):
+        """A query the array fails for another reason is not read as a
+        policy without members."""
+        blade = Mock()
+        blade.get_policies_all_members.side_effect = _members_served_ten_at_a_time(
+            broken=(_policy_id(5),)
+        )
+
+        with pytest.raises(AttributeError):
+            purefb_info_module._policy_members_by_name(blade, self.POLICIES)
+        # raised by the query that names the failing policy alone
+        assert blade.get_policies_all_members.call_args[1] == {
+            "policy_ids": [_policy_id(5)]
+        }
+
+    def test_refused_identity_makes_one_query(self):
+        """An identity the array refuses the read gets no members and is
+        not asked again policy by policy."""
+        client = _realm_admin_client(
+            get_policies_all=_listing(self.POLICIES),
+            get_policies_all_members=_refused(),
+        )
+
+        info = _run_main(client, "policies")[1]
+
+        assert info["policies"]["policy1"]["members"] == []
+        assert self._member_queries(client) == [None]
+
+    def test_refusals_are_told_apart(self):
+        too_wide = purefb_info_module._query_too_wide
+        gone = purefb_info_module._named_object_gone
+        assert too_wide(_SdkError(400, MEMBERS_QUERY_REFUSED))
+        assert not too_wide(_refused())
+        assert not too_wide(_SdkError(400, "Policy does not exist."))
+        assert not too_wide(_SdkError(500, "Unexpected error."))
+        assert not too_wide(_listing())
+        assert gone(_SdkError(400, "Policy does not exist."))
+        assert gone(_SdkError(400, "Member does not exist."))
+        assert not gone(_SdkError(400, MEMBERS_QUERY_REFUSED))
+        assert not gone(_SdkError(500, "Unexpected error."))
+        assert not gone(_listing())
+
+    # roles: GET /object-store-roles/object-store-access-policies is refused
+    # in the same way once the array holds more than ten roles; a query that
+    # names at most ten roles is served
+
+    @staticmethod
+    def _role(index):
+        return _Row(
+            name="acc/role{0}".format(index),
+            account=_ref("acc"),
+            created=1735689600000,
+            max_session_duration=3600000,
+            prn="prn::iam:array-id/local:obj-account-id/1:role/role{0}".format(index),
+            trusted_entities=[],
+        )
+
+    @staticmethod
+    def _role_policies_served_ten_at_a_time(gone=(), broken=()):
+        def read(member_names=None, **kwargs):
+            if member_names is None or len(member_names) > 10:
+                return _SdkError(400, MEMBERS_QUERY_REFUSED)
+            if any(name in broken for name in member_names):
+                return _SdkError(500, "Unexpected error.")
+            if any(name in gone for name in member_names):
+                return _SdkError(400, "Member does not exist.")
+            return _listing(
+                [
+                    _Row(
+                        member=_ref(name),
+                        policy=_ref("pure:policy/bucket-list"),
+                    )
+                    for name in member_names
+                ]
+            )
+
+        return read
+
+    def _roles_client(self, **kwargs):
+        return _array_admin_client(
+            get_object_store_roles=_listing(
+                [self._role(index) for index in range(1, 13)]
+            ),
+            get_object_store_roles_object_store_access_policies=(
+                self._role_policies_served_ten_at_a_time(**kwargs)
+            ),
+        )
+
+    @staticmethod
+    def _role_queries(client):
+        return [
+            call[1].get("member_names")
+            for call in client.calls
+            if call[0] == "get_object_store_roles_object_store_access_policies"
+        ]
+
+    def test_role_policies_are_read_ten_roles_at_a_time(self):
+        """main(), accounts subset: with more than ten roles every role
+        still reports its policy instead of none."""
+        client = self._roles_client()
+
+        roles = _run_main(client, "accounts")[1]["object_store_roles"]
+
+        assert len(roles) == 12
+        for index in range(1, 13):
+            assert roles["acc/role{0}".format(index)]["access_policies"] == [
+                "pure:policy/bucket-list"
+            ]
+        names = ["acc/role{0}".format(index) for index in range(1, 13)]
+        assert self._role_queries(client) == [None, names[:10], names[10:]]
+
+    def test_role_removed_while_reading_is_skipped(self):
+        client = self._roles_client(gone=("acc/role3",))
+
+        roles = _run_main(client, "accounts")[1]["object_store_roles"]
+
+        assert roles["acc/role3"]["access_policies"] == []
+        for index in (1, 2, 4, 10, 11, 12):
+            assert roles["acc/role{0}".format(index)]["access_policies"] == [
+                "pure:policy/bucket-list"
+            ]
+
+    def test_role_policies_that_cannot_be_read_stay_empty(self):
+        """As before, a failed read of the role policies does not fail the
+        accounts subset."""
+        client = self._roles_client(broken=("acc/role3",))
+        roles = _run_main(client, "accounts")[1]["object_store_roles"]
+        assert roles["acc/role3"]["access_policies"] == []
+        assert roles["acc/role4"]["access_policies"] == ["pure:policy/bucket-list"]
+
+        client = _array_admin_client(
+            get_object_store_roles=_listing([self._role(1)]),
+            get_object_store_roles_object_store_access_policies=_SdkError(
+                500, "Unexpected error."
+            ),
+        )
+        roles = _run_main(client, "accounts")[1]["object_store_roles"]
+        assert roles["acc/role1"]["access_policies"] == []
+        assert self._role_queries(client) == [None]

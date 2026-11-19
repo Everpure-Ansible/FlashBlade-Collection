@@ -76,7 +76,9 @@ options:
     - Policies already attached are left in place. Other policies attached
       to the role are only detached when listed in I(remove_access_policies)
       or when I(exclusive=true).
-    - Every listed policy must exist.
+    - Every listed policy must exist. A policy is identified by the name the
+      array returns for it, so a name given in another case than the array
+      stores refers to the same policy.
     type: list
     elements: str
   remove_access_policies:
@@ -315,6 +317,17 @@ def _check_role_name(module):
         )
 
 
+def _use_stored_spelling(module, key, stored):
+    """Take the array's spelling of a name given in another case.
+
+    The array finds an account or a role by name without regard to case,
+    but it attaches a policy only to a role named exactly as it stores it.
+    Once the object is found, every later request uses the stored name.
+    """
+    if stored and str(stored).lower() == module.params[key].lower():
+        module.params[key] = str(stored)
+
+
 def _qualify_policy(module, policy):
     """Built-in and account/policy names pass through; bare names get the account."""
     if "/" in policy:
@@ -384,6 +397,10 @@ def _realm_hint(module, policy):
 def _check_policies_usable(module, blade, account, policies):
     """Fail unless every policy exists and can be used by the role.
 
+    Returns the name the array gives each policy, keyed by the name asked
+    for. The array resolves a name without regard to case, so a policy asked
+    for in another spelling is the policy the array answers with.
+
     The array lets a role use the built-in policies, which belong to no
     account, and the policies of its own account. A policy of any other
     account, inside or outside a realm, is refused with "Cannot add policy
@@ -396,10 +413,17 @@ def _check_policies_usable(module, blade, account, policies):
     account_names = [
         name.lower() for name in (account_name, getattr(account, "name", None)) if name
     ]
+    names = {}
     for policy in policies:
         res = blade.get_object_store_access_policies(
             names=[policy], **_context_kwargs(module)
         )
+        if res.status_code != 200 and not _not_found(res):
+            module.fail_json(
+                msg="Failed to look up access policy {0}. Error: {1}".format(
+                    policy, get_error_message(res)
+                )
+            )
         items = list(res.items) if res.status_code == 200 else []
         if not items:
             module.fail_json(
@@ -422,19 +446,30 @@ def _check_policies_usable(module, blade, account, policies):
                     "and the policies of its own account ({2}/policy)."
                 ).format(policy, owner_name or owner_id, account_name)
             )
+        names[policy] = getattr(items[0], "name", None) or policy
+    return names
 
 
-def _requested_policies(module, key):
-    """Qualified, de-duplicated policy names from a list parameter."""
-    return _dedupe(
-        [_qualify_policy(module, policy) for policy in (module.params[key] or [])]
-    )
+def _requested_policies(module, key, names=None):
+    """Qualified, de-duplicated policy names from a list parameter.
+
+    names maps a requested name to the name the array gives that policy.
+    """
+    names = names or {}
+    qualified = [
+        _qualify_policy(module, policy) for policy in (module.params[key] or [])
+    ]
+    return _dedupe([names.get(policy, policy) for policy in qualified])
 
 
-def _desired_policy_changes(module, current):
-    """Return (to_attach, to_detach) from the parameters and the attached list."""
-    wanted = _requested_policies(module, "access_policies")
-    unwanted = _requested_policies(module, "remove_access_policies")
+def _desired_policy_changes(module, current, names=None):
+    """Return (to_attach, to_detach) from the parameters and the attached list.
+
+    With names, the requested policies are compared under the names the
+    array gives them, which is how the attached list spells them.
+    """
+    wanted = _requested_policies(module, "access_policies", names)
+    unwanted = _requested_policies(module, "remove_access_policies", names)
     clash = [policy for policy in wanted if policy in unwanted]
     if clash:
         module.fail_json(
@@ -523,9 +558,10 @@ def create_role(module, blade, account, duration_ms):
     changed = True
     role_name = _full_role_name(module)
     wanted, _unused = _desired_policy_changes(module, [])
-    _check_policies_usable(
+    names = _check_policies_usable(
         module, blade, account, _policies_to_validate(module, [], wanted)
     )
+    wanted, _unused = _desired_policy_changes(module, [], names)
     if module.check_mode:
         module.exit_json(
             changed=changed,
@@ -563,13 +599,16 @@ def update_role(module, blade, account, role, duration_ms):
     changed = False
     role_name = _full_role_name(module)
     current_policies = _get_attached_policies(module, blade)
-    to_attach, to_detach = _desired_policy_changes(module, current_policies)
-    _check_policies_usable(
+    to_attach, _unused = _desired_policy_changes(module, current_policies)
+    names = _check_policies_usable(
         module,
         blade,
         account,
         _policies_to_validate(module, current_policies, to_attach),
     )
+    # A name the array resolves to an attached policy is that policy: it is
+    # not attached again, and it is the one a removal detaches.
+    to_attach, to_detach = _desired_policy_changes(module, current_policies, names)
     if duration_ms is not None and duration_ms != getattr(
         role, "max_session_duration", None
     ):
@@ -670,8 +709,13 @@ def main():
                 module.params["account"]
             )
         )
+    _use_stored_spelling(module, "account", getattr(account, "name", None))
 
     role = _get_role(module, blade)
+    if role:
+        _use_stored_spelling(
+            module, "name", str(getattr(role, "name", "")).rpartition("/")[2]
+        )
     if state == "absent":
         if role:
             delete_role(module, blade)

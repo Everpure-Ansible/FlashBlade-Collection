@@ -58,7 +58,207 @@ sys.modules["ansible_collections.everpure.flashblade.plugins.module_utils.versio
     MagicMock()
 )
 
+from contextlib import ExitStack
+from types import SimpleNamespace
+from unittest.mock import mock_open
+
+import pytest
+
+from plugins.module_utils.version import LooseVersion as RealLooseVersion
+from plugins.modules import purefb_certs as certs_module
 from plugins.modules.purefb_certs import main
+
+MOD = "plugins.modules.purefb_certs"
+MISSING = "Certificate does not exist."
+NO_REALM = "Realm does not exist."
+NOT_PERMITTED = "Operation not permitted."
+ARRAY_TYPE_ONLY = (
+    "Certificate signing request is only supported for array-type certificates."
+)
+PEM = "-----BEGIN CERTIFICATE-----\nREALM\n-----END CERTIFICATE-----"
+CSR = "-----BEGIN CERTIFICATE REQUEST-----\nCSR\n-----END CERTIFICATE REQUEST-----"
+
+
+def _error_text(response, default="Unknown error"):
+    """get_error_message as module_utils.common implements it."""
+    errors = getattr(response, "errors", None)
+    if isinstance(errors, (list, tuple)) and errors:
+        return errors[0].message
+    return default
+
+
+@pytest.fixture(autouse=True)
+def array_error_text():
+    """Report the message an error response carries, as the collection does."""
+    with patch(MOD + ".get_error_message", side_effect=_error_text):
+        yield
+
+
+def _error_response(message, status_code=400):
+    """An error response of the SDK: a status and the errors, no items."""
+    res = Mock(spec=["status_code", "errors"])
+    res.status_code = status_code
+    res.errors = [SimpleNamespace(message=message)] if message else []
+    return res
+
+
+def _valid_response(items=None):
+    """A successful response of the SDK."""
+    res = Mock(spec=["status_code", "items"])
+    res.status_code = 200
+    res.items = list(items or [])
+    return res
+
+
+def _body(**kwargs):
+    """Stand-in for the SDK models so request bodies are comparable."""
+    return kwargs
+
+
+def _cert(name, certificate_type="array", **fields):
+    """A certificate as the array returns it."""
+    realm = name.rsplit("::", 1)[0] if "::" in name else None
+    cert = dict(
+        name=name,
+        realms=[SimpleNamespace(name=realm)] if realm else [],
+        certificate=PEM,
+        certificate_type=certificate_type,
+        common_name="s3.example.com",
+        country="US",
+        email=None,
+        intermediate_certificate=None,
+        key_algorithm="rsa",
+        key_size=2048,
+        locality=None,
+        organization="Acme Inc",
+        organizational_unit="DevOps",
+        state=None,
+        status="self-signed" if certificate_type == "array" else "imported",
+        subject_alternative_names=None,
+    )
+    cert.update(fields)
+    return SimpleNamespace(**cert)
+
+
+def _blade(certs=(), realms=None, read_error=None, csr_error=None):
+    """A FlashBlade that holds I(certs) and I(realms) (name: destroyed).
+
+    The array matches names without regard to case and answers a name it
+    does not have with an error.
+    """
+    blade = Mock()
+    stored = dict((cert.name.lower(), cert) for cert in certs)
+    known_realms = {"realm1": False} if realms is None else realms
+
+    def get_certificates(names=None, **kwargs):
+        if read_error is not None:
+            return read_error
+        cert = stored.get(names[0].lower())
+        if cert is None:
+            return _error_response(MISSING)
+        return _valid_response([cert])
+
+    def get_realms(names=None, **kwargs):
+        if not isinstance(known_realms, dict):
+            return known_realms
+        realm = names[0].lower()
+        if realm not in known_realms:
+            return _error_response(NO_REALM)
+        return _valid_response(
+            [SimpleNamespace(name=realm, destroyed=known_realms[realm])]
+        )
+
+    def post_csr(certificate=None, **kwargs):
+        if csr_error is not None:
+            return _error_response(csr_error)
+        if certificate["certificate"]["name"].lower() not in stored:
+            return _error_response(MISSING)
+        return _valid_response([SimpleNamespace(certificate_signing_request=CSR)])
+
+    blade.get_certificates.side_effect = get_certificates
+    blade.get_realms.side_effect = get_realms
+    blade.post_certificates_certificate_signing_requests.side_effect = post_csr
+    blade.post_certificates.return_value = _valid_response()
+    blade.patch_certificates.return_value = _valid_response()
+    blade.delete_certificates.return_value = _valid_response()
+    return blade
+
+
+def _module(check_mode=False, **overrides):
+    module = Mock()
+    module.params = {
+        "state": "present",
+        "name": "realm1::cert",
+        "generate": False,
+        "certificate_type": None,
+        "country": None,
+        "province": None,
+        "locality": None,
+        "organization": None,
+        "org_unit": None,
+        "common_name": None,
+        "email": None,
+        "key_size": None,
+        "certificate": None,
+        "intermediate_cert": None,
+        "key": None,
+        "export_file": None,
+        "passphrase": None,
+        "days": None,
+        "key_algorithm": None,
+        "subject_alternative_names": None,
+    }
+    module.params.update(overrides)
+    module.check_mode = check_mode
+    module.exit_json = Mock(side_effect=SystemExit)
+    module.fail_json = Mock(side_effect=SystemExit)
+    return module
+
+
+def _run(module, blade, api_version="2.30"):
+    """Run main() against I(blade) and return the mock that stands for open()."""
+    opened = mock_open()
+    patches = [
+        patch(MOD + ".AnsibleModule", return_value=module),
+        patch(MOD + ".get_system", return_value=blade),
+        patch(MOD + ".get_rest_api_version", return_value=api_version),
+        patch(MOD + ".LooseVersion", RealLooseVersion),
+        patch(MOD + ".HAS_PYPURECLIENT", True),
+        patch(MOD + ".HAS_PYCOUNTRY", True),
+        patch(MOD + ".pycountry"),
+        patch(MOD + ".CertificatePost", side_effect=_body),
+        patch(MOD + ".CertificatePatch", side_effect=_body),
+        patch(MOD + ".CertificateSigningRequestPost", side_effect=_body),
+        patch(MOD + ".Reference", side_effect=_body),
+        patch("builtins.open", opened),
+    ]
+    with ExitStack() as stack:
+        for item in patches:
+            stack.enter_context(item)
+        try:
+            main()
+        except SystemExit:
+            pass
+    return opened
+
+
+def _changed(module):
+    module.fail_json.assert_not_called()
+    module.exit_json.assert_called_once()
+    return module.exit_json.call_args[1]["changed"]
+
+
+def _failure(module):
+    module.exit_json.assert_not_called()
+    module.fail_json.assert_called_once()
+    return module.fail_json.call_args[1]["msg"]
+
+
+def _no_writes(blade):
+    blade.post_certificates.assert_not_called()
+    blade.patch_certificates.assert_not_called()
+    blade.delete_certificates.assert_not_called()
+    blade.post_certificates_certificate_signing_requests.assert_not_called()
 
 
 class TestPurefbCerts:
@@ -119,7 +319,7 @@ class TestPurefbCerts:
         mock_blade.get_arrays.return_value.items = [mock_array]
 
         # Certificate doesn't exist
-        mock_blade.get_certificates.return_value.status_code = 400
+        mock_blade.get_certificates.return_value = _error_response(MISSING)
 
         # Mock successful creation
         mock_response = Mock()
@@ -303,7 +503,7 @@ class TestPurefbCerts:
         mock_loose_version.return_value.__le__ = Mock(return_value=False)
 
         # Certificate doesn't exist
-        mock_blade.get_certificates.return_value.status_code = 400
+        mock_blade.get_certificates.return_value = _error_response(MISSING)
 
         mock_get_system.return_value = mock_blade
 
@@ -571,7 +771,7 @@ class TestPurefbCerts:
         mock_cert_response = Mock()
         mock_cert_response.status_code = 400
         mock_error = Mock()
-        mock_error.message = "Certificate not found"
+        mock_error.message = MISSING
         mock_cert_response.errors = [mock_error]
         mock_blade.get_certificates.return_value = mock_cert_response
 
@@ -647,6 +847,7 @@ class TestPurefbCerts:
             "-----END CERTIFICATE REQUEST-----\n",
         ]
         mock_csr_response = Mock()
+        mock_csr_response.status_code = 200
         mock_csr_response.items = [mock_csr_item]
         mock_blade.post_certificates_certificate_signing_requests.return_value = (
             mock_csr_response
@@ -1370,7 +1571,7 @@ class TestPurefbCerts:
         mock_loose_version.return_value.__le__ = Mock(return_value=True)
 
         # Certificate doesn't exist
-        mock_blade.get_certificates.return_value.status_code = 400
+        mock_blade.get_certificates.return_value = _error_response(MISSING)
 
         # Mock failed post
         mock_post_response = Mock()
@@ -1804,3 +2005,393 @@ class TestPurefbCerts:
         assert mock_certificate_patch.call_args[1]["key_size"] == 4096
         mock_module.exit_json.assert_called_once()
         assert mock_module.exit_json.call_args[1]["changed"] is True
+
+
+class TestRealmNames:
+    """A certificate in a realm is addressed by its full name, realm::certificate"""
+
+    @pytest.mark.parametrize(
+        "name, realm",
+        [
+            ("cert", ""),
+            ("realm1::cert", "realm1"),
+            ("outer::inner::cert", "outer::inner"),
+            ("", ""),
+            (None, ""),
+        ],
+    )
+    def test_realm_of(self, name, realm):
+        assert certs_module._realm_of(name) == realm
+
+    def test_create_sends_the_realm_name(self):
+        module = _module(common_name="s3.realm1.example.com", country="US")
+        blade = _blade()
+
+        _run(module, blade)
+
+        assert _changed(module) is True
+        blade.get_certificates.assert_called_once_with(names=["realm1::cert"])
+        blade.post_certificates.assert_called_once()
+        call = blade.post_certificates.call_args[1]
+        assert call["names"] == ["realm1::cert"]
+        assert call["certificate"]["common_name"] == "s3.realm1.example.com"
+        assert call["certificate"]["certificate_type"] == "array"
+        blade.get_realms.assert_not_called()
+
+    def test_update_changes_only_the_named_certificate(self):
+        """A namesake outside the realm is neither read nor changed"""
+        module = _module(org_unit="Storage")
+        blade = _blade([_cert("realm1::cert"), _cert("cert")])
+
+        _run(module, blade)
+
+        assert _changed(module) is True
+        for call in blade.get_certificates.call_args_list:
+            assert call[1]["names"] == ["realm1::cert"]
+        blade.patch_certificates.assert_called_once()
+        call = blade.patch_certificates.call_args[1]
+        assert call["names"] == ["realm1::cert"]
+        assert call["certificate"]["organizational_unit"] == "Storage"
+        blade.post_certificates.assert_not_called()
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_same_values_change_nothing(self, check_mode):
+        module = _module(check_mode=check_mode, org_unit="DevOps", country="US")
+        blade = _blade([_cert("realm1::cert"), _cert("cert", country="GB")])
+
+        _run(module, blade)
+
+        assert _changed(module) is False
+        _no_writes(blade)
+
+    def test_another_letter_case_is_not_a_difference(self):
+        """The array matches names without regard to case"""
+        module = _module(name="REALM1::Cert", org_unit="DevOps")
+        blade = _blade([_cert("realm1::cert")])
+
+        _run(module, blade)
+
+        assert _changed(module) is False
+        _no_writes(blade)
+
+    def test_delete_sends_the_realm_name(self):
+        module = _module(state="absent")
+        blade = _blade([_cert("realm1::cert"), _cert("cert")])
+
+        _run(module, blade)
+
+        assert _changed(module) is True
+        blade.delete_certificates.assert_called_once_with(names=["realm1::cert"])
+
+    def test_bare_name_does_not_reach_into_the_realm(self):
+        """state=absent with the bare name of a certificate that is only in a realm"""
+        module = _module(name="cert", state="absent")
+        blade = _blade([_cert("realm1::cert")])
+
+        _run(module, blade)
+
+        assert _changed(module) is False
+        blade.get_certificates.assert_called_once_with(names=["cert"])
+        _no_writes(blade)
+
+    def test_sign_references_the_realm_certificate(self):
+        module = _module(state="sign", export_file="/tmp/cert.csr", org_unit="CA")
+        blade = _blade([_cert("realm1::cert"), _cert("cert")])
+
+        opened = _run(module, blade)
+
+        assert _changed(module) is True
+        request = blade.post_certificates_certificate_signing_requests.call_args[1]
+        assert request["certificate"]["certificate"] == {"name": "realm1::cert"}
+        assert request["certificate"]["organizational_unit"] == "CA"
+        opened.assert_called_once_with("/tmp/cert.csr", "w", encoding="utf-8")
+        opened().write.assert_called_once_with(CSR)
+
+    def test_export_writes_the_realm_certificate(self):
+        module = _module(state="export", export_file="/tmp/cert.pem")
+        blade = _blade([_cert("realm1::cert", certificate="REALM PEM"), _cert("cert")])
+
+        opened = _run(module, blade)
+
+        assert _changed(module) is True
+        for call in blade.get_certificates.call_args_list:
+            assert call[1]["names"] == ["realm1::cert"]
+        opened.assert_called_once_with("/tmp/cert.pem", "w", encoding="utf-8")
+        opened().write.assert_called_once_with("REALM PEM")
+
+
+class TestMissingCertificate:
+    """state=sign and state=export need a certificate that exists"""
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize(
+        "state, action",
+        [
+            ("sign", "Creating a Certificate Signing Request failed."),
+            ("export", "Exporting Certificate failed."),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "name, hint", [("realm1::nope", False), ("cert", True), ("nope", True)]
+    )
+    def test_missing_certificate_fails(self, name, hint, state, action, check_mode):
+        """The same answer in check mode and in a real run, and no request"""
+        module = _module(
+            check_mode=check_mode, name=name, state=state, export_file="/tmp/out"
+        )
+        blade = _blade([_cert("realm1::cert")])
+
+        opened = _run(module, blade)
+
+        msg = _failure(module)
+        assert msg.startswith(action)
+        assert "Error: Certificate {0} does not exist.".format(name) in msg
+        assert ("named realm::certificate" in msg) is hint
+        blade.get_certificates.assert_called_once_with(names=[name])
+        _no_writes(blade)
+        opened.assert_not_called()
+
+    def test_refused_signing_request_reports_the_array_message(self):
+        """An error answer to the request is reported, not read for items"""
+        module = _module(name="realm1::ca", state="sign", export_file="/tmp/out")
+        blade = _blade(
+            [_cert("realm1::ca", certificate_type="external")],
+            csr_error=ARRAY_TYPE_ONLY,
+        )
+
+        opened = _run(module, blade)
+
+        msg = _failure(module)
+        assert msg == (
+            "Creating a Certificate Signing Request for realm1::ca failed. "
+            "Error: " + ARRAY_TYPE_ONLY
+        )
+        blade.post_certificates_certificate_signing_requests.assert_called_once()
+        opened.assert_not_called()
+
+    def test_check_mode_predicts_the_refusal_for_an_external_certificate(self):
+        module = _module(
+            check_mode=True, name="realm1::ca", state="sign", export_file="/tmp/out"
+        )
+        blade = _blade([_cert("realm1::ca", certificate_type="external")])
+
+        opened = _run(module, blade)
+
+        msg = _failure(module)
+        assert msg == (
+            "Creating a Certificate Signing Request for realm1::ca failed. "
+            "Error: " + ARRAY_TYPE_ONLY
+        )
+        _no_writes(blade)
+        opened.assert_not_called()
+
+    def test_check_mode_sign_of_an_array_certificate_reports_changed(self):
+        module = _module(check_mode=True, state="sign", export_file="/tmp/out")
+        blade = _blade([_cert("realm1::cert")])
+
+        opened = _run(module, blade)
+
+        assert _changed(module) is True
+        _no_writes(blade)
+        opened.assert_not_called()
+
+    def test_check_mode_export_of_an_existing_certificate_reports_changed(self):
+        module = _module(check_mode=True, state="export", export_file="/tmp/out")
+        blade = _blade([_cert("realm1::cert")])
+
+        opened = _run(module, blade)
+
+        assert _changed(module) is True
+        _no_writes(blade)
+        opened.assert_not_called()
+
+    def test_sign_on_an_old_array_fails_before_the_read(self):
+        module = _module(state="sign", export_file="/tmp/out")
+        blade = _blade([_cert("realm1::cert")])
+
+        _run(module, blade, api_version="2.19")
+
+        assert _failure(module) == "Purity//FB 4.6.3+ is required for CSRs"
+        blade.get_certificates.assert_not_called()
+        _no_writes(blade)
+
+
+class TestCheckedRead:
+    """Only "does not exist" means the certificate is absent"""
+
+    @pytest.mark.parametrize("status_code", [400, 403])
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("state", ["present", "absent", "import", "export", "sign"])
+    def test_refused_read_fails_with_the_array_message(
+        self, state, check_mode, status_code
+    ):
+        module = _module(
+            check_mode=check_mode,
+            state=state,
+            certificate=PEM if state == "import" else None,
+            export_file="/tmp/out",
+        )
+        blade = _blade(read_error=_error_response(NOT_PERMITTED, status_code))
+
+        opened = _run(module, blade)
+
+        assert _failure(module) == (
+            "Failed to read SSL certificate realm1::cert. Error: " + NOT_PERMITTED
+        )
+        _no_writes(blade)
+        blade.get_realms.assert_not_called()
+        opened.assert_not_called()
+
+    def test_error_without_a_message_is_not_read_as_absent(self):
+        module = _module(state="absent")
+        blade = _blade(read_error=_error_response(None, 500))
+
+        _run(module, blade)
+
+        assert _failure(module) == (
+            "Failed to read SSL certificate realm1::cert. Error: Unknown error"
+        )
+        _no_writes(blade)
+
+
+class TestCheckModeRealm:
+    """Check mode reads the realm a new certificate is to be created in"""
+
+    @pytest.mark.parametrize("state", ["present", "import"])
+    def test_unknown_realm_fails(self, state):
+        module = _module(
+            check_mode=True,
+            name="nowhere::cert",
+            state=state,
+            certificate=PEM if state == "import" else None,
+        )
+        blade = _blade()
+
+        _run(module, blade)
+
+        assert _failure(module) == (
+            "Creating SSL certificate nowhere::cert failed. Error: " + NO_REALM
+        )
+        blade.get_realms.assert_called_once_with(names=["nowhere"])
+        _no_writes(blade)
+
+    def test_destroyed_realm_fails(self):
+        module = _module(check_mode=True, name="old::cert")
+        blade = _blade(realms={"old": True})
+
+        _run(module, blade)
+
+        assert _failure(module) == (
+            "Creating SSL certificate old::cert failed. "
+            "Error: Realm has been destroyed."
+        )
+        _no_writes(blade)
+
+    @pytest.mark.parametrize("name", ["realm1::new", "REALM1::new"])
+    def test_existing_realm_reports_changed(self, name):
+        module = _module(check_mode=True, name=name)
+        blade = _blade()
+
+        _run(module, blade)
+
+        assert _changed(module) is True
+        blade.get_realms.assert_called_once()
+        _no_writes(blade)
+
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            _error_response(NOT_PERMITTED),
+            _error_response(NOT_PERMITTED, 403),
+            _error_response(None, 500),
+        ],
+    )
+    def test_only_a_definite_answer_fails(self, answer):
+        """A realm read that says nothing about the realm leaves the prediction"""
+        module = _module(check_mode=True, name="realm1::new")
+        blade = _blade(realms=answer)
+
+        _run(module, blade)
+
+        assert _changed(module) is True
+        _no_writes(blade)
+
+    def test_realm_outside_the_scope_of_the_caller_fails(self):
+        """Such a realm is read as an empty list, and the create is refused"""
+        module = _module(check_mode=True, name="other::cert")
+        blade = _blade(realms=_valid_response())
+
+        _run(module, blade)
+
+        assert _failure(module) == (
+            "Creating SSL certificate other::cert failed. Error: " + NO_REALM
+        )
+        blade.get_realms.assert_called_once_with(names=["other"])
+        _no_writes(blade)
+
+    def test_array_level_name_reads_no_realm(self):
+        module = _module(check_mode=True, name="new")
+        blade = _blade()
+
+        _run(module, blade)
+
+        assert _changed(module) is True
+        blade.get_realms.assert_not_called()
+        _no_writes(blade)
+
+    def test_array_without_realms_reads_no_realm(self):
+        module = _module(check_mode=True, name="nowhere::cert")
+        blade = _blade()
+
+        _run(module, blade, api_version="2.18")
+
+        assert _changed(module) is True
+        blade.get_realms.assert_not_called()
+        _no_writes(blade)
+
+    def test_existing_certificate_reads_no_realm(self):
+        module = _module(check_mode=True, org_unit="Storage")
+        blade = _blade([_cert("realm1::cert")])
+
+        _run(module, blade)
+
+        assert _changed(module) is True
+        blade.get_realms.assert_not_called()
+        _no_writes(blade)
+
+    def test_real_run_leaves_the_answer_to_the_array(self):
+        module = _module(name="nowhere::cert")
+        blade = _blade()
+        blade.post_certificates.return_value = _error_response(NO_REALM)
+
+        _run(module, blade)
+
+        assert _failure(module) == (
+            "Creating SSL certificate nowhere::cert failed. Error: " + NO_REALM
+        )
+        blade.get_realms.assert_not_called()
+        blade.post_certificates.assert_called_once()
+
+
+class TestBuiltInCertificate:
+    """The certificate named global is never deleted"""
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("name", ["global", "Global", "GLOBAL"])
+    def test_any_letter_case_is_refused(self, name, check_mode):
+        module = _module(check_mode=check_mode, name=name, state="absent")
+        blade = _blade([_cert("global")])
+
+        _run(module, blade)
+
+        assert _failure(module) == "Global certificate cannot be deleted"
+        _no_writes(blade)
+
+    def test_realm_certificate_called_global_is_deleted(self):
+        module = _module(name="realm1::global", state="absent")
+        blade = _blade([_cert("global"), _cert("realm1::global")])
+
+        _run(module, blade)
+
+        assert _changed(module) is True
+        blade.delete_certificates.assert_called_once_with(names=["realm1::global"])

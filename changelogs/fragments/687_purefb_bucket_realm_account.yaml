@@ -8,3 +8,6 @@ bugfixes:
   - purefb_bucket - a bucket created without ``quota`` or ``hard_limit`` takes the bucket defaults
     of its object store account instead of the account's own quota and hard limit, and ``quota``
     set to ``0`` creates an unlimited bucket.
+  - purefb_bucket - a ``name`` that is a comma-separated list of names is refused before the array
+    is contacted. The array changes one bucket name at a time, so check mode predicted a change
+    that the task could not make.

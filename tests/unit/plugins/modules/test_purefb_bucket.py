@@ -77,6 +77,7 @@ from plugins.module_utils.version import LooseVersion as RealLooseVersion
 from plugins.modules.purefb_bucket import (
     main,
     _check_account,
+    _check_one_name,
     _check_same_realm,
     _get_one,
     _realm_of,
@@ -92,6 +93,7 @@ OTHER_REALM = "Bucket must be created in the same realm as the account."
 NO_REALM = "Realm does not exist."
 QUOTA_RANGE = "The quota_limit for a bucket must be between 1 byte and 9.22 exabytes."
 NOT_PERMITTED = "Operation not permitted."
+ONE_NAME = "Cannot process more than one name at a time."
 
 # The only client methods the module may use. Anything else, such as an
 # attribute the client does not have, raises AttributeError as the client does.
@@ -226,10 +228,14 @@ def _bucket(name, account, quota=None, hard=False, destroyed=False, versioning="
 class _Array:
     """A small stateful stand-in for the array.
 
-    Names are matched without regard to case and a read of a missing name is
-    a 400, as on the array. A new bucket takes the limits the request leaves
-    out from the bucket defaults of its account. Every write is recorded in
-    writes as (verb, name, body) and changes the state a later read returns.
+    Names are matched without regard to case or to blanks around them, and a
+    read of a missing name is a 400, as on the array. A name with a comma is
+    a list of names: a read answers with every object of the list, sorted by
+    name, or with a 400 when one of them is missing, and a change or an
+    eradication of a bucket is refused for more than one name. A new bucket
+    takes the limits the request leaves out from the bucket defaults of its
+    account. Every write is recorded in writes as (verb, name, body) and
+    changes the state a later read returns.
 
     refuse maps a client method to the message it answers with instead of
     acting; hidden names are missed by a read although they exist; fleet is
@@ -264,17 +270,28 @@ class _Array:
         refused = self._seen("get_object_store_accounts", kwargs)
         if refused:
             return refused
-        account = self.accounts.get(kwargs["names"][0].lower())
-        return _ok([account]) if account else _error(NO_ACCOUNT)
+        keys = self._keys(kwargs["names"][0])
+        if not all(key in self.accounts for key in keys):
+            return _error(NO_ACCOUNT)
+        return _ok(sorted((self.accounts[key] for key in keys), key=self._by_name))
 
     def _get_buckets(self, **kwargs):
         refused = self._seen("get_buckets", kwargs)
         if refused:
             return refused
-        key = kwargs["names"][0].lower()
-        if key not in self.buckets or key in self.hidden:
+        keys = self._keys(kwargs["names"][0])
+        if not all(key in self.buckets and key not in self.hidden for key in keys):
             return _error(NO_BUCKET)
-        return _ok([self.buckets[key]])
+        return _ok(sorted((self.buckets[key] for key in keys), key=self._by_name))
+
+    @staticmethod
+    def _keys(name):
+        """The objects a name addresses: a comma separates the names of a list"""
+        return [part.strip().lower() for part in name.split(",")]
+
+    @staticmethod
+    def _by_name(item):
+        return item.name
 
     def _post_buckets(self, **kwargs):
         name = kwargs["names"][0]
@@ -283,7 +300,9 @@ class _Array:
         refused = self._seen("post_buckets", kwargs)
         if refused:
             return refused
-        account = self.accounts[body["account"]["name"].lower()]
+        assert "," not in name, "POST for a list of names"
+        name = name.strip()
+        account = self.accounts[body["account"]["name"].strip().lower()]
         if name.rpartition("::")[0].lower() != account.name.rpartition("::")[0].lower():
             return _error(OTHER_REALM)
         assert name.lower() not in self.buckets, "POST for a bucket that exists"
@@ -305,7 +324,9 @@ class _Array:
         refused = self._seen("patch_buckets", kwargs)
         if refused:
             return refused
-        bucket = self.buckets.get(name.lower())
+        if "," in name:
+            return _error(ONE_NAME)
+        bucket = self.buckets.get(name.strip().lower())
         if bucket is None:
             return _error(NO_BUCKET)
         for key in ("destroyed", "versioning", "retention_lock", "hard_limit_enabled"):
@@ -337,8 +358,11 @@ class _Array:
         refused = self._seen("delete_buckets", kwargs)
         if refused:
             return refused
-        assert self.buckets[name.lower()].destroyed, "eradication of a live bucket"
-        del self.buckets[name.lower()]
+        if "," in name:
+            return _error(ONE_NAME)
+        key = name.strip().lower()
+        assert self.buckets[key].destroyed, "eradication of a live bucket"
+        del self.buckets[key]
         return _ok()
 
     def _post_buckets_bucket_access_policies(self, **kwargs):
@@ -350,7 +374,7 @@ class _Array:
         return self._seen("post_buckets_bucket_access_policies_rules", kwargs) or _ok()
 
     def bucket(self, name):
-        return self.buckets[name.lower()]
+        return self.buckets[name.strip().lower()]
 
     def sent(self, verb):
         """The bodies of the requests of one kind, in the order they were sent."""
@@ -429,10 +453,32 @@ class TestHelpers:
 
     @pytest.mark.parametrize(
         "name,realm",
-        [("foo", ""), ("tenant1::foo", "tenant1"), ("a::b::foo", "a::b")],
+        [
+            ("foo", ""),
+            ("tenant1::foo", "tenant1"),
+            ("a::b::foo", "a::b"),
+            (" foo", ""),
+            (" tenant1::foo", "tenant1"),
+        ],
     )
     def test_realm_of(self, name, realm):
         assert _realm_of(name) == realm
+
+    @pytest.mark.parametrize("name", ["foo", "tenant1::foo", " foo "])
+    def test_one_name_is_accepted(self, name):
+        module = _module(name=name)
+        _check_one_name(module)
+        module.fail_json.assert_not_called()
+
+    @pytest.mark.parametrize("name", ["foo,baz", "tenant1::foo,foo", "foo,"])
+    def test_list_of_names_is_refused(self, name):
+        module = _module(name=name)
+        with pytest.raises(SystemExit):
+            _check_one_name(module)
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Bucket {0} is a list of names: a comma separates names, and a task "
+            "manages one bucket.".format(name)
+        )
 
     @pytest.mark.parametrize(
         "name,account",
@@ -440,6 +486,8 @@ class TestHelpers:
             ("foo", "bar"),
             ("tenant1::foo", "tenant1::bar"),
             ("TENANT1::foo", "tenant1::bar"),
+            (" tenant1::foo", "tenant1::bar"),
+            ("tenant1::foo", " tenant1::bar"),
         ],
     )
     def test_same_realm_is_accepted(self, name, account):
@@ -502,6 +550,17 @@ class TestHelpers:
 
     def test_get_one_without_items_is_absent(self):
         assert _get_one(_module(), _ok([]), "Object Store Bucket", "foo") is None
+
+    def test_get_one_fails_on_more_than_one_item(self):
+        module = _module()
+        with pytest.raises(SystemExit):
+            _get_one(
+                module, _ok([object(), object()]), "Object Store Account", "bar,other"
+            )
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Object Store Account bar,other matches 2 objects. The name of one "
+            "Object Store Account is needed."
+        )
 
     @pytest.mark.parametrize("message", [NO_BUCKET, NO_ACCOUNT, NO_REALM])
     def test_get_one_does_not_exist_is_absent(self, message):
@@ -603,6 +662,111 @@ class TestAccountOwnership:
         assert array.writes == []
         after = array.bucket(name)
         assert (after.quota_limit, after.destroyed) == before
+
+
+class TestNames:
+    """A list of names is not one bucket; blanks around a name are ignored"""
+
+    @staticmethod
+    def _array(destroyed=False):
+        # baz belongs to another account than foo and tenant1::foo
+        array = _twins()
+        array.buckets["baz"] = _bucket("baz", array.accounts["other"], quota=2 * GIB)
+        for bucket in array.buckets.values():
+            bucket.destroyed = destroyed
+        return array
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("state,eradicate,destroyed", ADDRESSED)
+    @pytest.mark.parametrize(
+        "name,account",
+        [
+            ("foo,baz", "bar"),
+            ("baz,foo", "bar"),
+            ("tenant1::foo,baz", "tenant1::bar"),
+            ("foo,foo", "bar"),
+        ],
+    )
+    def test_list_of_bucket_names_is_refused(
+        self, name, account, state, eradicate, destroyed, check_mode
+    ):
+        array = self._array(destroyed)
+        module = _module(
+            check_mode=check_mode,
+            name=name,
+            account=account,
+            state=state,
+            eradicate=eradicate,
+            quota="3G",
+        )
+        _run(module, array)
+        assert _failure(module) == (
+            "Bucket {0} is a list of names: a comma separates names, and a task "
+            "manages one bucket.".format(name)
+        )
+        # decided from the name: the array is not even asked
+        assert array.client.mock_calls == []
+        for bucket in array.buckets.values():
+            assert bucket.destroyed is destroyed
+            assert bucket.quota_limit in (GIB, 2 * GIB)
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_list_of_new_bucket_names_is_not_created(self, check_mode):
+        array = _Array(accounts=[_account("bar")])
+        module = _module(check_mode=check_mode, name="new1,new2")
+        _run(module, array)
+        assert "is a list of names" in _failure(module)
+        assert array.client.mock_calls == []
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    def test_list_of_account_names_is_refused(self, state, check_mode):
+        array = self._array()
+        module = _module(
+            check_mode=check_mode, account="bar,other", state=state, quota="3G"
+        )
+        _run(module, array)
+        assert _failure(module) == (
+            "Object Store Account bar,other matches 2 objects. The name of one "
+            "Object Store Account is needed."
+        )
+        assert array.writes == []
+
+    @pytest.mark.parametrize(
+        "name,account",
+        [
+            (" foo", "bar"),
+            ("foo", " bar "),
+            (" tenant1::foo", "tenant1::bar"),
+            ("tenant1::foo ", " tenant1::bar"),
+        ],
+    )
+    def test_blanks_around_a_name_are_ignored(self, name, account):
+        array = self._array()
+        module = _module(name=name, account=account, quota="3G")
+        _run(module, array)
+        assert _changed(module) is True
+        assert array.bucket(name).quota_limit == 3 * GIB
+        again = _module(name=name, account=account, quota="3G")
+        _run(again, array)
+        assert _changed(again) is False
+
+    def test_blank_padded_account_of_another_bucket_is_still_refused(self):
+        array = self._array()
+        array.bucket("foo").account.id = None
+        module = _module(name="foo", account=" other ", quota="3G")
+        _run(module, array)
+        assert _failure(module) == (
+            "Bucket foo belongs to Object Store Account bar, not  other ."
+        )
+        assert array.writes == []
+
+    def test_blank_padded_account_without_an_id_is_the_owner(self):
+        array = self._array()
+        array.bucket("foo").account.id = None
+        module = _module(name="foo", account=" BAR ", quota="3G")
+        _run(module, array)
+        assert _changed(module) is True
 
 
 class TestReads:

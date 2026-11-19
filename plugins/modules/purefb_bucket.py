@@ -28,6 +28,8 @@ options:
   name:
     description:
       - Bucket Name.
+      - A task manages one bucket. A comma-separated list of names is
+        refused.
       - A bucket in a realm is named C(realm::bucket) and belongs to an
         account of the same realm, so I(account) carries the same realm
         prefix.
@@ -393,7 +395,23 @@ def _object_lock_changes(module, bucket_detail):
 
 def _realm_of(name):
     """Return the realm of a realm::name name, empty for an array-level name"""
-    return name.rpartition("::")[0]
+    # the array ignores blanks around a name
+    return name.rpartition("::")[0].strip()
+
+
+def _check_one_name(module):
+    """Fail when name is a list of bucket names.
+
+    The array reads a comma as the separator of a list of names. A read
+    answers with every bucket of the list, but a bucket is changed,
+    destroyed, recovered and eradicated one name at a time, so such a task
+    can only fail and is refused before the array is asked.
+    """
+    if "," in module.params["name"]:
+        module.fail_json(
+            msg="Bucket {0} is a list of names: a comma separates names, and a "
+            "task manages one bucket.".format(module.params["name"])
+        )
 
 
 def _check_same_realm(module):
@@ -438,8 +456,8 @@ def _check_account(module, bucket, account):
     if owner_id and account_id:
         same = owner_id == account_id
     elif owner_name:
-        # the array matches names without regard to case
-        same = owner_name.lower() == module.params["account"].lower()
+        # the array matches names without regard to case or blanks around them
+        same = owner_name.lower() == module.params["account"].strip().lower()
     else:
         return
     if not same:
@@ -455,10 +473,17 @@ def _get_one(module, res, what, name):
 
     Only the array's "does not exist" means absent. Any other refusal fails
     the task with the array's message, so it is never mistaken for a missing
-    object.
+    object. A name the array reads as a list of names answers with several
+    objects; the task describes one, so it fails rather than act on the
+    first of them.
     """
     if res.status_code == 200:
         items = list(res.items)
+        if len(items) > 1:
+            module.fail_json(
+                msg="{0} {1} matches {2} objects. The name of one {0} is "
+                "needed.".format(what, name, len(items))
+            )
         return items[0] if items else None
     error = get_error_message(res)
     if "does not exist" not in str(error).lower():
@@ -1095,6 +1120,7 @@ def main():
         )
 
     # Decided from the names alone, before the array is asked or changed
+    _check_one_name(module)
     _check_same_realm(module)
 
     state = module.params["state"]

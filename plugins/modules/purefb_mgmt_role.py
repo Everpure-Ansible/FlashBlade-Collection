@@ -27,6 +27,16 @@ description:
   (I(object=ds_attach)).
 - Policies and their rules are managed by
   M(everpure.flashblade.purefb_mgmt_policy).
+- Roles, local admins, directory-service role mappings and management access
+  policies are array-level objects and are named without a realm prefix. Access
+  to a realm comes from the rules of a policy. A rule with the scope type
+  C(realms) grants its role, built-in or custom, in that realm to every admin
+  and role mapping the policy is attached to. An admin that holds only such
+  policies is limited to those realms.
+- An administrator who is limited to a realm cannot read roles, role mappings
+  or policy attachments, so run this module as an administrator with
+  array-wide access. A read that the array refuses fails the task with the
+  message of the array.
 - API-client policy attachment is not covered here. Policies are fixed when
   the client is created via the I(access_policies) option of
   M(everpure.flashblade.purefb_apiclient) and cannot be changed afterwards.
@@ -46,6 +56,9 @@ options:
   state:
     description:
     - For I(object=role), whether the role should exist.
+    - A role that a rule of any management access policy still grants is not
+      deleted. The task fails until the rule is removed with
+      M(everpure.flashblade.purefb_mgmt_policy).
     - For attachment modes, whether the listed policies should be attached
       (C(present)) or detached (C(absent)). Other policies on the subject
       are untouched.
@@ -58,6 +71,11 @@ options:
     description:
     - Name of the custom role. Required for I(object=role).
     - Maximum 63 characters. Cannot begin with an underscore (reserved).
+    - The array matches role names without regard to letter case.
+    - Roles are array-level objects. The array does not accept a realm
+      prefix (C(realm::name)) in a role name. To use a custom role in a
+      realm, grant it in a rule with the scope type C(realms) in
+      M(everpure.flashblade.purefb_mgmt_policy).
     type: str
   description:
     description:
@@ -106,6 +124,7 @@ options:
     description:
     - Name of the local admin whose policy list should be reconciled.
     - Required for I(object=admin_attach).
+    - Admins are array-level objects, named without a realm prefix.
     - The array refuses policy changes on built-in users (such as
       C(pureuser)); use a local admin created by
       M(everpure.flashblade.purefb_user).
@@ -115,12 +134,15 @@ options:
     - Name of the directory-service role mapping whose policy list should
       be reconciled.
     - Required for I(object=ds_attach).
+    - Role mappings are array-level objects, named without a realm prefix.
     type: str
   policies:
     description:
     - List of management access policy names to attach (with I(state=present))
       or detach (with I(state=absent)) from the subject.
     - Names are matched against the attached policies case-insensitively.
+    - A policy whose rules are scoped to a realm is itself an array-level
+      object and is named without a realm prefix.
     - Required for I(object=admin_attach) and I(object=ds_attach).
     type: list
     elements: str
@@ -147,6 +169,17 @@ EXAMPLES = r"""
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
+- name: Grant the custom role in a realm with a rule of a management access policy
+  everpure.flashblade.purefb_mgmt_policy:
+    name: tenant-a-ops
+    rules:
+      - role: backup-operator
+        scope:
+          name: tenant-a
+          resource_type: realms
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
 - name: Grant a role read-only on a second resource, remove any other permissions
   everpure.flashblade.purefb_mgmt_role:
     object: role
@@ -159,7 +192,7 @@ EXAMPLES = r"""
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
-- name: Delete a custom role
+- name: Delete a custom role (fails while a policy rule still grants it)
   everpure.flashblade.purefb_mgmt_role:
     object: role
     name: backup-operator
@@ -167,7 +200,7 @@ EXAMPLES = r"""
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
-- name: Attach a policy to a local admin
+- name: Attach the realm-scoped policy to a local admin (the policy name has no realm prefix)
   everpure.flashblade.purefb_mgmt_role:
     object: admin_attach
     admin: svc-automation
@@ -261,13 +294,34 @@ def _validate_role_name(module, name):
         module.fail_json(msg="Role names beginning with '_' are reserved")
 
 
+def _read_named(module, res, what):
+    """Return the items of a GET by name, [] when the name does not exist.
+
+    The array answers a GET for an unknown name with a 400 whose message
+    ends "does not exist.", so only that message reads as absent. Any
+    other failure (a read the array refuses, a context that is not a fleet
+    member) fails the task with the array's message instead of
+    masquerading as a missing object, which would let state=absent report
+    ok and state=present attempt a create or report a missing subject.
+    """
+    if res.status_code == 200:
+        return list(res.items)
+    error = get_error_message(res)
+    if "does not exist" in str(error).lower():
+        return []
+    module.fail_json(msg="Failed to read {0}. Error: {1}".format(what, error))
+    return []
+
+
 def _get_role(module, blade, ctx_kwargs):
-    res = blade.get_management_access_policies_roles(
-        names=[module.params["name"]], **ctx_kwargs
+    """Return the role called I(name), or None when it does not exist."""
+    items = _read_named(
+        module,
+        blade.get_management_access_policies_roles(
+            names=[module.params["name"]], **ctx_kwargs
+        ),
+        "role {0}".format(module.params["name"]),
     )
-    if res.status_code != 200:
-        return None
-    items = list(res.items)
     return items[0] if items else None
 
 
@@ -284,13 +338,34 @@ def _get_permissions(module, blade, ctx_kwargs):
     return list(res.items)
 
 
-def _role_referenced_by_rule(blade, role_name, ctx_kwargs):
-    """Return True if any policy has a rule referencing this role."""
+def _role_referenced_by_rule(module, blade, role, ctx_kwargs):
+    """Return True if any policy has a rule granting I(role).
+
+    I(role) is the role object the array returned. The array matches names
+    without regard to letter case and returns the stored spelling, so a
+    rule's role reference is compared by id and by lower-cased name with
+    the stored role, never with the spelling used in the task. A rule
+    listing that the array does not answer fails the task: the role is not
+    deleted on the strength of a guard that could not be evaluated.
+    """
     res = blade.get_management_access_policies_rules(**ctx_kwargs)
     if res.status_code != 200:
-        return False
+        module.fail_json(
+            msg=(
+                "Failed to list management access policy rules to check "
+                "whether role {0} is in use. Error: {1}"
+            ).format(module.params["name"], get_error_message(res))
+        )
+        return True
+    role_id = getattr(role, "id", None)
+    role_name = str(getattr(role, "name", None) or module.params["name"]).lower()
     for rule in list(res.items):
-        if getattr(rule.role, "name", None) == role_name:
+        ref = getattr(rule, "role", None)
+        if ref is None:
+            continue
+        if role_id and getattr(ref, "id", None) == role_id:
+            return True
+        if str(getattr(ref, "name", None) or "").lower() == role_name:
             return True
     return False
 
@@ -300,7 +375,7 @@ def _delete_role(module, blade, ctx_kwargs, existing):
         module.fail_json(
             msg="Built-in role {0} cannot be deleted".format(module.params["name"])
         )
-    if _role_referenced_by_rule(blade, module.params["name"], ctx_kwargs):
+    if _role_referenced_by_rule(module, blade, existing, ctx_kwargs):
         module.fail_json(
             msg=(
                 "Role {0} is referenced by one or more policy rules. Remove "
@@ -514,14 +589,18 @@ def _current_attached_policy_names(module, blade, kind, ctx_kwargs):
 
 
 def _subject_exists(module, blade, kind, ctx_kwargs):
-    """Return True if the attach subject (admin or ds_role) exists."""
+    """Return True if the attach subject (admin or ds_role) exists.
+
+    Only the array's "does not exist" reads as a missing subject; a read
+    that fails for any other reason fails the task (see _read_named).
+    """
     if kind == "admin":
-        res = blade.get_admins(names=[module.params["admin"]], **ctx_kwargs)
+        subject = module.params["admin"]
+        res = blade.get_admins(names=[subject], **ctx_kwargs)
     else:
-        res = blade.get_directory_services_roles(
-            names=[module.params["ds_role"]], **ctx_kwargs
-        )
-    return res.status_code == 200 and bool(list(res.items))
+        subject = module.params["ds_role"]
+        res = blade.get_directory_services_roles(names=[subject], **ctx_kwargs)
+    return bool(_read_named(module, res, "{0} {1}".format(kind, subject)))
 
 
 def _handle_attach(module, blade, api_version, ctx_kwargs, kind):

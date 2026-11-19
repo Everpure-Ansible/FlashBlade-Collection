@@ -222,7 +222,7 @@ def _realm(name):
     return name.rpartition("::")[0]
 
 
-def _by_name(blade, *policies):
+def _by_name(blade, *policies, fold=False):
     """Make the policy endpoints behave as the array does; return its policies.
 
     A policy is found by its full name only. A PATCH that carries a name
@@ -230,15 +230,20 @@ def _by_name(blade, *policies):
     its realm, a name in another realm or a name that is taken is refused.
     A POST adds the named policy. A PATCH only takes effect when the request
     body is a _Body.
+
+    With fold, names are matched without regard to case and kept in the case
+    they were given, and a policy can be renamed to its own name in another
+    case. The returned policies are then keyed by their lower-case names.
     """
-    known = dict((policy.name, policy) for policy in policies)
+    key = str.lower if fold else str
+    known = dict((key(policy.name), policy) for policy in policies)
 
     def get_policies(**kwargs):
-        policy = known.get(kwargs["names"][0])
+        policy = known.get(key(kwargs["names"][0]))
         return _response(200 if policy else 400, [policy] if policy else [])
 
     def patch_policies(**kwargs):
-        policy = known.get(kwargs["names"][0])
+        policy = known.get(key(kwargs["names"][0]))
         if policy is None:
             return _response(400)
         body = kwargs["policy"]
@@ -246,21 +251,32 @@ def _by_name(blade, *policies):
         if isinstance(new_name, str):
             if "::" not in new_name and _realm(policy.name):
                 new_name = "{0}::{1}".format(_realm(policy.name), new_name)
-            if _realm(new_name) != _realm(policy.name) or new_name in known:
+            taken = known.get(key(new_name))
+            own_name_in_another_case = (
+                fold and taken is policy and new_name != policy.name
+            )
+            if key(_realm(new_name)) != key(_realm(policy.name)) or (
+                taken is not None and not own_name_in_another_case
+            ):
                 return _response(400)
-            del known[policy.name]
+            del known[key(policy.name)]
+            if _realm(policy.name):
+                # the realm is a reference and keeps its own spelling
+                new_name = "{0}::{1}".format(
+                    _realm(policy.name), new_name.rpartition("::")[2]
+                )
             policy.name = new_name
-            known[new_name] = policy
+            known[key(new_name)] = policy
         if isinstance(getattr(body, "enabled", None), bool):
             policy.enabled = body.enabled
         return _response(200, [policy])
 
     def post_policies(**kwargs):
         name = kwargs["names"][0]
-        if name in known:
+        if key(name) in known:
             return _response(400)
-        known[name] = _array_policy(name)
-        return _response(200, [known[name]])
+        known[key(name)] = _array_policy(name)
+        return _response(200, [known[key(name)]])
 
     blade.get_user_group_quota_policies.side_effect = get_policies
     blade.patch_user_group_quota_policies.side_effect = patch_policies
@@ -1259,6 +1275,68 @@ class TestPurefbQuotaPolicyRealm:
             assert module.fail_json.call_args[1]["msg"] == (
                 "Cannot rename quota policy rz::qp1 to rz::qp2: "
                 "a quota policy named rz::qp2 already exists."
+            )
+            _assert_no_writes(blade)
+
+    # ---- names that differ only in case
+
+    def test_resolve_rename_compares_the_realm_without_regard_to_case(self):
+        module = _module(_base_params(name="RZ::qp1", rename="rz::qp2"))
+        assert _resolve_rename(module) == "rz::qp2"
+        module.fail_json.assert_not_called()
+
+    def test_main_rename_that_only_changes_the_case_is_sent_once(self):
+        """The array matches names without regard to case, so the new name
+        finds the policy itself. That is not a name that is taken: the
+        request goes to the array, and the next run has nothing to do."""
+        for name, rename, sent, kept in (
+            ("qp1", "QP1", "QP1", "QP1"),
+            ("rz::qp1", "QP1", "rz::QP1", "rz::QP1"),
+            ("rz::qp1", "RZ::Qp1", "RZ::Qp1", "rz::Qp1"),
+        ):
+            policy = _array_policy(name)
+            blade = _blade()
+            _by_name(blade, policy, fold=True)
+            results = []
+            with patch(MODULE + ".UserGroupQuotaPolicy", side_effect=_Body) as model:
+                for _run_number in range(2):
+                    module = _module(
+                        _base_params(name=name, rename=rename, enabled=True)
+                    )
+                    _run(module, blade)
+                    module.fail_json.assert_not_called()
+                    results.append(module.exit_json.call_args[1])
+            model.assert_called_once_with(name=sent)
+            assert blade.patch_user_group_quota_policies.call_count == 1
+            assert [result["changed"] for result in results] == [True, False]
+            assert [result["policy"]["name"] for result in results] == [kept] * 2
+
+    def test_main_rename_to_own_name_in_another_realm_case_is_a_noop(self):
+        """The realm is spelled in another case than the array keeps it."""
+        module = _module(_base_params(name="RZ::qp1", rename="rz::qp1"))
+        blade = _blade()
+        _by_name(blade, _array_policy("rz::qp1"), fold=True)
+        _run(module, blade)
+        module.fail_json.assert_not_called()
+        _assert_no_writes(blade)
+        assert module.exit_json.call_args[1]["changed"] is False
+        assert module.exit_json.call_args[1]["policy"]["name"] == "rz::qp1"
+
+    def test_main_rename_onto_another_policy_in_another_case_fails(self):
+        """A different policy that answers to the new name is still a name
+        that is taken, whatever its case."""
+        for check_mode in (True, False):
+            module = _module(
+                _base_params(name="qp1", rename="QP2", enabled=False),
+                check_mode=check_mode,
+            )
+            blade = _blade()
+            _by_name(blade, _array_policy("qp1"), _array_policy("qp2"), fold=True)
+            _run(module, blade)
+            module.fail_json.assert_called_once()
+            assert module.fail_json.call_args[1]["msg"] == (
+                "Cannot rename quota policy qp1 to QP2: "
+                "a quota policy named QP2 already exists."
             )
             _assert_no_writes(blade)
 

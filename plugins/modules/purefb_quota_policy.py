@@ -72,7 +72,7 @@ options:
       policy that does not exist yet is created as I(name).
     - Idempotent when a policy with the new name already exists and the
       policy I(name) does not. The module fails without changing anything
-      when both exist.
+      when another policy already has the new name.
     - A rename cannot move a policy into, out of or between realms. For a
       policy in a realm the new name is given either without the realm, in
       which case the policy keeps its realm, or as C(realm::name) with the
@@ -467,7 +467,8 @@ def _resolve_rename(module):
     realm = _realm_of(name)
     if "::" not in rename:
         return "{0}::{1}".format(realm, rename) if realm else rename
-    if _realm_of(rename) != realm:
+    # the array matches names without regard to case
+    if _realm_of(rename).lower() != realm.lower():
         module.fail_json(
             msg=(
                 "Cannot rename quota policy {0} to {1}: a rename cannot change "
@@ -989,7 +990,7 @@ def main():
             # rename already applied by an earlier run
             policy = renamed
             module.params["name"] = new_name
-        elif renamed is not None:
+        elif renamed is not None and renamed.id != policy.id:
             # refused here, before enabled, rules and file_systems are applied
             module.fail_json(
                 msg=(
@@ -997,6 +998,12 @@ def main():
                     "named {1} already exists."
                 ).format(name, new_name)
             )
+        elif renamed is not None and (
+            renamed.name.rpartition("::")[2] == new_name.rpartition("::")[2]
+        ):
+            # the array matches names without regard to case: both names are
+            # this one policy, which already carries the new one
+            module.params["name"] = new_name
 
     if state == "absent" and policy is not None:
         delete_policy(module, blade, policy)

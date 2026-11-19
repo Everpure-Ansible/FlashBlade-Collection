@@ -32,6 +32,9 @@ options:
         give the short name together with I(realm).
       - Without I(realm) the name is sent to the array as it is given. The
         module never adds a realm to it.
+      - A realm-scoped administrator must use the realm-qualified name, or the
+        short name together with I(realm). A bare name is not placed in, or
+        resolved to, the administrator's realm.
     required: true
     type: str
   state:
@@ -113,7 +116,13 @@ options:
   promote:
     description:
       - Promote/demote a filesystem.
-      - Can only demote the file-system if it is in a replica-link relationship.
+      - Demoting restores the filesystem from its latest snapshot, so
+        C(false) on a promoted filesystem requires I(discard_snaps), unless
+        I(quiesce) starts a planned failover. Without it the module fails
+        before anything is changed.
+      - The array decides whether a filesystem can be demoted. It refuses, for
+        example, while the latest snapshot of the filesystem is not a
+        replication snapshot.
       - A filesystem that is C(demoting) in a planned failover cannot be
         promoted directly; use I(abort_quiesce) to cancel the failover.
     required: false
@@ -188,6 +197,11 @@ options:
       - Filesystem policy to assign to or remove from a filesystem.
       - A WORM data policy cannot be attached this way, use I(worm_policy)
         when creating the filesystem.
+      - A filesystem in a realm only takes policies of the same realm, and a
+        filesystem outside of any realm only array-level policies. Give the
+        policy of a realm by its full name C(realm::policy); I(realm) does not
+        qualify this name. A policy to attach that does not exist, or is in
+        another realm, fails the task before anything is changed.
     required: false
     type: str
   policy_state:
@@ -207,6 +221,9 @@ options:
       - The array only creates a WORM filesystem in C(retention-based)
         eradication mode, so I(eradication_mode) defaults to that value when
         this option is set.
+      - A filesystem in a realm only takes a WORM data policy of the same
+        realm, given by its full name C(realm::policy); I(realm) does not
+        qualify this name.
       - Requires Purity//FB REST API 2.15 or later.
     type: str
     version_added: "1.30.0"
@@ -234,7 +251,8 @@ options:
     type: bool
   discard_snaps:
     description:
-      - Allow a filesystem to be demoted.
+      - Allow a filesystem to be demoted. The data written since the latest
+        snapshot of the filesystem is discarded.
       - Also required to skip a planned failover, that is I(quiesce) set to
         C(false) on a C(demoting) filesystem.
     required: false
@@ -264,6 +282,8 @@ options:
       option to attach NFS export policies via the dedicated File
       System Exports endpoints.
       This parameter will be removed in 2.0.0.
+    - The array does not accept this field on a filesystem in a realm. The
+      module fails before anything is changed when it is set for one.
     type: str
     version_added: "1.9.0"
   share_policy:
@@ -277,6 +297,8 @@ options:
       option to attach SMB share policies via the dedicated File
       System Exports endpoints.
       This parameter will be removed in 2.0.0.
+    - The array does not accept this field on a filesystem in a realm. The
+      module fails before anything is changed when it is set for one.
     type: str
     version_added: "1.12.0"
   client_policy:
@@ -290,6 +312,8 @@ options:
       option to attach SMB client policies via the dedicated File
       System Exports endpoints.
       This parameter will be removed in 2.0.0.
+    - The array does not accept this field on a filesystem in a realm. The
+      module fails before anything is changed when it is set for one.
     type: str
     version_added: "1.12.0"
   continuous_availability:
@@ -347,7 +371,13 @@ options:
     - Requires Purity//FB 4.6.1+ (REST API 2.19+).
     - The realm of a filesystem can only be set when the filesystem is created.
     - To move a filesystem to a different realm, the filesystem must be destroyed and recreated.
-    - If the realm has a QoS policy, the filesystem will inherit it unless overridden.
+    - If the realm has a QoS policy, the filesystem inherits it.
+    - A filesystem in a realm is created without default exports; export it
+      with M(everpure.flashblade.purefb_export). I(nfs_rules) is ignored for
+      it and I(export_policy), I(share_policy) and I(client_policy) are
+      refused.
+    - The realm must exist and must not be destroyed when the filesystem is
+      created.
     - With I(realm) set, a short I(name) always means the filesystem
       C(realm::name), for every I(state). A filesystem with the same short
       name outside the realm is never read or changed.
@@ -399,6 +429,15 @@ EXAMPLES = """
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
   # The short name with realm: production-realm addresses the same filesystem
   # Realm association cannot be changed after creation
+
+- name: Attach snapshot policy daily of realm production-realm to a filesystem in that realm
+  everpure.flashblade.purefb_fs:
+    name: production-realm::prod-fs
+    policy: production-realm::daily
+    state: present
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+  # A policy is always given by its full name, realm does not qualify it
 
 - name: Delete filesystem prod-fs in realm production-realm
   everpure.flashblade.purefb_fs:
@@ -691,35 +730,219 @@ def _resolve_name(module):
     return name
 
 
+def _realm_of(name):
+    """Return the realm of a ``realm::name`` name, empty for an array-level name."""
+    return name.rpartition("::")[0]
+
+
+def _context_kwargs(module, api_version):
+    """Return the fleet context argument of a request, when one applies."""
+    if (
+        LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
+        and module.params["context"]
+    ):
+        return {"context_names": [module.params["context"]]}
+    return {}
+
+
+def _is_missing(res):
+    """Return True when a refused read says that the object does not exist.
+
+    Any other refusal is no proof that the object is absent, so the caller
+    reports it with the message of the array.
+    """
+    return "does not exist" in str(get_error_message(res)).lower()
+
+
+def _check_legacy_policy_options(module):
+    """Refuse the legacy policy options for a filesystem in a realm.
+
+    The array does not accept ``nfs.export_policy``, ``smb.share_policy`` or
+    ``smb.client_policy`` on a filesystem in a realm. It would refuse them
+    only after the filesystem was created or its other attributes were
+    written, so the task fails before anything is sent, in check mode too.
+    """
+    fs_name = module.params["name"]
+    if module.params["state"] != "present" or not _realm_of(fs_name):
+        return
+    given = [
+        option
+        for option in ("export_policy", "share_policy", "client_policy")
+        if module.params.get(option)
+    ]
+    if given:
+        module.fail_json(
+            msg="{0} cannot be set on filesystem {1}: the array does not accept "
+            "export_policy, share_policy or client_policy on a filesystem in a "
+            "realm. Attach policies to an export of the filesystem with the "
+            "purefb_export module.".format(", ".join(given), fs_name)
+        )
+
+
+def _check_policy_scope(module, fs_name, option):
+    """Fail when the policy named by ``option`` is outside the realm of the
+    filesystem.
+
+    The array attaches a policy of a realm only to filesystems of that realm
+    and an array-level policy only to filesystems outside of any realm. The
+    name of the policy has to carry the realm itself: the ``realm`` option
+    only qualifies the name of the filesystem.
+    """
+    policy = module.params.get(option)
+    if not policy:
+        return
+    realm = _realm_of(fs_name)
+    # the array matches names without regard to case
+    if _realm_of(policy).lower() == realm.lower():
+        return
+    if realm:
+        reason = (
+            "a filesystem in realm {0} only takes policies of that realm, "
+            "named {0}::<policy>"
+        ).format(realm)
+    else:
+        reason = "a filesystem outside of any realm only takes array-level policies"
+    module.fail_json(
+        msg="Cannot attach {0} {1} to filesystem {2}: {3}.".format(
+            option, policy, fs_name, reason
+        )
+    )
+
+
+def _check_realm(module, blade, fs_name, api_version):
+    """Fail unless a filesystem can be created in the realm of ``fs_name``."""
+    realm = _realm_of(fs_name)
+    if not realm:
+        return
+    if LooseVersion(REALM_API_VERSION) > LooseVersion(api_version):
+        module.fail_json(
+            msg="Realm support requires Purity//FB 4.6.1+ (REST API 2.19+)"
+        )
+    res = blade.get_realms(names=[realm])
+    if res.status_code == 200:
+        realms = list(res.items)
+        if not realms:
+            module.fail_json(msg="Realm '{0}' does not exist".format(realm))
+        elif getattr(realms[0], "destroyed", False):
+            module.fail_json(
+                msg="Realm '{0}' is destroyed. Recover the realm before "
+                "creating a filesystem in it.".format(realm)
+            )
+    elif _is_missing(res):
+        module.fail_json(msg="Realm '{0}' does not exist".format(realm))
+    else:
+        module.fail_json(
+            msg="Failed to read realm '{0}'. Error: {1}".format(
+                realm, get_error_message(res)
+            )
+        )
+
+
+def _check_policy_exists(module, blade, api_version):
+    """Fail unless the snapshot policy named by ``policy`` exists."""
+    policy = module.params["policy"]
+    res = blade.get_policies(names=[policy], **_context_kwargs(module, api_version))
+    if res.status_code == 200:
+        return
+    if _is_missing(res):
+        module.fail_json(msg="Policy {0} doesn't exist.".format(policy))
+    else:
+        module.fail_json(
+            msg="Failed to read policy {0}. Error: {1}".format(
+                policy, get_error_message(res)
+            )
+        )
+
+
+def _check_worm_policy_exists(module, blade, api_version):
+    """Fail unless the WORM data policy named by ``worm_policy`` exists."""
+    policy = module.params["worm_policy"]
+    res = blade.get_worm_data_policies(
+        names=[policy], **_context_kwargs(module, api_version)
+    )
+    if res.status_code == 200:
+        return
+    if _is_missing(res):
+        module.fail_json(msg="WORM data policy {0} doesn't exist.".format(policy))
+    else:
+        module.fail_json(
+            msg="Failed to read WORM data policy {0}. Error: {1}".format(
+                policy, get_error_message(res)
+            )
+        )
+
+
+def _policy_attached(module, blade, fs_name, api_version):
+    """Return True when the filesystem is a member of the snapshot policy."""
+    policy = module.params["policy"]
+    res = blade.get_policies_file_systems(
+        policy_names=[policy],
+        member_names=[fs_name],
+        **_context_kwargs(module, api_version)
+    )
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to read the filesystems of policy {0}. Error: {1}".format(
+                policy, get_error_message(res)
+            )
+        )
+    # A 200 with no items means that the policy is not attached.
+    return bool(_item_count(res))
+
+
+def _validate_create(module, blade, api_version):
+    """Check, before anything is created, what the array would refuse.
+
+    Runs in check mode too, so that a create which cannot succeed fails the
+    task instead of being reported as a pending change.
+    """
+    fs_name = module.params["name"]
+    # Boolean flags default to None so that modify_fs only touches them
+    # when the caller sets them. At creation time None means the array
+    # default (safeguard_acls on, every other flag off).
+    safeguard_acls = module.params["safeguard_acls"]
+    if safeguard_acls is None:
+        safeguard_acls = True
+    if module.params["access_control"] == "nfs" and not (
+        module.params["nfsv3"] or module.params["nfsv4"]
+    ):
+        module.fail_json(
+            msg="Cannot set access_control to nfs when NFS is not enabled."
+        )
+    if (
+        module.params["access_control"] in ["smb", "independent"]
+        and not module.params["smb"]
+    ):
+        module.fail_json(
+            msg="Cannot set access_control to smb or independent when SMB is not enabled."
+        )
+    if safeguard_acls and (
+        module.params["access_control"] in ["mode-bits", "independent"]
+    ):
+        module.fail_json(
+            msg="ACL Safeguarding cannot be enabled if access_control is mode-bits or independent."
+        )
+    _check_realm(module, blade, fs_name, api_version)
+    _check_policy_scope(module, fs_name, "worm_policy")
+    _check_policy_scope(module, fs_name, "policy")
+    if module.params.get("worm_policy"):
+        _check_worm_policy_exists(module, blade, api_version)
+    if module.params["policy"]:
+        _check_policy_exists(module, blade, api_version)
+
+
 def create_fs(module, blade):
     """Create Filesystem"""
     changed = True
     api_version = get_rest_api_version(blade)
+    _validate_create(module, blade, api_version)
     if not module.check_mode:
-        # Boolean flags default to None so that modify_fs only touches them
-        # when the caller sets them. At creation time None means the array
-        # default (safeguard_acls on, every other flag off).
         safeguard_acls = module.params["safeguard_acls"]
         if safeguard_acls is None:
             safeguard_acls = True
-        # Determine realm from either realm parameter or name prefix (realm::fs)
-        realm_name = None
-        if module.params.get("realm"):
-            realm_name = module.params["realm"]
-        elif "::" in module.params["name"]:
-            # Extract realm from name (e.g., "production::prod-fs" -> "production")
-            realm_name = module.params["name"].split("::")[0]
-
-        # Validate realm if present
-        if realm_name:
-            if LooseVersion(REALM_API_VERSION) > LooseVersion(api_version):
-                module.fail_json(
-                    msg="Realm support requires Purity//FB 4.6.1+ (REST API 2.19+)"
-                )
-            # Check realm exists
-            realm_check = blade.get_realms(destroyed=False, names=[realm_name])
-            if realm_check.status_code != 200:
-                module.fail_json(msg="Realm '{0}' does not exist".format(realm_name))
+        # A filesystem is in a realm when its name is realm::name; main()
+        # has resolved the realm option into the name.
+        realm_name = _realm_of(module.params["name"]) or None
 
         if module.params["size"]:
             size = human_to_bytes(module.params["size"])
@@ -734,32 +957,6 @@ def create_fs(module, blade):
             group_quota = human_to_bytes(module.params["group_quota"])
         else:
             group_quota = None
-
-        if module.params["access_control"] == "nfs" and not (
-            module.params["nfsv3"] or module.params["nfsv4"]
-        ):
-            module.fail_json(
-                msg="Cannot set access_control to nfs when NFS is not enabled."
-            )
-        if (
-            module.params["access_control"] in ["smb", "independent"]
-            and not module.params["smb"]
-        ):
-            module.fail_json(
-                msg="Cannot set access_control to smb or independent when SMB is not enabled."
-            )
-        if safeguard_acls and (
-            module.params["access_control"] in ["mode-bits", "independent"]
-        ):
-            module.fail_json(
-                msg="ACL Safeguarding cannot be enabled if access_control is mode-bits or independent."
-            )
-        # Determine if this is a realm filesystem
-        realm_name = None
-        if module.params.get("realm"):
-            realm_name = module.params["realm"]
-        elif "::" in module.params["name"]:
-            realm_name = module.params["name"].split("::")[0]
 
         # nfs_rules is deprecated in favour of export_policy. It is still
         # honoured for non-realm filesystems for backwards compatibility, but
@@ -839,10 +1036,7 @@ def create_fs(module, blade):
             default_group_quota=group_quota,
             **fs_kwargs
         )
-        # Construct filesystem name - if realm provided, prepend realm::
         fs_name = module.params["name"]
-        if realm_name and "::" not in fs_name:
-            fs_name = "{0}::{1}".format(realm_name, fs_name)
 
         # Build post_file_systems call with optional parameters
         post_kwargs = {
@@ -874,35 +1068,13 @@ def create_fs(module, blade):
                 )
             )
         if module.params["policy"]:
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-                and module.params["context"]
-            ):
-                res = blade.get_policies(
-                    names=[module.params["policy"]],
-                    context_names=[module.params["context"]],
-                )
-            else:
-                res = blade.get_policies(names=[module.params["policy"]])
-            if res.status_code != 200:
-                _delete_fs(module, blade)
-                module.fail_json(
-                    msg="Policy {0} doesn't exist.".format(module.params["policy"])
-                )
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-                and module.params["context"]
-            ):
-                res = blade.post_policies_file_systems(
-                    policy_names=[module.params["policy"]],
-                    member_names=[fs_name],
-                    context_names=[module.params["context"]],
-                )
-            else:
-                res = blade.post_policies_file_systems(
-                    policy_names=[module.params["policy"]],
-                    member_names=[fs_name],
-                )
+            # _validate_create has checked that the policy exists and is in
+            # the realm of the filesystem.
+            res = blade.post_policies_file_systems(
+                policy_names=[module.params["policy"]],
+                member_names=[fs_name],
+                **_context_kwargs(module, api_version)
+            )
             if res.status_code != 200:
                 _delete_fs(module, blade)
                 module.fail_json(
@@ -1107,7 +1279,11 @@ def _check_create_only_options(module, blade, fsys, api_version):
                 )
             )
     if worm_policy:
-        member_kwargs = {"member_names": [fs_name]}
+        # By id: the array lists the members of a WORM data policy without
+        # their realm and matches member names the same way, so a name
+        # finds nothing for a filesystem in a realm, and finds the
+        # filesystem of the same name in any realm for one outside.
+        member_kwargs = {"member_ids": [fsys.id]}
         if (
             LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
             and module.params["context"]
@@ -1123,11 +1299,78 @@ def _check_create_only_options(module, blade, fsys, api_version):
             getattr(getattr(item, "policy", None), "name", None)
             for item in list(res.items)
         ]
-        if worm_policy not in attached:
+        # the array matches names without regard to case
+        if worm_policy.lower() not in [name.lower() for name in attached if name]:
             module.fail_json(
                 msg="Filesystem {0} has WORM data policy {1}. A WORM data policy "
                 "can only be attached when the filesystem is created.".format(
                     fs_name, ", ".join(name for name in attached if name) or "none"
+                )
+            )
+
+
+def _patch_body(before, after):
+    """Return the FileSystemPatch arguments for the attributes that differ.
+
+    ``before`` holds the values on the array and ``after`` the values the
+    task asks for. An attribute that keeps its value is left out, so that
+    the array is not asked to set it again: it refuses ``writable`` in a
+    request that demotes the filesystem, for instance.
+    """
+    differs = [key for key in after if after[key] != before[key]]
+    body = {}
+    for key, field in (
+        ("provisioned", "provisioned"),
+        ("default_user_quota", "default_user_quota"),
+        ("default_group_quota", "default_group_quota"),
+        ("fastremove", "fast_remove_directory_enabled"),
+        ("hardlimit", "hard_limit_enabled"),
+        ("snapshot", "snapshot_directory_enabled"),
+        ("writable", "writable"),
+        ("requested_promotion_state", "requested_promotion_state"),
+    ):
+        if key in differs:
+            body[field] = after[key]
+    nfs = {}
+    if "nfsv3" in differs:
+        nfs["v3_enabled"] = after["nfsv3"]
+    if "nfsv4" in differs:
+        nfs["v4_1_enabled"] = after["nfsv4"]
+    if nfs:
+        body["nfs"] = NfsPatch(**nfs)
+    if "smb" in differs:
+        body["smb"] = Smb(enabled=after["smb"])
+    if "http" in differs:
+        body["http"] = Http(enabled=after["http"])
+    multi_protocol = {}
+    if "acs" in differs:
+        multi_protocol["access_control_style"] = after["acs"]
+    if "safeguard_acls" in differs:
+        multi_protocol["safeguard_acls"] = after["safeguard_acls"]
+    if multi_protocol:
+        body["multi_protocol"] = MultiProtocol(**multi_protocol)
+    return body
+
+
+def _change_policy_membership(module, blade, fs_name, api_version, action):
+    """Attach the filesystem to the snapshot policy, or detach it from it."""
+    policy = module.params["policy"]
+    kwargs = {"policy_names": [policy], "member_names": [fs_name]}
+    kwargs.update(_context_kwargs(module, api_version))
+    if action == "attach":
+        res = blade.post_policies_file_systems(**kwargs)
+        if res.status_code != 200:
+            module.fail_json(
+                msg="Failed to add filesystem {0} to policy {1}. Error: {2}".format(
+                    fs_name, policy, get_error_message(res)
+                )
+            )
+    else:
+        res = blade.delete_policies_file_systems(**kwargs)
+        if res.status_code != 200:
+            module.fail_json(
+                msg="Failed to remove filesystem {0} from policy {1}. Error: {2}".format(
+                    fs_name, policy, get_error_message(res)
                 )
             )
 
@@ -1142,123 +1385,34 @@ def modify_fs(module, blade):
     change_go = False
     change_sc = False
     change_rules = False
-    mod_fs = False
-    # Determine if this is a realm filesystem
-    realm_name = None
-    if module.params.get("realm"):
-        realm_name = module.params["realm"]
-    elif "::" in module.params["name"]:
-        realm_name = module.params["name"].split("::")[0]
-    # Construct filesystem name - if realm provided, prepend realm::
+    policy_action = None
+    # A filesystem is in a realm when its name is realm::name; main() has
+    # resolved the realm option into the name.
     fs_name = module.params["name"]
-    if realm_name and "::" not in fs_name:
-        fs_name = "{0}::{1}".format(realm_name, fs_name)
+    realm_name = _realm_of(fs_name) or None
     api_version = get_rest_api_version(blade)
+    # Snapshot policy membership is decided here and written further down,
+    # after every other check has passed and never in check mode.
     if module.params["policy"] and module.params["policy_state"] == "present":
-        if (
-            LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-            and module.params["context"]
-        ):
-            res = blade.get_policies(
-                names=[module.params["policy"]],
-                context_names=[module.params["context"]],
-            )
-        else:
-            res = blade.get_policies(names=[module.params["policy"]])
-        if res.status_code != 200:
-            module.fail_json(
-                msg="Policy {0} doesn't exist.".format(module.params["policy"])
-            )
-        if (
-            LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-            and module.params["context"]
-        ):
-            res = blade.get_policies_file_systems(
-                policy_names=[module.params["policy"]],
-                member_names=[fs_name],
-                context_names=[module.params["context"]],
-            )
-        else:
-            res = blade.get_policies_file_systems(
-                policy_names=[module.params["policy"]],
-                member_names=[fs_name],
-            )
-        if not _item_count(res):
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-                and module.params["context"]
-            ):
-                res = blade.post_policies_file_systems(
-                    policy_names=[module.params["policy"]],
-                    member_names=[fs_name],
-                    context_names=[module.params["context"]],
-                )
-            else:
-                res = blade.post_policies_file_systems(
-                    policy_names=[module.params["policy"]],
-                    member_names=[fs_name],
-                )
-            mod_fs = True
-            if res.status_code != 200:
-                module.fail_json(
-                    msg="Failed to add filesystem {0} to policy {1}. Error: {2}".format(
-                        fs_name,
-                        module.params["policy"],
-                        get_error_message(res),
-                    )
-                )
+        _check_policy_scope(module, fs_name, "policy")
+        _check_policy_exists(module, blade, api_version)
+        if not _policy_attached(module, blade, fs_name, api_version):
+            policy_action = "attach"
     if module.params["policy"] and module.params["policy_state"] == "absent":
-        if (
-            LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-            and module.params["context"]
-        ):
-            res = blade.get_policies(
-                names=[module.params["policy"]],
-                context_names=[module.params["context"]],
-            )
-        else:
-            res = blade.get_policies(names=[module.params["policy"]])
+        res = blade.get_policies(
+            names=[module.params["policy"]], **_context_kwargs(module, api_version)
+        )
         if res.status_code == 200:
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-                and module.params["context"]
-            ):
-                res = blade.get_policies_file_systems(
-                    policy_names=[module.params["policy"]],
-                    member_names=[fs_name],
-                    context_names=[module.params["context"]],
-                )
-            else:
-                res = blade.get_policies_file_systems(
-                    policy_names=[module.params["policy"]],
-                    member_names=[fs_name],
-                )
             # A 200 with no items means the policy is not attached, so a
             # second policy_state=absent run must be a no-op.
-            if _item_count(res):
-                if (
-                    LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-                    and module.params["context"]
-                ):
-                    res = blade.delete_policies_file_systems(
-                        policy_names=[module.params["policy"]],
-                        member_names=[fs_name],
-                        context_names=[module.params["context"]],
-                    )
-                else:
-                    res = blade.delete_policies_file_systems(
-                        policy_names=[module.params["policy"]],
-                        member_names=[fs_name],
-                    )
-                mod_fs = True
-                if res.status_code != 200:
-                    module.fail_json(
-                        msg="Failed to remove filesystem {0} from policy {1}. Error: {2}".format(
-                            fs_name,
-                            module.params["policy"],
-                            get_error_message(res),
-                        )
-                    )
+            if _policy_attached(module, blade, fs_name, api_version):
+                policy_action = "detach"
+        elif not _is_missing(res):
+            module.fail_json(
+                msg="Failed to read policy {0}. Error: {1}".format(
+                    module.params["policy"], get_error_message(res)
+                )
+            )
     if module.params["user_quota"]:
         user_quota = human_to_bytes(module.params["user_quota"])
     if module.params["group_quota"]:
@@ -1284,25 +1438,22 @@ def modify_fs(module, blade):
         "requested_promotion_state": fsys.requested_promotion_state,
         "storage_class": getattr(getattr(fsys, "storage_class", None), "name", None),
     }
+    # The values as they are on the array. What the task asks for is written
+    # into new_fsys below, and only the attributes that differ are sent.
+    before = dict(new_fsys)
     if fsys.destroyed:
         new_fsys["destroyed"] = False
-        mod_fs = True
     if module.params["size"]:
         if human_to_bytes(module.params["size"]) != fsys.provisioned:
             new_fsys["provisioned"] = human_to_bytes(module.params["size"])
-            mod_fs = True
     if module.params["nfsv3"] != fsys.nfs.v3_enabled:
         new_fsys["nfsv3"] = module.params["nfsv3"]
-        mod_fs = True
     if module.params["nfsv4"] != fsys.nfs.v4_1_enabled:
         new_fsys["nfsv4"] = module.params["nfsv4"]
-        mod_fs = True
     if module.params["user_quota"] and user_quota != fsys.default_user_quota:
         new_fsys["default_user_quota"] = user_quota
-        mod_fs = True
     if module.params["group_quota"] and group_quota != fsys.default_group_quota:
         new_fsys["default_group_quota"] = group_quota
-        mod_fs = True
     # Boolean flags are only compared when the caller set them, and then in
     # both directions, so an explicit false turns the setting off.
     bool_flags = [
@@ -1316,21 +1467,17 @@ def modify_fs(module, blade):
     for param, key, current in bool_flags:
         if module.params[param] is not None and module.params[param] != current:
             new_fsys[key] = module.params[param]
-            mod_fs = True
     if module.params["access_control"] != fsys.multi_protocol.access_control_style:
         new_fsys["acs"] = module.params["access_control"]
-        mod_fs = True
     if module.params["writable"] is not None:
         if not module.params["writable"] and fsys.writable:
             new_fsys["writable"] = module.params["writable"]
-            mod_fs = True
         if (
             module.params["writable"]
             and not fsys.writable
             and fsys.promotion_status == "promoted"
         ):
             new_fsys["writable"] = module.params["writable"]
-            mod_fs = True
     failover = None
     if module.params["promote"] is not None:
         failover = _failover_action(module, blade, fsys, fs_name)
@@ -1349,117 +1496,57 @@ def modify_fs(module, blade):
                     "cancel the failover.".format(fs_name)
                 )
             new_fsys["requested_promotion_state"] = "promoted"
-            mod_fs = True
         if not module.params["promote"] and fsys.promotion_status == "promoted":
-            # Demotion only allowed on filesystems in a replica-link
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-                and module.params["context"]
-            ):
-                res = blade.get_file_system_replica_links(
-                    local_file_system_names=[fs_name],
-                    context_names=[module.params["context"]],
-                )
-            else:
-                res = blade.get_file_system_replica_links(
-                    local_file_system_names=[fs_name]
-                )
-            if res.status_code != 200:
-                module.fail_json(
-                    msg="Filesystem {0} not demoted. Not in a replica-link".format(
-                        fs_name
-                    )
-                )
             new_fsys["requested_promotion_state"] = "demoted"
-            mod_fs = True
-    if mod_fs:
+            if (
+                before["requested_promotion_state"] != "demoted"
+                and not module.params["discard_snaps"]
+            ):
+                # The array only demotes with discard_non_snapshotted_data.
+                module.fail_json(
+                    msg="Filesystem {0} is promoted. Demoting it restores the "
+                    "filesystem from its latest snapshot and discards the data "
+                    "written since; set discard_snaps=true to confirm, or use "
+                    "quiesce=true for a planned failover.".format(fs_name)
+                )
+    recover = new_fsys["destroyed"] != fsys.destroyed
+    patch_body = _patch_body(before, new_fsys)
+    if policy_action:
         changed = True
         if not module.check_mode:
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-                and module.params["context"]
-            ):
-                if new_fsys["destroyed"] != fsys.destroyed:
-                    delres = blade.patch_file_systems(
-                        names=[fs_name],
-                        context_names=[module.params["context"]],
-                        file_system=FileSystemPatch(destroyed=new_fsys["destroyed"]),
-                    )
-                    if delres.status_code != 200:
-                        module.fail_json(
-                            msg="Failed to update filesystem {0} deleted status. Error {1}".format(
-                                fs_name, get_error_message(res)
-                            )
-                        )
+            _change_policy_membership(
+                module, blade, fs_name, api_version, policy_action
+            )
+    if recover or patch_body:
+        changed = True
+        if not module.check_mode:
+            context_kwargs = _context_kwargs(module, api_version)
+            if recover:
                 res = blade.patch_file_systems(
                     names=[fs_name],
-                    context_names=[module.params["context"]],
-                    file_system=FileSystemPatch(
-                        default_group_quota=new_fsys["default_group_quota"],
-                        default_user_quota=new_fsys["default_user_quota"],
-                        fast_remove_directory_enabled=new_fsys["fastremove"],
-                        hard_limit_enabled=new_fsys["hardlimit"],
-                        snapshot_directory_enabled=new_fsys["snapshot"],
-                        http=Http(enabled=new_fsys["http"]),
-                        multi_protocol=MultiProtocol(
-                            access_control_style=new_fsys["acs"],
-                            safeguard_acls=new_fsys["safeguard_acls"],
-                        ),
-                        nfs=NfsPatch(
-                            v3_enabled=new_fsys["nfsv3"],
-                            v4_1_enabled=new_fsys["nfsv4"],
-                        ),
-                        provisioned=new_fsys["provisioned"],
-                        requested_promotion_state=new_fsys["requested_promotion_state"],
-                        smb=Smb(enabled=new_fsys["smb"]),
-                        writable=new_fsys["writable"],
-                    ),
-                    discard_non_snapshotted_data=module.params["discard_snaps"],
-                    ignore_usage=module.params["ignore_usage"],
+                    file_system=FileSystemPatch(destroyed=new_fsys["destroyed"]),
+                    **context_kwargs
                 )
-            else:
-                if new_fsys["destroyed"] != fsys.destroyed:
-                    delres = blade.patch_file_systems(
-                        names=[fs_name],
-                        file_system=FileSystemPatch(destroyed=new_fsys["destroyed"]),
-                    )
-                    if delres.status_code != 200:
-                        module.fail_json(
-                            msg="Failed to update filesystem {0} deleted status. Error {1}".format(
-                                fs_name, get_error_message(res)
-                            )
+                if res.status_code != 200:
+                    module.fail_json(
+                        msg="Failed to update filesystem {0} deleted status. Error {1}".format(
+                            fs_name, get_error_message(res)
                         )
+                    )
+            if patch_body:
                 res = blade.patch_file_systems(
                     names=[fs_name],
-                    file_system=FileSystemPatch(
-                        default_group_quota=new_fsys["default_group_quota"],
-                        default_user_quota=new_fsys["default_user_quota"],
-                        fast_remove_directory_enabled=new_fsys["fastremove"],
-                        hard_limit_enabled=new_fsys["hardlimit"],
-                        snapshot_directory_enabled=new_fsys["snapshot"],
-                        http=Http(enabled=new_fsys["http"]),
-                        multi_protocol=MultiProtocol(
-                            access_control_style=new_fsys["acs"],
-                            safeguard_acls=new_fsys["safeguard_acls"],
-                        ),
-                        nfs=NfsPatch(
-                            v3_enabled=new_fsys["nfsv3"],
-                            v4_1_enabled=new_fsys["nfsv4"],
-                        ),
-                        provisioned=new_fsys["provisioned"],
-                        requested_promotion_state=new_fsys["requested_promotion_state"],
-                        smb=Smb(enabled=new_fsys["smb"]),
-                        writable=new_fsys["writable"],
-                    ),
+                    file_system=FileSystemPatch(**patch_body),
                     discard_non_snapshotted_data=module.params["discard_snaps"],
                     ignore_usage=module.params["ignore_usage"],
+                    **context_kwargs
                 )
-            if res.status_code != 200:
-                module.fail_json(
-                    msg="Failed to update filesystem {0}. Error {1}".format(
-                        fs_name, get_error_message(res)
+                if res.status_code != 200:
+                    module.fail_json(
+                        msg="Failed to update filesystem {0}. Error {1}".format(
+                            fs_name, get_error_message(res)
+                        )
                     )
-                )
     if failover in ("quiesce", "skip_quiesce", "abort_quiesce"):
         changed = True
         if not module.check_mode:
@@ -1929,6 +2016,7 @@ def main():
     # name outside the realm is never read, compared against or changed.
     # Every later read and write uses module.params["name"].
     module.params["name"] = _resolve_name(module)
+    _check_legacy_policy_options(module)
     blade = get_system(module)
     api_version = get_rest_api_version(blade)
     if module.params.get("quiesce") is not None or module.params.get("abort_quiesce"):

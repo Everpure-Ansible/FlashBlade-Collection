@@ -1,0 +1,23 @@
+bugfixes:
+  - purefb_policy - check mode no longer attaches or detaches the file systems and replica links of
+    a snapshot policy.
+  - purefb_policy - ``replica_link`` on an existing snapshot policy failed with an AttributeError.
+    The replica link is now looked up by its local file system and attached or detached by that
+    name and its remote, and a file system without a replica link fails with a message.
+  - purefb_policy - a rename is settled before the check-mode branch. For a policy in a realm
+    (``realm::name``) a new name without a realm keeps the realm and a new name in another realm
+    is refused. A rename of a policy that does not exist, or onto the name of another policy, fails
+    instead of reporting ok, and renaming a snapshot policy fails in check mode as in a real run.
+  - purefb_policy - a snapshot policy and its ``filesystem`` and ``replica_link`` members must be
+    in the same realm, or all outside a realm. Members are checked before the policy is created,
+    so a refused or missing member no longer leaves an empty policy behind.
+  - purefb_policy - SMB share policy rules are changed and deleted by id, which also works for an
+    administrator whose access is limited to the realm of the policy.
+  - purefb_policy - a new SMB share or SMB client policy without ``principal`` or ``client`` fails
+    before the policy is created, in check mode too.
+  - purefb_policy - a failed access policy create reports the array's reason, a realm on the
+    ``name`` of an access policy is refused with a pointer to ``account``, and the "already exists"
+    message of a rule copy names the target policy.
+  - purefb_policy - a read the array refuses is reported with the array's message instead of being
+    taken for a missing policy, for example ``policy_type=network`` for an administrator limited
+    to a realm.

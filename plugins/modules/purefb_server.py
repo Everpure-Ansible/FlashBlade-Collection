@@ -64,9 +64,9 @@ options:
       array-level DNS configuration that is shared with the realm through
       M(everpure.flashblade.purefb_resource_access).
     - A name without a realm always means the array-level DNS configuration,
-      also where the realm of the server has one of the same name. Give the
-      realm in the name of a DNS configuration in the case the array reports
-      it.
+      also where the realm of the server has one of the same name. Write the
+      realm of a DNS configuration in the same case as in I(name); the array
+      does not accept it in another case.
     type: list
     elements: str
   directory_service:
@@ -86,7 +86,8 @@ options:
     description:
     - Name of an existing local directory service to associate with this server
     - A server in a realm takes a local directory service of its own realm,
-      named C(realm::name).
+      named C(realm::name). Write the realm in the same case as in I(name);
+      the array does not accept it in another case.
     - Set to an empty string (C("")) to clear a previously assigned local directory
       service. This only applies on update; on create an empty string is treated the
       same as omitting the parameter.
@@ -98,7 +99,7 @@ options:
     - Name of a local directory service for the array to create and associate
       with this server.
     - For a server in a realm the name carries the realm of the server,
-      C(realm::name).
+      C(realm::name), written in the same case as in I(name).
     - Only applies when the server is created. On an existing server the module
       checks that this is the local directory service attached and fails otherwise,
       since the array cannot create and attach one after the fact. Create it with
@@ -115,8 +116,9 @@ notes:
 - Check mode reports the request the module would send. Whether the array
   accepts a DNS configuration or a local directory service for the server,
   or creates a server in a realm without I(dns), is only known when the
-  request is sent. Where the array refuses a reference of a server in a
-  realm, the module adds to its message what a server in that realm can use.
+  request is sent. Where the array refuses a reference that is named outside
+  the realm of the server, the module adds to its message what a server in
+  that realm can use.
 extends_documentation_fragment:
 - everpure.flashblade.everpure.fb
 """
@@ -260,6 +262,10 @@ def _reference_error(res, server, dns=None, local_ds=None, new=False):
     configuration does not exist. The rule is added where the server is in a
     realm, the message is about that kind of reference and the request names
     one outside the realm, or creates a server without a DNS configuration.
+    ``server`` is the name of the server as the task writes it. The array
+    matches the realm in the name of a server whatever its case, and accepts
+    the realm of a reference only as it is written in that name, so a
+    reference that names the realm in another case is outside it.
     Nothing is refused here: an array-level DNS configuration that is shared
     with the realm is a valid reference, named without a realm.
     """
@@ -274,15 +280,16 @@ def _reference_error(res, server, dns=None, local_ds=None, new=False):
     ):
         hint += (
             " A server in realm {0} can only use a DNS configuration of that "
-            "realm, named {0}::<name> with the realm in the case the array "
-            "reports it, or an array-level DNS configuration, named without "
-            "a realm, that is shared with the realm through "
+            "realm, named {0}::<name> with the realm written as in the name "
+            "of the server, or an array-level DNS configuration, named "
+            "without a realm, that is shared with the realm through "
             "purefb_resource_access.".format(realm)
         )
     if "local directory service" in text and local_ds and _realm_of(local_ds) != realm:
         hint += (
             " A server in realm {0} can only use a local directory service "
-            "of that realm, named {0}::{1}.".format(realm, local_ds.rpartition("::")[2])
+            "of that realm, named {0}::{1} with the realm written as in the "
+            "name of the server.".format(realm, local_ds.rpartition("::")[2])
         )
     return "{0}{1}".format(error, hint)
 
@@ -291,12 +298,13 @@ def _check_directory_service(module, server, current, new=False):
     """Fail unless directory_service names the directory services of the
     server.
 
-    The directory services of a server are created with it. The array
-    accepts them in a change of the server and ignores them, so the option
-    cannot change anything and nothing is sent for it. It is compared with
-    what the server has, or is created with, before any write and in check
-    mode as well. On a server in a realm a name without a realm is compared
-    in the realm of the server, where all its directory services are.
+    The directory services of a server are created with it and are
+    read-only afterwards: no request to create or change a server carries
+    them, so the option cannot change anything and nothing is sent for it.
+    It is compared with what the server has, or is created with, before any
+    write and in check mode as well. On a server in a realm a name without a
+    realm is compared in the realm of the server, where all its directory
+    services are.
     """
     wanted = module.params["directory_service"]
     if wanted is None:
@@ -439,8 +447,10 @@ def update_server(module, blade, server_info):
     """Update server object"""
     changed = False
     # The array matches names whatever their case and returns them as they
-    # are stored: the realm of the server is read from the stored name, and
-    # references are compared without regard to case.
+    # are stored: the directory services are compared in the realm of the
+    # stored name, and references are compared without regard to case. A
+    # refused reference is explained with the name of the task, which is
+    # what the array compares its realm with.
     stored_name = _field(server_info, "name") or module.params["name"]
     current_lds = _field(_field(server_info, "local_directory_service"), "name")
     if module.params["create_local_directory_service"]:
@@ -480,7 +490,9 @@ def update_server(module, blade, server_info):
                         msg="Failed to update DNS config for server {0}. Error: {1}".format(
                             module.params["name"],
                             _reference_error(
-                                res, stored_name, dns=module.params["dns"]
+                                res,
+                                module.params["name"],
+                                dns=module.params["dns"],
                             ),
                         )
                     )
@@ -506,7 +518,7 @@ def update_server(module, blade, server_info):
                             module.params["name"],
                             _reference_error(
                                 res,
-                                stored_name,
+                                module.params["name"],
                                 local_ds=module.params["local_directory_service"],
                             ),
                         )
@@ -518,9 +530,9 @@ def add_server(module, blade):
     """Add server object"""
     changed = True
     final_dns = []
-    # The array creates the server with this one directory service, whatever
-    # the request names, so a task that expects another one is refused
-    # before the server is created
+    # The array creates the server with this one directory service, named in
+    # create_ds, so a task that expects another one is refused before the
+    # server is created
     _check_directory_service(
         module, module.params["name"], [module.params["name"] + "_nfs"], new=True
     )

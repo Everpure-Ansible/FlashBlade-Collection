@@ -1477,7 +1477,7 @@ class TestPurefbServer:
         )
 
         msg = module.fail_json.call_args[1]["msg"]
-        assert "with the realm in the case the array reports it" in msg
+        assert "named rzaudit::<name> with the realm written as in the name" in msg
 
     def test_realm_server_dns_in_its_realm_gets_no_rule(self):
         """A reference that is named in the realm fails for another reason"""
@@ -1494,21 +1494,163 @@ class TestPurefbServer:
             "does not exist."
         )
 
-    def test_realm_of_the_rule_is_the_stored_one(self):
-        """The realm of the server is read from the name the array returned,
-        not from the spelling of the task"""
+    def test_rule_names_the_realm_as_the_task_writes_it(self):
+        """The array accepts the realm of a reference only as it is written
+        in the name of the server: with the server named in another case,
+        the local directory service in the stored spelling is refused and
+        the rule gives the spelling of the task"""
         blade = Mock()
         blade.get_servers.return_value = _response(200, [_realm_server()])
-        blade.patch_servers.return_value = _response(400, message="DNS does not exist.")
+        blade.patch_servers.return_value = _response(
+            400,
+            message="Cannot update server. Local directory service is not "
+            "accessible to the server.",
+        )
 
         module = _run_main(
-            _base_params(name="RZAUDIT::SRV", dns=["rzaudit::nodns"]), blade
+            _base_params(name="RZAUDIT::srv", local_directory_service="rzaudit::lds1"),
+            blade,
         )
 
         assert module.fail_json.call_args[1]["msg"] == (
-            "Failed to update DNS config for server RZAUDIT::SRV. Error: DNS "
-            "does not exist."
+            "Failed to update local directory service for server RZAUDIT::srv. "
+            "Error: Cannot update server. Local directory service is not "
+            "accessible to the server. A server in realm RZAUDIT can only use "
+            "a local directory service of that realm, named RZAUDIT::lds1 with "
+            "the realm written as in the name of the server."
         )
+
+    def test_rule_for_a_bare_local_ds_uses_the_realm_of_the_task(self):
+        """The name the rule proposes is one the array accepts for the server
+        as the task names it"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_realm_server()])
+        blade.patch_servers.return_value = _response(
+            400,
+            message="Cannot update server. Local directory service is not "
+            "accessible to the server.",
+        )
+
+        module = _run_main(
+            _base_params(name="RZAUDIT::SRV", local_directory_service="lds1"), blade
+        )
+
+        msg = module.fail_json.call_args[1]["msg"]
+        assert msg.endswith(
+            "A server in realm RZAUDIT can only use a local directory service "
+            "of that realm, named RZAUDIT::lds1 with the realm written as in "
+            "the name of the server."
+        )
+        assert "rzaudit::lds1" not in msg
+
+    def test_local_ds_realm_in_another_case_than_the_name_gets_the_rule(self):
+        """A local directory service whose realm is in another case than in
+        the name of the server is refused by the array"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_realm_server()])
+        blade.patch_servers.return_value = _response(
+            400,
+            message="Cannot update server. Local directory service is not "
+            "accessible to the server.",
+        )
+
+        module = _run_main(
+            _base_params(name="rzaudit::srv", local_directory_service="RZAUDIT::lds1"),
+            blade,
+        )
+
+        assert module.fail_json.call_args[1]["msg"].endswith(
+            "named rzaudit::lds1 with the realm written as in the name of the "
+            "server."
+        )
+
+    def test_local_ds_realm_written_as_in_the_name_gets_no_rule(self):
+        """A reference whose realm is written as in the name of the server
+        is in the realm for the array: it fails for another reason"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_realm_server()])
+        blade.patch_servers.return_value = _response(
+            400, message="Local directory service does not exist."
+        )
+
+        module = _run_main(
+            _base_params(name="RZAUDIT::srv", local_directory_service="RZAUDIT::nolds"),
+            blade,
+        )
+
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Failed to update local directory service for server RZAUDIT::srv. "
+            "Error: Local directory service does not exist."
+        )
+
+    def test_create_rule_names_the_realm_as_the_task_writes_it(self):
+        """A new server named with the realm in another case takes its
+        references with the realm in that case"""
+        blade = Mock()
+        blade.get_servers.return_value = _absent()
+        blade.post_servers.return_value = _response(
+            400,
+            message="Cannot create server. Local directory service is not "
+            "accessible to the server.",
+        )
+
+        module = _run_main(
+            _base_params(
+                name="RZAUDIT::srv",
+                dns=["shareddns"],
+                local_directory_service="rzaudit::lds1",
+            ),
+            blade,
+        )
+
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Failed to add server RZAUDIT::srv. Error: Cannot create server. "
+            "Local directory service is not accessible to the server. A server "
+            "in realm RZAUDIT can only use a local directory service of that "
+            "realm, named RZAUDIT::lds1 with the realm written as in the name "
+            "of the server."
+        )
+
+    def test_create_lds_rule_names_the_realm_as_the_task_writes_it(self):
+        """create_local_directory_service follows the same rule"""
+        blade = Mock()
+        blade.get_servers.return_value = _absent()
+        blade.post_servers.return_value = _response(
+            400,
+            message="Cannot create server. Local directory service is not "
+            "accessible to the server.",
+        )
+
+        module = _run_main(
+            _base_params(
+                name="RZAUDIT::srv",
+                dns=["shareddns"],
+                create_local_directory_service="rzaudit::lds2",
+            ),
+            blade,
+        )
+
+        assert module.fail_json.call_args[1]["msg"].endswith(
+            "named RZAUDIT::lds2 with the realm written as in the name of the "
+            "server."
+        )
+
+    def test_create_dns_rule_names_the_realm_as_the_task_writes_it(self):
+        """The DNS rule names the realm as the task writes it as well"""
+        blade = Mock()
+        blade.get_servers.return_value = _absent()
+        blade.post_servers.return_value = _response(400, message="DNS does not exist.")
+
+        module = _run_main(_base_params(name="RZAUDIT::srv", dns=["mydns"]), blade)
+
+        msg = module.fail_json.call_args[1]["msg"]
+        assert msg.startswith(
+            "Failed to add server RZAUDIT::srv. Error: DNS does not exist. A "
+            "server in realm RZAUDIT can only use a DNS configuration of that "
+            "realm, named RZAUDIT::<name> with the realm written as in the "
+            "name of the server, or an array-level DNS configuration"
+        )
+        assert "the array reports" not in msg
 
     def test_array_server_dns_failure_gets_no_rule(self):
         """Array-level servers keep the message of the array as it is"""
@@ -1542,7 +1684,8 @@ class TestPurefbServer:
             "Failed to update local directory service for server rzaudit::srv. "
             "Error: Cannot update server. Local directory service is not "
             "accessible to the server. A server in realm rzaudit can only use "
-            "a local directory service of that realm, named rzaudit::lds1."
+            "a local directory service of that realm, named rzaudit::lds1 with "
+            "the realm written as in the name of the server."
         )
         assert "DNS configuration" not in msg
 
@@ -1623,7 +1766,8 @@ class TestPurefbServer:
         msg = module.fail_json.call_args[1]["msg"]
         assert msg.endswith(
             "accessible to the server. A server in realm rzaudit can only use "
-            "a local directory service of that realm, named rzaudit::lds2."
+            "a local directory service of that realm, named rzaudit::lds2 with "
+            "the realm written as in the name of the server."
         )
         assert "DNS configuration" not in msg
 
@@ -1652,7 +1796,8 @@ class TestPurefbServer:
             "Failed to add server rzaudit::srv. Error: Cannot create server. "
             "Local directory service is not accessible to the server. A server "
             "in realm rzaudit can only use a local directory service of that "
-            "realm, named rzaudit::lds2."
+            "realm, named rzaudit::lds2 with the realm written as in the name "
+            "of the server."
         )
 
     def test_refused_dns_gets_no_local_ds_rule(self):
@@ -1728,6 +1873,22 @@ class TestPurefbServer:
 
         module = _run_main(
             _base_params(name="rzaudit::srv", local_directory_service="rzaudit::LDS1"),
+            blade,
+        )
+
+        blade.patch_servers.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    def test_update_lds_with_the_realm_in_another_case_is_noop(self):
+        """The attached local directory service is the same one when the task
+        writes its realm in another case: nothing is sent"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(
+            200, [_realm_server(lds="rzaudit::lds1")]
+        )
+
+        module = _run_main(
+            _base_params(name="RZAUDIT::srv", local_directory_service="RZAUDIT::lds1"),
             blade,
         )
 

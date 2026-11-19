@@ -9402,6 +9402,35 @@ class TestPurefbInfoPerformanceAboveTen:
             name for name in self.FILE_SYSTEMS if name != "fs11"
         )
 
+    def test_file_system_without_a_sample_yet_is_left_out(self):
+        """The array has no sample yet for a file system it has just
+        created: the query that names it answers with the rows of the
+        others, and nothing is asked again name by name."""
+        served = _performance_served_for_ten(FS_QUERY_REFUSED)
+
+        def read(names=None, **kwargs):
+            response = served(names=names, **kwargs)
+            if response.status_code == 200:
+                response.items = [
+                    row for row in response.items if row.name != "realm1::fs3"
+                ]
+            return response
+
+        client = self._client(get_file_systems_performance=read)
+
+        performance = _run_main(client, "performance")[1]["performance"]
+
+        names = self.FILE_SYSTEMS
+        assert sorted(performance["filesystems"]) == sorted(
+            name for name in names if name != "realm1::fs3"
+        )
+        assert self._names_asked(client, "get_file_systems_performance") == [
+            None,
+            names[:10],
+            names[10:20],
+            names[20:],
+        ]
+
     def test_no_samples_when_the_names_cannot_be_listed(self):
         client = self._client(get_file_systems=_SdkError(500, "Unexpected error."))
 
@@ -10221,6 +10250,30 @@ class TestPurefbInfoDirectoryServices:
         )
         config = _run_main(client, "config")[1]["config"]
         assert config["local_directory_services"] == {}
+
+    def test_rows_of_a_service_that_is_not_listed_are_left_out(self):
+        """An administrator limited to a realm lists the local directory
+        service of its realm only, yet the array shows it the users, groups
+        and memberships of every other one: they belong to no entry, those
+        of the array-level namesake included."""
+        client = self._lds_client(
+            get_directory_services_local_directory_services=_listing(
+                [_lds_row("realm1::lds1", LDS_REALM_ID, "realm1::srv1", "realm1")]
+            )
+        )
+
+        services = _run_main(client, "config")[1]["config"]["local_directory_services"]
+
+        assert list(services) == ["realm1::lds1"]
+        in_realm = services["realm1::lds1"]
+        assert sorted(in_realm["users"]) == ["Administrator", "alice"]
+        assert in_realm["users"]["alice"]["uid"] == 5001
+        assert in_realm["users"]["alice"]["groups"] == ["staff", "Administrators"]
+        assert sorted(in_realm["groups"]) == ["Administrators", "staff"]
+        assert in_realm["groups"]["staff"]["gid"] == 7001
+        assert in_realm["groups"]["staff"]["members"] == [
+            {"name": "alice", "resource_type": "directory-services/local/users"}
+        ]
 
     @pytest.mark.parametrize(
         "read, what",

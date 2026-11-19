@@ -196,7 +196,8 @@ options:
       - The counters of the C(minimum) subset count what the credentials
         in use can see. For an administrator of the array that includes
         the objects in every realm; an administrator limited to a realm
-        gets the counts of that realm.
+        gets the counts of that realm, which include the array-level
+        objects the array shows it, such as the built-in policies.
       - The C(config) subset reports every directory service under its
         full name in C(directory_services). The directory services of the
         array keep their keys C(management_directory_service),

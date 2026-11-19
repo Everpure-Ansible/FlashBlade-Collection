@@ -207,8 +207,8 @@ options:
     - To amend policy members use the I(everpure.flashblade.purefb_fs) module
     - The file systems of a policy in a realm are named C(realm::filesystem)
       and must be in the realm of the policy. A policy that is not in a realm
-      only takes file systems outside of any realm. Any other file system is
-      refused before the policy is created or changed.
+      only takes file systems outside of any realm. An attempt to add any
+      other file system is refused before the policy is created or changed.
     type: list
     elements: str
   replica_link:
@@ -313,9 +313,9 @@ options:
       keeps its realm, or as C(realm::name) with the realm of I(name). Any
       other realm is refused.
     - If I(name) no longer exists and a policy with the new name does, the
-      rename is taken as already applied. The task fails when neither policy
-      exists, or when I(name) exists and another policy already has the new
-      name.
+      rename is taken as already applied. For NFS, SMB, snapshot and WORM
+      policies the task fails when neither policy exists, or when I(name)
+      exists and another policy already has the new name.
     type: str
     version_added: "1.10.0"
   destroy_snapshots:
@@ -328,7 +328,7 @@ options:
     description:
      - The user or group who is the subject of this rule, and their domain
      - Required to create an SMB share policy, which is created with its
-       first rule.
+       first rule. That rule must allow or deny at least I(read).
     type: str
     version_added: '1.12.0'
   change:
@@ -1505,6 +1505,10 @@ def create_smb_share_policy(module, blade):
     # is created with its first rule, and must not be left behind without one.
     if not module.params["principal"]:
         module.fail_json(msg="principal is required to create a new rule")
+    # The permissions as the array stores them (see _share_rule_perms); the
+    # raw task values can mix allow and deny, which POST rejects. A rule
+    # that grants or denies nothing cannot be created, and fails here.
+    perms = _share_rule_desired(module, {})
     if not module.check_mode:
         if (
             LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
@@ -1551,10 +1555,6 @@ def create_smb_share_policy(module, blade):
                         module.params["name"], get_error_message(res)
                     )
                 )
-        # Send the permissions as the array stores them (see
-        # _share_rule_perms); the raw task values can mix allow and deny,
-        # which POST rejects.
-        perms = _share_rule_desired(module, {})
         rule = SmbSharePolicyRule(
             principal=module.params["principal"],
             **{level: value for level, value in perms.items() if value},
@@ -4788,7 +4788,9 @@ def main():
     else:
         if not HAS_PYPURECLIENT:
             module.fail_json(msg="py-pure-client sdk is required for this module")
-        if state != "copy":
+        if state == "present":
+            # Only an attach can cross a realm boundary. With state=absent a
+            # member of another scope is simply not attached: nothing to do.
             _check_member_realms(module)
         policy, new_policy = _find_policies(
             module, blade.get_policies, "snapshot policy", ctx, renaming

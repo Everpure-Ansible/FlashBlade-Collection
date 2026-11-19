@@ -13,8 +13,9 @@ bugfixes:
     so a refused or missing member no longer leaves an empty policy behind.
   - purefb_policy - SMB share policy rules are changed and deleted by id, which also works for an
     administrator whose access is limited to the realm of the policy.
-  - purefb_policy - a new SMB share or SMB client policy without ``principal`` or ``client`` fails
-    before the policy is created, in check mode too.
+  - purefb_policy - a new SMB share or SMB client policy without ``principal`` or ``client``, and a
+    new SMB share policy whose first rule sets no permission, fail before the policy is created,
+    in check mode too.
   - purefb_policy - a failed access policy create reports the array's reason, a realm on the
     ``name`` of an access policy is refused with a pointer to ``account``, and the "already exists"
     message of a rule copy names the target policy.

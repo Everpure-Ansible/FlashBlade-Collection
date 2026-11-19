@@ -2960,13 +2960,49 @@ class TestSnapMemberRealmsInMain:
         blade.get_policies.assert_not_called()
         create.assert_not_called()
 
-    def test_detach_of_a_member_of_another_scope_is_refused(self):
+    @pytest.mark.parametrize("option", ["filesystem", "replica_link"])
+    @pytest.mark.parametrize(
+        "name,member",
+        [
+            ("rzaudit::snap", "fs1"),
+            ("rzaudit::snap", "other::fs1"),
+            ("snap", "rzaudit::fs1"),
+        ],
+    )
+    def test_absent_with_a_member_of_another_scope_is_not_refused(
+        self, name, member, option
+    ):
+        """Only an attach can cross a realm boundary. A member of another
+        scope cannot be attached to the policy, so state=absent has nothing
+        to detach and nothing to refuse."""
         module, blade, create, failed = self._run(
-            name="rzaudit::snap", state="absent", filesystem=["fs1"]
+            name=name, state="absent", **{option: [member]}
         )
 
-        assert failed
-        assert "same realm" in module.fail_json.call_args[1]["msg"]
+        assert not failed
+        module.fail_json.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+    def test_absent_hands_a_member_of_another_scope_to_the_detach_path(self):
+        """With an existing policy the member list is still reconciled."""
+        module = _main_module(
+            policy_type="snapshot",
+            name="rzaudit::snap",
+            state="absent",
+            filesystem=["fs1"],
+        )
+        blade = _main_blade()
+        blade.get_policies.side_effect = _by_name(
+            {"rzaudit::snap": _sdk_policy("rzaudit::snap", "id-1")}
+        )
+        update = Mock()
+        delete = Mock()
+
+        _run_main(module, blade, update_snap_policy=update, delete_snap_policy=delete)
+
+        module.fail_json.assert_not_called()
+        update.assert_called_once_with(module, blade)
+        delete.assert_not_called()
 
     @pytest.mark.parametrize(
         "name,member",
@@ -3056,6 +3092,26 @@ class TestCreateSnapPolicyMembers:
             create_snap_policy(module, blade)
 
         assert "has no replica link" in module.fail_json.call_args[1]["msg"]
+        blade.post_policies.assert_not_called()
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_destroyed_file_system_fails_before_the_policy_is_created(self, check_mode):
+        """The array answers a read of a destroyed file system that asks
+        for live ones with an error of its own."""
+        module = _snap_create_module(
+            check_mode=check_mode, name="snap", filesystem=["fs1"]
+        )
+        blade = Mock()
+        blade.get_file_systems.return_value = _error_response(
+            "File system has been destroyed."
+        )
+
+        with pytest.raises(SystemExit):
+            create_snap_policy(module, blade)
+
+        blade.get_file_systems.assert_called_once_with(names=["fs1"], destroyed=False)
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "fs1" in msg and "File system has been destroyed." in msg
         blade.post_policies.assert_not_called()
 
     def test_refused_file_system_read_fails_with_the_array_message(self):
@@ -3222,6 +3278,19 @@ class TestSnapPolicyFileSystemMembers:
 
         blade.delete_policies_file_systems.assert_called_once()
         module.exit_json.assert_called_once_with(changed=True)
+
+    def test_namesake_outside_the_realm_is_not_detached(self):
+        """The member of a policy in a realm is realm::filesystem. The same
+        name without the realm is another file system: nothing is detached."""
+        module = _member_module(
+            name="rzaudit::snap", state="absent", filesystem=["fs1"]
+        )
+        blade = _member_blade(file_systems=[_fs_member("rzaudit::fs1")])
+
+        update_snap_policy(module, blade)
+
+        blade.delete_policies_file_systems.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
 
     def test_same_member_twice_is_attached_once(self):
         module = _member_module(name="snap", filesystem=["fs1", "FS1"])
@@ -3475,6 +3544,31 @@ class TestSmbPolicyCreateNeedsItsRule:
         )
         blade.post_smb_share_policies_rules.assert_called_once()
         module.exit_json.assert_called_once_with(changed=True)
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize(
+        "perms",
+        [
+            {},
+            {"read": "", "change": "", "full_control": ""},
+        ],
+    )
+    def test_share_policy_whose_rule_grants_nothing_creates_nothing(
+        self, perms, check_mode
+    ):
+        """A principal without a permission is no rule: the array has no
+        such rule, so the policy is not created for it either."""
+        module = _share_module(name="rzaudit::share_pol", **perms)
+        module.check_mode = check_mode
+        blade = Mock()
+
+        with pytest.raises(SystemExit):
+            create_smb_share_policy(module, blade)
+
+        assert "at least read" in module.fail_json.call_args[1]["msg"]
+        blade.post_smb_share_policies.assert_not_called()
+        blade.post_smb_share_policies_rules.assert_not_called()
+        module.exit_json.assert_not_called()
 
     def test_share_policy_check_mode_with_principal_is_changed(self):
         module = _share_module(name="rzaudit::share_pol", read="allow")

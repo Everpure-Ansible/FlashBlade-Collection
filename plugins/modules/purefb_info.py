@@ -557,7 +557,7 @@ def _guard_reads(module, blade):
 
         return read
 
-    for name in dir(type(blade)):
+    for name in dir(blade.__class__):
         method = getattr(blade, name, None) if name.startswith("get_") else None
         if callable(method):
             setattr(blade, name, guarded(name, method))

@@ -173,7 +173,9 @@ def _array(visible_lds=(), users=(), groups=None, memberships=None):
     visible_lds names the LDSes the caller can read: the array answers "does
     not exist" for any other one, yet it lists the users of every LDS.
     groups is {lds: [group names]} and memberships is {(lds, user): [edges]}.
-    Names are matched without regard to case, as the array matches them.
+    Names are matched without regard to case, as the array matches them. A
+    comma in a name separates names and a blank name is refused, as measured
+    on the array.
     """
     groups = dict((k.lower(), v) for k, v in (groups or {}).items())
     memberships = dict(
@@ -186,26 +188,33 @@ def _array(visible_lds=(), users=(), groups=None, memberships=None):
     def lds_of(kwargs):
         return kwargs["filter"][len("local_directory_service.name='") : -1].lower()
 
+    def asked(names):
+        return [n.lower() for n in names[0].split(",")]
+
     def get_lds(names, **kwargs):
-        found = [n for n in visible_lds if n.lower() == names[0].lower()]
-        if found:
-            return _lds_response(found[0])
+        if not names[0].strip():
+            return _error("Missing or invalid parameter.")
+        found = [n for n in visible_lds if n.lower() in asked(names)]
+        if found and len(found) == len(asked(names)):
+            return _ok([_ref(n) for n in found])
         return _error("Local directory service does not exist.")
 
     def get_users(names, **kwargs):
+        if not names[0].strip():
+            return _error("Missing or invalid parameter.")
         found = [
             u
             for u in users
-            if u.name.lower() == names[0].lower()
+            if u.name.lower() in asked(names)
             and u.local_directory_service.name.lower() == lds_of(kwargs)
         ]
         return _ok(found) if found else _error("Local user was not found.")
 
     def get_groups(names, **kwargs):
+        if not names[0].strip():
+            return _error("Missing or invalid parameter.")
         found = [
-            _ref(g)
-            for g in groups.get(lds_of(kwargs), [])
-            if g.lower() == names[0].lower()
+            _ref(g) for g in groups.get(lds_of(kwargs), []) if g.lower() in asked(names)
         ]
         return _ok(found) if found else _error("Local group was not found.")
 
@@ -2064,3 +2073,244 @@ class TestRenameIdempotency:
 
         assert _writes(blade) == []
         assert module.exit_json.call_args[1]["changed"] is False
+
+
+class TestOneNamePerTask:
+    """The array reads a comma as a separator of names; a task names one object"""
+
+    def _two_users(self):
+        return _array(
+            visible_lds=[REALM_LDS, "myserver_local"],
+            users=[
+                _user("alice", REALM_LDS, "staff"),
+                _user("bob", REALM_LDS, "staff"),
+            ],
+            groups={REALM_LDS: ["staff", "developers"]},
+            memberships={
+                (REALM_LDS, "alice"): [_edge("staff", primary=True)],
+                (REALM_LDS, "bob"): [_edge("staff", primary=True)],
+            },
+        )
+
+    def test_name_with_a_comma_is_refused_before_any_request(self):
+        """Two users are never updated or deleted through one name"""
+        for state in ("present", "absent"):
+            for check_mode in (True, False):
+                blade = self._two_users()
+                module = _run(
+                    _base_params(
+                        name="alice,bob",
+                        state=state,
+                        local_directory_service=REALM_LDS,
+                        primary_group="staff",
+                        email="both@example.com",
+                    ),
+                    blade,
+                    check_mode=check_mode,
+                )
+
+                module.exit_json.assert_not_called()
+                msg = module.fail_json.call_args[1]["msg"]
+                assert "name alice,bob is not valid" in msg
+                assert "comma" in msg
+                assert _writes(blade) == []
+                blade.get_directory_services_local_directory_services.assert_not_called()
+                blade.get_directory_services_local_users.assert_not_called()
+
+    def test_new_name_with_a_comma_is_refused(self):
+        """The users of a list of names are not taken for the renamed user"""
+        for check_mode in (True, False):
+            blade = self._two_users()
+            module = _run(
+                _base_params(
+                    name="carol",
+                    new_name="alice,bob",
+                    local_directory_service=REALM_LDS,
+                    primary_group="staff",
+                    email="both@example.com",
+                    enabled=None,
+                    password=None,
+                ),
+                blade,
+                check_mode=check_mode,
+            )
+
+            module.exit_json.assert_not_called()
+            msg = module.fail_json.call_args[1]["msg"]
+            assert "new_name alice,bob is not valid" in msg
+            assert _writes(blade) == []
+
+    def test_new_name_is_ignored_for_absent(self):
+        """state=absent does not use new_name, so it is not checked either"""
+        blade = self._two_users()
+        module = _run(
+            _base_params(
+                name="alice",
+                new_name="carol,dave",
+                state="absent",
+                local_directory_service=REALM_LDS,
+            ),
+            blade,
+        )
+
+        module.fail_json.assert_not_called()
+        assert _writes(blade) == [USERS_DELETE]
+        deleted = blade.delete_directory_services_local_users.call_args[1]
+        assert deleted["names"] == ["alice"]
+
+    def test_lds_with_a_comma_is_refused(self):
+        """Two LDSes are never addressed through one name"""
+        for state in ("present", "absent"):
+            blade = self._two_users()
+            module = _run(
+                _base_params(
+                    name="carol",
+                    state=state,
+                    local_directory_service=REALM_LDS + ",myserver_local",
+                    primary_group="staff",
+                    enabled=False,
+                    password=None,
+                ),
+                blade,
+            )
+
+            module.exit_json.assert_not_called()
+            msg = module.fail_json.call_args[1]["msg"]
+            assert "local_directory_service" in msg and "is not valid" in msg
+            assert _writes(blade) == []
+            blade.get_directory_services_local_directory_services.assert_not_called()
+
+    def test_group_names_with_a_comma_or_empty_are_refused(self):
+        """A group reference that the array cannot resolve stops both modes"""
+        cases = [
+            (
+                dict(primary_group="staff,developers"),
+                "primary_group staff,developers is not valid",
+            ),
+            (
+                dict(primary_group="staff", groups=["developers,staff"]),
+                "groups developers,staff is not valid",
+            ),
+            (
+                dict(primary_group="staff", groups=["developers", " "]),
+                "groups cannot hold an empty group name",
+            ),
+            (dict(primary_group=""), "primary_group cannot hold an empty group name"),
+        ]
+        for check_mode in (True, False):
+            for overrides, expected in cases:
+                blade = self._two_users()
+                module = _run(
+                    _base_params(
+                        name="alice", local_directory_service=REALM_LDS, **overrides
+                    ),
+                    blade,
+                    check_mode=check_mode,
+                )
+
+                module.exit_json.assert_not_called()
+                assert expected in module.fail_json.call_args[1]["msg"]
+                assert _writes(blade) == []
+
+    def test_blank_name_fails_with_the_arrays_message(self):
+        """The array refuses the lookup of a blank name; that is not "absent" """
+        for state in ("present", "absent"):
+            blade = self._two_users()
+            module = _run(
+                _base_params(
+                    name="",
+                    state=state,
+                    local_directory_service=REALM_LDS,
+                    primary_group="staff",
+                    enabled=False,
+                    password=None,
+                ),
+                blade,
+            )
+
+            module.exit_json.assert_not_called()
+            msg = module.fail_json.call_args[1]["msg"]
+            assert "Failed to read local user" in msg
+            assert "Missing or invalid parameter." in msg
+            assert _writes(blade) == []
+
+    def test_built_in_user_is_not_taken_for_the_renamed_user(self):
+        """No rename ends in a built-in user, so the task does not continue with it"""
+        for check_mode in (True, False):
+            blade = _array(
+                visible_lds=[REALM_LDS],
+                users=[
+                    _user(
+                        "Administrator",
+                        REALM_LDS,
+                        "Administrators",
+                        built_in=True,
+                        enabled=True,
+                    )
+                ],
+                groups={REALM_LDS: ["Administrators", "developers"]},
+                memberships={
+                    (REALM_LDS, "Administrator"): [
+                        _edge("Administrators", primary=True)
+                    ]
+                },
+            )
+            module = _run(
+                _base_params(
+                    name="carol",
+                    new_name="Administrator",
+                    local_directory_service=REALM_LDS,
+                    primary_group="Administrators",
+                    groups=["developers"],
+                    enabled=None,
+                    password=None,
+                ),
+                blade,
+                check_mode=check_mode,
+            )
+
+            module.exit_json.assert_not_called()
+            msg = module.fail_json.call_args[1]["msg"]
+            assert "carol does not exist and Administrator is a built-in user" in msg
+            assert _writes(blade) == []
+
+    @patch(MODULE + "get_error_message", side_effect=_message)
+    def test_get_user_never_picks_one_of_several(self, mock_message):
+        """An answer that holds more than one user is not narrowed to the first"""
+        module = Mock()
+        module.params = {"name": "alice", "context": ""}
+        module.fail_json = Mock(side_effect=SystemExit)
+        blade = Mock()
+        blade.get_directory_services_local_users.return_value = _ok(
+            [_user("alice", REALM_LDS, "staff"), _user("bob", REALM_LDS, "staff")]
+        )
+
+        try:
+            _get_user(module, blade, REALM_LDS)
+        except SystemExit:
+            pass
+
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "matches 2 local users" in msg
+        assert REALM_LDS in msg
+
+    def test_absent_in_an_lds_the_array_does_not_show_says_why(self):
+        """The unchanged delete names the realm form of the LDS name"""
+        for check_mode in (True, False):
+            blade = self._two_users()
+            module = _run(
+                _base_params(
+                    name="alice",
+                    state="absent",
+                    local_directory_service="nolds",
+                ),
+                blade,
+                check_mode=check_mode,
+            )
+
+            module.fail_json.assert_not_called()
+            result = module.exit_json.call_args[1]
+            assert result["changed"] is False
+            assert "nolds does not exist or cannot be managed" in result["msg"]
+            assert "realm::name" in result["msg"]
+            assert _writes(blade) == []

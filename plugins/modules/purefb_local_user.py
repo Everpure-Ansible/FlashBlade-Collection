@@ -38,6 +38,10 @@ options:
     - Name of the local user inside the LDS.
     - The name never takes a realm prefix; the realm is part of
       I(local_directory_service).
+    - A task manages one user. A name that contains a comma is refused,
+      because the array reads a comma as the separator of a list of names.
+      The same holds for I(local_directory_service), I(new_name),
+      I(primary_group) and I(groups).
     type: str
     required: true
   state:
@@ -64,7 +68,8 @@ options:
     - Rejected for built-in users.
     - Idempotent when I(name) no longer exists and a user named I(new_name)
       exists in the same LDS; the module then continues with that user. It
-      fails without changing anything when both names exist.
+      fails without changing anything when both names exist, or when I(name)
+      does not exist and I(new_name) is a built-in user.
     - The array matches user names without regard to case and does not
       rename a user to another spelling of its own name; such a request
       changes nothing.
@@ -261,6 +266,37 @@ def _lds_filter(local_ds_name, extra=None):
     return expr
 
 
+def _check_names(module):
+    """Fail, before any request, on a name that is not the name of one object.
+
+    The array reads a comma as the separator of a list of names: a lookup of
+    such a name answers with several objects, and a PATCH or a DELETE of it
+    addresses each of them. A group name that is empty cannot be looked up.
+    The refusals apply to every state and in check mode as well.
+    """
+    names = [
+        ("local_directory_service", module.params["local_directory_service"]),
+        ("name", module.params["name"]),
+    ]
+    groups = []
+    if module.params["state"] == "present":
+        names.append(("new_name", module.params["new_name"]))
+        groups.append(("primary_group", module.params["primary_group"]))
+        groups.extend(("groups", group) for group in module.params["groups"] or [])
+    for option, value in names + groups:
+        if value and "," in value:
+            module.fail_json(
+                msg=(
+                    "{0} {1} is not valid: the array reads a comma as the "
+                    "separator of a list of names, so this would address "
+                    "more than one object. Give one name."
+                ).format(option, value)
+            )
+    for option, value in groups:
+        if value is not None and not str(value).strip():
+            module.fail_json(msg="{0} cannot hold an empty group name".format(option))
+
+
 def _is_absent(res):
     """True when the array's answer to a read says that the object is not there.
 
@@ -304,6 +340,14 @@ def _get_user(module, blade, local_ds_name, name=None):
     )
     if res.status_code == 200:
         items = list(res.items)
+        if len(items) > 1:
+            # The task works on one user; never pick one of several.
+            module.fail_json(
+                msg=(
+                    "{0} matches {1} local users of local directory service "
+                    "{2}. Give the name of one user."
+                ).format(name, len(items), local_ds_name)
+            )
         return items[0] if items else None
     if _is_absent(res):
         return None
@@ -724,6 +768,7 @@ def main():
 
     local_ds_name = module.params["local_directory_service"]
     state = module.params["state"]
+    _check_names(module)
     local_ds = _get_local_ds(module, blade, local_ds_name)
     user = _get_user(module, blade, local_ds_name)
 
@@ -732,7 +777,15 @@ def main():
         # caller, so the task stops here, in check mode too. Only a delete of
         # a user the array does not list either has nothing left to do.
         if state == "absent" and not user:
-            module.exit_json(changed=False)
+            module.exit_json(
+                changed=False,
+                msg=(
+                    "Local directory service {0} does not exist or cannot be "
+                    "managed by this user, so it has no local user {1} to "
+                    "delete. A local directory service in a realm is "
+                    "addressed as realm::name."
+                ).format(local_ds_name, module.params["name"]),
+            )
         module.fail_json(
             msg=(
                 "Local directory service {0} does not exist or cannot be "
@@ -745,6 +798,15 @@ def main():
     if state == "present" and not user and new_name:
         renamed = _get_user(module, blade, local_ds_name, new_name)
         if renamed:
+            if getattr(renamed, "built_in", False):
+                # A rename never ends in a built-in user, so this one is not
+                # the user of the task.
+                module.fail_json(
+                    msg=(
+                        "Cannot rename local user {0} to {1}: {0} does not "
+                        "exist and {1} is a built-in user"
+                    ).format(module.params["name"], new_name)
+                )
             # Already renamed: continue with the user that carries new_name.
             user = renamed
             module.params["name"] = new_name

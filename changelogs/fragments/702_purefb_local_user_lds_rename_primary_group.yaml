@@ -10,3 +10,6 @@ bugfixes:
   - purefb_local_user - user and group names are compared without regard to case, as the array
     matches them, and a group the local directory service does not have stops the task before
     anything is written, in check mode too.
+  - purefb_local_user - a name that holds a comma is refused before any request. The array reads
+    a comma as the separator of a list of names, so such a task addressed more than one user or
+    local directory service. An empty group name is refused as well, in check mode too.

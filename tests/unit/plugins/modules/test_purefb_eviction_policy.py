@@ -8,6 +8,7 @@ from __future__ import absolute_import, division, print_function
 __metaclass__ = type
 
 import sys
+import itertools
 import multiprocessing
 import ctypes
 from unittest.mock import Mock, patch, MagicMock
@@ -119,8 +120,13 @@ def _response(status_code=200, items=None):
     return res
 
 
+_POLICY_IDS = itertools.count(1)
+
+
 def _policy(name="edge_cache", enabled=True, keep_size=100 * GIB):
-    policy = Mock(spec=["name", "enabled", "keep_size", "is_local", "realms"])
+    policy = Mock(spec=["id", "name", "enabled", "keep_size", "is_local", "realms"])
+    # Every policy has its own id, whatever it is called.
+    policy.id = "policy-{0}".format(next(_POLICY_IDS))
     policy.name = name
     policy.enabled = enabled
     policy.keep_size = keep_size
@@ -149,11 +155,13 @@ def _policies_by_name(existing, missing_status=200):
 
     C(missing_status) is the status of a lookup that matches nothing: 200
     is an empty list, 400 is the array's own answer for a name that does
-    not exist.
+    not exist. Names are matched without regard to case, as the array
+    matches them, and come back as the policy carries them.
     """
 
     def _get(names=None, **kwargs):
-        items = [p for p in existing if p.name in (names or [])]
+        wanted = [name.lower() for name in names or []]
+        items = [p for p in existing if p.name.lower() in wanted]
         if not items and missing_status != 200:
             return _response(status_code=missing_status)
         return _response(items=items)
@@ -987,7 +995,7 @@ class TestPurefbEvictionPolicyRealms:
 
     def test_main_rename_refused_by_the_array_is_relayed(self):
         """The array's refusal of a new name is relayed with its message"""
-        blade = _realm_blade([_policy(name=REALM_POLICY), _policy(name="site_b")])
+        blade = _blade([_policy(name=REALM_POLICY), _policy(name="site_b")])
         blade.patch_data_eviction_policies.return_value = _response(status_code=400)
         module, _post_model, patch_model = _run_main(
             _base_params(name=REALM_POLICY, rename="site_b"),
@@ -1144,7 +1152,12 @@ class TestPurefbEvictionPolicyRealms:
         assert module.exit_json.call_args[1]["changed"] is True
 
     def test_main_realm_in_another_case_is_not_refused(self):
-        """A realm spelled in another case is the same realm and goes to the array"""
+        """A realm spelled in another case is the same realm
+
+        The new name is sent with the realm as name spells it: the array
+        refuses a new name whose realm is spelled in another way than the
+        name the policy is addressed by.
+        """
         blade = _realm_blade([_policy(name=REALM_POLICY)])
         module, _post_model, patch_model = _run_realm(
             _base_params(
@@ -1158,25 +1171,25 @@ class TestPurefbEvictionPolicyRealms:
         blade.post_data_eviction_policies_file_systems.assert_called_once_with(
             policy_names=[REALM_POLICY], member_names=["Tenant1::fs_a"]
         )
-        patch_model.assert_called_once_with(name="TENANT1::site_b")
+        patch_model.assert_called_once_with(name="tenant1::site_b")
         assert blade.patch_data_eviction_policies.call_args[1]["names"] == [
             REALM_POLICY
         ]
         assert module.exit_json.call_args[1]["changed"] is True
 
     def test_main_fallback_with_the_realm_in_another_case(self):
-        """An already-applied rename is looked up under the new name as given"""
-        blade = _realm_blade([_policy(name="TENANT1::site_b")])
+        """An already-applied rename is found whatever the case of the realm"""
+        blade = _realm_blade([_policy(name="tenant1::site_b")])
         module, _post_model, patch_model = _run_realm(
             _base_params(name="tenant1::gone", rename="TENANT1::site_b"), blade
         )
-        assert _lookups(blade)[:2] == [["tenant1::gone"], ["TENANT1::site_b"]]
+        assert _lookups(blade)[:2] == [["tenant1::gone"], ["tenant1::site_b"]]
         module.fail_json.assert_not_called()
         patch_model.assert_not_called()
         blade.patch_data_eviction_policies.assert_not_called()
         result = module.exit_json.call_args[1]
         assert result["changed"] is False
-        assert result["policy"]["name"] == "TENANT1::site_b"
+        assert result["policy"]["name"] == "tenant1::site_b"
 
     # ---------------- array-level policies are unchanged ----------------
 
@@ -1401,5 +1414,206 @@ class TestPurefbEvictionPolicyRealms:
         )
         blade.delete_data_eviction_policies.assert_called_once_with(
             names=[REALM_POLICY]
+        )
+        assert module.exit_json.call_args[1]["changed"] is True
+
+
+class TestPurefbEvictionPolicyNames:
+    """New names that are taken, and names given in another case"""
+
+    # ---------------- the new name is taken ----------------
+
+    def test_main_rename_to_a_name_another_realm_policy_has_is_refused(self):
+        """A new name another policy of the realm has fails before any write"""
+        for check_mode in (False, True):
+            blade = _realm_blade(
+                [_policy(name=REALM_POLICY), _policy(name="tenant1::site_b")]
+            )
+            module, _post_model, patch_model = _run_realm(
+                _base_params(
+                    name=REALM_POLICY,
+                    rename="site_b",
+                    keep_size="200G",
+                    file_systems=["tenant1::fs_a"],
+                ),
+                blade,
+                check_mode=check_mode,
+            )
+            module.fail_json.assert_called_once()
+            msg = module.fail_json.call_args[1]["msg"]
+            assert (
+                "Cannot rename data eviction policy tenant1::edge_cache to "
+                "tenant1::site_b"
+            ) in msg
+            assert "a data eviction policy named tenant1::site_b already exists" in msg
+            module.exit_json.assert_not_called()
+            assert _lookups(blade) == [[REALM_POLICY], ["tenant1::site_b"]]
+            patch_model.assert_not_called()
+            blade.patch_data_eviction_policies.assert_not_called()
+            blade.get_data_eviction_policies_file_systems.assert_not_called()
+            blade.post_data_eviction_policies_file_systems.assert_not_called()
+
+    def test_main_array_level_rename_to_a_taken_name_is_refused(self):
+        """A new name another array-level policy has fails before any write"""
+        for check_mode in (False, True):
+            blade = _realm_blade([_policy(), _policy(name="site_b")])
+            module, _post_model, patch_model = _run_realm(
+                _base_params(rename="site_b", enabled=False),
+                blade,
+                check_mode=check_mode,
+            )
+            module.fail_json.assert_called_once()
+            msg = module.fail_json.call_args[1]["msg"]
+            assert "Cannot rename data eviction policy edge_cache to site_b" in msg
+            assert "already exists" in msg
+            module.exit_json.assert_not_called()
+            assert _lookups(blade) == [["edge_cache"], ["site_b"]]
+            patch_model.assert_not_called()
+            blade.patch_data_eviction_policies.assert_not_called()
+
+    def test_main_rename_to_a_leaf_only_the_other_scope_has_is_sent(self):
+        """A policy of the other scope with the new leaf name does not block"""
+        old = _policy()
+        twin = _policy(name="tenant1::site_b")
+        blade = _realm_blade([old, twin])
+        blade.patch_data_eviction_policies.side_effect = _swap_policies(
+            blade, [_policy(name="site_b"), twin], missing_status=400
+        )
+        module, _post_model, patch_model = _run_realm(
+            _base_params(rename="site_b"), blade
+        )
+        module.fail_json.assert_not_called()
+        assert ["tenant1::site_b"] not in _lookups(blade)
+        patch_model.assert_called_once_with(name="site_b")
+        result = module.exit_json.call_args[1]
+        assert result["changed"] is True
+        assert result["policy"]["name"] == "site_b"
+
+    def test_main_rename_that_only_changes_the_case_is_sent_once(self):
+        """The policy itself under the new name is not a taken name"""
+        old = _policy(name=REALM_POLICY)
+        blade = _realm_blade([old])
+        blade.patch_data_eviction_policies.side_effect = _swap_policies(
+            blade, [_policy(name="tenant1::EDGE_CACHE")], missing_status=400
+        )
+        params = dict(name=REALM_POLICY, rename="tenant1::EDGE_CACHE")
+        module, _post_model, patch_model = _run_realm(_base_params(**params), blade)
+        module.fail_json.assert_not_called()
+        patch_model.assert_called_once_with(name="tenant1::EDGE_CACHE")
+        result = module.exit_json.call_args[1]
+        assert result["changed"] is True
+        assert result["policy"]["name"] == "tenant1::EDGE_CACHE"
+
+        # the same task again: the old name still finds the policy
+        blade.patch_data_eviction_policies.reset_mock()
+        module, _post_model, patch_model = _run_realm(_base_params(**params), blade)
+        patch_model.assert_not_called()
+        blade.patch_data_eviction_policies.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    # ---------------- the realm in another case ----------------
+
+    def test_main_name_with_the_realm_in_another_case_renames_once(self):
+        """The new name carries the realm as name spells it, and only once"""
+        blade = _realm_blade([_policy(name=REALM_POLICY)])
+        blade.patch_data_eviction_policies.side_effect = _swap_policies(
+            blade, [_policy(name="tenant1::site_b")], missing_status=400
+        )
+        params = dict(name="TENANT1::edge_cache", rename="site_b")
+        module, _post_model, patch_model = _run_realm(_base_params(**params), blade)
+        patch_model.assert_called_once_with(name="TENANT1::site_b")
+        assert blade.patch_data_eviction_policies.call_args[1]["names"] == [
+            "TENANT1::edge_cache"
+        ]
+        result = module.exit_json.call_args[1]
+        assert result["changed"] is True
+        assert result["policy"]["name"] == "tenant1::site_b"
+
+        # the same task again: found under the new name, nothing is sent
+        blade.patch_data_eviction_policies.reset_mock()
+        for check_mode in (False, True):
+            module, _post_model, patch_model = _run_realm(
+                _base_params(**params), blade, check_mode=check_mode
+            )
+            module.fail_json.assert_not_called()
+            patch_model.assert_not_called()
+            blade.patch_data_eviction_policies.assert_not_called()
+            result = module.exit_json.call_args[1]
+            assert result["changed"] is False
+            assert result["policy"]["name"] == "tenant1::site_b"
+
+    def test_main_new_name_with_only_the_realm_in_another_case_is_a_noop(self):
+        """The name the policy has, with the realm in another case, is no rename"""
+        for check_mode in (False, True):
+            blade = _realm_blade([_policy(name="tenant1::site_b")])
+            module, _post_model, patch_model = _run_realm(
+                _base_params(name="tenant1::site_b", rename="TENANT1::site_b"),
+                blade,
+                check_mode=check_mode,
+            )
+            module.fail_json.assert_not_called()
+            patch_model.assert_not_called()
+            blade.patch_data_eviction_policies.assert_not_called()
+            assert _lookups(blade)[0] == ["tenant1::site_b"]
+            assert module.exit_json.call_args[1]["changed"] is False
+
+    def test_main_realm_policy_reported_under_its_bare_name_is_not_renamed(self):
+        """Only the part after the realm decides whether a rename is needed"""
+        bare = _policy(name="site_b")
+
+        def _get(names=None, **kwargs):
+            if names == ["tenant1::site_b"]:
+                return _response(items=[bare])
+            return _response(status_code=400)
+
+        blade = _realm_blade()
+        blade.get_data_eviction_policies.side_effect = _get
+        module, _post_model, patch_model = _run_realm(
+            _base_params(name="tenant1::gone", rename="site_b"), blade
+        )
+        module.fail_json.assert_not_called()
+        patch_model.assert_not_called()
+        blade.patch_data_eviction_policies.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    # ---------------- file systems in another case ----------------
+
+    def test_main_file_system_in_another_case_is_the_attached_one(self):
+        """A member listed in another case is neither attached nor detached"""
+        cases = (
+            (REALM_POLICY, "tenant1::fs_a", "TENANT1::FS_A"),
+            ("edge_cache", "fs_a", "FS_A"),
+        )
+        for name, attached, listed in cases:
+            for check_mode in (False, True):
+                blade = _realm_blade(
+                    [_policy(name=name)], members=[_member(name, attached)]
+                )
+                module, _post_model, _patch_model = _run_realm(
+                    _base_params(name=name, file_systems=[listed]),
+                    blade,
+                    check_mode=check_mode,
+                )
+                module.fail_json.assert_not_called()
+                blade.post_data_eviction_policies_file_systems.assert_not_called()
+                blade.delete_data_eviction_policies_file_systems.assert_not_called()
+                result = module.exit_json.call_args[1]
+                assert result["changed"] is False
+                assert result["policy"]["file_systems"] == [attached]
+
+    def test_main_reconcile_matches_members_without_case(self):
+        """Only members missing or surplus whatever their case are written"""
+        blade = _realm_blade(
+            [_policy()],
+            members=[_member("edge_cache", "fs_a"), _member("edge_cache", "fs_b")],
+        )
+        module, _post_model, _patch_model = _run_realm(
+            _base_params(file_systems=["FS_A", "fs_c"]), blade
+        )
+        blade.post_data_eviction_policies_file_systems.assert_called_once_with(
+            policy_names=["edge_cache"], member_names=["fs_c"]
+        )
+        blade.delete_data_eviction_policies_file_systems.assert_called_once_with(
+            policy_names=["edge_cache"], member_names=["fs_b"]
         )
         assert module.exit_json.call_args[1]["changed"] is True

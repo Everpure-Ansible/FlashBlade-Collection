@@ -81,6 +81,7 @@ from plugins.modules.purefb_legal_hold import (
     _hold_dict,
     _entity_dict,
     _realm_of,
+    _same_name,
     _same_scope,
 )
 
@@ -1230,6 +1231,13 @@ LONG_LEAF = "h" * 63
 REALM_HOLD = "realm1::case-42"
 REALM_FS = "realm1::evidence"
 SCOPE_MSG = "must be in the same realm, or both outside a realm"
+# (hold as given, file system as given, file system as the array reports it)
+CASE_PAIRS = [
+    ("case-42", "EVIDENCE", "evidence"),
+    (REALM_HOLD, "REALM1::evidence", REALM_FS),
+    (REALM_HOLD, "realm1::Evidence", REALM_FS),
+    ("REALM1::CASE-42", REALM_FS, REALM_FS),
+]
 
 
 def _realm(name="realm1", destroyed=False):
@@ -1299,8 +1307,37 @@ class TestPurefbLegalHoldRealmHelpers:
         assert _same_scope("realm1::case-42", "realm2::evidence") is False
 
     def test_same_scope_ignores_the_case_of_the_realm(self):
-        # never refuse a pair the array may treat as one realm
+        # the array ignores the case of realm names
         assert _same_scope("REALM1::case-42", "realm1::evidence") is True
+
+    def test_same_name_ignores_case(self):
+        assert _same_name("evidence", "EVIDENCE") is True
+        assert _same_name("realm1::evidence", "REALM1::Evidence") is True
+        assert _same_name("evidence", "evidence2") is False
+        assert _same_name(None, "evidence") is False
+
+    def test_get_entity_ignores_the_case_of_the_file_system(self):
+        # the array reports the file system as it was created, whatever
+        # the case of the name in the request
+        module = Mock()
+        module.params = _base_params(
+            name=REALM_HOLD, file_system="REALM1::Evidence", path="/case-42"
+        )
+        wanted = _entity(file_system=REALM_FS, path="/case-42")
+        blade = Mock()
+        blade.get_legal_holds_held_entities.return_value = _response(200, [wanted])
+
+        assert _get_entity(module, blade) is wanted
+
+    def test_get_entity_keeps_namesakes_apart(self):
+        # same file system name outside the realm and inside it
+        module = Mock()
+        module.params = _base_params(file_system="evidence", path="/case-42")
+        namesake = _entity(file_system=REALM_FS, path="/case-42")
+        blade = Mock()
+        blade.get_legal_holds_held_entities.return_value = _response(200, [namesake])
+
+        assert _get_entity(module, blade) is None
 
     def test_check_realm_passes_for_a_live_realm(self):
         module, blade = _check_realm_with(REALM_HOLD, _response(200, [_realm()]))
@@ -1388,6 +1425,33 @@ class TestPurefbLegalHoldRealmMain:
         assert "63 characters" in msg
         assert "realm prefix" in msg
         get_system.assert_not_called()
+
+    def test_empty_leaf_name_refused(self):
+        # the array takes realm1:: for a hold named after the realm
+        for name in ("", "realm1::", "::"):
+            for check_mode in (False, True):
+                blade = _blade(hold=None)
+
+                module, get_system = _run_main(
+                    _base_params(name=name), blade, check_mode=check_mode
+                )
+
+                module.fail_json.assert_called_once()
+                msg = module.fail_json.call_args[1]["msg"]
+                assert "1 to 63 characters" in msg
+                assert "realm prefix" in msg
+                module.exit_json.assert_not_called()
+                get_system.assert_not_called()
+                blade.post_legal_holds.assert_not_called()
+
+    def test_one_character_leaf_name_is_sent(self):
+        for name in ("h", "realm1::h"):
+            blade = _blade(hold=None)
+
+            module, get_system = _run_main(_base_params(name=name), blade)
+
+            module.fail_json.assert_not_called()
+            assert blade.post_legal_holds.call_args[1]["names"] == [name]
 
     def test_array_level_name_of_63_characters_is_sent(self):
         blade = _blade(hold=None)
@@ -1492,6 +1556,84 @@ class TestPurefbLegalHoldRealmMain:
             recursive=False,
         )
         assert module.exit_json.call_args[1]["changed"] is True
+
+    # ---------------- names in another case than the array reports ----------------
+
+    def test_apply_is_idempotent_whatever_the_case_of_the_names(self):
+        for name, given, stored in CASE_PAIRS:
+            for check_mode in (False, True):
+                blade = _blade(
+                    hold=_hold(name=name.lower()),
+                    entities=[_entity(file_system=stored, path="/case-42")],
+                )
+
+                module, get_system = _run_main(
+                    _base_params(name=name, file_system=given, path="/case-42"),
+                    blade,
+                    check_mode=check_mode,
+                )
+
+                module.fail_json.assert_not_called()
+                blade.post_legal_holds_held_entities.assert_not_called()
+                result = module.exit_json.call_args[1]
+                assert result["changed"] is False
+                assert result["held_entities"][0]["file_system"] == stored
+
+    def test_release_finds_the_path_whatever_the_case_of_the_names(self):
+        for name, given, stored in CASE_PAIRS:
+            for how in ({"release": True}, {"state": "absent"}):
+                blade = _blade(
+                    hold=_hold(name=name.lower()),
+                    entities=[_entity(file_system=stored, path="/case-42")],
+                )
+
+                module, get_system = _run_main(
+                    _base_params(name=name, file_system=given, path="/case-42", **how),
+                    blade,
+                )
+
+                module.fail_json.assert_not_called()
+                blade.patch_legal_holds_held_entities.assert_called_once_with(
+                    names=[name],
+                    file_system_names=[given],
+                    paths=["/case-42"],
+                    released=True,
+                    recursive=False,
+                )
+                assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_check_mode_release_whatever_the_case_of_the_names(self):
+        for name, given, stored in CASE_PAIRS:
+            blade = _blade(
+                hold=_hold(name=name.lower()),
+                entities=[_entity(file_system=stored, path="/case-42")],
+            )
+
+            module, get_system = _run_main(
+                _base_params(
+                    name=name, file_system=given, path="/case-42", release=True
+                ),
+                blade,
+                check_mode=True,
+            )
+
+            module.fail_json.assert_not_called()
+            blade.patch_legal_holds_held_entities.assert_not_called()
+            assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_the_case_of_the_path_still_matters(self):
+        blade = _blade(
+            hold=_hold(), entities=[_entity(file_system="evidence", path="/Case-42")]
+        )
+
+        module, get_system = _run_main(
+            _base_params(file_system="evidence", path="/case-42", release=True),
+            blade,
+        )
+
+        module.fail_json.assert_not_called()
+        blade.patch_legal_holds_held_entities.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
 
     # ---------------- hold and file system in different scopes ----------------
 

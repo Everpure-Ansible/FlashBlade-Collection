@@ -36,13 +36,15 @@ description:
   to a file system in the same realm, and a legal hold outside a realm only
   to a file system outside a realm. Realms require FlashBlade REST API
   version 2.19 or later.
+- The array ignores the case of legal hold, file system and realm names,
+  and so does the module.
 - Requires FlashBlade REST API version 2.17 or later (Purity//FB 4.5.6+).
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
   name:
     description:
-    - Name of the legal hold. Maximum 63 characters.
+    - Name of the legal hold, 1 to 63 characters.
     - To manage a legal hold in a realm use C(realm::name). The realm prefix
       does not count towards the 63 characters.
     type: str
@@ -227,17 +229,22 @@ def _leaf_name(name):
     return name.rsplit("::", 1)[-1]
 
 
-def _same_scope(name, file_system):
-    """True when both names are in the same realm, or both outside a realm.
+def _same_name(first, second):
+    """True when the array takes both names for the same object.
 
-    Realm names are compared without regard to case, so a pair the array
-    may treat as one realm is never refused here.
+    The array ignores the case of names and reports each one as it was
+    created.
     """
+    return (first or "").lower() == (second or "").lower()
+
+
+def _same_scope(name, file_system):
+    """True when both names are in the same realm, or both outside a realm."""
     realm = _realm_of(name)
     fs_realm = _realm_of(file_system)
     if realm is None or fs_realm is None:
         return realm is fs_realm
-    return realm.lower() == fs_realm.lower()
+    return _same_name(realm, fs_realm)
 
 
 def _scope_text(name):
@@ -302,12 +309,16 @@ def _get_held_entities(module, blade, file_system=None, path=None):
 
 
 def _get_entity(module, blade):
-    """Return the held entity for the requested file_system/path, or None."""
+    """Return the held entity for the requested file_system/path, or None.
+
+    The array reports the file system under the name it was created with,
+    whatever the case of the name in the request.
+    """
     file_system = module.params["file_system"]
     path = module.params["path"]
     for entity in _get_held_entities(module, blade, file_system, path):
         fs_name = getattr(getattr(entity, "file_system", None), "name", None)
-        if fs_name == file_system and _norm_path(
+        if _same_name(fs_name, file_system) and _norm_path(
             getattr(entity, "path", None)
         ) == _norm_path(path):
             return entity
@@ -546,10 +557,10 @@ def main():
         module.fail_json(msg="py-pure-client sdk is required for this module")
 
     name = module.params["name"]
-    if len(_leaf_name(name)) > MAX_NAME_LENGTH:
+    if not 1 <= len(_leaf_name(name)) <= MAX_NAME_LENGTH:
         module.fail_json(
             msg=(
-                "Legal hold name must be {0} characters or fewer, not counting "
+                "Legal hold name must be 1 to {0} characters, not counting "
                 "a realm prefix"
             ).format(MAX_NAME_LENGTH)
         )

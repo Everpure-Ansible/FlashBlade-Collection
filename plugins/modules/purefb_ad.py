@@ -23,12 +23,21 @@ description:
 - Add or delete FlashBlade Active Directory Account
 - FlashBlade allows the creation of one AD computer account, or joining of an
   existing AD computer account.
+- An account belongs to a server. An account of the default server
+  C(_array_server) has a plain name, an account of any other server is named
+  C(server::account), and an account of a server in a realm is named
+  C(realm::server::account).
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
   name:
     description:
     - Name of the AD account
+    - Either the plain account name, with I(server) naming the server when it
+      is not the default one, or the full name C(server::account) or
+      C(realm::server::account).
+    - A realm-scoped administrator must use the realm-qualified name; a bare
+      name is not placed in, or resolved to, the administrator's realm.
     type: str
     required: true
   existing:
@@ -41,6 +50,7 @@ options:
     - Define whether the AD sccount is deleted or not
     - Test state will perform a test against the suppied account name
     - Rotate will force a keytab rotation for the specified account
+    - C(test) and C(rotate) fail when the account does not exist
     - With I(ca_certificate) or I(ca_certificate_group), C(test) runs the tests
       using that CA in place of the configured one and leaves the stored
       configuration unchanged
@@ -50,19 +60,23 @@ options:
   computer:
     description:
     -  The common name of the computer account to be created in the Active Directory domain.
-    - If not specified, defaults to the name of the Active Directory configuration.
+    - If not specified, defaults to the account part of I(name), without the
+      server and realm it may carry, with underscores replaced by hyphens.
     type: str
   domain:
     description:
     - The Active Directory domain to join
+    - Required to create the account.
     type: str
   username:
     description:
     - A user capable of creating a computer account within the domain
+    - Required to create the account.
     type: str
   password:
     description:
     - Password string for I(username)
+    - Required to create the account.
     type: str
   encryption:
     description:
@@ -129,6 +143,9 @@ options:
     description:
     - Name of the local array server into which the AD account is added
     - Do not provide if the AD account is to connect to the default server
+    - A server in a realm is named C(realm::server).
+    - The module addresses the account as C(server::name). When I(name)
+      already is a full name, its server must be the one given here.
     version_added: "1.23.0"
     type: str
   local_only:
@@ -197,6 +214,24 @@ EXAMPLES = r"""
       - "HOST/vip2.flashblade.acme.com"
     global_catalog_servers:
       - gc1.flashblade.acme.com
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Create new AD account for a server in a realm
+  everpure.flashblade.purefb_ad:
+    name: realm1::server1::ad_account
+    computer: FLASHBLADE-R1
+    domain: acme.com
+    username: Administrator
+    password: Password
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Test the AD account of a server in a realm
+  everpure.flashblade.purefb_ad:
+    name: ad_account
+    server: realm1::server1
+    state: test
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
@@ -294,7 +329,7 @@ test_response:
   - Result of each test the array ran against the servers of the account.
   - With I(ca_certificate) or I(ca_certificate_group) the tests used that CA
     in place of the configured one.
-  returned: when C(state=test) and the account exists
+  returned: when C(state=test)
   type: list
   elements: dict
   contains:
@@ -377,6 +412,104 @@ REFERENCE_PARAMS = {
     "ca_certificate_group": "ca_certificate_group",
 }
 
+# An account of this server has a plain name; an account of any other server
+# is named server::account, or realm::server::account for a server in a realm.
+DEFAULT_SERVER = "_array_server"
+JOIN_PARAMS = ("domain", "username", "password")
+
+
+def _server_of(name):
+    """Server an account name places the account on, or "" for the default."""
+    return name.rpartition("::")[0]
+
+
+def _leaf(name):
+    """Account part of an account name, without its server and realm."""
+    return name.rpartition("::")[2]
+
+
+def _account_name(module, api_version):
+    """Full name of the account the task addresses.
+
+    The server option goes in front of a plain name with the :: separator.
+    A name that already carries a server has to agree with the option, and
+    the default server adds nothing. Names are compared without regard to
+    case, as the array does. Servers need REST 2.16; before that the option
+    is not used.
+    """
+    name = module.params["name"]
+    server = module.params["server"]
+    if not server or LooseVersion(SERVERS_API_VERSION) > LooseVersion(api_version):
+        return name
+    named_server = _server_of(name)
+    if named_server:
+        if named_server.lower() != server.lower():
+            module.fail_json(
+                msg=(
+                    "Active Directory Account {0} is named for server {1}, "
+                    "but server is {2}. Give the server once, or the same "
+                    "server in both."
+                ).format(name, named_server, server)
+            )
+        return name
+    if server.lower() == DEFAULT_SERVER:
+        return name
+    return "{0}::{1}".format(server, name)
+
+
+def _get_account(module, blade, name):
+    """Return the account called name, or None when it does not exist.
+
+    Only the array's "does not exist" answer reads as absent. Any other
+    failed read fails the task, so that a refused or failed lookup is never
+    followed by an attempt to join the domain again.
+    """
+    res = blade.get_active_directory(names=[name])
+    if res.status_code == 200:
+        items = list(res.items)
+        return items[0] if items else None
+    error = get_error_message(res)
+    if "does not exist" in str(error).lower():
+        return None
+    module.fail_json(
+        msg="Failed to read Active Directory Account {0}. Error: {1}".format(
+            name, error
+        )
+    )
+
+
+def _check_server(module, blade):
+    """Fail unless the server a new account is to belong to exists.
+
+    The server is the one the full name carries, or the default server when
+    the task names it in the server option. A plain name on its own is not
+    checked.
+    """
+    server = _server_of(module.params["name"]) or module.params["server"]
+    if not server:
+        return
+    res = blade.get_servers(names=[server])
+    if res.status_code == 200:
+        return
+    error = get_error_message(res)
+    if "does not exist" in str(error).lower():
+        module.fail_json(
+            msg="Server {0} does not exist on this FlashBlade.".format(server)
+        )
+    module.fail_json(msg="Failed to read server {0}. Error: {1}".format(server, error))
+
+
+def _check_join_params(module):
+    """Fail when an account is to be created without what a join needs."""
+    missing = [param for param in JOIN_PARAMS if not module.params[param]]
+    if missing:
+        module.fail_json(
+            msg=(
+                "Active Directory Account {0} does not exist. Creating it "
+                "requires {1}."
+            ).format(module.params["name"], ", ".join(missing))
+        )
+
 
 def _reference_name(obj, field):
     """Name held by a reference field on an AD configuration, or None."""
@@ -420,7 +553,9 @@ def delete_account(module, blade):
         )
         if res.status_code != 200:
             module.fail_json(
-                msg="Failed to delete AD Account {0}".format(module.params["name"])
+                msg="Failed to delete AD Account {0}. Error: {1}".format(
+                    module.params["name"], get_error_message(res)
+                )
             )
     module.exit_json(changed=changed)
 
@@ -507,14 +642,14 @@ def create_account(module, blade):
     module.exit_json(changed=changed)
 
 
-def update_account(module, blade):
-    """Update Active Directory Account"""
+def update_account(module, blade, current_ad):
+    """Update Active Directory Account
+
+    current_ad is the account as main() read it under its full name.
+    """
     api_version = get_rest_api_version(blade)
     changed = False
     mod_ad = False
-    current_ad = list(blade.get_active_directory(names=[module.params["name"]]).items)[
-        0
-    ]
     attr = {}
     # join_ou is only compared when it was given: the array reports its
     # own default (e.g. CN=Computers) which an omitted option must not undo.
@@ -727,24 +862,19 @@ def main():
         for crypt in module.params["encryption"]
     ]
     state = module.params["state"]
-    exists = bool(
-        blade.get_active_directory(names=[module.params["name"]]).status_code == 200
-    )
-
-    if not module.params["computer"]:
-        module.params["computer"] = module.params["name"].replace("_", "-")
     api_version = get_rest_api_version(blade)
-    if (
-        LooseVersion(SERVERS_API_VERSION) <= LooseVersion(api_version)
-        and module.params["server"]
-    ):
-        if blade.get_servers(names=[module.params["server"]]).status_code != 200:
-            module.fail_json(
-                msg="Server {0} does not exist on this FlashBlade.".format(
-                    module.params["server"]
-                )
+    # The full name is settled before the first read, so that the lookup and
+    # every later request address the same account.
+    module.params["name"] = _account_name(module, api_version)
+    if not module.params["computer"]:
+        module.params["computer"] = _leaf(module.params["name"]).replace("_", "-")
+    current_ad = _get_account(module, blade, module.params["name"])
+    if current_ad is None and state in ("test", "rotate"):
+        module.fail_json(
+            msg="Active Directory Account {0} does not exist.".format(
+                module.params["name"]
             )
-        module.params["name"] = module.params["server"] + module.params["name"]
+        )
     if module.params["kerberos_servers"]:
         module.params["kerberos_servers"] = module.params["kerberos_servers"][0:5]
     if module.params["directory_servers"]:
@@ -763,15 +893,20 @@ def main():
         for param in ca_params:
             _check_certificate(module, blade, param)
 
-    if not exists and state == "present":
+    if state == "present" and current_ad is None:
+        # Refusals the module can foresee are settled before the check-mode
+        # branch, so a check-mode run does not predict a join that fails.
+        if LooseVersion(SERVERS_API_VERSION) <= LooseVersion(api_version):
+            _check_server(module, blade)
+        _check_join_params(module)
         create_account(module, blade)
-    elif exists and state == "present":
-        update_account(module, blade)
-    elif exists and state == "test":
+    elif state == "present":
+        update_account(module, blade, current_ad)
+    elif state == "test":
         test_account(module, blade)
-    elif exists and state == "rotate":
+    elif state == "rotate":
         rotate_account(module, blade)
-    elif exists and state == "absent":
+    elif current_ad is not None:
         delete_account(module, blade)
 
     module.exit_json(changed=False)

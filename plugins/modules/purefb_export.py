@@ -253,7 +253,34 @@ def _check_names(module):
     refused for every state, in check mode as well, instead of reporting a
     change the array refuses, or no change while the export that was meant
     stays as it is. The export name itself carries no realm.
+
+    The file system, the server and each policy of an export are one object
+    each. The array reads a comma as the separator of a list of names, so a
+    name that holds one passes a lookup when every name in it exists,
+    although it is not the name of one object, and the lookup of the
+    export never finds it again. An empty name addresses nothing.
     """
+    for option in ("name", "filesystem", "server"):
+        if not (module.params[option] or "").strip():
+            module.fail_json(msg="{0} cannot be empty.".format(option))
+    kinds = {"filesystem": "file system", "server": "server"}
+    if module.params["type"] == "NFS":
+        policies = ["export_policy"]
+    else:
+        policies = ["client_policy", "share_policy"]
+    for option in ["filesystem", "server"] + policies:
+        value = module.params[option]
+        if value and "," in value:
+            module.fail_json(
+                msg=(
+                    "{0} {1} is not valid: a comma separates the names of a "
+                    "list, and an export has one {2}."
+                ).format(
+                    option,
+                    value,
+                    kinds.get(option) or POLICY_READS[option][0] + " policy",
+                )
+            )
     for option in ("name", "rename"):
         value = module.params[option]
         if value and "::" in value:

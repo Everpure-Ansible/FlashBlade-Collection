@@ -329,12 +329,18 @@ def _by_name(existing, missing):
 
     C(missing) is the array's message for a name it does not find; None
     stands for the empty list a realm-scoped administrator gets instead.
+    The client joins the names with commas and the array splits them
+    there, so one name that holds a comma is read as several names.
     """
 
     def _get(names=None, **kwargs):
-        wanted = [name.lower() for name in names or []]
+        if not names:
+            return _response(items=list(existing))
+        wanted = set(",".join(names).lower().split(","))
+        if [name for name in wanted if not name.strip()]:
+            return _error("Missing or invalid parameter.")
         items = [item for item in existing if item.name.lower() in wanted]
-        if not items and missing:
+        if missing and len(items) < len(wanted):
             return _error(missing)
         return _response(items=items)
 
@@ -962,3 +968,61 @@ class TestFleetContext:
             blade, check_mode=True, export_policy="nfs9", context="array2"
         )
         assert _failed(module) == "NFS export policy nfs9 does not exist."
+
+
+class TestNamesAddressOneObject:
+    """The file system, the server and each policy of an export are one
+    object each, and an empty name addresses nothing."""
+
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    @pytest.mark.parametrize(
+        "task, said",
+        [
+            ({"filesystem": "fs1,fs1"}, "filesystem fs1,fs1 is not valid"),
+            (
+                {"server": "srv1,_array_server"},
+                "server srv1,_array_server is not valid",
+            ),
+            ({"export_policy": "nfs1,nfs2"}, "export_policy nfs1,nfs2 is not valid"),
+            (
+                {"type": "SMB", "client_policy": "tenant1::client1,tenant1::client1"},
+                "client_policy tenant1::client1,tenant1::client1 is not valid",
+            ),
+            (
+                {"type": "SMB", "share_policy": "share1,_smb_share_allow_everyone"},
+                "share_policy share1,_smb_share_allow_everyone is not valid",
+            ),
+        ],
+    )
+    def test_a_list_of_names_fails(self, task, said, state):
+        """The array reads a comma as the separator of a list. Where every
+        name of the list exists the lookups passed, so check mode reported
+        a create for a name that is not one object."""
+        blade = _blade()
+        params = dict({"export_policy": "nfs1", "state": state}, **task)
+        module, body, login = _run(blade, check_mode=True, **params)
+        msg = _failed(module)
+        assert said in msg
+        assert "an export has one" in msg
+        login.assert_not_called()
+        assert blade.method_calls == []
+
+    def test_a_policy_of_the_other_protocol_is_not_judged(self):
+        """An NFS task does not use share_policy, as before."""
+        blade = _blade([_export()])
+        module, body, login = _run(blade, export_policy="nfs1", share_policy="a,b")
+        assert _changed(module) is False
+        assert _writes(blade) == []
+
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    @pytest.mark.parametrize("option", ["name", "filesystem", "server"])
+    @pytest.mark.parametrize("value", ["", "  "])
+    def test_an_empty_name_fails(self, option, value, state):
+        """An empty export name was reported as a create in check mode, and
+        an empty file system or server as a failed read without a name."""
+        blade = _blade()
+        task = {"export_policy": "nfs1", "state": state, option: value}
+        module, body, login = _run(blade, check_mode=True, **task)
+        assert _failed(module) == "{0} cannot be empty.".format(option)
+        login.assert_not_called()
+        assert blade.method_calls == []

@@ -15,3 +15,7 @@ bugfixes:
     as an export name is never realm-qualified.
   - purefb_export - documentation describes exports of a file system in a realm and has an
     example for one.
+  - purefb_export - an empty ``name``, ``filesystem`` or ``server``, and a ``filesystem``,
+    ``server`` or policy name that holds a comma, is refused before any request. The array reads
+    such a name as a list of names, so the lookups passed and check mode reported a create for
+    a name that is not one file system, server or policy.

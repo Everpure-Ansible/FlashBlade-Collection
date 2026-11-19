@@ -504,7 +504,7 @@ class TestPurefbBucketReplica:
 
 # ---------------- realm names, letter case and refused reads ----------------
 
-REALM = "rzaudit"
+REALM = "realm1"
 REALM_BUCKET = REALM + "::foo"
 REALM_CRED = REALM + "::" + CRED
 NOT_SAME_REALM = "must be in the same realm"
@@ -530,7 +530,7 @@ def _message(response, default="Unknown error"):
 
 
 def _realm_blade(link=None):
-    """The array holding bucket rzaudit::foo and credential rzaudit::cred_1"""
+    """The array holding bucket realm1::foo and credential realm1::cred_1"""
     blade = _blade(link=link)
     blade.get_buckets.return_value = _response([_ref(REALM_BUCKET)])
     blade.get_object_store_remote_credentials.return_value = _response(
@@ -590,9 +590,9 @@ class TestPurefbBucketReplicaRealm:
         """The realm is the prefix before the last separator"""
         from plugins.modules.purefb_bucket_replica import _realm_of
 
-        assert _realm_of("rzaudit::foo") == "rzaudit"
+        assert _realm_of("realm1::foo") == "realm1"
         assert _realm_of("foo") == ""
-        assert _realm_of("rzaudit::cred_1") == "rzaudit"
+        assert _realm_of("realm1::cred_1") == "realm1"
 
     def test_main_creates_realm_link(self):
         """A realm bucket with a credential of its realm is created"""
@@ -633,7 +633,7 @@ class TestPurefbBucketReplicaRealm:
         msg = _failure(module)
         assert NOT_SAME_REALM in msg
         assert REALM_BUCKET in msg
-        assert "rzaudit::<credential>" in msg
+        assert "realm1::<credential>" in msg
         _no_write(blade)
         # decided from the names of the task, before the array is asked
         mocks["get_system"].assert_not_called()
@@ -664,7 +664,7 @@ class TestPurefbBucketReplicaRealm:
 
         msg = _failure(module)
         assert NOT_SAME_REALM in msg
-        assert "rzaudit::<bucket>" in msg
+        assert "realm1::<bucket>" in msg
         _no_write(blade)
         module.exit_json.assert_not_called()
 
@@ -713,7 +713,7 @@ class TestPurefbBucketReplicaRealm:
         blade = _realm_blade(link=_link(paused=True, credential=REALM_CRED))
         module, mocks = _main(
             params=_base_params(
-                name="RZAUDIT::foo", credential="Rzaudit::" + CRED, paused=True
+                name="REALM1::foo", credential="Realm1::" + CRED, paused=True
             ),
             blade=blade,
         )
@@ -749,7 +749,7 @@ class TestPurefbBucketReplicaRealm:
         )
 
         module.fail_json.assert_not_called()
-        mocks["reference"].assert_called_once_with(name=REMOTE + "/rzaudit::cred_2")
+        mocks["reference"].assert_called_once_with(name=REMOTE + "/realm1::cred_2")
         assert module.exit_json.call_args[1]["changed"] is True
 
     def test_main_absent_ignores_the_credential(self):
@@ -846,7 +846,7 @@ class TestPurefbBucketReplicaRealm:
         )
 
         msg = _failure(module)
-        assert "Failed to create bucket replica link rzaudit::foo." in msg
+        assert "Failed to create bucket replica link realm1::foo." in msg
         assert MIXED_SCOPE_ERROR in msg
 
     def test_main_absent_missing_bucket_is_unchanged(self):

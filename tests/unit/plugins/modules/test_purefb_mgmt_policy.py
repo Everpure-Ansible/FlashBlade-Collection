@@ -8,6 +8,7 @@ from __future__ import absolute_import, division, print_function
 __metaclass__ = type
 
 import sys
+import fnmatch
 import multiprocessing
 import ctypes
 from unittest.mock import Mock, patch, MagicMock
@@ -76,6 +77,8 @@ from plugins.modules.purefb_mgmt_policy import (
     _rule_key,
     _desired_rules_by_key,
     _validate_rules,
+    _check_one_name,
+    _find_realm,
     _get_policy,
     _get_current_rules,
     _members_attached,
@@ -2212,6 +2215,8 @@ class TestPurefbMgmtPolicy:
 MOD = "plugins.modules.purefb_mgmt_policy"
 POLICY_NOT_FOUND = "Management access policy does not exist."
 REALM_NOT_FOUND = "Realm does not exist."
+NO_REALM_MATCHES = "Realm was not found."
+INVALID_NAME = "Missing or invalid parameter."
 NOT_PERMITTED = "Operation not permitted."
 
 
@@ -2240,20 +2245,39 @@ def _realm_rule(role, realm):
 
 
 def _realm_reads(*existing):
-    """get_realms as the array answers it: a name matches without regard to
-    case and comes back in the stored spelling, and a name the array does
-    not know (a realm::name included) is a 400."""
+    """get_realms as the array answers it.
+
+    A name matches without regard to case, blanks around it are ignored and
+    the realm comes back in the stored spelling. A comma separates the names
+    of a list and * is a wildcard, so the answer holds every realm that
+    matches, the realm named last first here. A name the array does not
+    know (a realm::name included) is a 400, and so are a pattern that
+    matches nothing and an empty name, each with its own message.
+    """
     known = dict((name.lower(), name) for name in existing)
 
     def get_realms(names=None, **kwargs):
-        if all(name.lower() in known for name in names):
-            realms = []
-            for name in names:
-                realm = Mock()
-                realm.name = known[name.lower()]
-                realms.append(realm)
-            return _items(*realms)
-        return _refused(REALM_NOT_FOUND)
+        wanted = [part.strip().lower() for name in names for part in name.split(",")]
+        wanted = [part for part in wanted if part]
+        if not wanted:
+            return _refused(INVALID_NAME)
+        found = []
+        for part in wanted:
+            if "*" in part:
+                matches = [key for key in known if fnmatch.fnmatchcase(key, part)]
+                if not matches:
+                    return _refused(NO_REALM_MATCHES)
+            elif part in known:
+                matches = [part]
+            else:
+                return _refused(REALM_NOT_FOUND)
+            found.extend(key for key in matches if key not in found)
+        realms = []
+        for key in reversed(found):
+            realm = Mock()
+            realm.name = known[key]
+            realms.append(realm)
+        return _items(*realms)
 
     return Mock(side_effect=get_realms)
 
@@ -2912,3 +2936,251 @@ class TestRealmScopes:
             ("realms", "rzaudit"),
             ("realms", "other"),
         ]
+
+
+class TestOneRealmPerScope:
+    """The realm read answers a list of names or a wildcard with other
+    realms. A rule is only ever put on the realm the task names."""
+
+    def _refused_scope(self, scope_name, realms, current=()):
+        module = _module(
+            rules=[_realm_rule("admin", "rzaudit"), _realm_rule("storage", scope_name)]
+        )
+        blade = _blade(realms=realms)
+
+        _run(_resolve_realm_scopes, module, blade, {}, list(current))
+
+        module.fail_json.assert_called_once_with(
+            msg=(
+                "Cannot add rule (role=storage, scope=realms/{0}) to policy "
+                "tenant-a-ops: realm {0} does not exist. The scope name of a "
+                "rule is the bare name of an existing realm."
+            ).format(scope_name)
+        )
+        # The scope is left as the task wrote it, never respelled.
+        assert module.params["rules"][1] == _realm_rule("storage", scope_name)
+
+    def test_wildcard_scope_is_not_taken_for_a_realm_it_matches(self):
+        self._refused_scope("tenant-*", ("rzaudit", "tenant-a", "tenant-b"))
+
+    def test_wildcard_scope_that_matches_one_realm_is_refused(self):
+        self._refused_scope("tenant-*", ("rzaudit", "tenant-a"))
+
+    def test_wildcard_scope_that_matches_every_realm_is_refused(self):
+        self._refused_scope("*", ("rzaudit",))
+
+    def test_wildcard_scope_that_matches_nothing_is_refused(self):
+        self._refused_scope("tenant-*", ("rzaudit",))
+
+    def test_list_of_realms_as_scope_is_refused(self):
+        self._refused_scope("tenant-a,tenant-b", ("rzaudit", "tenant-a", "tenant-b"))
+
+    def test_list_with_one_realm_as_scope_is_refused(self):
+        self._refused_scope("tenant-a,", ("rzaudit", "tenant-a"))
+
+    def test_wildcard_scope_is_refused_beside_a_current_rule_on_that_realm(self):
+        current = [_current_rule("viewer", name="tenant-a", resource_type="realms")]
+        self._refused_scope("tenant-*", ("rzaudit", "tenant-a"), current)
+
+    def test_blanks_around_a_realm_name_are_ignored(self):
+        module = _module(rules=[_realm_rule("viewer", " RZAudit ")])
+        blade = _blade()
+
+        _run(_resolve_realm_scopes, module, blade, {}, [])
+
+        module.fail_json.assert_not_called()
+        assert module.params["rules"] == [_realm_rule("viewer", "rzaudit")]
+
+    def test_empty_scope_name_is_left_to_the_array(self):
+        """The read answers "Missing or invalid parameter.", which is not a
+        statement about a realm"""
+        module = _module(rules=[_realm_rule("viewer", "")])
+        blade = _blade()
+
+        _run(_resolve_realm_scopes, module, blade, {}, [])
+
+        module.fail_json.assert_not_called()
+        assert module.params["rules"] == [_realm_rule("viewer", "")]
+
+    def test_find_realm_returns_the_stored_spelling(self):
+        blade = _blade(realms=("Tenant-A", "tenant-b"))
+
+        assert _run(_find_realm, blade, {}, "TENANT-a") == "Tenant-A"
+        blade.get_realms.assert_called_once_with(names=["TENANT-a"])
+
+    def test_find_realm_none_for_an_answer_without_that_realm(self):
+        blade = _blade(realms=("tenant-a", "tenant-b"))
+
+        for name in ("tenant-*", "*", "tenant-a,tenant-b", "tenant-b,tenant-a"):
+            assert _run(_find_realm, blade, {}, name) is None
+
+    def test_find_realm_none_for_an_empty_answer(self):
+        blade = _blade()
+        blade.get_realms = Mock(return_value=_items())
+
+        assert _run(_find_realm, blade, {}, "rzaudit") is None
+
+    def test_find_realm_none_when_the_array_has_no_such_realm(self):
+        blade = _blade()
+
+        assert _run(_find_realm, blade, {}, "gone") is None
+        assert _run(_find_realm, blade, {}, "rzaudit::x") is None
+        assert _run(_find_realm, blade, {}, "gone-*") is None
+
+    def test_find_realm_returns_the_name_when_the_read_says_nothing(self):
+        blade = _blade()
+        for message in (NOT_PERMITTED, INVALID_NAME, "Internal error."):
+            blade.get_realms = Mock(return_value=_refused(message))
+
+            assert _run(_find_realm, blade, {}, "RZAudit") == "RZAudit"
+
+    def test_find_realm_forwards_the_context(self):
+        blade = _blade()
+
+        _run(_find_realm, blade, {"context_names": ["fb2"]}, "rzaudit")
+
+        blade.get_realms.assert_called_once_with(
+            names=["rzaudit"], context_names=["fb2"]
+        )
+
+    def test_create_with_a_wildcard_scope_fails_before_the_post(self):
+        for check_mode in (True, False):
+            module = _module(
+                check_mode=check_mode, rules=[_realm_rule("storage", "tenant-*")]
+            )
+            blade = _blade(realms=("rzaudit", "tenant-a", "tenant-b"))
+
+            _main(module, blade)
+
+            module.fail_json.assert_called_once()
+            assert (
+                "realm tenant-* does not exist" in module.fail_json.call_args[1]["msg"]
+            )
+            module.exit_json.assert_not_called()
+            assert _writes(blade) == []
+
+    def test_update_with_a_list_scope_fails_before_any_write(self):
+        """Neither the enabled PATCH nor a rule for one realm of the list"""
+        for check_mode in (True, False):
+            module = _module(
+                check_mode=check_mode,
+                enabled=False,
+                rules=[
+                    _realm_rule("admin", "rzaudit"),
+                    _realm_rule("storage", "tenant-a,tenant-b"),
+                ],
+            )
+            current = [_current_rule("admin", name="rzaudit", resource_type="realms")]
+            blade = _blade(
+                policy=_stored_policy(),
+                rules=current,
+                realms=("rzaudit", "tenant-a", "tenant-b"),
+            )
+
+            _main(module, blade)
+
+            module.fail_json.assert_called_once()
+            assert (
+                "realm tenant-a,tenant-b does not exist"
+                in module.fail_json.call_args[1]["msg"]
+            )
+            module.exit_json.assert_not_called()
+            assert _writes(blade) == []
+
+    def test_inline_update_with_a_wildcard_scope_fails_before_the_patch(self):
+        module = _module(rules=[_realm_rule("viewer", "*")])
+        stored = _stored_policy(rules=[_inline_rule("viewer", "arrays", "fb1")])
+        blade = _blade(policy=stored, realms=("rzaudit", "tenant-a"))
+
+        _main(module, blade, api_version="2.21")
+
+        module.fail_json.assert_called_once()
+        assert "realm * does not exist" in module.fail_json.call_args[1]["msg"]
+        assert _writes(blade) == []
+
+
+class TestOnePolicyName:
+    """A name the array reads as a list or a pattern is refused before any
+    read: the rules and members of every policy that matches would be
+    taken for those of one policy."""
+
+    MESSAGE = (
+        "Policy name {0} is not the name of one policy: the array reads a "
+        "comma as the separator of a list of names and * as a wildcard. A "
+        "task manages one policy."
+    )
+
+    def test_check_one_name_refuses_a_list_and_a_wildcard(self):
+        for name in ("tenant-a-ops,readonly", "tenant-*", "*", "tenant-a-ops,"):
+            module = _module(name=name)
+
+            _run(_check_one_name, module)
+
+            module.fail_json.assert_called_once_with(msg=self.MESSAGE.format(name))
+
+    def test_check_one_name_passes_a_single_name(self):
+        """A realm-qualified name is left to the name rule of the array"""
+        for name in ("tenant-a-ops", "Tenant_A", "a1", "rzaudit::tenant", ""):
+            module = _module(name=name)
+
+            _run(_check_one_name, module)
+
+            module.fail_json.assert_not_called()
+
+    def test_main_refuses_a_wildcard_name_before_any_read(self):
+        """Two policies match: the rules of both would be reconciled as one"""
+        for check_mode in (True, False):
+            module = _module(
+                check_mode=check_mode, name="tenant-*", rules=[_rule_spec("viewer")]
+            )
+            first = _current_rule("viewer", rule_id="rule-of-tenant-a")
+            second = _current_rule("storage", rule_id="rule-of-tenant-b")
+            blade = _blade(policy=_stored_policy(), rules=[first, second])
+
+            _main(module, blade)
+
+            module.fail_json.assert_called_once_with(
+                msg=self.MESSAGE.format("tenant-*")
+            )
+            module.exit_json.assert_not_called()
+            assert blade.method_calls == []
+
+    def test_main_refuses_a_list_name_for_absent(self):
+        """A list with one missing policy read as "does not exist" before"""
+        for check_mode in (True, False):
+            module = _module(
+                check_mode=check_mode, name="tenant-a-ops,gone", state="absent"
+            )
+            blade = _blade()
+
+            _main(module, blade)
+
+            module.fail_json.assert_called_once_with(
+                msg=self.MESSAGE.format("tenant-a-ops,gone")
+            )
+            module.exit_json.assert_not_called()
+            assert blade.method_calls == []
+
+    def test_main_refuses_a_list_that_hides_a_builtin_policy(self):
+        module = _module(name="tenant-a-ops,readonly", enabled=False)
+        blade = _blade(policy=_stored_policy())
+
+        _main(module, blade)
+
+        module.fail_json.assert_called_once_with(
+            msg=self.MESSAGE.format("tenant-a-ops,readonly")
+        )
+        assert blade.method_calls == []
+
+    def test_main_single_name_is_read_as_before(self):
+        module = _module(name="Tenant_A-ops", enabled=False)
+        blade = _blade(policy=_stored_policy())
+
+        _main(module, blade)
+
+        module.fail_json.assert_not_called()
+        blade.get_management_access_policies.assert_called_once_with(
+            names=["Tenant_A-ops"]
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+        assert _writes(blade) == ["patch_management_access_policies"]

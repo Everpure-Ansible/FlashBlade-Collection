@@ -40,6 +40,9 @@ options:
     - Case-insensitive, case-preserving. This is the handle used for
       attachment and for naming child rules.
     - The array refuses a realm-qualified name (C(realm::name)).
+    - A task manages one policy. The array reads a comma as the separator
+      of a list of names and C(*) as a wildcard, so a name that holds
+      either is refused.
     type: str
     required: true
   state:
@@ -109,8 +112,9 @@ options:
               I(resource_type=realms)).
             - A realm is named by its bare name, in any letter case, and
               must exist. A rule to add that names a realm the array does
-              not know (a C(realm::name) included) fails the task before
-              anything is changed, in check mode too.
+              not know fails the task before anything is changed, in check
+              mode too. That includes a C(realm::name), a list of names
+              and a name with the wildcard C(*), as a rule names one realm.
             - A rule follows its realm through a rename. After a realm has
               been renamed, give the new realm name here.
             - Remove the rules that name a realm before the realm is
@@ -312,6 +316,27 @@ def _validate_rules(module):
         seen.add(key)
 
 
+def _check_one_name(module):
+    """Fail when ``name`` is not the name of one policy.
+
+    The array reads a comma as the separator of a list of names and * as a
+    wildcard, and answers a read with every policy that matches. The rules
+    and members of all of them would be taken for those of one policy, and
+    rules are changed and removed by id, so one task would reach into every
+    policy that matches. Neither character can be part of a policy name, so
+    the name is refused before the array is asked.
+    """
+    name = module.params["name"]
+    if "," in name or "*" in name:
+        module.fail_json(
+            msg=(
+                "Policy name {0} is not the name of one policy: the array "
+                "reads a comma as the separator of a list of names and * as "
+                "a wildcard. A task manages one policy."
+            ).format(name)
+        )
+
+
 def _does_not_exist(error):
     """Whether an error of the array says that the object does not exist."""
     return "does not exist" in str(error).lower()
@@ -368,6 +393,33 @@ def _members_attached(module, blade, ctx_kwargs):
     return bool(list(res.items))
 
 
+def _find_realm(blade, ctx_kwargs, name):
+    """Look a realm up by the scope name of a rule.
+
+    Returns the name as the array holds it, None when the array has no
+    realm of that name, and ``name`` unchanged when the read is refused or
+    fails, which says nothing about the realm.
+
+    The array finds a realm without regard to letter case and ignores
+    blanks around the name. It also reads a comma as the separator of a
+    list of names and * as a wildcard, and then answers with every realm
+    that matches (or with "was not found"). Only a realm of this very name
+    counts, so that a rule is never put on a realm the task did not name.
+    """
+    res = blade.get_realms(names=[name], **ctx_kwargs)
+    if res.status_code == 200:
+        wanted = name.strip().lower()
+        for item in list(res.items):
+            stored = getattr(item, "name", None)
+            if stored and str(stored).lower() == wanted:
+                return stored
+        return None
+    error = get_error_message(res)
+    if _does_not_exist(error) or "was not found" in str(error).lower():
+        return None
+    return name
+
+
 def _resolve_realm_scopes(module, blade, ctx_kwargs, current_rules):
     """Settle the realm scopes of the desired rules before any write.
 
@@ -381,7 +433,7 @@ def _resolve_realm_scopes(module, blade, ctx_kwargs, current_rules):
     is read, yet accepts a rule only with the spelling it holds. The scope
     name of a desired rule is therefore replaced by that spelling: the one
     on a rule the policy already has at that scope, or else the name the
-    realm read returns.
+    realm read returns for the realm of that very name.
 
     Only a definite answer fails the task: a realm read that is refused or
     fails says nothing about the realm and leaves the decision to the
@@ -398,13 +450,8 @@ def _resolve_realm_scopes(module, blade, ctx_kwargs, current_rules):
             continue
         key = _rule_key(rule["role"], scope["resource_type"], scope["name"])[1:]
         if key not in stored:
-            stored[key] = scope["name"]
-            res = blade.get_realms(names=[scope["name"]], **ctx_kwargs)
-            if res.status_code == 200:
-                items = list(res.items)
-                if items and getattr(items[0], "name", None):
-                    stored[key] = items[0].name
-            elif _does_not_exist(get_error_message(res)):
+            spelling = _find_realm(blade, ctx_kwargs, scope["name"])
+            if spelling is None:
                 module.fail_json(
                     msg=(
                         "Cannot add rule (role={0}, scope=realms/{1}) to policy "
@@ -412,6 +459,7 @@ def _resolve_realm_scopes(module, blade, ctx_kwargs, current_rules):
                         "is the bare name of an existing realm."
                     ).format(rule["role"], scope["name"], module.params["name"])
                 )
+            stored[key] = spelling
         scope["name"] = stored[key]
 
 
@@ -745,6 +793,7 @@ def main():
 
     state = module.params["state"]
     name = module.params["name"]
+    _check_one_name(module)
     # Policy names are case-insensitive/case-preserving on the array, so
     # the guard must match case variants (e.g. "Readonly") too.
     is_builtin = name.lower() in BUILTIN_POLICIES

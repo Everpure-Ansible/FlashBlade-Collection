@@ -76,8 +76,9 @@ options:
     - Whether the realm connection between I(realm) and I(remote_realm)
       should exist.
     - With C(absent), a I(realm) that does not exist or is destroyed is
-      reported as unchanged. The task fails when the FlashBlade cannot
-      answer the lookup of I(realm).
+      reported as unchanged. The task fails when the FlashBlade refuses the
+      lookup of I(realm), as it does for a user whose role may not read
+      realms, or cannot answer it.
     - Not used when I(generate_key) or I(invalidate_keys) is set.
     type: str
     default: present
@@ -278,9 +279,10 @@ VERSION = "1.5"
 USER_AGENT_BASE = "Ansible"
 MIN_REQUIRED_API_VERSION = "2.25"
 WAIT_INTERVAL = 5
-# HTTP status of a realm lookup that says the realm is not there (missing,
-# destroyed or hidden from the user).
-REALM_NOT_THERE_CODES = (400, 404)
+# HTTP status that by itself says the realm is not there. The FlashBlade
+# answers 400 for a realm that is missing, destroyed or hidden from the user
+# and also for a lookup it refuses, so a 400 is read by its text.
+REALM_NOT_THERE_CODES = (404,)
 
 
 def _user_agent():
@@ -307,7 +309,8 @@ def _realm_error(module, blade):
 def _realm_not_there(status_code, reason):
     """Whether a failed realm lookup says the realm is missing, destroyed or hidden.
 
-    False means the lookup itself failed and says nothing about the realm.
+    False means the lookup itself failed or was refused (the user may not
+    read realms) and says nothing about the realm.
     """
     reason = reason.lower()
     return (

@@ -752,6 +752,11 @@ def create_s3user(module, blade):
                     res = blade.get_object_store_users_object_store_access_policies(
                         member_names=[username], policy_names=[policy]
                     )
+                if res.status_code != 200:
+                    module.fail_json(
+                        msg="Failed to read the access policies of object store "
+                        "user {0}. Error: {1}".format(username, get_error_message(res))
+                    )
                 if not list(res.items):
                     if (
                         LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)

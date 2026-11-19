@@ -1294,6 +1294,16 @@ class TestCheckedReads:
             assert REFUSED in _failure(module)
             _no_writes(array.blade)
 
+    def test_refused_policy_membership_read(self):
+        array = _Array(policies=["pure:policy/object-read"])
+        array.refuse["get_object_store_users_object_store_access_policies"] = REFUSED
+        module = _module(policy=["pure:policy/object-read"])
+        _run(module, array)
+        message = _failure(module)
+        assert "Failed to read the access policies" in message
+        assert REFUSED in message
+        assert array.attached == set()
+
 
 class TestHelpers:
     """The private helpers."""

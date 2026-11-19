@@ -72,6 +72,8 @@ options:
     - Name of the custom role. Required for I(object=role).
     - Maximum 63 characters. Cannot begin with an underscore (reserved).
     - The array matches role names without regard to letter case.
+    - This is the name of one role. A name that holds a comma or a C(*),
+      which the array reads as a list of names or as a pattern, is refused.
     - Roles are array-level objects. The array does not accept a realm
       prefix (C(realm::name)) in a role name. To use a custom role in a
       realm, grant it in a rule with the scope type C(realms) in
@@ -125,6 +127,8 @@ options:
     - Name of the local admin whose policy list should be reconciled.
     - Required for I(object=admin_attach).
     - Admins are array-level objects, named without a realm prefix.
+    - This is the name of one admin. A comma-separated list of names is
+      refused.
     - The array refuses policy changes on built-in users (such as
       C(pureuser)); use a local admin created by
       M(everpure.flashblade.purefb_user).
@@ -135,6 +139,8 @@ options:
       be reconciled.
     - Required for I(object=ds_attach).
     - Role mappings are array-level objects, named without a realm prefix.
+    - This is the name of one role mapping. A comma-separated list of names
+      is refused.
     type: str
   policies:
     description:
@@ -151,6 +157,8 @@ options:
     - Name of fleet member on which to perform the operation.
     - This requires the array receiving the request is a member of a fleet
       and the context name to be a member of the same fleet.
+    - Not supported with I(object=ds_attach), which fails when it is set. The
+      REST API offers no fleet context for directory-service role mappings.
     type: str
     default: ""
 extends_documentation_fragment:
@@ -292,6 +300,17 @@ def _validate_role_name(module, name):
         module.fail_json(msg="Role name must be 63 characters or fewer")
     if name.startswith("_"):
         module.fail_json(msg="Role names beginning with '_' are reserved")
+    if "," in name or "*" in name:
+        # The array reads a comma as a separator of names and * as a pattern
+        # and answers the lookup with every role that matches. Only the first
+        # of them would be checked (built-in, granted by a policy rule) while
+        # the delete addresses them all. No role name holds either character.
+        module.fail_json(
+            msg=(
+                "Role name {0} must be the name of one role: the array reads "
+                "a comma as a separator of names and * as a pattern."
+            ).format(name)
+        )
 
 
 def _read_named(module, res, what):
@@ -610,6 +629,27 @@ def _handle_attach(module, blade, api_version, ctx_kwargs, kind):
                 "FlashBlade REST version {0} does not support management "
                 "access policy attachment (requires {1}+)."
             ).format(api_version, MIN_ATTACH_API_VERSION)
+        )
+
+    subject = module.params["admin"] if kind == "admin" else module.params["ds_role"]
+    if kind == "ds_role" and ctx_kwargs:
+        # No call that reads or changes a role mapping or its policies takes
+        # a fleet context, so the task cannot be run on another fleet member.
+        module.fail_json(
+            msg=(
+                "context is not supported with object=ds_attach: the REST API "
+                "offers no fleet context for directory-service role mappings."
+            )
+        )
+    if subject and "," in subject:
+        # The array reads a comma as a separator of names. The policies of
+        # every subject on such a list are read as one set, so a policy that
+        # one of them holds would count as attached to all of them.
+        module.fail_json(
+            msg=(
+                "{0} {1} must be the name of one {2}: the array reads a comma "
+                "as a separator of names."
+            ).format(kind, subject, "admin" if kind == "admin" else "role mapping")
         )
 
     state = module.params["state"]

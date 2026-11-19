@@ -3,3 +3,9 @@ bugfixes:
     answer now fails with the array's message instead of being taken for a missing object.
   - purefb_mgmt_role - a role that a policy rule still grants is no longer deleted when the task
     names it in another letter case or when the policy rules cannot be listed.
+  - purefb_mgmt_role - a role name that holds a comma or a ``*`` and a comma-separated list in
+    ``admin`` or ``ds_role`` are refused. The array answers such a value with several objects, of
+    which only the first was checked before a delete and whose policies were read as one set
+    before an attach.
+  - purefb_mgmt_role - ``object=ds_attach`` with ``context`` fails with a message instead of an
+    exception. The REST API offers no fleet context for directory-service role mappings.

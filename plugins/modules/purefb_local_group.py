@@ -41,6 +41,9 @@ options:
     - Name of the local group inside the LDS.
     - The name never takes a realm prefix, also when the LDS is in a realm.
       A name that contains C(::) is refused.
+    - A name that contains a comma is refused as well. The array reads a
+      comma as the separator of a list of names.
+    - Both rules apply to I(new_name) too.
     type: str
     required: true
   state:
@@ -56,6 +59,7 @@ options:
     - The LDS has to exist. The module fails when the array does not find
       it, in check mode as well. With I(state=absent) a group of an LDS that
       does not exist is reported as absent.
+    - The option names one LDS. A name that contains a comma is refused.
     - Attach LDSes to servers via M(everpure.flashblade.purefb_server).
     type: str
     required: true
@@ -85,6 +89,7 @@ options:
     description:
     - List of local-user names that should be members of this group.
     - These are names of users of the same LDS, without a realm prefix.
+      They are compared without regard to case, as the array matches them.
     - When set, the module reconciles the group's user members against this
       list via C(/directory-services/local/groups/members) filtered to user
       members (nested-group and external members are unaffected).
@@ -227,11 +232,13 @@ def _lds_filter(local_ds_name, extra=None):
 
 
 def _check_names(module):
-    """Fail on a group name with a realm prefix, before any request.
+    """Fail on a name that is not the name of one object, before any request.
 
     A group is placed by its LDS. Its own name carries no realm, and the array
-    refuses a colon in it. The refusal here names the form that works, for
-    every state and in check mode as well.
+    refuses a colon in it. The array reads a comma as the separator of a list
+    of names, so a name with a comma addresses several groups, or several
+    LDSes, in one request. The refusals here say what works, for every state
+    and in check mode as well.
     """
     options = ["name"]
     if module.params["state"] == "present":
@@ -245,6 +252,16 @@ def _check_names(module):
                     "realm prefix. Give the local directory service of the "
                     "realm as realm::name in local_directory_service and the "
                     "group name on its own."
+                ).format(option, value)
+            )
+    for option in ["local_directory_service"] + options:
+        value = module.params[option]
+        if value and "," in value:
+            module.fail_json(
+                msg=(
+                    "{0} {1} is not valid: the array reads a comma as the "
+                    "separator of a list of names, so this would address "
+                    "more than one object. Give one name."
                 ).format(option, value)
             )
 
@@ -452,13 +469,23 @@ def _remove_user_members(module, blade, local_ds_name, users, group_name):
 
 
 def _reconcile_user_members(module, blade, local_ds_name, group_name):
-    """Reconcile user members against module.params['local_users']."""
-    desired = set(module.params["local_users"] or [])
-    current = _get_current_user_members(
+    """Reconcile user members against module.params['local_users'].
+
+    The array matches user names without regard to case and returns the
+    stored spelling, so the two lists are compared in lower case: a member
+    named in another case is left as it is, and a name given twice counts
+    once.
+    """
+    desired = {}
+    for user in module.params["local_users"] or []:
+        desired.setdefault(user.lower(), user)
+    current = {}
+    for user in _get_current_user_members(
         module, blade, local_ds_name, group_name=group_name
-    )
-    add = desired - current
-    remove = current - desired
+    ):
+        current[user.lower()] = user
+    add = [desired[key] for key in sorted(desired) if key not in current]
+    remove = [current[key] for key in sorted(current) if key not in desired]
     changed = bool(add or remove)
     if changed and not module.check_mode:
         if add:

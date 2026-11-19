@@ -1066,33 +1066,58 @@ def _group(name, lds="myserver_local", gid=6001, email=None, built_in=False):
     return item
 
 
-def _array(lds="myserver_local", groups=(), lds_answer=None, group_answer=None):
-    """A client for an array with one LDS and the groups given.
+def _member(name, group="developers"):
+    """The membership of a local user as the array returns it."""
+    edge = Mock(spec=["group", "member"])
+    edge.group = _reference(group)
+    edge.member = Mock(spec=["name", "resource_type"])
+    edge.member.name = name
+    edge.member.resource_type = "directory-services/local/users"
+    return edge
+
+
+def _array(
+    lds="myserver_local", groups=(), lds_answer=None, group_answer=None, members=()
+):
+    """A client for an array with the LDS, or LDSes, and the groups given.
 
     ``lds=None`` is an LDS the array does not show to the caller; its groups
-    are listed all the same.
+    are listed all the same. The array reads a comma in ``names`` as the
+    separator of a list: it returns every LDS named when each of them exists,
+    and every group of the LDS in the filter that matches one of the names.
+    ``members`` are the user members the array reports for a group.
     """
     blade = Mock()
     blade.get_fleets.return_value = _response([])
+    known = [lds] if isinstance(lds, str) else list(lds or [])
 
     def read_lds(names, **kwargs):
         if lds_answer is not None:
             return lds_answer
-        if lds and names[0].lower() == lds.lower():
-            return _response([_lds(lds)])
+        wanted = ",".join(names).lower().split(",")
+        found = [name for name in known if name.lower() in wanted]
+        if found and len(found) == len(wanted):
+            return _response([_lds(name) for name in found])
         return _error(LDS_MISSING)
 
     def read_groups(names, **kwargs):
         if group_answer is not None:
             return group_answer
-        for group in groups:
-            if group.name.lower() == names[0].lower():
-                return _response([group])
-        return _error(GROUP_MISSING)
+        wanted = ",".join(names).lower().split(",")
+        owner = kwargs.get("filter", "").partition("='")[2].rstrip("'").lower()
+        found = [
+            group
+            for group in groups
+            if group.name.lower() in wanted
+            and (not owner or group.local_directory_service.name.lower() == owner)
+        ]
+        return _response(found) if found else _error(GROUP_MISSING)
 
     blade.get_directory_services_local_directory_services.side_effect = read_lds
     blade.get_directory_services_local_groups.side_effect = read_groups
-    blade.get_directory_services_local_groups_members.return_value = _response([])
+    blade.get_directory_services_local_groups_members.return_value = _response(
+        [_member(name) for name in members]
+    )
     for method in WRITES:
         getattr(blade, method).return_value = _response()
     return blade
@@ -1488,3 +1513,139 @@ class TestRenameIdempotency:
         first.sid = None
         assert _same_group(first, second) is True
         assert _same_group(first, _group("developers")) is False
+
+
+class TestNamesWithAComma:
+    """The array reads a comma as the separator of a list of names"""
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    def test_two_group_names_in_one_are_refused(self, state, check_mode):
+        """The array returns both groups for the one name"""
+        blade = _array(
+            groups=[_group("developers", gid=6001), _group("devs", gid=6002)]
+        )
+        module = _run(
+            blade,
+            check_mode=check_mode,
+            state=state,
+            name="developers,devs",
+            gid=7001,
+            force=True,
+        )
+        msg = _failed(module)
+        assert "name developers,devs is not valid" in msg
+        assert "comma" in msg
+        _no_write(blade)
+        blade.get_directory_services_local_directory_services.assert_not_called()
+        blade.get_directory_services_local_groups.assert_not_called()
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_a_group_name_and_a_name_that_is_not_there_are_refused(self, check_mode):
+        """The array returns the one group it finds for the two names"""
+        blade = _array(groups=[_group("developers", gid=6001)])
+        module = _run(blade, check_mode=check_mode, name="developers,nogroup", gid=7001)
+        assert "name developers,nogroup is not valid" in _failed(module)
+        _no_write(blade)
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    def test_two_lds_names_in_one_are_refused(self, state, check_mode):
+        """The array returns both LDSes for the one name"""
+        blade = _array(lds=["tenant_local", "realm1::tenant_local"])
+        module = _run(
+            blade,
+            check_mode=check_mode,
+            state=state,
+            local_directory_service="tenant_local,realm1::tenant_local",
+        )
+        msg = _failed(module)
+        assert (
+            "local_directory_service tenant_local,realm1::tenant_local is not valid"
+            in msg
+        )
+        assert "comma" in msg
+        _no_write(blade)
+        blade.get_directory_services_local_directory_services.assert_not_called()
+        blade.get_directory_services_local_groups.assert_not_called()
+
+    def test_comma_in_new_name_is_refused(self):
+        blade = _array(groups=[_group("developers")])
+        module = _run(blade, check_mode=True, new_name="devs,ops")
+        assert "new_name devs,ops is not valid" in _failed(module)
+        _no_write(blade)
+        blade.get_directory_services_local_groups.assert_not_called()
+
+    def test_new_name_is_not_looked_at_for_absent(self):
+        blade = _array(groups=[_group("developers")])
+        module = _run(blade, state="absent", new_name="devs,ops")
+        assert _changed(module) is True
+        blade.delete_directory_services_local_groups.assert_called_once_with(
+            names=["developers"], local_directory_service_names=["myserver_local"]
+        )
+
+    def test_group_of_the_same_name_in_another_lds_is_not_the_group(self):
+        """The group read is scoped to the LDS the task names"""
+        blade = _array(
+            lds=["tenant_local", "realm1::tenant_local"],
+            groups=[_group("developers", lds="tenant_local", gid=6002)],
+        )
+        module = _run(
+            blade,
+            local_directory_service="realm1::tenant_local",
+            gid=6001,
+        )
+        assert _changed(module) is True
+        blade.patch_directory_services_local_groups.assert_not_called()
+        blade.post_directory_services_local_groups.assert_called_once_with(
+            names=["developers"],
+            local_directory_service_names=["realm1::tenant_local"],
+            local_group={"gid": 6001},
+        )
+
+
+class TestMemberNames:
+    """Member names are compared as the array matches them: without regard to case"""
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_member_named_in_another_case_is_not_a_change(self, check_mode):
+        blade = _array(groups=[_group("developers")], members=["alice"])
+        module = _run(blade, check_mode=check_mode, local_users=["ALICE"])
+        assert _changed(module) is False
+        _no_write(blade)
+
+    def test_member_named_twice_counts_once(self):
+        blade = _array(groups=[_group("developers")], members=["alice"])
+        module = _run(blade, local_users=["alice", "Alice"])
+        assert _changed(module) is False
+        _no_write(blade)
+
+    def test_members_that_differ_are_added_and_removed(self):
+        blade = _array(groups=[_group("developers")], members=["Alice", "bob"])
+        with patch(
+            MOD + ".ReferenceWritable", side_effect=lambda **kwargs: kwargs
+        ), patch(
+            MOD + ".LocalGroupMembershipPostMembers",
+            side_effect=lambda **kwargs: kwargs,
+        ), patch(
+            MOD + ".LocalGroupMembershipPost", side_effect=lambda **kwargs: kwargs
+        ):
+            module = _run(blade, local_users=["alice", "Carol"])
+        assert _changed(module) is True
+        blade.post_directory_services_local_groups_members.assert_called_once_with(
+            local_membership={"members": [{"member": {"name": "Carol"}}]},
+            group_names=["developers"],
+            local_directory_service_names=["myserver_local"],
+        )
+        blade.delete_directory_services_local_groups_members.assert_called_once_with(
+            group_names=["developers"],
+            member_names=["bob"],
+            member_types=["User"],
+            local_directory_service_names=["myserver_local"],
+        )
+
+    def test_check_mode_reports_the_members_that_differ(self):
+        blade = _array(groups=[_group("developers")], members=["Alice", "bob"])
+        module = _run(blade, check_mode=True, local_users=["alice"])
+        assert _changed(module) is True
+        _no_write(blade)

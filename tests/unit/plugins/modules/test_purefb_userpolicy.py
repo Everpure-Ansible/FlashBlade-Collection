@@ -424,6 +424,18 @@ class TestPurefbUserpolicyUnresolvedPolicy:
         assert _failure(module) == "Access policy {0} does not exist.".format(policy)
         array.delete.assert_not_called()
 
+    def test_unknown_built_in_policy_on_a_realm_user_gets_no_realm_hint(self):
+        """A built-in policy has no realm form, so the hint would mislead."""
+        array = _array()
+
+        for policy in ("pure:policy/nopol", "PURE:POLICY/NOPOL"):
+            module = _run(array, account=REALM_ACCOUNT, policy=[policy])
+
+            assert _failure(module) == "Access policy {0} does not exist.".format(
+                policy
+            )
+        array.post.assert_not_called()
+
     def test_nothing_is_attached_when_a_later_policy_is_unknown(self):
         array = _array()
 
@@ -760,6 +772,80 @@ class TestPurefbUserpolicyRealm:
         result = _exit(module)
         assert result["changed"] is False
         assert result["policy_list"] == [REALM_POLICY, READ]
+
+
+class TestPurefbUserpolicyOneName:
+    """The array reads * in a name as a pattern and a comma as a separator of
+    names. A task names one user and each entry of policy one policy, so such
+    a name is refused before anything is read, in check mode too."""
+
+    TAIL = (
+        ": in {0} the array reads * as a pattern and a comma as a separator "
+        "of names."
+    )
+
+    def _refused(self, message, value, **params):
+        array = _array()
+        array.attach("myaccount/myuser", READ)
+        array.attach(REALM_USER, READ)
+
+        module = _run(array, **params)
+
+        assert _failure(module) == message + self.TAIL.format(value)
+        # nothing was read and nothing was written
+        assert array.blade.method_calls == []
+        assert array.policies_of("myaccount/myuser") == [READ]
+        assert array.policies_of(REALM_USER) == [READ]
+
+    def test_user_that_is_a_pattern_or_a_list(self):
+        message = "name must be the name of one Object Store User"
+        for name in ("myuser*", "*", "myuser,myrealm::myaccount/myuser"):
+            for state in ("present", "absent", "show"):
+                for check_mode in (False, True):
+                    self._refused(
+                        message,
+                        name,
+                        name=name,
+                        state=state,
+                        check_mode=check_mode,
+                        policy=[READ],
+                    )
+
+    def test_account_that_is_a_pattern_or_a_list(self):
+        message = "account must be the name of one Object Store Account"
+        for account in ("*", "myrealm::*", "myaccount/myuser,myrealm::myaccount"):
+            for state in ("present", "absent", "show"):
+                for check_mode in (False, True):
+                    self._refused(
+                        message,
+                        account,
+                        account=account,
+                        state=state,
+                        check_mode=check_mode,
+                        policy=[READ],
+                    )
+
+    def test_policy_entry_that_is_a_pattern_or_a_list(self):
+        message = "Each entry of policy must be the name of one access policy"
+        for entry in ("pure:policy/bucket-*", "*", READ + "," + LIST):
+            for state in ("present", "absent"):
+                for check_mode in (False, True):
+                    self._refused(
+                        message,
+                        entry,
+                        state=state,
+                        check_mode=check_mode,
+                        policy=[LIST, entry],
+                    )
+
+    def test_show_does_not_use_policy(self):
+        """state=show ignores policy, so an entry of it cannot stop the listing."""
+        array = _array()
+        array.attach("myaccount/myuser", READ)
+
+        module = _run(array, state="show", policy=["pure:policy/*"])
+
+        assert _exit(module)["policy_list"] == [READ]
 
 
 class TestPurefbUserpolicyPolicyList:

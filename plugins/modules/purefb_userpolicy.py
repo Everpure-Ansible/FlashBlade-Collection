@@ -31,6 +31,8 @@ options:
     description:
     - Name of the Object Store User
     - The user to have the policy request applied to
+    - A task names one user. An I(account) or I(name) with a C(*) or a comma,
+      which the array reads as a pattern or as a list of names, is refused.
     type: str
   account:
     description:
@@ -53,6 +55,8 @@ options:
       C(realm::account/policy) for an account in a realm. The built-in
       C(pure:policy/...) policies can be used with the users of every account.
     - The user and an account policy must belong to the same account.
+    - Each entry names one policy. An entry with a C(*) or a comma, which the
+      array reads as a pattern or as a list of names, is refused.
     - A policy that does not exist fails the task, and so does adding a policy
       of another account. Both are found before anything is changed.
     type: list
@@ -145,6 +149,11 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
 )
 
 CONTEXT_API_VERSION = "2.17"
+ONE_NAME = {
+    "account": "account must be the name of one Object Store Account",
+    "name": "name must be the name of one Object Store User",
+    "policy": "Each entry of policy must be the name of one access policy",
+}
 
 
 def _context_kwargs(module, api_version):
@@ -155,6 +164,26 @@ def _context_kwargs(module, api_version):
     ):
         return {"context_names": [module.params["context"]]}
     return {}
+
+
+def _single_names(module):
+    """Refuse a name that the array does not read as the name of one object.
+
+    In a request the array reads * in a name as a pattern and a comma as a
+    separator of names, so such a name reaches every user or policy that
+    matches it, or several at once. A task changes the policies of one user
+    and each entry of policy is one policy, so such a name is refused before
+    anything is read.
+    """
+    names = [(option, module.params[option]) for option in ("account", "name")]
+    if module.params["state"] != "show":
+        names += [("policy", policy) for policy in module.params["policy"] or []]
+    for option, value in names:
+        if value and ("*" in value or "," in value):
+            module.fail_json(
+                msg="{0}: in {1} the array reads * as a pattern and a comma as "
+                "a separator of names.".format(ONE_NAME[option], value)
+            )
 
 
 def _account_id(obj):
@@ -197,7 +226,11 @@ def _get_policy(module, blade, policy, ctx):
                 msg="Failed to get access policy {0}. Error: {1}".format(policy, reason)
             )
     hint = ""
-    if "::" in module.params["account"] and "::" not in policy:
+    if (
+        "::" in module.params["account"]
+        and "::" not in policy
+        and not policy.strip().lower().startswith("pure:policy/")
+    ):
         hint = " A policy of an account in a realm is named realm::account/policy."
     module.fail_json(msg="Access policy {0} does not exist.{1}".format(policy, hint))
 
@@ -352,6 +385,7 @@ def main():
         argument_spec, required_if=required_if, supports_check_mode=True
     )
 
+    _single_names(module)
     blade = get_system(module)
     api_version = get_rest_api_version(blade)
     if (

@@ -7,3 +7,7 @@ bugfixes:
     and a policy of another account is refused before anything is written, in check mode too.
   - purefb_userpolicy - ``policy_list`` holds the policies of the user once each, also when nothing
     changed.
+  - purefb_userpolicy - an ``account``, a ``name`` or an entry of ``policy`` with a ``*`` or a
+    comma, which the array reads as a pattern or as a list of names, is refused before anything is
+    read. Such a name addresses several users or policies, so the task was checked against one of
+    them and the request was sent for all of them.

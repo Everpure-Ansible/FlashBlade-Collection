@@ -922,3 +922,43 @@ class TestReadsAreChecked:
         assert _failed(module) == (
             "Failed to read server _array_server. Error: Internal error."
         )
+
+
+class TestFleetContext:
+    """The lookups made before a change is reported follow the fleet context."""
+
+    def test_lookups_before_a_create_carry_the_context(self):
+        blade = _blade()
+        module, body, login = _run(
+            blade, check_mode=True, export_policy="nfs1", context="array2"
+        )
+        assert _changed(module) is True
+        blade.get_file_systems.assert_any_call(names=["fs1"], context_names=["array2"])
+        blade.get_nfs_export_policies.assert_called_once_with(
+            names=["nfs1"], context_names=["array2"]
+        )
+        assert _writes(blade) == []
+
+    def test_policy_lookup_before_an_update_carries_the_context(self):
+        smb = _export(
+            protocol="SMB",
+            policy="_smb_client_allow_everyone",
+            share_policy="_smb_share_allow_everyone",
+        )
+        blade = _blade([smb])
+        module, body, login = _run(
+            blade, check_mode=True, type="SMB", share_policy="share1", context="array2"
+        )
+        assert _changed(module) is True
+        blade.get_smb_share_policies.assert_called_once_with(
+            names=["share1"], context_names=["array2"]
+        )
+        blade.get_smb_client_policies.assert_not_called()
+        assert _writes(blade) == []
+
+    def test_missing_policy_in_a_context_fails(self):
+        blade = _blade()
+        module, body, login = _run(
+            blade, check_mode=True, export_policy="nfs9", context="array2"
+        )
+        assert _failed(module) == "NFS export policy nfs9 does not exist."

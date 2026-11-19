@@ -10,6 +10,7 @@ __metaclass__ = type
 import sys
 import multiprocessing
 import ctypes
+from contextlib import ExitStack
 from unittest.mock import Mock, patch, MagicMock
 
 # Mock multiprocessing context for Windows
@@ -75,7 +76,18 @@ from plugins.modules.purefb_local_user import (
     _get_user,
     _get_current_groups,
     _reconcile_memberships,
+    _get_local_ds,
+    _membership_plan,
+    _require_groups,
 )
+
+MODULE = "plugins.modules.purefb_local_user."
+REALM_LDS = "myrealm::myserver_local"
+USERS_POST = "post_directory_services_local_users"
+USERS_PATCH = "patch_directory_services_local_users"
+USERS_DELETE = "delete_directory_services_local_users"
+MEMBERS_POST = "post_directory_services_local_users_members"
+MEMBERS_DELETE = "delete_directory_services_local_users_members"
 
 
 def _base_params(**overrides):
@@ -95,6 +107,171 @@ def _base_params(**overrides):
     }
     params.update(overrides)
     return params
+
+
+def _ok(items):
+    """A 200 answer holding ``items``"""
+    response = Mock()
+    response.status_code = 200
+    response.items = list(items)
+    return response
+
+
+def _error(message, status_code=400):
+    """An error answer in the shape the SDK returns it (errors[0].message)"""
+    error = Mock()
+    error.message = message
+    response = Mock()
+    response.status_code = status_code
+    response.errors = [error]
+    return response
+
+
+def _message(response, default="Unknown error"):
+    """Stand-in for module_utils.common.get_error_message, mocked away above"""
+    errors = getattr(response, "errors", None)
+    return errors[0].message if errors else default
+
+
+def _ref(name):
+    ref = Mock()
+    ref.name = name
+    return ref
+
+
+def _lds_response(name="myserver_local"):
+    """GET of a Local Directory Service that exists"""
+    return _ok([_ref(name)])
+
+
+def _user(name, lds, primary_group, **fields):
+    """A LocalUser as GET /directory-services/local/users returns it"""
+    user = Mock()
+    user.name = name
+    user.built_in = fields.get("built_in", False)
+    user.email = fields.get("email")
+    user.enabled = fields.get("enabled", False)
+    user.uid = fields.get("uid", 1000)
+    user.sid = "S-1-5-21-1943874365-4244124768-3581963543-1003"
+    user.primary_group = _ref(primary_group)
+    user.local_directory_service = _ref(lds)
+    user.realms = [_ref(lds.split("::")[0])] if "::" in lds else []
+    return user
+
+
+def _edge(group, primary=False):
+    """A LocalMember as GET /directory-services/local/users/members returns it"""
+    edge = Mock()
+    edge.group = _ref(group)
+    edge.is_primary_group = primary
+    return edge
+
+
+def _array(visible_lds=(), users=(), groups=None, memberships=None):
+    """A client that answers like the array for the local directory objects given.
+
+    visible_lds names the LDSes the caller can read: the array answers "does
+    not exist" for any other one, yet it lists the users of every LDS.
+    groups is {lds: [group names]} and memberships is {(lds, user): [edges]}.
+    Names are matched without regard to case, as the array matches them.
+    """
+    groups = dict((k.lower(), v) for k, v in (groups or {}).items())
+    memberships = dict(
+        ((k[0].lower(), k[1].lower()), v) for k, v in (memberships or {}).items()
+    )
+    blade = Mock()
+    blade.get_versions.return_value.items = ["2.30"]
+    blade.get_fleets.return_value = _ok([])
+
+    def lds_of(kwargs):
+        return kwargs["filter"][len("local_directory_service.name='") : -1].lower()
+
+    def get_lds(names, **kwargs):
+        found = [n for n in visible_lds if n.lower() == names[0].lower()]
+        if found:
+            return _lds_response(found[0])
+        return _error("Local directory service does not exist.")
+
+    def get_users(names, **kwargs):
+        found = [
+            u
+            for u in users
+            if u.name.lower() == names[0].lower()
+            and u.local_directory_service.name.lower() == lds_of(kwargs)
+        ]
+        return _ok(found) if found else _error("Local user was not found.")
+
+    def get_groups(names, **kwargs):
+        found = [
+            _ref(g)
+            for g in groups.get(lds_of(kwargs), [])
+            if g.lower() == names[0].lower()
+        ]
+        return _ok(found) if found else _error("Local group was not found.")
+
+    def get_members(member_names, **kwargs):
+        return _ok(memberships.get((lds_of(kwargs), member_names[0].lower()), []))
+
+    blade.get_directory_services_local_directory_services.side_effect = get_lds
+    blade.get_directory_services_local_users.side_effect = get_users
+    blade.get_directory_services_local_groups.side_effect = get_groups
+    blade.get_directory_services_local_users_members.side_effect = get_members
+    for write in (USERS_POST, USERS_PATCH, USERS_DELETE, MEMBERS_POST, MEMBERS_DELETE):
+        getattr(blade, write).return_value = _ok([])
+    return blade
+
+
+def _run(params, blade, check_mode=False):
+    """Run main() against ``blade`` and return the module mock.
+
+    The SDK models are replaced by plain data, so a request body can be
+    compared as a dict (LocalUserPost, LocalUserPatch), a name
+    (ReferenceWritable) or a list of group names (LocalUserMembershipPost).
+    """
+    module = Mock()
+    module.exit_json = Mock(side_effect=SystemExit)
+    module.fail_json = Mock(side_effect=SystemExit)
+    module.params = params
+    module.check_mode = check_mode
+    with ExitStack() as stack:
+        stack.enter_context(patch(MODULE + "AnsibleModule", return_value=module))
+        stack.enter_context(patch(MODULE + "get_system", return_value=blade))
+        stack.enter_context(patch(MODULE + "HAS_PYPURECLIENT", True))
+        loose = stack.enter_context(patch(MODULE + "LooseVersion"))
+        loose.return_value.__gt__ = Mock(return_value=False)
+        stack.enter_context(patch(MODULE + "get_error_message", side_effect=_message))
+        stack.enter_context(
+            patch(MODULE + "ReferenceWritable", side_effect=lambda name: name)
+        )
+        stack.enter_context(
+            patch(MODULE + "LocalUserPost", side_effect=lambda **fields: fields)
+        )
+        stack.enter_context(
+            patch(MODULE + "LocalUserPatch", side_effect=lambda **fields: fields)
+        )
+        stack.enter_context(
+            patch(
+                MODULE + "LocalUserMembershipPostGroups",
+                side_effect=lambda group: group,
+            )
+        )
+        stack.enter_context(
+            patch(MODULE + "LocalUserMembershipPost", side_effect=lambda groups: groups)
+        )
+        try:
+            main()
+        except SystemExit:
+            pass
+    return module
+
+
+def _writes(blade):
+    """Names of the write requests sent to the array, in order"""
+    return [
+        call[0]
+        for call in blade.method_calls
+        if call[0].startswith(("post_", "patch_", "delete_"))
+    ]
 
 
 class TestPurefbLocalUser:
@@ -310,6 +487,9 @@ class TestPurefbLocalUser:
 
         blade = Mock()
         blade.get_versions.return_value.items = ["2.24"]
+        blade.get_directory_services_local_directory_services.return_value = (
+            _lds_response()
+        )
         mock_get_system.return_value = blade
 
         get_response = Mock()
@@ -361,6 +541,9 @@ class TestPurefbLocalUser:
 
         blade = Mock()
         blade.get_versions.return_value.items = ["2.24"]
+        blade.get_directory_services_local_directory_services.return_value = (
+            _lds_response()
+        )
         mock_get_system.return_value = blade
 
         get_response = Mock()
@@ -395,6 +578,9 @@ class TestPurefbLocalUser:
 
         blade = Mock()
         blade.get_versions.return_value.items = ["2.24"]
+        blade.get_directory_services_local_directory_services.return_value = (
+            _lds_response()
+        )
         mock_get_system.return_value = blade
 
         get_response = Mock()
@@ -428,6 +614,9 @@ class TestPurefbLocalUser:
 
         blade = Mock()
         blade.get_versions.return_value.items = ["2.24"]
+        blade.get_directory_services_local_directory_services.return_value = (
+            _lds_response()
+        )
         mock_get_system.return_value = blade
 
         get_response = Mock()
@@ -469,6 +658,9 @@ class TestPurefbLocalUser:
 
         blade = Mock()
         blade.get_versions.return_value.items = ["2.24"]
+        blade.get_directory_services_local_directory_services.return_value = (
+            _lds_response()
+        )
         mock_get_system.return_value = blade
 
         existing = Mock()
@@ -520,6 +712,9 @@ class TestPurefbLocalUser:
 
         blade = Mock()
         blade.get_versions.return_value.items = ["2.24"]
+        blade.get_directory_services_local_directory_services.return_value = (
+            _lds_response()
+        )
         mock_get_system.return_value = blade
 
         existing = Mock()
@@ -562,6 +757,9 @@ class TestPurefbLocalUser:
 
         blade = Mock()
         blade.get_versions.return_value.items = ["2.24"]
+        blade.get_directory_services_local_directory_services.return_value = (
+            _lds_response()
+        )
         mock_get_system.return_value = blade
 
         existing = Mock()
@@ -615,6 +813,9 @@ class TestPurefbLocalUser:
 
         blade = Mock()
         blade.get_versions.return_value.items = ["2.24"]
+        blade.get_directory_services_local_directory_services.return_value = (
+            _lds_response()
+        )
         mock_get_system.return_value = blade
 
         existing = Mock()
@@ -667,6 +868,9 @@ class TestPurefbLocalUser:
 
         blade = Mock()
         blade.get_versions.return_value.items = ["2.24"]
+        blade.get_directory_services_local_directory_services.return_value = (
+            _lds_response()
+        )
         mock_get_system.return_value = blade
 
         existing = Mock()
@@ -710,6 +914,9 @@ class TestPurefbLocalUser:
 
         blade = Mock()
         blade.get_versions.return_value.items = ["2.24"]
+        blade.get_directory_services_local_directory_services.return_value = (
+            _lds_response()
+        )
         mock_get_system.return_value = blade
 
         existing = Mock()
@@ -756,6 +963,9 @@ class TestPurefbLocalUser:
 
         blade = Mock()
         blade.get_versions.return_value.items = ["2.24"]
+        blade.get_directory_services_local_directory_services.return_value = (
+            _lds_response()
+        )
         mock_get_system.return_value = blade
 
         existing = Mock()
@@ -799,6 +1009,9 @@ class TestPurefbLocalUser:
 
         blade = Mock()
         blade.get_versions.return_value.items = ["2.24"]
+        blade.get_directory_services_local_directory_services.return_value = (
+            _lds_response()
+        )
         mock_get_system.return_value = blade
 
         existing = Mock()
@@ -845,6 +1058,9 @@ class TestPurefbLocalUser:
 
         blade = Mock()
         blade.get_versions.return_value.items = ["2.24"]
+        blade.get_directory_services_local_directory_services.return_value = (
+            _lds_response()
+        )
         mock_get_system.return_value = blade
 
         existing = Mock()
@@ -887,6 +1103,9 @@ class TestPurefbLocalUser:
 
         blade = Mock()
         blade.get_versions.return_value.items = ["2.24"]
+        blade.get_directory_services_local_directory_services.return_value = (
+            _lds_response()
+        )
         mock_get_system.return_value = blade
 
         existing = Mock()
@@ -931,6 +1150,9 @@ class TestPurefbLocalUser:
 
         blade = Mock()
         blade.get_versions.return_value.items = ["2.24"]
+        blade.get_directory_services_local_directory_services.return_value = (
+            _lds_response()
+        )
         mock_get_system.return_value = blade
 
         existing = Mock()
@@ -970,6 +1192,9 @@ class TestPurefbLocalUser:
 
         blade = Mock()
         blade.get_versions.return_value.items = ["2.24"]
+        blade.get_directory_services_local_directory_services.return_value = (
+            _lds_response()
+        )
         mock_get_system.return_value = blade
 
         existing = Mock()
@@ -1008,6 +1233,9 @@ class TestPurefbLocalUser:
 
         blade = Mock()
         blade.get_versions.return_value.items = ["2.24"]
+        blade.get_directory_services_local_directory_services.return_value = (
+            _lds_response()
+        )
         mock_get_system.return_value = blade
 
         get_response = Mock()
@@ -1045,6 +1273,9 @@ class TestPurefbLocalUser:
 
         blade = Mock()
         blade.get_versions.return_value.items = ["2.24"]
+        blade.get_directory_services_local_directory_services.return_value = (
+            _lds_response()
+        )
         mock_get_system.return_value = blade
 
         get_response = Mock()
@@ -1134,3 +1365,702 @@ class TestPurefbLocalUser:
 
         module.fail_json.assert_called_once()
         assert "py-pure-client" in module.fail_json.call_args[1]["msg"]
+
+
+class TestLocalDirectoryServiceLookup:
+    """The LDS is read before anything else, in a realm and at array level"""
+
+    @patch(MODULE + "get_error_message", side_effect=_message)
+    def test_get_local_ds_returns_the_lds(self, mock_message):
+        """_get_local_ds returns the LDS under the realm-qualified name"""
+        module = Mock()
+        module.params = {"context": ""}
+        blade = _array(visible_lds=[REALM_LDS])
+
+        assert _get_local_ds(module, blade, REALM_LDS).name == REALM_LDS
+        blade.get_directory_services_local_directory_services.assert_called_once_with(
+            names=[REALM_LDS]
+        )
+
+    @patch(MODULE + "get_error_message", side_effect=_message)
+    def test_get_local_ds_none_when_it_does_not_exist(self, mock_message):
+        """_get_local_ds returns None for the array's "does not exist" answer"""
+        module = Mock()
+        module.params = {"context": ""}
+        module.fail_json = Mock(side_effect=SystemExit)
+
+        assert _get_local_ds(module, _array(), "myrealm::nolds") is None
+        module.fail_json.assert_not_called()
+
+    @patch(MODULE + "get_error_message", side_effect=_message)
+    def test_get_local_ds_reports_a_refused_read(self, mock_message):
+        """_get_local_ds fails with the array's message for any other answer"""
+        module = Mock()
+        module.params = {"context": ""}
+        module.fail_json = Mock(side_effect=SystemExit)
+        blade = Mock()
+        blade.get_directory_services_local_directory_services.return_value = _error(
+            "Operation not permitted.", 403
+        )
+
+        try:
+            _get_local_ds(module, blade, "myserver_local")
+        except SystemExit:
+            pass
+
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Failed to read local directory service myserver_local" in msg
+        assert "Operation not permitted." in msg
+
+    @patch(MODULE + "get_error_message", side_effect=_message)
+    def test_get_user_by_another_name(self, mock_message):
+        """_get_user looks up the name it is given inside the LDS"""
+        module = Mock()
+        module.params = {"name": "alice", "context": ""}
+        blade = _array(users=[_user("alice2", REALM_LDS, "staff")])
+
+        assert _get_user(module, blade, REALM_LDS, "alice2").name == "alice2"
+        blade.get_directory_services_local_users.assert_called_once_with(
+            names=["alice2"],
+            filter="local_directory_service.name='myrealm::myserver_local'",
+        )
+        assert _get_user(module, blade, REALM_LDS) is None
+
+    @patch(MODULE + "get_error_message", side_effect=_message)
+    def test_get_user_reports_a_refused_read(self, mock_message):
+        """_get_user does not read a refused GET as "no such user" """
+        module = Mock()
+        module.params = {"name": "alice", "context": ""}
+        module.fail_json = Mock(side_effect=SystemExit)
+        blade = Mock()
+        blade.get_directory_services_local_users.return_value = _error(
+            "Operation not permitted. Authorization for 'get' on "
+            "'directory-services/local/users' is required.",
+            403,
+        )
+
+        try:
+            _get_user(module, blade, "myserver_local")
+        except SystemExit:
+            pass
+
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Failed to read local user alice" in msg
+        assert "Operation not permitted." in msg
+
+    def test_create_in_missing_lds_fails_in_both_modes(self):
+        """A create in an LDS that does not exist stops before the POST"""
+        for check_mode in (True, False):
+            blade = _array(visible_lds=[REALM_LDS])
+            module = _run(
+                _base_params(
+                    name="bob",
+                    local_directory_service="myrealm::nolds",
+                    primary_group="staff",
+                    enabled=False,
+                    password=None,
+                ),
+                blade,
+                check_mode=check_mode,
+            )
+
+            module.exit_json.assert_not_called()
+            msg = module.fail_json.call_args[1]["msg"]
+            assert "myrealm::nolds does not exist or cannot be managed" in msg
+            assert "realm::name" in msg
+            assert _writes(blade) == []
+
+    def test_update_in_hidden_lds_fails_in_both_modes(self):
+        """A user the array lists from an LDS it hides is not updated"""
+        for check_mode in (True, False):
+            # A realm-scoped administrator: only the LDS of its realm is
+            # readable, but the users of the array-level LDS are listed.
+            blade = _array(
+                visible_lds=[REALM_LDS],
+                users=[_user("alice", "myserver_local", "staff")],
+            )
+            module = _run(
+                _base_params(primary_group="staff", uid=2000, enabled=None),
+                blade,
+                check_mode=check_mode,
+            )
+
+            module.exit_json.assert_not_called()
+            msg = module.fail_json.call_args[1]["msg"]
+            assert "myserver_local does not exist or cannot be managed" in msg
+            assert _writes(blade) == []
+
+    def test_delete_in_hidden_lds_fails_in_both_modes(self):
+        """A user the array lists from an LDS it hides is not deleted"""
+        for lds in ("myserver_local", "otherrealm::myserver_local"):
+            for check_mode in (True, False):
+                blade = _array(
+                    visible_lds=[REALM_LDS], users=[_user("alice", lds, "staff")]
+                )
+                module = _run(
+                    _base_params(state="absent", local_directory_service=lds),
+                    blade,
+                    check_mode=check_mode,
+                )
+
+                module.exit_json.assert_not_called()
+                msg = module.fail_json.call_args[1]["msg"]
+                assert "does not exist or cannot be managed" in msg
+                assert _writes(blade) == []
+
+    def test_delete_in_missing_lds_is_noop(self):
+        """Nothing is left to delete when neither the LDS nor the user exists"""
+        for lds in ("myserver_local", "myrealm::nolds"):
+            blade = _array(visible_lds=[REALM_LDS])
+            module = _run(
+                _base_params(state="absent", local_directory_service=lds), blade
+            )
+
+            module.fail_json.assert_not_called()
+            assert module.exit_json.call_args[1]["changed"] is False
+            assert _writes(blade) == []
+
+    def test_refused_lds_read_is_not_absent(self):
+        """A refused read of the LDS fails, also for state=absent"""
+        blade = _array()
+        blade.get_directory_services_local_directory_services.side_effect = None
+        blade.get_directory_services_local_directory_services.return_value = _error(
+            "Operation not permitted.", 403
+        )
+        module = _run(_base_params(state="absent"), blade)
+
+        module.exit_json.assert_not_called()
+        assert "Operation not permitted." in module.fail_json.call_args[1]["msg"]
+        assert _writes(blade) == []
+
+    def test_refused_user_read_does_not_create(self):
+        """A refused read of the user is reported, not taken for "absent" """
+        blade = _array(visible_lds=["myserver_local"])
+        blade.get_directory_services_local_users.side_effect = None
+        blade.get_directory_services_local_users.return_value = _error(
+            "Operation not permitted.", 403
+        )
+        module = _run(_base_params(primary_group="staff"), blade)
+
+        module.exit_json.assert_not_called()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Failed to read local user alice" in msg
+        assert _writes(blade) == []
+
+    def test_create_in_realm_lds(self):
+        """A user of a realm LDS is created under bare user and group names"""
+        blade = _array(
+            visible_lds=[REALM_LDS], groups={REALM_LDS: ["staff", "developers"]}
+        )
+        module = _run(
+            _base_params(
+                name="bob",
+                local_directory_service=REALM_LDS,
+                primary_group="staff",
+                groups=["developers"],
+            ),
+            blade,
+        )
+
+        module.fail_json.assert_not_called()
+        assert _writes(blade) == [USERS_POST, MEMBERS_POST]
+        assert blade.post_directory_services_local_users.call_args[1] == {
+            "names": ["bob"],
+            "local_directory_service_names": [REALM_LDS],
+            "local_user": {
+                "enabled": True,
+                "password": "s3cret!",
+                "primary_group": "staff",
+            },
+        }
+        assert blade.post_directory_services_local_users_members.call_args[1] == {
+            "local_membership": ["developers"],
+            "member_names": ["bob"],
+            "local_directory_service_names": [REALM_LDS],
+        }
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_delete_in_realm_lds_leaves_the_namesake_alone(self):
+        """The delete names the realm LDS, not the array-level namesake"""
+        blade = _array(
+            visible_lds=[REALM_LDS, "myserver_local"],
+            users=[
+                _user("alice", REALM_LDS, "staff"),
+                _user("alice", "myserver_local", "staff"),
+            ],
+        )
+        module = _run(
+            _base_params(state="absent", local_directory_service=REALM_LDS), blade
+        )
+
+        blade.delete_directory_services_local_users.assert_called_once_with(
+            names=["alice"], local_directory_service_names=[REALM_LDS]
+        )
+        assert module.exit_json.call_args[1]["changed"] is True
+
+
+class TestGroupChecks:
+    """Groups that the LDS does not have stop the task before any write"""
+
+    @patch(MODULE + "get_error_message", side_effect=_message)
+    def test_require_groups_names_the_missing_group(self, mock_message):
+        """_require_groups fails for a group the array does not find"""
+        module = Mock()
+        module.params = {"context": ""}
+        module.fail_json = Mock(side_effect=SystemExit)
+        blade = _array(groups={REALM_LDS: ["staff"]})
+
+        _require_groups(module, blade, REALM_LDS, ["STAFF"])
+        module.fail_json.assert_not_called()
+        try:
+            _require_groups(module, blade, REALM_LDS, ["staff", "myrealm::staff"])
+        except SystemExit:
+            pass
+
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Local group myrealm::staff does not exist" in msg
+        assert "without a realm prefix" in msg
+
+    @patch(MODULE + "get_error_message", side_effect=_message)
+    def test_require_groups_leaves_a_refused_read_to_the_array(self, mock_message):
+        """_require_groups only refuses on a definite "not found" """
+        module = Mock()
+        module.params = {"context": ""}
+        module.fail_json = Mock(side_effect=SystemExit)
+        blade = Mock()
+        blade.get_directory_services_local_groups.return_value = _error(
+            "Operation not permitted.", 403
+        )
+
+        _require_groups(module, blade, "myserver_local", ["staff"])
+        module.fail_json.assert_not_called()
+
+    def test_membership_plan_ignores_case_and_primary_groups(self):
+        """_membership_plan adds the task's spelling, removes the array's"""
+        module = Mock()
+        module.params = {"groups": ["Developers", "infra", "STAFF", "Admins"]}
+
+        add, remove = _membership_plan(
+            module, {"developers", "staff", "old", "wheel"}, ("admins", "Wheel")
+        )
+
+        assert add == ["infra"]
+        assert remove == ["old"]
+
+    def test_create_with_missing_primary_group_fails_in_both_modes(self):
+        """A create with a primary group the LDS lacks stops before the POST"""
+        for check_mode in (True, False):
+            blade = _array(visible_lds=[REALM_LDS], groups={REALM_LDS: ["staff"]})
+            module = _run(
+                _base_params(
+                    local_directory_service=REALM_LDS, primary_group="myrealm::staff"
+                ),
+                blade,
+                check_mode=check_mode,
+            )
+
+            module.exit_json.assert_not_called()
+            msg = module.fail_json.call_args[1]["msg"]
+            assert "Local group myrealm::staff does not exist" in msg
+            assert _writes(blade) == []
+
+    def test_create_with_missing_group_fails_before_the_post(self):
+        """A create with a group the LDS lacks does not leave a user behind"""
+        blade = _array(
+            visible_lds=["myserver_local"], groups={"myserver_local": ["staff"]}
+        )
+        module = _run(_base_params(primary_group="staff", groups=["nogroup"]), blade)
+
+        module.exit_json.assert_not_called()
+        assert "Local group nogroup" in module.fail_json.call_args[1]["msg"]
+        assert _writes(blade) == []
+
+    def test_create_with_refused_group_read_is_left_to_the_array(self):
+        """A group read the array refuses does not block the create"""
+        blade = _array(visible_lds=["myserver_local"])
+        blade.get_directory_services_local_groups.side_effect = None
+        blade.get_directory_services_local_groups.return_value = _error(
+            "Operation not permitted.", 403
+        )
+        module = _run(_base_params(primary_group="staff"), blade)
+
+        module.fail_json.assert_not_called()
+        assert _writes(blade) == [USERS_POST]
+
+    def test_update_with_missing_group_fails_before_any_write(self):
+        """An update whose groups the LDS lacks sends nothing, PATCH included"""
+        for check_mode in (True, False):
+            blade = _array(
+                visible_lds=["myserver_local"],
+                users=[_user("alice", "myserver_local", "staff")],
+                groups={"myserver_local": ["staff"]},
+                memberships={
+                    ("myserver_local", "alice"): [_edge("staff", primary=True)]
+                },
+            )
+            module = _run(
+                _base_params(
+                    primary_group="staff",
+                    groups=["nogroup"],
+                    email="alice@example.com",
+                    enabled=None,
+                ),
+                blade,
+                check_mode=check_mode,
+            )
+
+            module.exit_json.assert_not_called()
+            assert "Local group nogroup" in module.fail_json.call_args[1]["msg"]
+            assert _writes(blade) == []
+
+    def test_groups_in_another_spelling_are_no_change(self):
+        """A group named in another letter case is the membership the user has"""
+        blade = _array(
+            visible_lds=[REALM_LDS],
+            users=[_user("alice", REALM_LDS, "staff")],
+            groups={REALM_LDS: ["staff", "developers"]},
+            memberships={
+                (REALM_LDS, "alice"): [
+                    _edge("staff", primary=True),
+                    _edge("developers"),
+                ]
+            },
+        )
+        module = _run(
+            _base_params(
+                local_directory_service=REALM_LDS,
+                primary_group="staff",
+                groups=["Developers"],
+                enabled=None,
+            ),
+            blade,
+        )
+
+        module.fail_json.assert_not_called()
+        assert _writes(blade) == []
+        assert module.exit_json.call_args[1]["changed"] is False
+
+
+class TestPrimaryGroupChange:
+    """The module makes the user a member of a new primary group first"""
+
+    def _blade(self, edges, primary_group="staff", lds=REALM_LDS):
+        return _array(
+            visible_lds=[lds],
+            users=[_user("alice", lds, primary_group)],
+            groups={lds: ["staff", "admins", "developers", "old"]},
+            memberships={(lds, "alice"): edges},
+        )
+
+    def test_membership_is_added_before_the_patch(self):
+        """A new primary group the user is not in is added, then set"""
+        blade = self._blade([_edge("staff", primary=True)])
+        module = _run(
+            _base_params(
+                local_directory_service=REALM_LDS,
+                primary_group="admins",
+                enabled=None,
+            ),
+            blade,
+        )
+
+        module.fail_json.assert_not_called()
+        assert _writes(blade) == [MEMBERS_POST, USERS_PATCH]
+        assert blade.post_directory_services_local_users_members.call_args[1] == {
+            "local_membership": ["admins"],
+            "member_names": ["alice"],
+            "local_directory_service_names": [REALM_LDS],
+        }
+        assert blade.patch_directory_services_local_users.call_args[1] == {
+            "names": ["alice"],
+            "local_directory_service_names": [REALM_LDS],
+            "local_user": {"primary_group": "admins"},
+        }
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_array_level_lds(self):
+        """The same on an array-level LDS"""
+        blade = self._blade([_edge("staff", primary=True)], lds="myserver_local")
+        module = _run(_base_params(primary_group="admins", enabled=None), blade)
+
+        assert _writes(blade) == [MEMBERS_POST, USERS_PATCH]
+        post = blade.post_directory_services_local_users_members.call_args[1]
+        assert post["local_directory_service_names"] == ["myserver_local"]
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_check_mode_sends_nothing(self):
+        """Check mode predicts the change and sends no write"""
+        blade = self._blade([_edge("staff", primary=True)])
+        module = _run(
+            _base_params(
+                local_directory_service=REALM_LDS,
+                primary_group="admins",
+                enabled=None,
+            ),
+            blade,
+            check_mode=True,
+        )
+
+        module.fail_json.assert_not_called()
+        assert _writes(blade) == []
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_missing_group_fails_in_both_modes(self):
+        """A primary group the LDS lacks is refused before any write"""
+        for check_mode in (True, False):
+            blade = self._blade([_edge("staff", primary=True)])
+            module = _run(
+                _base_params(
+                    local_directory_service=REALM_LDS,
+                    primary_group="nogroup",
+                    enabled=None,
+                ),
+                blade,
+                check_mode=check_mode,
+            )
+
+            module.exit_json.assert_not_called()
+            assert "Local group nogroup" in module.fail_json.call_args[1]["msg"]
+            assert _writes(blade) == []
+
+    def test_existing_membership_is_not_added_again(self):
+        """A new primary group the user is already in needs the PATCH only"""
+        blade = self._blade([_edge("staff", primary=True), _edge("admins")])
+        module = _run(
+            _base_params(
+                local_directory_service=REALM_LDS,
+                primary_group="admins",
+                enabled=None,
+            ),
+            blade,
+        )
+
+        assert _writes(blade) == [USERS_PATCH]
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_groups_converge_in_one_run(self):
+        """With groups set, the former primary group goes in the same run"""
+        blade = self._blade([_edge("staff", primary=True), _edge("old")])
+        module = _run(
+            _base_params(
+                local_directory_service=REALM_LDS,
+                primary_group="admins",
+                groups=["admins", "developers"],
+                enabled=None,
+            ),
+            blade,
+        )
+
+        module.fail_json.assert_not_called()
+        assert _writes(blade) == [
+            MEMBERS_POST,
+            MEMBERS_DELETE,
+            USERS_PATCH,
+            MEMBERS_DELETE,
+        ]
+        post = blade.post_directory_services_local_users_members.call_args[1]
+        assert post["local_membership"] == ["developers", "admins"]
+        deletes = blade.delete_directory_services_local_users_members.call_args_list
+        assert [call[1]["group_names"] for call in deletes] == [["old"], ["staff"]]
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_second_run_is_unchanged(self):
+        """The state the first run leaves is the state the task asks for"""
+        blade = self._blade(
+            [_edge("admins", primary=True), _edge("developers")],
+            primary_group="admins",
+        )
+        module = _run(
+            _base_params(
+                local_directory_service=REALM_LDS,
+                primary_group="admins",
+                groups=["admins", "developers"],
+                enabled=None,
+            ),
+            blade,
+        )
+
+        assert _writes(blade) == []
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    def test_former_primary_group_is_kept_when_listed(self):
+        """The former primary group stays when groups lists it"""
+        blade = self._blade([_edge("staff", primary=True)])
+        module = _run(
+            _base_params(
+                local_directory_service=REALM_LDS,
+                primary_group="admins",
+                groups=["Staff"],
+                enabled=None,
+            ),
+            blade,
+        )
+
+        assert _writes(blade) == [MEMBERS_POST, USERS_PATCH]
+        post = blade.post_directory_services_local_users_members.call_args[1]
+        assert post["local_membership"] == ["admins"]
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_former_primary_group_is_kept_without_groups(self):
+        """Without groups the module leaves the former primary group alone"""
+        blade = self._blade([_edge("staff", primary=True), _edge("admins")])
+        _run(
+            _base_params(
+                local_directory_service=REALM_LDS,
+                primary_group="admins",
+                enabled=None,
+            ),
+            blade,
+        )
+
+        blade.delete_directory_services_local_users_members.assert_not_called()
+
+    def test_another_spelling_is_no_change(self):
+        """The current primary group in another letter case is not a change"""
+        blade = self._blade([_edge("staff", primary=True)])
+        module = _run(
+            _base_params(
+                local_directory_service=REALM_LDS, primary_group="STAFF", enabled=None
+            ),
+            blade,
+        )
+
+        module.fail_json.assert_not_called()
+        assert _writes(blade) == []
+        assert module.exit_json.call_args[1]["changed"] is False
+
+
+class TestRenameIdempotency:
+    """A rename that has already happened continues with the renamed user"""
+
+    def _params(self, **overrides):
+        # The form of the module's own rename example: no password, no enabled
+        params = _base_params(
+            new_name="alice2",
+            local_directory_service=REALM_LDS,
+            primary_group="staff",
+            enabled=None,
+            password=None,
+        )
+        params.update(overrides)
+        return params
+
+    def _renamed(self, **fields):
+        return _array(
+            visible_lds=[REALM_LDS],
+            users=[_user("alice2", REALM_LDS, "staff", **fields)],
+            groups={REALM_LDS: ["staff", "developers"]},
+            memberships={(REALM_LDS, "alice2"): [_edge("staff", primary=True)]},
+        )
+
+    def test_second_run_is_unchanged(self):
+        """The rename task run again finds the renamed user and changes nothing"""
+        for check_mode in (True, False):
+            blade = self._renamed()
+            module = _run(self._params(), blade, check_mode=check_mode)
+
+            module.fail_json.assert_not_called()
+            assert _writes(blade) == []
+            assert module.exit_json.call_args[1]["changed"] is False
+
+    def test_second_run_does_not_recreate_the_old_name(self):
+        """Other options are applied to the renamed user, nothing is created"""
+        blade = self._renamed(enabled=True)
+        module = _run(self._params(enabled=False, email="a2@example.com"), blade)
+
+        module.fail_json.assert_not_called()
+        assert _writes(blade) == [USERS_PATCH]
+        assert blade.patch_directory_services_local_users.call_args[1] == {
+            "names": ["alice2"],
+            "local_directory_service_names": [REALM_LDS],
+            "local_user": {"email": "a2@example.com", "enabled": False},
+        }
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_second_run_reconciles_groups_of_the_renamed_user(self):
+        """Memberships are read and written under the new name"""
+        blade = self._renamed()
+        module = _run(self._params(groups=["developers"]), blade)
+
+        assert _writes(blade) == [MEMBERS_POST]
+        post = blade.post_directory_services_local_users_members.call_args[1]
+        assert post["member_names"] == ["alice2"]
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_rename_then_memberships_use_the_new_name(self):
+        """The first run renames, then writes memberships under the new name"""
+        blade = _array(
+            visible_lds=[REALM_LDS],
+            users=[_user("alice", REALM_LDS, "staff")],
+            groups={REALM_LDS: ["staff", "developers"]},
+            memberships={(REALM_LDS, "alice"): [_edge("staff", primary=True)]},
+        )
+        module = _run(self._params(groups=["developers"]), blade)
+
+        assert _writes(blade) == [USERS_PATCH, MEMBERS_POST]
+        patched = blade.patch_directory_services_local_users.call_args[1]
+        assert patched["names"] == ["alice"]
+        assert patched["local_user"] == {"name": "alice2"}
+        post = blade.post_directory_services_local_users_members.call_args[1]
+        assert post["member_names"] == ["alice2"]
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_another_spelling_of_the_name_is_no_rename(self):
+        """The array keeps the stored spelling, so the module asks for nothing"""
+        blade = _array(
+            visible_lds=[REALM_LDS], users=[_user("alice", REALM_LDS, "staff")]
+        )
+        module = _run(self._params(new_name="ALICE"), blade)
+
+        module.fail_json.assert_not_called()
+        assert _writes(blade) == []
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    def test_both_names_exist_fails(self):
+        """A rename onto another user of the LDS is refused"""
+        blade = _array(
+            visible_lds=[REALM_LDS],
+            users=[
+                _user("alice", REALM_LDS, "staff"),
+                _user("alice2", REALM_LDS, "staff"),
+            ],
+        )
+        module = _run(self._params(), blade)
+
+        assert "target name already exists" in module.fail_json.call_args[1]["msg"]
+        assert _writes(blade) == []
+
+    def test_namesake_in_another_lds_is_not_the_renamed_user(self):
+        """A user called new_name in another LDS does not end the rename"""
+        blade = _array(
+            visible_lds=[REALM_LDS, "myserver_local"],
+            users=[
+                _user("alice", REALM_LDS, "staff"),
+                _user("alice2", "myserver_local", "staff"),
+            ],
+        )
+        module = _run(self._params(), blade)
+
+        module.fail_json.assert_not_called()
+        assert _writes(blade) == [USERS_PATCH]
+        patched = blade.patch_directory_services_local_users.call_args[1]
+        assert patched["local_directory_service_names"] == [REALM_LDS]
+        assert patched["local_user"] == {"name": "alice2"}
+
+    def test_neither_name_exists_creates_name(self):
+        """A user that does not exist yet is created as name"""
+        blade = _array(visible_lds=[REALM_LDS], groups={REALM_LDS: ["staff"]})
+        module = _run(self._params(enabled=False), blade)
+
+        assert _writes(blade) == [USERS_POST]
+        created = blade.post_directory_services_local_users.call_args[1]
+        assert created["names"] == ["alice"]
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_absent_does_not_follow_new_name(self):
+        """state=absent deletes name only; the renamed user is left alone"""
+        blade = self._renamed()
+        module = _run(self._params(state="absent"), blade)
+
+        assert _writes(blade) == []
+        assert module.exit_json.call_args[1]["changed"] is False

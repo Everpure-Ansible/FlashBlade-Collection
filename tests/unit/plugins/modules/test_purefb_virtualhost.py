@@ -10,6 +10,7 @@ __metaclass__ = type
 import sys
 import multiprocessing
 import ctypes
+import re
 from unittest.mock import Mock, patch, MagicMock
 
 import pytest
@@ -95,6 +96,9 @@ KNOWN_SERVERS = (
 NOT_FOUND = "Virtual host does not exist."
 # What it answers to a write addressed in another letter case than it stores
 WRONG_CASE = "Object changed during processing. Please try again."
+# What it answers when a pattern matches no virtual host, and to a blank name
+NO_MATCH = "Virtual host was not found."
+BLANK_NAME = "Missing or invalid parameter."
 
 
 def _base_params(**overrides):
@@ -173,13 +177,16 @@ def _blade(existing=None, servers=KNOWN_SERVERS, realm_defaults=None):
 
     existing maps vhost name -> vhost object; unknown names return 400 with
     the array's "does not exist" message (the array's behaviour for a names=
-    filter on a missing object). A GET matches names without regard to case,
-    while a PATCH or DELETE is refused unless the host is addressed by its
-    name as stored, both as on the array. A GET with no names lists every
-    host. POST, PATCH and DELETE change that state so that a later GET reads
-    it back. servers are
-    the server names GET /servers knows, realm_defaults maps a realm name to
-    its default object store server (None for a realm without one).
+    filter on a missing object). A GET matches names without regard to case
+    and to white space around them, reads * as a pattern and a comma as a
+    separator of names, and answers with every host that matches, while a
+    PATCH or DELETE is refused unless the host is addressed by its name as
+    stored, all as on the array. A GET with no names lists every host. POST,
+    PATCH and DELETE change that state so that a later GET reads it back.
+    servers are the server names GET /servers knows: that look-up ignores
+    case and white space and splits on commas as well, has no patterns, and
+    answers with the stored names. realm_defaults maps a realm name to its
+    default object store server (None for a realm without one).
 
     blade.quirks makes the array misbehave for the defence-in-depth tests:
     post_without_servers, hidden (names a GET cannot read), ignore_attach,
@@ -205,10 +212,21 @@ def _blade(existing=None, servers=KNOWN_SERVERS, realm_defaults=None):
         names = kwargs.get("names")
         if names is None:
             return _response(200, items=list(hosts.values()), total=len(hosts))
-        vhost = hosts.get(_key(names[0]))
-        if vhost is None or names[0] in blade.quirks.get("hidden", ()):
+        if names[0] in blade.quirks.get("hidden", ()):
             return _response(400, items=[], error=NOT_FOUND)
-        return _response(200, items=[vhost])
+        if not names[0].strip():
+            return _response(400, items=[], error=BLANK_NAME)
+        found = []
+        for part in names[0].split(","):
+            pattern = ".*".join(
+                re.escape(piece) for piece in part.strip().lower().split("*")
+            )
+            hits = [stored for stored in hosts if re.fullmatch(pattern, stored.lower())]
+            if not hits:
+                error = NO_MATCH if "*" in part else NOT_FOUND
+                return _response(400, items=[], error=error)
+            found += [stored for stored in hits if stored not in found]
+        return _response(200, items=[hosts[stored] for stored in found])
 
     def _post(**kwargs):
         name = kwargs["names"][0]
@@ -254,11 +272,16 @@ def _blade(existing=None, servers=KNOWN_SERVERS, realm_defaults=None):
         return _response(200)
 
     def _get_servers(**kwargs):
-        names = kwargs.get("names") or []
-        known = set(srv.lower() for srv in servers)
-        if [srv for srv in names if srv.lower() not in known]:
-            return _response(400, items=[])
-        return _response(200, items=_server_refs(names))
+        known = dict((srv.lower(), srv) for srv in servers)
+        found = []
+        for name in kwargs.get("names") or []:
+            for part in name.split(","):
+                stored = known.get(part.strip().lower())
+                if stored is None:
+                    return _response(400, items=[])
+                if stored not in found:
+                    found.append(stored)
+        return _response(200, items=_server_refs(found))
 
     def _get_realms_defaults(**kwargs):
         realm = kwargs["realm_names"][0]
@@ -2161,3 +2184,271 @@ class TestStoredName:
         _no_writes(blade)
         module.warn.assert_called_once()
         assert _changed(module) is False
+
+
+class TestOneName:
+    """Only the virtual host that has the name given is ever read as found"""
+
+    @BOTH_MODES
+    def test_pattern_as_name_refused(self, check_mode):
+        """The array would answer with every host the pattern matches"""
+        module = _module(check_mode=check_mode, name="acme-*", hostname="new.acme.com")
+        blade = _blade(_namesakes())
+        _run(module, blade)
+        assert _failure(module) == (
+            "name must be the name of one Object Store Virtual Host: in acme-* "
+            "the array reads * as a pattern and a comma as a separator of names."
+        )
+        blade.get_object_store_virtual_hosts.assert_not_called()
+        _untouched(blade)
+
+    @BOTH_MODES
+    def test_pattern_as_name_refused_on_delete(self, check_mode):
+        module = _module(check_mode=check_mode, state="absent", name="*")
+        blade = _blade(_namesakes())
+        _run(module, blade)
+        assert "name must be the name of one" in _failure(module)
+        _untouched(blade)
+        assert sorted(blade.hosts) == ["acme-s3", "tenant1::acme-s3"]
+
+    @BOTH_MODES
+    def test_pattern_as_realm_of_the_name_refused(self, check_mode):
+        """*::host would find the host of that name in any realm"""
+        module = _module(
+            check_mode=check_mode, name="*::acme-s3", hostname="new.acme.com"
+        )
+        blade = _blade(_namesakes())
+        _run(module, blade)
+        assert "name must be the name of one" in _failure(module)
+        _untouched(blade)
+
+    @BOTH_MODES
+    def test_list_of_names_refused(self, check_mode):
+        """Both exist: the array would answer with both"""
+        module = _module(
+            check_mode=check_mode, state="absent", name="acme-s3,tenant1::acme-s3"
+        )
+        blade = _blade(_namesakes())
+        _run(module, blade)
+        assert "name must be the name of one" in _failure(module)
+        blade.get_object_store_virtual_hosts.assert_not_called()
+        _untouched(blade)
+        assert sorted(blade.hosts) == ["acme-s3", "tenant1::acme-s3"]
+
+    @BOTH_MODES
+    def test_pattern_as_new_name_refused(self, check_mode):
+        """name is absent: a pattern must not find a host to manage instead"""
+        module = _module(
+            check_mode=check_mode,
+            name="acme-old",
+            rename="acme-*",
+            hostname="new.acme.com",
+        )
+        blade = _blade(_namesakes())
+        _run(module, blade)
+        assert _failure(module).startswith(
+            "rename must be the name of one Object Store Virtual Host: in acme-* "
+        )
+        blade.get_object_store_virtual_hosts.assert_not_called()
+        _untouched(blade)
+
+    @BOTH_MODES
+    def test_list_as_new_name_refused(self, check_mode):
+        module = _module(check_mode=check_mode, name="acme-s3", rename="acme-a,acme-b")
+        blade = _blade(_namesakes())
+        _run(module, blade)
+        assert "rename must be the name of one" in _failure(module)
+        _untouched(blade)
+
+    def test_delete_takes_no_notice_of_a_pattern_as_new_name(self):
+        module = _module(state="absent", name="acme-s3", rename="acme-*")
+        blade = _blade(_namesakes())
+        _run(module, blade)
+        blade.delete_object_store_virtual_hosts.assert_called_once_with(
+            names=["acme-s3"]
+        )
+        assert _changed(module) is True
+
+    def test_name_with_white_space_around_it_is_the_stored_host(self):
+        """The array finds it, so it is written under its stored name"""
+        module = _module(name=" Acme-S3 ", hostname="new.acme.com")
+        blade = _blade(_namesakes())
+        _run(module, blade)
+        blade.patch_object_store_virtual_hosts.assert_called_once_with(
+            names=["acme-s3"],
+            object_store_virtual_host={"hostname": "new.acme.com"},
+        )
+        assert _changed(module) is True
+        assert blade.hosts["tenant1::acme-s3"].hostname == "a.acme.com"
+
+    def test_new_name_with_white_space_that_differs_only_in_case(self):
+        module = _module(name="acme-s3", rename=" ACME-S3 ")
+        blade = _blade(_namesakes())
+        _run(module, blade)
+        _untouched(blade)
+        assert _changed(module) is False
+
+    @BOTH_MODES
+    def test_answer_with_another_host_is_not_taken(self, check_mode):
+        """Whatever makes the array answer with a host of another name"""
+        module = _module(check_mode=check_mode, hostname="new.acme.com")
+        blade = _blade(_namesakes())
+        other = blade.hosts["tenant1::acme-s3"]
+        blade.get_object_store_virtual_hosts.side_effect = None
+        blade.get_object_store_virtual_hosts.return_value = _response(
+            200, items=[other]
+        )
+        _run(module, blade)
+        assert _failure(module) == (
+            "Failed to read Object Store Virtual Host acme-s3: the array "
+            "answered with tenant1::acme-s3, which does not have that name. "
+            "Give the name of one virtual host."
+        )
+        _untouched(blade)
+
+    def test_answer_with_another_host_is_not_deleted(self):
+        module = _module(state="absent")
+        blade = _blade(_namesakes())
+        other = blade.hosts["tenant1::acme-s3"]
+        blade.get_object_store_virtual_hosts.side_effect = None
+        blade.get_object_store_virtual_hosts.return_value = _response(
+            200, items=[other]
+        )
+        _run(module, blade)
+        assert "which does not have that name" in _failure(module)
+        _untouched(blade)
+        assert sorted(blade.hosts) == ["acme-s3", "tenant1::acme-s3"]
+
+    @BOTH_MODES
+    def test_answer_with_another_host_is_not_adopted_as_renamed(self, check_mode):
+        """name is absent and the look-up of the new name returns another host"""
+        module = _module(
+            check_mode=check_mode,
+            name="acme-old",
+            rename="acme-new",
+            hostname="new.acme.com",
+        )
+        blade = _blade(_namesakes())
+        other = blade.hosts["acme-s3"]
+        inner = blade.get_object_store_virtual_hosts.side_effect
+
+        def _get(**kwargs):
+            if kwargs.get("names") == ["acme-new"]:
+                return _response(200, items=[other])
+            return inner(**kwargs)
+
+        blade.get_object_store_virtual_hosts.side_effect = _get
+        _run(module, blade)
+        msg = _failure(module)
+        assert "Failed to read Object Store Virtual Host acme-new" in msg
+        assert "answered with acme-s3" in msg
+        _untouched(blade)
+
+    def test_host_is_picked_by_name_from_a_longer_answer(self):
+        vhost = _vhost("acme-s3")
+        other = _vhost("acme-s33")
+        blade = Mock()
+        blade.get_object_store_virtual_hosts.return_value = _response(
+            200, items=[other, vhost]
+        )
+        module = _module()
+        assert _find_host(module, blade, "ACME-S3", {}) is vhost
+        assert _get_host(blade, " acme-s3", {}) is vhost
+        module.fail_json.assert_not_called()
+
+    def test_read_back_does_not_take_another_host(self):
+        blade = Mock()
+        blade.get_object_store_virtual_hosts.return_value = _response(
+            200, items=[_vhost("acme-s33")]
+        )
+        assert _get_host(blade, "acme-s3", {}) is None
+
+    def test_created_host_is_not_confirmed_by_another_host(self):
+        """The read-back after a create looks for the new host by its name"""
+        module = _module(name="acme-new", servers=["tenant_a"])
+        blade = _blade(_namesakes())
+        other = blade.hosts["acme-s3"]
+        inner = blade.get_object_store_virtual_hosts.side_effect
+        calls = []
+
+        def _get(**kwargs):
+            calls.append(kwargs.get("names"))
+            if len(calls) > 1:
+                return _response(200, items=[other])
+            return inner(**kwargs)
+
+        blade.get_object_store_virtual_hosts.side_effect = _get
+        _run(module, blade)
+        assert "an attached server could not be confirmed" in _failure(module)
+        blade.delete_object_store_virtual_hosts.assert_called_once_with(
+            names=["acme-new"]
+        )
+        assert sorted(blade.hosts) == ["acme-s3", "tenant1::acme-s3"]
+
+    def test_reserved_host_in_another_case_keeps_its_warning_for_any_new_name(self):
+        """A new name in a realm is not judged for the reserved host"""
+        module = _module(name="S3.AmazonAWS.com", rename="tenant1::acme-object")
+        blade = _blade({RESERVED: _vhost(RESERVED, servers=["*"])})
+        _run(module, blade)
+        _no_writes(blade)
+        module.warn.assert_called_once()
+        assert "reserved" in module.warn.call_args[0][0]
+        assert _changed(module) is False
+
+    def test_name_with_white_space_around_its_realm_is_in_that_realm(self):
+        module = _module(
+            name=" tenant1::acme-s3",
+            servers=["tenant1::s3srv", "tenant1::s3srv2"],
+        )
+        blade = _blade(_namesakes())
+        _run(module, blade)
+        assert _bodies(blade) == [{"add_attached_servers": [_ref("tenant1::s3srv2")]}]
+        assert _changed(module) is True
+
+
+class TestServersByName:
+    """A new virtual host only names servers the array has under that name"""
+
+    @BOTH_MODES
+    def test_two_servers_in_one_entry_refused(self, check_mode):
+        """The array answers that look-up with both servers; none has the name"""
+        module = _module(
+            check_mode=check_mode, name="new-s3", servers=["tenant_a,tenant_b"]
+        )
+        blade = _blade()
+        _run(module, blade)
+        assert _failure(module) == (
+            "Object Store Virtual Host new-s3 was not created: servers "
+            "tenant_a,tenant_b could not all be found."
+        )
+        blade.get_servers.assert_called_once_with(names=["tenant_a,tenant_b"])
+        _no_writes(blade)
+
+    @BOTH_MODES
+    def test_one_server_twice_in_one_entry_refused(self, check_mode):
+        module = _module(
+            check_mode=check_mode, name="new-s3", servers=["tenant_a,tenant_a"]
+        )
+        blade = _blade()
+        _run(module, blade)
+        assert "could not all be found" in _failure(module)
+        _no_writes(blade)
+
+    def test_server_in_another_case_is_found_by_name(self):
+        module = _module(name="new-s3", servers=["Tenant_A", "TENANT_B"])
+        blade = _blade()
+        _run(module, blade)
+        blade.post_object_store_virtual_hosts.assert_called_once_with(
+            names=["new-s3"],
+            object_store_virtual_host={
+                "attached_servers": [_ref("Tenant_A"), _ref("TENANT_B")]
+            },
+        )
+        assert _changed(module) is True
+
+    def test_one_missing_server_of_two_refused(self):
+        module = _module(name="new-s3", servers=["tenant_a", "nosuch"])
+        blade = _blade()
+        _run(module, blade)
+        assert "was not created" in _failure(module)
+        _no_writes(blade)

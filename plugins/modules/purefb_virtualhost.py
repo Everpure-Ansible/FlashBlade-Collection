@@ -45,6 +45,9 @@ options:
     - A realm-scoped virtual host is named C(realm::host). Such a name
       cannot contain dots and the array requires I(hostname) for it.
     - Names are not case sensitive. A name is never completed with a realm.
+    - This is the name of one virtual host. A name with a C(*) or a comma,
+      which the array reads as a pattern or as a list of names, is refused,
+      for I(rename) as well.
     type: str
     required: true
   hostname:
@@ -96,7 +99,8 @@ options:
       virtual host without a realm. Any other new name is refused before
       anything is changed.
     - Names are not case sensitive, so a new name that differs from
-      I(name) only in letter case is not a rename.
+      I(name) only in letter case is not a rename. The array refuses a new
+      name that contains dots.
     - When no virtual host called I(name) exists but one called I(rename)
       does, the rename is treated as already done and the host is managed
       under its new name, so a rename task can be re-run.
@@ -235,9 +239,48 @@ def _realm_of(name):
 def _same_realm(first, second):
     """Tell whether two names are in the same realm, or both in none.
 
-    The array matches names without regard to case.
+    The array matches names without regard to case and to white space
+    around them.
     """
-    return _realm_of(first).lower() == _realm_of(second).lower()
+    return _realm_of(first).strip().lower() == _realm_of(second).strip().lower()
+
+
+def _same_name(first, second):
+    """Tell whether two names are the same name on the array.
+
+    The array matches a name without regard to case and to white space
+    around it.
+    """
+    return first.strip().lower() == second.strip().lower()
+
+
+def _single_name(module, option):
+    """Refuse a name that the array does not read as the name of one host.
+
+    In a request the array reads * in a name as a pattern and a comma as a
+    separator of names, so such a name reaches virtual hosts that only match
+    it, or several at once. This module manages the one virtual host that
+    has the name given, so the name is refused before anything is read.
+    """
+    value = module.params[option]
+    if value and ("*" in value or "," in value):
+        module.fail_json(
+            msg="{0} must be the name of one Object Store Virtual Host: in {1} "
+            "the array reads * as a pattern and a comma as a separator of "
+            "names.".format(option, value)
+        )
+
+
+def _pick(items, name):
+    """Return the virtual host called name from the answer to a look-up.
+
+    Only a virtual host that has the name asked for is taken, never one the
+    array returned because it matches that name in some other way.
+    """
+    for item in items:
+        if _same_name(str(getattr(item, "name", "")), name):
+            return item
+    return None
 
 
 def _check_scope(module):
@@ -309,11 +352,23 @@ def _find_host(module, blade, name, ctx):
     Any other answer fails the task with the array's message. Read as
     "absent" it would let state=absent report that there is nothing to
     delete, or state=present send a create for a virtual host that exists.
+    An answer that holds only virtual hosts of another name fails the task
+    as well: none of them is the virtual host the task names.
     """
     res = blade.get_object_store_virtual_hosts(names=[name], **ctx)
     if res.status_code == 200:
         items = list(res.items)
-        return items[0] if items else None
+        vhost = _pick(items, name)
+        if vhost is None and items:
+            module.fail_json(
+                msg="Failed to read Object Store Virtual Host {0}: the array "
+                "answered with {1}, which does not have that name. Give the "
+                "name of one virtual host.".format(
+                    name,
+                    ", ".join(str(getattr(item, "name", "")) for item in items[:5]),
+                )
+            )
+        return vhost
     error = get_error_message(res)
     if "does not exist" in str(error).lower():
         return None
@@ -333,9 +388,7 @@ def _get_host(blade, name, ctx):
     """
     res = blade.get_object_store_virtual_hosts(names=[name], **ctx)
     if res.status_code == 200:
-        items = list(res.items)
-        if items:
-            return items[0]
+        return _pick(list(res.items), name)
     return None
 
 
@@ -425,7 +478,11 @@ def _require_servers(module, blade, servers, ctx):
                 module.params["name"], ", ".join(names), get_error_message(res)
             )
         )
-    if len(list(res.items)) < len(names):
+    # By name, not by number: the array reads a comma in a name as a
+    # separator of names, so one entry can be answered with several servers
+    # although no server has that name.
+    found = set(str(getattr(item, "name", "")).strip().lower() for item in res.items)
+    if [srv for srv in names if srv.strip().lower() not in found]:
         module.fail_json(
             msg="Object Store Virtual Host {0} was not created: servers {1} "
             "could not all be found.".format(module.params["name"], ", ".join(names))
@@ -751,7 +808,7 @@ def update_host(module, blade, vhost, api_version, ctx):
     current_servers = _server_names(vhost)
     # Names are not case sensitive on the array: a new name that differs
     # from the current one only in case is the same name, not a rename.
-    new_name = bool(rename and rename.lower() != name.lower())
+    new_name = bool(rename and not _same_name(rename, name))
 
     if name == RESERVED_HOST:
         if (
@@ -898,13 +955,16 @@ def main():
     name = module.params["name"]
     rename = module.params["rename"]
 
+    # Whatever the state, the task names one virtual host.
+    _single_name(module, "name")
     # A delete renames and attaches nothing, and the reserved host is never
     # modified and keeps its own handling.
-    managed = state == "present" and name != RESERVED_HOST
+    managed = state == "present" and not _same_name(name, RESERVED_HOST)
     if managed:
+        _single_name(module, "rename")
         _check_scope(module)
     vhost = _find_host(module, blade, name, ctx)
-    if managed and rename and rename.lower() != name.lower():
+    if managed and rename and not _same_name(rename, name):
         # _check_scope has settled that the new name is in the scope of the
         # old one, so a host found here is never a namesake in another realm.
         renamed = _find_host(module, blade, rename, ctx)

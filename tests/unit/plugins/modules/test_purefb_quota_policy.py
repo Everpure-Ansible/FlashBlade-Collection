@@ -7,11 +7,14 @@ from __future__ import absolute_import, division, print_function
 
 __metaclass__ = type
 
+import re
 import sys
 import multiprocessing
 import ctypes
 from contextlib import contextmanager
 from unittest.mock import Mock, patch, MagicMock
+
+import pytest
 
 # Mock multiprocessing context for Windows
 if sys.platform == "win32":
@@ -76,6 +79,7 @@ from plugins.modules.purefb_quota_policy import (
     _context_kwargs,
     _match_rule,
     _normalise_rules,
+    _resolve_rename,
 )
 
 MODULE = "plugins.modules.purefb_quota_policy"
@@ -155,6 +159,7 @@ def _array_rule(
 def _array_policy(name="qp1", enabled=True):
     policy = Mock()
     policy.name = name
+    policy.id = name + "-id"
     policy.enabled = enabled
     return policy
 
@@ -204,6 +209,130 @@ def _blade(policy=None, rules=None, members=None, attached=None):
     for method in WRITE_METHODS:
         getattr(blade, method).return_value = _response(200)
     return blade
+
+
+class _Body:
+    """Stands in for an SDK request model and keeps the fields it was given."""
+
+    def __init__(self, **fields):
+        self.__dict__.update(fields)
+
+
+def _realm(name):
+    return name.rpartition("::")[0]
+
+
+def _by_name(blade, *policies):
+    """Make the policy endpoints behave as the array does; return its policies.
+
+    A policy is found by its full name only. A PATCH that carries a name
+    renames the policy: a new name without a realm keeps a realm policy in
+    its realm, a name in another realm or a name that is taken is refused.
+    A POST adds the named policy. A PATCH only takes effect when the request
+    body is a _Body.
+    """
+    known = dict((policy.name, policy) for policy in policies)
+
+    def get_policies(**kwargs):
+        policy = known.get(kwargs["names"][0])
+        return _response(200 if policy else 400, [policy] if policy else [])
+
+    def patch_policies(**kwargs):
+        policy = known.get(kwargs["names"][0])
+        if policy is None:
+            return _response(400)
+        body = kwargs["policy"]
+        new_name = getattr(body, "name", None)
+        if isinstance(new_name, str):
+            if "::" not in new_name and _realm(policy.name):
+                new_name = "{0}::{1}".format(_realm(policy.name), new_name)
+            if _realm(new_name) != _realm(policy.name) or new_name in known:
+                return _response(400)
+            del known[policy.name]
+            policy.name = new_name
+            known[new_name] = policy
+        if isinstance(getattr(body, "enabled", None), bool):
+            policy.enabled = body.enabled
+        return _response(200, [policy])
+
+    def post_policies(**kwargs):
+        name = kwargs["names"][0]
+        if name in known:
+            return _response(400)
+        known[name] = _array_policy(name)
+        return _response(200, [known[name]])
+
+    blade.get_user_group_quota_policies.side_effect = get_policies
+    blade.patch_user_group_quota_policies.side_effect = patch_policies
+    blade.post_user_group_quota_policies.side_effect = post_policies
+    return known
+
+
+def _reference(ref_id, name):
+    """A reference as the array lists it: an id and a name."""
+    reference = Mock(spec=["id", "name"])
+    reference.id = ref_id
+    reference.name = name
+    return reference
+
+
+def _policy_rule(policy, uid, quota_limit, listed_as=None):
+    """A user rule of policy.
+
+    listed_as is the policy name the array lists the rule under when that is
+    not the full name of the policy.
+    """
+    rule = _array_rule((listed_as or policy.name) + ".1", "user", quota_limit, id=uid)
+    rule.id = "{0}-rule-{1}".format(policy.id, uid)
+    rule.policy = _reference(policy.id, listed_as) if listed_as else policy
+    return rule
+
+
+def _rules_by_policy(blade, rules):
+    """Answer the rules GET for a policy.id or a policy.name filter."""
+
+    def get_rules(**kwargs):
+        field, value = re.match(r"policy\.(id|name)='(.*)'$", kwargs["filter"]).groups()
+        return _response(
+            200, [rule for rule in rules if getattr(rule.policy, field) == value]
+        )
+
+    blade.get_user_group_quota_policies_rules.side_effect = get_rules
+
+
+def _attachment(policy, member_id, member_name, listed_as=None):
+    """An attachment of policy to a file system.
+
+    member_name is the file system name the array lists and listed_as the
+    policy name it lists when that is not the full name of the policy.
+    """
+    item = Mock(spec=["policy", "member"])
+    item.policy = _reference(policy.id, listed_as) if listed_as else policy
+    item.member = _reference(member_id, member_name)
+    return item
+
+
+def _attachments(blade, records):
+    """Answer both attachment GETs by the ids and the names the array lists."""
+
+    def get_members(**kwargs):
+        found = list(records)
+        for key, side, part in (
+            ("policy_ids", "policy", "id"),
+            ("policy_names", "policy", "name"),
+            ("member_ids", "member", "id"),
+            ("member_names", "member", "name"),
+        ):
+            if key in kwargs:
+                found = [
+                    record
+                    for record in found
+                    if getattr(getattr(record, side), part) in kwargs[key]
+                ]
+        return _response(200, found)
+
+    blade.get_user_group_quota_policies_members.side_effect = get_members
+    blade.get_file_systems_user_group_quota_policies.side_effect = get_members
 
 
 def _assert_no_writes(blade):
@@ -782,14 +911,15 @@ class TestPurefbQuotaPolicyMain:
 
     def test_main_rename_patches_name_last(self):
         module = _module(_base_params(rename="qp2"))
-        blade = _blade(policy=_array_policy())
-        with patch(MODULE + ".UserGroupQuotaPolicy") as policy_model:
+        blade = _blade()
+        _by_name(blade, _array_policy())
+        with patch(MODULE + ".UserGroupQuotaPolicy", side_effect=_Body) as policy_model:
             _run(module, blade)
         policy_model.assert_called_once_with(name="qp2")
         assert blade.patch_user_group_quota_policies.call_args[1]["names"] == ["qp1"]
         assert module.exit_json.call_args[1]["changed"] is True
         # the facts are read back under the new name
-        blade.get_user_group_quota_policies.assert_called_with(names=["qp2"])
+        assert module.exit_json.call_args[1]["policy"]["name"] == "qp2"
 
     def test_main_rename_already_applied_is_idempotent(self):
         module = _module(_base_params(rename="qp2"))
@@ -814,7 +944,7 @@ class TestPurefbQuotaPolicyMain:
             for call in blade.delete_user_group_quota_policies_file_systems.call_args_list
         )
         assert detached == ["fs1", "fs2"]
-        blade.delete_user_group_quota_policies.assert_called_once_with(names=["qp1"])
+        blade.delete_user_group_quota_policies.assert_called_once_with(ids=["qp1-id"])
         assert module.exit_json.call_args[1]["changed"] is True
 
     def test_main_delete_fails_on_api_error(self):
@@ -913,3 +1043,386 @@ class TestPurefbQuotaPolicyMain:
         _run(module, blade)
         kwargs = blade.patch_user_group_quota_policies.call_args[1]
         assert kwargs["ignore_usage"] is True
+
+
+class TestPurefbQuotaPolicyRealm:
+    """Realm policies (realm::name): rename resolution and lookups by policy id"""
+
+    # ---- the name a rename resolves to
+
+    def test_resolve_rename_none_without_rename(self):
+        module = _module(_base_params(name="rz::qp1"))
+        assert _resolve_rename(module) is None
+        module.fail_json.assert_not_called()
+
+    def test_resolve_rename_bare_name_takes_the_realm_of_the_policy(self):
+        module = _module(_base_params(name="rz::qp1", rename="qp2"))
+        assert _resolve_rename(module) == "rz::qp2"
+
+    def test_resolve_rename_name_in_the_same_realm_is_kept(self):
+        module = _module(_base_params(name="rz::qp1", rename="rz::qp2"))
+        assert _resolve_rename(module) == "rz::qp2"
+
+    def test_resolve_rename_bare_name_of_array_level_policy_is_kept(self):
+        module = _module(_base_params(name="qp1", rename="qp2"))
+        assert _resolve_rename(module) == "qp2"
+        module.fail_json.assert_not_called()
+
+    def test_resolve_rename_into_another_realm_fails(self):
+        module = _module(_base_params(name="rz::qp1", rename="other::qp2"))
+        with pytest.raises(SystemExit):
+            _resolve_rename(module)
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Cannot rename quota policy rz::qp1 to other::qp2" in msg
+        assert "cannot change the realm" in msg
+        assert msg.endswith("Give the new name without a realm or as rz::<name>.")
+
+    def test_resolve_rename_of_array_level_policy_into_a_realm_fails(self):
+        module = _module(_base_params(name="qp1", rename="rz::qp2"))
+        with pytest.raises(SystemExit):
+            _resolve_rename(module)
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Cannot rename quota policy qp1 to rz::qp2" in msg
+        assert msg.endswith("Give the new name without a realm.")
+
+    # ---- rename of a realm policy
+
+    def test_main_bare_rename_three_runs_stay_in_the_realm(self):
+        """The array keeps a realm policy in its realm when the new name is
+        bare. Runs 2 and 3 of the task must find it there, create no stray
+        policy and leave the array-level policy of that bare name alone."""
+        realm_policy = _array_policy("rz::qp1")
+        namesake = _array_policy("qp2")
+        blade = _blade()
+        known = _by_name(blade, realm_policy, namesake)
+        _rules_by_policy(
+            blade,
+            [
+                _policy_rule(realm_policy, 1001, GIB),
+                _policy_rule(namesake, 3003, 2 * GIB),
+            ],
+        )
+        results = []
+        with patch(MODULE + ".UserGroupQuotaPolicy", side_effect=_Body) as model:
+            for _run_number in range(3):
+                module = _module(
+                    _base_params(
+                        name="rz::qp1",
+                        rename="qp2",
+                        enabled=False,
+                        rules=[_rule_param("user", "1G", id=1001)],
+                    )
+                )
+                _run(module, blade)
+                module.fail_json.assert_not_called()
+                results.append(module.exit_json.call_args[1])
+        assert [result["changed"] for result in results] == [True, False, False]
+        assert [result["policy"]["name"] for result in results] == ["rz::qp2"] * 3
+        assert [result["policy"]["enabled"] for result in results] == [False] * 3
+        for result in results:
+            assert [rule["subject"]["id"] for rule in result["policy"]["rules"]] == [
+                1001
+            ]
+        # run 1 disabled the policy and sent the full new name; nothing after
+        assert [call[1] for call in model.call_args_list] == [
+            {"enabled": False},
+            {"name": "rz::qp2"},
+        ]
+        assert sorted(known) == ["qp2", "rz::qp2"]
+        assert namesake.enabled is True
+        blade.post_user_group_quota_policies.assert_not_called()
+        blade.post_user_group_quota_policies_rules.assert_not_called()
+        blade.delete_user_group_quota_policies_rules.assert_not_called()
+        for call in blade.get_user_group_quota_policies.call_args_list:
+            assert call[1]["names"] != ["qp2"]
+
+    def test_main_bare_rename_check_mode_is_honest(self):
+        """Check mode reports the pending rename, writes nothing, and reports
+        no change once the policy carries the new name in its realm."""
+        blade = _blade()
+        known = _by_name(blade, _array_policy("rz::qp1"), _array_policy("qp2"))
+        params = dict(name="rz::qp1", rename="qp2")
+
+        before = _module(_base_params(**params), check_mode=True)
+        _run(before, blade)
+        _assert_no_writes(blade)
+        assert before.exit_json.call_args[1]["changed"] is True
+        # check mode reports the state before the change
+        assert before.exit_json.call_args[1]["policy"]["name"] == "rz::qp1"
+
+        with patch(MODULE + ".UserGroupQuotaPolicy", side_effect=_Body):
+            _run(_module(_base_params(**params)), blade)
+        assert sorted(known) == ["qp2", "rz::qp2"]
+
+        after = _module(_base_params(**params), check_mode=True)
+        _run(after, blade)
+        assert after.exit_json.call_args[1]["changed"] is False
+        assert after.exit_json.call_args[1]["policy"]["name"] == "rz::qp2"
+
+    def test_main_rename_with_the_full_name_of_the_realm(self):
+        blade = _blade()
+        known = _by_name(blade, _array_policy("rz::qp1"))
+        results = []
+        with patch(MODULE + ".UserGroupQuotaPolicy", side_effect=_Body) as model:
+            for _run_number in range(2):
+                module = _module(_base_params(name="rz::qp1", rename="rz::qp2"))
+                _run(module, blade)
+                results.append(module.exit_json.call_args[1])
+        model.assert_called_once_with(name="rz::qp2")
+        assert [result["changed"] for result in results] == [True, False]
+        assert [result["policy"]["name"] for result in results] == ["rz::qp2"] * 2
+        assert sorted(known) == ["rz::qp2"]
+
+    def test_main_rename_to_own_leaf_name_is_a_noop(self):
+        module = _module(_base_params(name="rz::qp1", rename="qp1"))
+        blade = _blade()
+        _by_name(blade, _array_policy("rz::qp1"))
+        _run(module, blade)
+        _assert_no_writes(blade)
+        assert module.exit_json.call_args[1]["changed"] is False
+        assert module.exit_json.call_args[1]["policy"]["name"] == "rz::qp1"
+
+    def test_main_missing_realm_policy_with_rename_is_created_as_name(self):
+        """Neither name exists: the policy is created as name, and the bare
+        new name is never looked up at the array level."""
+        module = _module(_base_params(name="rz::qp1", rename="qp2"))
+        blade = _blade()
+        known = _by_name(blade, _array_policy("qp2"))
+        _run(module, blade)
+        assert sorted(known) == ["qp2", "rz::qp1"]
+        assert module.exit_json.call_args[1]["changed"] is True
+        assert module.exit_json.call_args[1]["policy"]["name"] == "rz::qp1"
+        blade.patch_user_group_quota_policies.assert_not_called()
+        for call in blade.get_user_group_quota_policies.call_args_list:
+            assert call[1]["names"] != ["qp2"]
+
+    # ---- renames that are refused before anything is written
+
+    def test_main_rename_into_another_realm_fails_before_any_call(self):
+        module = _module(
+            _base_params(name="rz::qp1", rename="other::qp2", enabled=False)
+        )
+        blade = _blade()
+        _by_name(blade, _array_policy("rz::qp1", enabled=True))
+        _run(module, blade)
+        module.fail_json.assert_called_once()
+        assert "cannot change the realm" in module.fail_json.call_args[1]["msg"]
+        blade.get_user_group_quota_policies.assert_not_called()
+        _assert_no_writes(blade)
+
+    def test_main_qualified_rename_of_array_level_policy_fails_before_any_call(self):
+        module = _module(_base_params(rename="rz::qp2", enabled=False), check_mode=True)
+        blade = _blade()
+        _by_name(blade, _array_policy(enabled=True))
+        _run(module, blade)
+        module.fail_json.assert_called_once()
+        assert "Cannot rename quota policy qp1 to rz::qp2" in (
+            module.fail_json.call_args[1]["msg"]
+        )
+        blade.get_user_group_quota_policies.assert_not_called()
+        _assert_no_writes(blade)
+
+    def test_main_rename_onto_existing_policy_fails_before_any_write(self):
+        """enabled, rules and file_systems are applied before the rename, so
+        a name that is taken has to be refused first."""
+        module = _module(
+            _base_params(
+                rename="qp2",
+                enabled=False,
+                rules=[_rule_param("user", "1G", id=1001)],
+                file_systems=["fs1"],
+            )
+        )
+        blade = _blade()
+        _by_name(blade, _array_policy("qp1", enabled=True), _array_policy("qp2"))
+        _run(module, blade)
+        module.fail_json.assert_called_once()
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Cannot rename quota policy qp1 to qp2: "
+            "a quota policy named qp2 already exists."
+        )
+        _assert_no_writes(blade)
+
+    def test_main_bare_rename_onto_existing_realm_policy_is_never_sent(self):
+        """The array answers a bare rename onto a realm policy with an
+        unexpected error and then lists that policy's attachment without the
+        realm, so the request must not reach it, in check mode or not."""
+        for check_mode in (True, False):
+            module = _module(
+                _base_params(name="rz::qp1", rename="qp2", enabled=False),
+                check_mode=check_mode,
+            )
+            blade = _blade()
+            _by_name(blade, _array_policy("rz::qp1"), _array_policy("rz::qp2"))
+            _run(module, blade)
+            module.fail_json.assert_called_once()
+            assert module.fail_json.call_args[1]["msg"] == (
+                "Cannot rename quota policy rz::qp1 to rz::qp2: "
+                "a quota policy named rz::qp2 already exists."
+            )
+            _assert_no_writes(blade)
+
+    # ---- rules and attachments are read by policy id
+
+    def test_main_rules_of_array_level_policy_exclude_realm_namesake(self):
+        """The array can list the rule of a realm policy under the bare
+        policy name, which is the name of an array-level policy; that rule
+        must not be reported for, or removed from, the array-level policy."""
+        realm_policy = _array_policy("rz::qp2")
+        namesake = _array_policy("qp2")
+        blade = _blade()
+        _by_name(blade, realm_policy, namesake)
+        _rules_by_policy(
+            blade,
+            [
+                _policy_rule(realm_policy, 1001, GIB, listed_as="qp2"),
+                _policy_rule(namesake, 3003, 2 * GIB),
+            ],
+        )
+        module = _module(
+            _base_params(name="qp2", rules=[_rule_param("user", "2G", id=3003)])
+        )
+        _run(module, blade)
+        _assert_no_writes(blade)
+        assert module.exit_json.call_args[1]["changed"] is False
+        facts = module.exit_json.call_args[1]["policy"]
+        assert [rule["subject"]["id"] for rule in facts["rules"]] == [3003]
+
+    def test_main_rules_of_realm_policy_listed_without_realm_are_found(self):
+        realm_policy = _array_policy("rz::qp2")
+        namesake = _array_policy("qp2")
+        blade = _blade()
+        _by_name(blade, realm_policy, namesake)
+        _rules_by_policy(
+            blade,
+            [
+                _policy_rule(realm_policy, 1001, GIB, listed_as="qp2"),
+                _policy_rule(namesake, 3003, 2 * GIB),
+            ],
+        )
+        module = _module(
+            _base_params(name="rz::qp2", rules=[_rule_param("user", "1G", id=1001)])
+        )
+        _run(module, blade)
+        _assert_no_writes(blade)
+        assert module.exit_json.call_args[1]["changed"] is False
+        facts = module.exit_json.call_args[1]["policy"]
+        assert [rule["subject"]["id"] for rule in facts["rules"]] == [1001]
+
+    def test_main_members_of_array_level_policy_exclude_realm_namesake(self):
+        """The array can list the attachment of a realm policy without the
+        realm in either name; by name it then also answers for an array-level
+        policy of that name, which is not attached to anything."""
+        realm_policy = _array_policy("rz::qp2")
+        namesake = _array_policy("qp2")
+        blade = _blade()
+        _by_name(blade, realm_policy, namesake)
+        _attachments(
+            blade, [_attachment(realm_policy, "fs1-id", "fs1", listed_as="qp2")]
+        )
+        module = _module(_base_params(name="qp2", file_systems=[]))
+        _run(module, blade)
+        _assert_no_writes(blade)
+        assert module.exit_json.call_args[1]["changed"] is False
+        assert module.exit_json.call_args[1]["policy"]["file_systems"] == []
+
+    def test_main_members_of_realm_policy_listed_without_realm_are_qualified(self):
+        realm_policy = _array_policy("rz::qp2")
+        blade = _blade()
+        _by_name(blade, realm_policy)
+        _attachments(
+            blade, [_attachment(realm_policy, "fs1-id", "fs1", listed_as="qp2")]
+        )
+        module = _module(_base_params(name="rz::qp2", file_systems=["rz::fs1"]))
+        _run(module, blade)
+        _assert_no_writes(blade)
+        assert module.exit_json.call_args[1]["changed"] is False
+        assert module.exit_json.call_args[1]["policy"]["file_systems"] == ["rz::fs1"]
+
+    def test_main_delete_realm_policy_with_attachment_listed_without_realm(self):
+        """The attachment is found by policy id and detached under the full
+        names. rename is not used with state=absent, so its realm is not
+        checked."""
+        realm_policy = _array_policy("rz::qp2")
+        blade = _blade()
+        _by_name(blade, realm_policy)
+        _attachments(
+            blade, [_attachment(realm_policy, "fs1-id", "fs1", listed_as="qp2")]
+        )
+        module = _module(
+            _base_params(name="rz::qp2", state="absent", rename="other::qp3")
+        )
+        _run(module, blade)
+        module.fail_json.assert_not_called()
+        blade.delete_user_group_quota_policies_file_systems.assert_called_once_with(
+            policy_names=["rz::qp2"], member_names=["rz::fs1"]
+        )
+        blade.delete_user_group_quota_policies.assert_called_once_with(
+            ids=["rz::qp2-id"]
+        )
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_main_delete_array_level_policy_keeps_realm_namesake_attached(self):
+        realm_policy = _array_policy("rz::qp2")
+        namesake = _array_policy("qp2")
+        blade = _blade()
+        _by_name(blade, realm_policy, namesake)
+        _attachments(
+            blade, [_attachment(realm_policy, "fs1-id", "fs1", listed_as="qp2")]
+        )
+        module = _module(_base_params(name="qp2", state="absent"))
+        _run(module, blade)
+        module.fail_json.assert_not_called()
+        blade.delete_user_group_quota_policies_file_systems.assert_not_called()
+        blade.delete_user_group_quota_policies.assert_called_once_with(ids=["qp2-id"])
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_main_create_realm_policy_attaches_and_reads_members_by_id(self):
+        module = _module(_base_params(name="rz::qp1", file_systems=["rz::fs1"]))
+        blade = _blade()
+        known = _by_name(blade)
+        records = []
+        _attachments(blade, records)
+
+        def attach(**kwargs):
+            policy = known[kwargs["policy_names"][0]]
+            name = kwargs["member_names"][0]
+            records.append(_attachment(policy, name + "-id", name))
+            return _response(200)
+
+        blade.post_user_group_quota_policies_file_systems.side_effect = attach
+        _run(module, blade)
+        assert sorted(known) == ["rz::qp1"]
+        blade.post_user_group_quota_policies_file_systems.assert_called_once_with(
+            policy_names=["rz::qp1"], member_names=["rz::fs1"]
+        )
+        blade.delete_user_group_quota_policies_file_systems.assert_not_called()
+        assert [
+            call[1]
+            for call in blade.get_user_group_quota_policies_members.call_args_list
+        ] == [{"policy_ids": ["rz::qp1-id"]}]
+        assert module.exit_json.call_args[1]["changed"] is True
+        assert module.exit_json.call_args[1]["policy"]["file_systems"] == ["rz::fs1"]
+
+    # ---- array-level policies next to a realm namesake
+
+    def test_main_array_level_rename_ignores_realm_namesake(self):
+        """An array-level policy is renamed to a name that a realm policy
+        carries inside its realm: the two names are different policies."""
+        realm_policy = _array_policy("rz::qp2", enabled=False)
+        blade = _blade()
+        known = _by_name(blade, _array_policy("qp1"), realm_policy)
+        results = []
+        with patch(MODULE + ".UserGroupQuotaPolicy", side_effect=_Body) as model:
+            for _run_number in range(2):
+                module = _module(_base_params(name="qp1", rename="qp2", enabled=True))
+                _run(module, blade)
+                module.fail_json.assert_not_called()
+                results.append(module.exit_json.call_args[1])
+        model.assert_called_once_with(name="qp2")
+        assert [result["changed"] for result in results] == [True, False]
+        assert [result["policy"]["name"] for result in results] == ["qp2", "qp2"]
+        assert sorted(known) == ["qp2", "rz::qp2"]
+        assert realm_policy.enabled is False
+        for call in blade.get_user_group_quota_policies.call_args_list:
+            assert call[1]["names"] != ["rz::qp2"]

@@ -90,6 +90,10 @@ KEY_REALM = "User and imported access key must belong to the same realm."
 KEY_TAKEN = "The access key provided already belongs to a user."
 POLICY_ACCOUNT = "Cannot add policy to user in a different account."
 REFUSED = "Operation not permitted."
+NO_NAME = "Missing or invalid parameter."
+MANY_NAMES = "Cannot process more than one name at a time."
+MANY_KEYS_PATCH = "Cannot update more than one access keys at a time."
+MANY_KEYS_DELETE = "Cannot delete more than one access keys at a time."
 
 
 def _params(**overrides):
@@ -172,8 +176,11 @@ class _Array:
     read by name of something that is not there answers 400 with the
     array's "does not exist" text. A generated access key of a user in a
     realm is named realm::<ID>; an import is refused when the name is not
-    in the realm of the user or the name is taken. refuse maps a blade
-    method to a message: that call then answers 400 with it.
+    in the realm of the user or the name is taken. A comma separates
+    names: a read of users or access keys answers every object on the
+    list, and a request that would create a second user, or change or
+    delete a second access key, is refused. refuse maps a blade method to
+    a message: that call then answers 400 with it.
     """
 
     def __init__(self, accounts=("acc1",), users=(), keys=(), policies=()):
@@ -220,18 +227,29 @@ class _Array:
                 return name
         return None
 
+    @staticmethod
+    def _split(names):
+        """The names of a request: the array reads a comma as a separator."""
+        return [part for name in names for part in name.split(",")]
+
     def _fleets(self, **kwargs):
         return _ok([])
 
     def _get_object_store_accounts(self, **kwargs):
+        if "" in kwargs["names"]:
+            return _error(NO_NAME)
         found = self._find(self.accounts, kwargs["names"][0])
         return _ok([_named(found)]) if found else _error(NO_ACCOUNT)
 
     def _get_object_store_users(self, **kwargs):
-        found = self._find(self.users, kwargs["names"][0])
-        return _ok([_named(found)]) if found else _error(NO_USER)
+        found = [self._find(self.users, name) for name in self._split(kwargs["names"])]
+        if None in found:
+            return _error(NO_USER)
+        return _ok([_named(name) for name in self.users if name in found])
 
     def _post_object_store_users(self, **kwargs):
+        if len(self._split(kwargs["names"])) > 1:
+            return _error(MANY_NAMES)
         self.users.append(kwargs["names"][0])
         return _ok([_named(kwargs["names"][0])])
 
@@ -248,8 +266,12 @@ class _Array:
         names = kwargs.get("names")
         if names is None:
             return _ok(self.keys.values())
-        found = self._find(self.keys, names[0])
-        return _ok([self.keys[found]]) if found else _error(NO_KEY)
+        if "" in names:
+            return _error(NO_NAME)
+        found = [self._find(self.keys, name) for name in self._split(names)]
+        if None in found:
+            return _error(NO_KEY)
+        return _ok([key for name, key in self.keys.items() if name in found])
 
     def _post_object_store_access_keys(self, **kwargs):
         body = kwargs["object_store_access_key"]
@@ -274,6 +296,8 @@ class _Array:
         return _ok([self.keys[name]])
 
     def _patch_object_store_access_keys(self, **kwargs):
+        if len(self._split(kwargs["names"])) > 1:
+            return _error(MANY_KEYS_PATCH)
         found = self._find(self.keys, kwargs["names"][0])
         if not found:
             return _error(NO_KEY)
@@ -281,6 +305,8 @@ class _Array:
         return _ok([self.keys[found]])
 
     def _delete_object_store_access_keys(self, **kwargs):
+        if len(self._split(kwargs["names"])) > 1:
+            return _error(MANY_KEYS_DELETE)
         found = self._find(self.keys, kwargs["names"][0])
         if not found:
             return _error(NO_KEY)
@@ -1167,6 +1193,117 @@ class TestRealmKeyNames:
                 _no_writes(array.blade)
 
 
+class TestOneName:
+    """A task names one account, one user and one access key."""
+
+    def _two_keys(self):
+        return _Array(
+            users=["acc1/user1", "acc1/user2"],
+            keys=[_key(KEY_A, "acc1/user1"), _key(KEY_B, "acc1/user1")],
+        )
+
+    def test_list_of_key_names_is_refused(self):
+        for state in ("keystate", "remove_key"):
+            for check_mode in (False, True):
+                array = self._two_keys()
+                module = _module(
+                    check_mode=check_mode,
+                    state=state,
+                    key_name=KEY_A + "," + KEY_B,
+                    enable_key=False,
+                )
+                _run(module, array)
+                assert "key_name names more than one object" in _failure(module)
+                array.blade.get_object_store_accounts.assert_not_called()
+                array.blade.get_object_store_access_keys.assert_not_called()
+                _no_writes(array.blade)
+                assert array.keys_of("acc1/user1") == [KEY_A, KEY_B]
+                assert array.enabled(KEY_A) is True
+                assert array.enabled(KEY_B) is True
+
+    def test_list_of_key_names_in_a_realm_is_refused(self):
+        array = _twins()
+        key_name = KEY_A + "," + KEY_A
+        module = _module(
+            check_mode=True, account="rz::acc1", state="remove_key", key_name=key_name
+        )
+        _run(module, array)
+        assert "key_name names more than one object" in _failure(module)
+        assert module.params["key_name"] == key_name
+        array.blade.get_object_store_access_keys.assert_not_called()
+        _no_writes(array.blade)
+
+    def test_list_of_user_names_is_refused(self):
+        for state in ("absent", "present"):
+            for check_mode in (False, True):
+                array = _Array(users=["acc1/user1", "acc1/user2"])
+                module = _module(
+                    check_mode=check_mode, state=state, name="user1,acc1/user2"
+                )
+                _run(module, array)
+                assert "name names more than one object" in _failure(module)
+                array.blade.get_object_store_users.assert_not_called()
+                _no_writes(array.blade)
+                assert array.users == ["acc1/user1", "acc1/user2"]
+
+    def test_list_of_new_user_names_is_refused(self):
+        for check_mode in (False, True):
+            array = _Array()
+            module = _module(check_mode=check_mode, name="user1,acc1/user2")
+            _run(module, array)
+            assert "name names more than one object" in _failure(module)
+            _no_writes(array.blade)
+            assert array.users == []
+
+    def test_list_of_accounts_is_refused(self):
+        array = _Array(accounts=["acc1", "acc2"], users=["acc1/user1"])
+        module = _module(check_mode=True, account="acc1,acc2", state="absent")
+        _run(module, array)
+        assert "account names more than one object" in _failure(module)
+        array.blade.get_object_store_accounts.assert_not_called()
+        _no_writes(array.blade)
+
+    def test_list_of_imported_keys_is_refused(self):
+        for users in (["acc1/user1"], []):
+            for check_mode in (False, True):
+                array = _Array(users=users)
+                module = _module(
+                    check_mode=check_mode,
+                    imported_key=KEY_A + "," + KEY_B,
+                    imported_secret=SECRET,
+                )
+                _run(module, array)
+                assert "imported_key names more than one object" in _failure(module)
+                array.blade.get_object_store_access_keys.assert_not_called()
+                _no_writes(array.blade)
+
+    def test_empty_names_are_refused(self):
+        cases = (
+            (dict(name=""), "name must not be empty."),
+            (dict(name="  "), "name must not be empty."),
+            (dict(account=""), "account must not be empty."),
+            (dict(state="keystate", key_name=""), "key_name must not be empty."),
+            (dict(state="remove_key", key_name=" "), "key_name must not be empty."),
+            (dict(state="remove_key", key_name=None), "key_name must not be empty."),
+            (
+                dict(account="rz::acc1", state="remove_key", key_name=""),
+                "key_name must not be empty.",
+            ),
+            (
+                dict(account="rz::acc1", state="keystate", key_name="rz::"),
+                "key_name must hold an access key ID.",
+            ),
+        )
+        for overrides, message in cases:
+            array = _twins()
+            module = _module(check_mode=True, **overrides)
+            _run(module, array)
+            assert _failure(module) == message
+            array.blade.get_object_store_users.assert_not_called()
+            array.blade.get_object_store_access_keys.assert_not_called()
+            _no_writes(array.blade)
+
+
 class TestKeyFacts:
     """s3user_info carries the key name and the access key ID."""
 
@@ -1324,6 +1461,25 @@ class TestHelpers:
         assert purefb_s3user._owner(_key(KEY_A, "acc1/user1")) == "acc1/user1"
         orphan = Mock(spec=["name"])
         assert purefb_s3user._owner(orphan) is None
+
+    def test_one_name(self):
+        module = _module(account="rz::acc1", key_name="rz::" + KEY_A)
+        for option in ("name", "account", "key_name"):
+            purefb_s3user._one_name(module, option)
+        module.fail_json.assert_not_called()
+        cases = (
+            (None, "name must not be empty."),
+            ("", "name must not be empty."),
+            (" ", "name must not be empty."),
+            ("a,b", "name names more than one object (a,b)."),
+        )
+        for value, message in cases:
+            module = _module(name=value)
+            try:
+                purefb_s3user._one_name(module, "name")
+            except SystemExit:
+                pass
+            assert _failure(module).startswith(message)
 
     def test_qualify_key(self):
         module = _module(account="rz::acc1", key_name=KEY_A)

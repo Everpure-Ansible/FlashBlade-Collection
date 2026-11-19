@@ -42,6 +42,7 @@ options:
   name:
     description:
     - The name of object store user
+    - A task names one user. A list of names is refused.
     type: str
     required: true
   account:
@@ -68,6 +69,7 @@ options:
     description:
     - Access key to be modified
     - Required when I(state) is C(keystate) or C(remove_key).
+    - A task names one access key. A list of names is refused.
     - The access key must belong to the user named by I(name) and I(account).
       The task fails, and changes nothing, when it belongs to another user.
     - The access key of a user of an account in a realm is named
@@ -300,6 +302,23 @@ def _owner(key):
     return getattr(getattr(key, "user", None), "name", None)
 
 
+def _one_name(module, option):
+    """Fail unless an option holds the name of exactly one object.
+
+    The array reads a comma as a separator of names. It answers a read of
+    such a list with every object on it and refuses to change more than
+    one of them in a request, so a list is refused before anything is read.
+    """
+    value = module.params[option]
+    if not value or not value.strip():
+        module.fail_json(msg="{0} must not be empty.".format(option))
+    if "," in value:
+        module.fail_json(
+            msg="{0} names more than one object ({1}). A task takes one name; "
+            "the array reads a comma as a separator of names.".format(option, value)
+        )
+
+
 def _qualify_key(module, option):
     """Place the access key that an option names in the realm of the account.
 
@@ -312,7 +331,10 @@ def _qualify_key(module, option):
     before anything is read or sent. The array matches names without regard
     to case; the prefix is rewritten the way the account spells it.
     """
+    _one_name(module, option)
     key = module.params[option]
+    if not key.rpartition("::")[2].strip():
+        module.fail_json(msg="{0} must hold an access key ID.".format(option))
     realm = _realm_of(module.params["account"])
     if "::" not in key:
         if realm:
@@ -939,6 +961,8 @@ def main():
         module.fail_json(msg="py-pure-client sdk is required for this module")
 
     state = module.params["state"]
+    for option in ("name", "account"):
+        _one_name(module, option)
     blade = get_system(module)
     api_version = get_rest_api_version(blade)
     if (

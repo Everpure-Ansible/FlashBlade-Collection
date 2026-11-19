@@ -12,6 +12,9 @@ bugfixes:
     the user) now fails with the error of the array instead of being taken for a missing object or
     ending in a traceback. User names are compared without regard to case when access keys are
     counted.
+  - purefb_s3user - a comma-separated list in ``name``, ``account``, ``key_name`` or
+    ``imported_key`` and an empty ``name``, ``account`` or ``key_name`` are now refused before
+    any object is read, in check mode too. The array changes one user or access key per request.
 minor_changes:
   - purefb_s3user - ``s3user_info`` now also returns ``access_key_id``, the access key ID without
     the realm prefix that ``access_id`` carries for a user in a realm.

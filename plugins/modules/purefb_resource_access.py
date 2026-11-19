@@ -31,16 +31,26 @@ options:
         name of the resource.
       - The set of valid resource types is defined by the array and grows
         with the REST API version, so it is not validated by this module.
-      - For a realm scope, Purity//FB 4.6 accepts the array-level resources
-        that can be delegated to a realm, C(subnets) and C(dns).
-      - Policies (for example NFS export policies) live at the array level
-        and cannot be shared with a realm through a resource access; the
-        array rejects them with C(Invalid resource type).
+      - For a realm scope, the array accepts the array-level resources that
+        can be shared with a realm. Purity//FB 4.6 accepts C(subnets) and
+        C(dns). Purity//FB 4.8 also accepts C(sso/oidc/idps), an OIDC
+        identity provider managed with M(everpure.flashblade.purefb_oidc).
+      - Purity//FB 4.8 keeps OIDC identity providers at the array level. A
+        provider has to be shared with a realm before the trust policies of
+        the object store roles in that realm can name it, and the array
+        refuses to revoke the share while one of them does.
+      - Policies cannot be shared with a realm through a resource access;
+        the array rejects them with C(Invalid resource type). A policy for
+        a realm, for example an NFS export policy, is created in the realm
+        under the name C(realm::policy).
     type: str
     required: true
   resource_name:
     description:
       - The name of the resource you want to target.
+      - A resource that is shared with a realm is an array-level object, so
+        give its name without a realm prefix. The array does not find an
+        OIDC identity provider that is named C(realm::provider).
     type: str
     required: true
   state:
@@ -87,6 +97,15 @@ EXAMPLES = r"""
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
 
+- name: Share OIDC identity provider okta with realm realm_foo
+  everpure.flashblade.purefb_resource_access:
+    resource_type: sso/oidc/idps
+    resource_name: okta
+    scope_type: realms
+    scope_name: realm_foo
+    fb_url: 10.10.10.2
+    api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+
 - name: Revoke the subnet delegation (the subnet itself is not deleted)
   everpure.flashblade.purefb_resource_access:
     resource_type: subnets
@@ -121,6 +140,31 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
 )
 
 MINIMUM_API_VERSION = "2.19"
+
+REALM_PREFIX_HINT = (
+    "A resource that is shared with a realm is an array-level object and is"
+    " named without a realm prefix."
+)
+
+
+def _access_text(module):
+    """Name both ends of the resource access for a message"""
+    return "{0} {1} and {2} {3}".format(
+        module.params["scope_type"],
+        module.params["scope_name"],
+        module.params["resource_type"],
+        module.params["resource_name"],
+    )
+
+
+def _realm_prefix_hint(module):
+    """Hint for a realm-qualified resource name the array refused to share"""
+    if (
+        module.params["scope_type"] == "realms"
+        and "::" in module.params["resource_name"]
+    ):
+        return " " + REALM_PREFIX_HINT
+    return ""
 
 
 def get_resource_access(module, blade):
@@ -160,9 +204,9 @@ def create_resource_access(module, blade):
         res = blade.post_resource_accesses_batch(items=[resource])
         if res.status_code != 200:
             module.fail_json(
-                msg="Create resource access between {0} and {1} failed. Error: {2}".format(
-                    module.params["scope_name"],
-                    module.params["resource_type"],
+                msg="Create resource access between {0} failed.{1} Error: {2}".format(
+                    _access_text(module),
+                    _realm_prefix_hint(module),
                     get_error_message(res),
                 )
             )
@@ -176,9 +220,8 @@ def delete_resource_access(module, blade, access_id):
         res = blade.delete_resource_accesses(ids=[access_id])
         if res.status_code != 200:
             module.fail_json(
-                msg="Delete resource access between {0} and {1} failed. Error: {2}".format(
-                    module.params["scope_name"],
-                    module.params["resource_type"],
+                msg="Delete resource access between {0} failed. Error: {1}".format(
+                    _access_text(module),
                     get_error_message(res),
                 )
             )

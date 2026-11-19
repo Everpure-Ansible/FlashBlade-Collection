@@ -25,8 +25,15 @@ description:
 - A realm connection is the prerequisite for realm-level replication.
 - Requires FlashBlade REST API 2.25 or later (Purity//FB 4.8.0+) on both
   FlashBlades. The two FlashBlades must already be connected with
-  M(everpure.flashblade.purefb_connect), which makes the remote realms
-  visible to the local FlashBlade.
+  M(everpure.flashblade.purefb_connect).
+- The module can be run by an array administrator, or by an administrator
+  whose management access is scoped to I(realm) (a realm administrator). A
+  realm administrator can only manage a realm in its scope; any other realm
+  is reported as not existing.
+- The remote realm is not looked up before a connection is created, because
+  a realm administrator may not be shown a remote realm that is not yet
+  connected. The FlashBlade decides whether I(remote_realm) and the
+  connection key match, and its answer is reported.
 - Realm connections between two realms on the same FlashBlade are not
   supported, and realm names must be unique across connected FlashBlades.
 - A connection is created with a connection key generated on the remote
@@ -43,23 +50,35 @@ description:
   remote FlashBlade.
 - A realm connection has no modifiable attributes. An existing pair is
   reported with its status and is never re-created, whatever its status.
+- A destroyed realm cannot be used until it is recovered with
+  M(everpure.flashblade.purefb_realm). Its outstanding connection keys are
+  kept and are listed again after the recovery.
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
   realm:
     description:
     - Name of the realm on the local FlashBlade.
+    - Realms are not nested, so this is a plain realm name. A value in the
+      C(realm::name) form is reported as a realm that does not exist.
     type: str
     required: true
   remote_realm:
     description:
     - Name of the realm on the remote FlashBlade to connect I(realm) to.
     - Required unless I(generate_key) or I(invalidate_keys) is set.
+    - In check mode a pair that is not connected is reported as a change,
+      with a warning when the local FlashBlade does not list the remote
+      realm for the user running the task.
     type: str
   state:
     description:
     - Whether the realm connection between I(realm) and I(remote_realm)
       should exist.
+    - With C(absent), a I(realm) that does not exist or is destroyed is
+      reported as unchanged. The task fails when the FlashBlade refuses the
+      lookup of I(realm), as it does for a user whose role may not read
+      realms, or cannot answer it.
     - Not used when I(generate_key) or I(invalidate_keys) is set.
     type: str
     default: present
@@ -142,6 +161,15 @@ EXAMPLES = r"""
     connection_key: "{{ remote_key.key.connection_key }}"
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+  no_log: true
+
+- name: Generate a connection key as an administrator scoped to realm finance-dr
+  everpure.flashblade.purefb_realm_connection:
+    realm: finance-dr
+    generate_key: true
+    fb_url: 10.10.10.20
+    api_token: T-3c1d9e2f-6b4a-4f0e-8d7c-5a9b1e2f3c4d
+  register: realm_admin_key
   no_log: true
 
 - name: Invalidate all outstanding connection keys of realm finance-dr
@@ -251,6 +279,10 @@ VERSION = "1.5"
 USER_AGENT_BASE = "Ansible"
 MIN_REQUIRED_API_VERSION = "2.25"
 WAIT_INTERVAL = 5
+# HTTP status that by itself says the realm is not there. The FlashBlade
+# answers 400 for a realm that is missing, destroyed or hidden from the user
+# and also for a lookup it refuses, so a 400 is read by its text.
+REALM_NOT_THERE_CODES = (404,)
 
 
 def _user_agent():
@@ -266,10 +298,26 @@ def _user_agent():
     }
 
 
-def _realm_exists(module, blade):
-    """Return True if the local realm exists and is not destroyed."""
+def _realm_error(module, blade):
+    """Return (None, None) for a live local realm, else the status code and reason."""
     res = blade.get_realms(destroyed=False, names=[module.params["realm"]])
-    return res.status_code == 200
+    if res.status_code == 200:
+        return None, None
+    return res.status_code, str(get_error_message(res) or "Unknown error")
+
+
+def _realm_not_there(status_code, reason):
+    """Whether a failed realm lookup says the realm is missing, destroyed or hidden.
+
+    False means the lookup itself failed or was refused (the user may not
+    read realms) and says nothing about the realm.
+    """
+    reason = reason.lower()
+    return (
+        status_code in REALM_NOT_THERE_CODES
+        or "does not exist" in reason
+        or "destroyed" in reason
+    )
 
 
 def _connection_filter(module):
@@ -305,16 +353,31 @@ def connection_to_dict(connection):
     }
 
 
-def _check_remote_realm_visible(module, blade):
-    """Fail unless the remote realm is visible from the local FlashBlade."""
+def _warn_unlisted_remote_realm(module, blade):
+    """Check mode only: warn when the remote realm is not listed for this user."""
     res = blade.get_remote_realms(names=[module.params["remote_realm"]])
     if res.status_code != 200 or not list(res.items):
-        module.fail_json(
-            msg=(
-                "Remote realm {0} is not visible from this FlashBlade; "
-                "connect the arrays first with purefb_connect. Error: {1}"
-            ).format(module.params["remote_realm"], get_error_message(res))
+        module.warn(
+            "Remote realm {0} is not listed by this FlashBlade for the user "
+            "running the task, so check mode cannot confirm it. The "
+            "FlashBlade decides when the connection is created.".format(
+                module.params["remote_realm"]
+            )
         )
+
+
+def _array_connection_hint(blade):
+    """Return a purefb_connect hint when this user is shown no array connection."""
+    try:
+        res = blade.get_array_connections()
+    except Exception:
+        return ""
+    if res.status_code != 200 or list(res.items):
+        return ""
+    return (
+        " No array connection is visible to this user: if the FlashBlades "
+        "are not connected yet, connect them first with purefb_connect."
+    )
 
 
 def _remote_client(module):
@@ -397,13 +460,14 @@ def create_connection(module, blade):
                 "required to create a realm connection"
             )
         )
-    _check_remote_realm_visible(module, blade)
     changed = True
     connection = None
     remote_system = None
     if module.params["target_api"]:
         remote_system = _remote_client(module)
-    if not module.check_mode:
+    if module.check_mode:
+        _warn_unlisted_remote_realm(module, blade)
+    else:
         if module.params["connection_key"]:
             connection_key = module.params["connection_key"]
         else:
@@ -419,13 +483,16 @@ def create_connection(module, blade):
                 module.params["remote_realm"],
                 get_error_message(res),
             )
+            notes = _array_connection_hint(blade)
             if remote_system is not None:
-                msg += (
+                notes += (
                     " The connection key generated for remote realm {0} on {1} "
                     "remains outstanding there until it expires or is "
                     "invalidated with invalidate_keys."
                 ).format(module.params["remote_realm"], module.params["target_url"])
-            module.fail_json(msg=msg)
+            if notes and not msg.endswith("."):
+                msg += "."
+            module.fail_json(msg=msg + notes)
         items = list(res.items) if getattr(res, "items", None) is not None else []
         connection = items[0] if items else None
         if module.params["wait"]:
@@ -561,10 +628,25 @@ def main():
             )
         )
 
-    if not _realm_exists(module, blade):
-        if state == "absent" and not key_operation:
+    realm_status, realm_error = _realm_error(module, blade)
+    if realm_error is not None:
+        if (
+            state == "absent"
+            and not key_operation
+            and _realm_not_there(realm_status, realm_error)
+        ):
             module.exit_json(changed=False, connection=None)
-        module.fail_json(msg="Realm {0} does not exist.".format(module.params["realm"]))
+        msg = "Realm {0} is not available. Error: {1}".format(
+            module.params["realm"], realm_error
+        )
+        if "destroyed" in realm_error.lower():
+            if not msg.endswith("."):
+                msg += "."
+            msg += (
+                " Recover it with purefb_realm before managing its realm "
+                "connections or connection keys."
+            )
+        module.fail_json(msg=msg)
 
     if module.params["generate_key"]:
         generate_key(module, blade)

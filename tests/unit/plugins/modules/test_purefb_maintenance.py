@@ -93,6 +93,12 @@ from plugins.modules.purefb_maintenance import (
 MOD = "plugins.modules.purefb_maintenance"
 CREATED = 1700000000000
 ONE_HOUR_MS = 3600000
+# What the array answers (400) to a duration outside its range.
+ARRAY_RANGE_ERROR = "Duration must be between 1 hour and 48 hours."
+RANGE_MESSAGE = (
+    "timeout must be between 1 hour and 48 hours "
+    "(3600 to 172800 seconds), got {0} seconds"
+)
 
 
 def _window(created=CREATED, duration_ms=ONE_HOUR_MS, name="array"):
@@ -134,7 +140,7 @@ def _fail_msg(module):
 
 
 class TestParseTimeout:
-    """parse_timeout accepts seconds or s/m/h/d durations within 1s..48h"""
+    """parse_timeout accepts seconds or s/m/h/d durations within 1h..48h"""
 
     @pytest.mark.parametrize(
         "value,expected",
@@ -143,11 +149,14 @@ class TestParseTimeout:
             ("90m", 5400),
             ("2d", 172800),
             ("48h", 172800),
-            ("1s", 1),
+            ("172800", 172800),
+            ("1d", 86400),
+            ("1h", 3600),
+            ("60m", 3600),
+            ("3600s", 3600),
             ("3600", 3600),
             (3600, 3600),
-            ("1", 1),
-            (" 30M ", 1800),
+            (" 90M ", 5400),
         ],
     )
     def test_valid_values(self, value, expected):
@@ -158,12 +167,22 @@ class TestParseTimeout:
     @pytest.mark.parametrize(
         "value,fragment",
         [
-            ("49h", "between 1 second and 48 hours"),
-            ("172801", "between 1 second and 48 hours"),
-            ("3d", "between 1 second and 48 hours"),
+            ("49h", "between 1 hour and 48 hours"),
+            ("172801", "between 1 hour and 48 hours"),
+            ("3d", "between 1 hour and 48 hours"),
             ("1w", "Invalid timeout"),
-            ("0", "between 1 second and 48 hours"),
-            ("0s", "between 1 second and 48 hours"),
+            ("0", "between 1 hour and 48 hours"),
+            ("0s", "between 1 hour and 48 hours"),
+            # The array refuses anything shorter than one hour, so the
+            # module does too instead of sending it.
+            ("3599", "between 1 hour and 48 hours"),
+            (3599, "between 1 hour and 48 hours"),
+            ("3599s", "between 1 hour and 48 hours"),
+            ("59m", "between 1 hour and 48 hours"),
+            (" 30M ", "between 1 hour and 48 hours"),
+            ("5s", "between 1 hour and 48 hours"),
+            ("1s", "between 1 hour and 48 hours"),
+            ("1", "between 1 hour and 48 hours"),
             ("-1h", "Invalid timeout"),
             ("abc", "Invalid timeout"),
             ("4x", "Invalid timeout"),
@@ -182,6 +201,16 @@ class TestParseTimeout:
         with pytest.raises(SystemExit):
             parse_timeout(module)
         assert fragment in _fail_msg(module)
+
+    @pytest.mark.parametrize(
+        "value,seconds",
+        [("30m", 1800), ("3599", 3599), ("0", 0), ("172801", 172801)],
+    )
+    def test_out_of_range_message_names_both_bounds(self, value, seconds):
+        module = _module({"timeout": value})
+        with pytest.raises(SystemExit):
+            parse_timeout(module)
+        assert _fail_msg(module) == RANGE_MESSAGE.format(seconds)
 
 
 class TestWindowHelpers:
@@ -405,6 +434,62 @@ class TestSetWindow:
         blade.post_maintenance_windows.assert_not_called()
         assert "48 hours" in _fail_msg(module)
 
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("timeout", ["30m", "3599", "5s"])
+    def test_sub_hour_timeout_opens_nothing(self, timeout, check_mode):
+        module = _module({"timeout": timeout}, check_mode=check_mode)
+        blade = Mock()
+        blade.post_maintenance_windows.return_value = _response(
+            status=400, error=ARRAY_RANGE_ERROR
+        )
+        with pytest.raises(SystemExit):
+            set_window(module, blade, None)
+        assert "between 1 hour and 48 hours" in _fail_msg(module)
+        blade.post_maintenance_windows.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("extend", [False, True])
+    def test_sub_hour_timeout_leaves_open_window_alone(self, extend, check_mode):
+        module = _module({"timeout": "30m", "extend": extend}, check_mode=check_mode)
+        blade = Mock()
+        blade.post_maintenance_windows.return_value = _response(
+            status=400, error=ARRAY_RANGE_ERROR
+        )
+        with pytest.raises(SystemExit):
+            set_window(module, blade, _window())
+        assert _fail_msg(module) == RANGE_MESSAGE.format(1800)
+        blade.post_maintenance_windows.assert_not_called()
+        blade.delete_maintenance_windows.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "timeout,milliseconds",
+        [
+            ("3600", 3600000),
+            ("60m", 3600000),
+            ("172800", 172800000),
+            ("48h", 172800000),
+        ],
+    )
+    def test_range_bounds_are_sent_to_the_array(self, timeout, milliseconds):
+        module = _module({"timeout": timeout})
+        blade = Mock()
+        blade.post_maintenance_windows.return_value = _response()
+        blade.get_maintenance_windows.return_value = _response(
+            items=[_window(duration_ms=milliseconds)]
+        )
+        with patch(MOD + ".MaintenanceWindowPost") as mock_post_model:
+            with pytest.raises(SystemExit):
+                set_window(module, blade, None)
+        mock_post_model.assert_called_once_with(timeout=milliseconds)
+        blade.post_maintenance_windows.assert_called_once_with(
+            names=[WINDOW_NAME], maintenance_window=mock_post_model.return_value
+        )
+        args = _exit_args(module)
+        assert args["changed"] is True
+        assert args["maintenance_window"]["timeout"] == milliseconds // 1000
+
 
 class TestMain:
     """main() wiring: SDK check, version gate, state dispatch"""
@@ -592,3 +677,51 @@ class TestMain:
         assert _fail_msg(module).startswith("Failed to get maintenance window")
         blade.post_maintenance_windows.assert_not_called()
         blade.delete_maintenance_windows.assert_not_called()
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_main_sub_hour_timeout_fails_in_module(self, check_mode):
+        blade = Mock()
+        blade.get_maintenance_windows.return_value = _response(items=[])
+        blade.post_maintenance_windows.return_value = _response(
+            status=400, error=ARRAY_RANGE_ERROR
+        )
+        module = self._run({"timeout": "30m"}, blade, check_mode=check_mode)
+        assert _fail_msg(module) == RANGE_MESSAGE.format(1800)
+        blade.post_maintenance_windows.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_main_sub_hour_timeout_keeps_open_window(self, check_mode):
+        blade = Mock()
+        blade.get_maintenance_windows.return_value = _response(items=[_window()])
+        blade.post_maintenance_windows.return_value = _response(
+            status=400, error=ARRAY_RANGE_ERROR
+        )
+        module = self._run({"timeout": "3599"}, blade, check_mode=check_mode)
+        assert _fail_msg(module) == RANGE_MESSAGE.format(3599)
+        blade.post_maintenance_windows.assert_not_called()
+        blade.delete_maintenance_windows.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    def test_main_one_hour_window_is_opened(self):
+        blade = Mock()
+        blade.get_maintenance_windows.side_effect = [
+            _response(items=[]),
+            _response(items=[_window()]),
+        ]
+        blade.post_maintenance_windows.return_value = _response()
+        module = self._run({"timeout": "60m"}, blade)
+        module.post_model.assert_called_once_with(timeout=ONE_HOUR_MS)
+        module.fail_json.assert_not_called()
+        args = _exit_args(module)
+        assert args["changed"] is True
+        assert args["maintenance_window"]["timeout"] == 3600
+
+    def test_main_absent_ignores_sub_hour_timeout(self):
+        blade = Mock()
+        blade.get_maintenance_windows.return_value = _response(items=[_window()])
+        blade.delete_maintenance_windows.return_value = _response()
+        module = self._run({"state": "absent", "timeout": "30m"}, blade)
+        blade.delete_maintenance_windows.assert_called_once_with(names=[WINDOW_NAME])
+        module.fail_json.assert_not_called()
+        assert _exit_args(module) == {"changed": True, "maintenance_window": {}}

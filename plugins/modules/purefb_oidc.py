@@ -29,6 +29,14 @@ description:
   (C(prn)).
 - Providers are array-wide objects. An array supports up to five OIDC
   identity providers for the object service.
+- A provider cannot be created in a realm, so the module refuses a
+  realm-qualified I(name) or I(rename) (C(realm::name)). To let object store
+  roles in a realm trust a provider, share the provider with the realm using
+  M(everpure.flashblade.purefb_resource_access) with
+  I(resource_type=sso/oidc/idps) and I(scope_type=realms). A shared provider
+  keeps its unqualified name and its C(prn).
+- Deleting a provider also removes its shares. A share cannot be removed
+  while a trust policy in the realm still references the provider.
 - Requires FlashBlade REST API version 2.17 or later (Purity//FB 4.5.6+).
 - The array does not contact the provider when it is configured. The
   provider's public keys are fetched when a token is validated, so a
@@ -42,6 +50,8 @@ options:
   name:
     description:
     - Name of the identity provider.
+    - Providers are array-level objects, so the name cannot be
+      realm-qualified (C(realm::name)).
     type: str
     required: true
   state:
@@ -98,6 +108,7 @@ options:
       provider changes the C(prn) that object store trust policies
       reference.
     - The task fails when a provider called I(rename) already exists.
+    - Like I(name), the new name cannot be realm-qualified.
     type: str
 extends_documentation_fragment:
 - everpure.flashblade.everpure.fb
@@ -115,6 +126,15 @@ EXAMPLES = r"""
 - name: Show the PRN to reference from object store trust policies
   debug:
     var: result.prn
+
+- name: Share the provider with a realm so that roles in the realm can trust it
+  everpure.flashblade.purefb_resource_access:
+    resource_type: sso/oidc/idps
+    resource_name: okta
+    scope_type: realms
+    scope_name: realm1
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
 - name: Create a disabled provider validated by a CA certificate group
   everpure.flashblade.purefb_oidc:
@@ -233,6 +253,32 @@ REFERENCE_FIELDS = {
     "ca_certificate": "provider_url_ca_certificate",
     "ca_certificate_group": "provider_url_ca_certificate_group",
 }
+REALM_NAME_MSG = (
+    "Invalid {0} '{1}': OIDC identity providers are array-wide objects and "
+    "their names cannot be realm-qualified (realm::name). Use the unqualified "
+    "provider name. To make a provider usable in a realm, share it with the "
+    "realm using the purefb_resource_access module (resource_type "
+    "sso/oidc/idps, scope_type realms)."
+)
+
+
+def _refuse_realm_names(module):
+    """Fail when name or rename is realm-qualified (realm::name).
+
+    Providers are array-level objects. The array's name rule rejects the
+    realm separator on create and rename with a message that does not
+    mention realms, and it answers a lookup of such a name like any missing
+    provider, so state=absent would report an unchanged no-op and check
+    mode a change that cannot happen. rename is only read for
+    state=present.
+    """
+    options = ["name"]
+    if module.params["state"] == "present":
+        options.append("rename")
+    for option in options:
+        value = module.params[option]
+        if value and "::" in value:
+            module.fail_json(msg=REALM_NAME_MSG.format(option, value))
 
 
 def _reference_name(obj, field):
@@ -417,6 +463,9 @@ def main():
 
     if not HAS_PYPURECLIENT:
         module.fail_json(msg="py-pure-client sdk is required for this module")
+
+    # Refused before the array is contacted, in check mode too.
+    _refuse_realm_names(module)
 
     blade = get_system(module)
     api_version = get_rest_api_version(blade)

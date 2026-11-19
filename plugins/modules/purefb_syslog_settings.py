@@ -25,6 +25,9 @@ description:
   M(everpure.flashblade.purefb_syslog)).
 - The settings object is an array-wide singleton that always exists; the
   module only changes which certificate or certificate group it references.
+- The settings object belongs to the array. It cannot be created in or
+  scoped to a realm, and the array refuses a realm-scoped administrator
+  both reading and changing it.
 - Requires FlashBlade REST API version 2.0 or later (Purity//FB 3.2.0+).
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
@@ -35,6 +38,11 @@ options:
     - When omitted the module operates on the array's single settings object
       (named C(management) on current arrays) and fails if the array returns
       more than one.
+    - The array returns its settings object whatever name is requested, so
+      the module compares I(name) with the name of that object, without
+      regard to case as the array matches names, and fails, in check mode
+      too, when they differ. A realm-qualified name such as
+      C(realm1::management) therefore fails.
     type: str
   state:
     description:
@@ -48,6 +56,14 @@ options:
     description:
     - Name of an existing certificate on the array used to validate the
       syslog servers. Use M(everpure.flashblade.purefb_certs) to import one.
+    - A bare name always refers to the array-level certificate, never to a
+      certificate of that name inside a realm. The array also accepts the
+      C(realm::name) form of a certificate that lives in a realm; the
+      settings remain array-wide.
+    - The array finds a certificate by name without regard to case, but in
+      the settings it accepts only the spelling it stores. The module
+      therefore compares and sends the stored spelling, so a name written in
+      another case is the same certificate and not a change.
     - An empty string clears a configured CA certificate.
     - The array references at most one of a CA certificate and a CA
       certificate group; when one is set the module clears the other in the
@@ -58,6 +74,8 @@ options:
     - Name of an existing certificate group on the array whose certificates
       validate the syslog servers. Use M(everpure.flashblade.purefb_certgrp)
       to create one.
+    - The name is treated like I(ca_certificate). A bare name is the
+      array-level group and C(realm::name) is a group inside a realm.
     - An empty string clears a configured CA certificate group.
     type: str
 extends_documentation_fragment:
@@ -141,6 +159,14 @@ def _reference_name(obj, field):
     return getattr(ref, "name", None) or None
 
 
+def _same_name(first, second):
+    """Whether two names are one object name to the array.
+
+    The array matches object names without regard to case.
+    """
+    return (first or "").lower() == (second or "").lower()
+
+
 def get_settings(module, blade):
     """Return the syslog server settings object the module operates on."""
     if module.params["name"]:
@@ -156,6 +182,25 @@ def get_settings(module, blade):
     items = list(res.items)
     if not items:
         module.fail_json(msg="No syslog server settings object found.")
+    if module.params["name"]:
+        # The array ignores the names query on this endpoint and returns its
+        # settings object whatever name was asked for, so match it here, the
+        # way the array matches names: without regard to case.
+        matching = [
+            item
+            for item in items
+            if _same_name(getattr(item, "name", None), module.params["name"])
+        ]
+        if not matching:
+            module.fail_json(
+                msg="Syslog server settings object {0} does not exist. Syslog "
+                "server settings are array-wide and cannot be scoped to a "
+                "realm; the settings object of this array is {1}.".format(
+                    module.params["name"],
+                    ", ".join(getattr(item, "name", None) or "" for item in items),
+                )
+            )
+        items = matching
     if len(items) > 1:
         module.fail_json(
             msg="More than one syslog server settings object exists ({0}). "
@@ -165,7 +210,12 @@ def get_settings(module, blade):
 
 
 def _check_reference(module, blade, param, name):
-    """Fail unless the named certificate or certificate group exists."""
+    """Fail unless the named certificate or certificate group exists.
+
+    Returns the name as the array stores it. The array finds an object by
+    name without regard to case, but in the settings it accepts a reference
+    only in the stored spelling, so that is the spelling to compare and send.
+    """
     if param == "ca_certificate_group":
         res = blade.get_certificate_groups(names=[name])
         kind = "Certificate group"
@@ -178,6 +228,13 @@ def _check_reference(module, blade, param, name):
                 kind, name, get_error_message(res)
             )
         )
+    stored = [getattr(item, "name", None) for item in list(res.items)]
+    if name in stored:
+        return name
+    for stored_name in stored:
+        if _same_name(stored_name, name):
+            return stored_name
+    return name
 
 
 def _wanted_changes(module, blade, settings):
@@ -197,7 +254,10 @@ def _wanted_changes(module, blade, settings):
             if current:
                 patch_fields[field] = {"name": ""}
         elif wanted != current:
-            _check_reference(module, blade, param, wanted)
+            wanted = _check_reference(module, blade, param, wanted)
+            if wanted == current:
+                # The object already referenced, written in another case.
+                continue
             patch_fields[field] = {"name": wanted}
             other = _OTHER_FIELD[field]
             if _reference_name(settings, other):

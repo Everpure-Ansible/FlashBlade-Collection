@@ -30,8 +30,14 @@ description:
   holding it is not consulted and may corrupt its data when another client
   is granted the lock, so only clear locks whose client has gone away, and
   only with the agreement of the owner of the data.
-- A I(file_system), I(path) or I(inode) that does not exist is rejected
-  by the array and fails the task.
+- A I(file_system) that does not exist fails the task. A I(path) or
+  I(inode) is not checked by the module. The array rejects a lock request
+  for one that does not exist. For open files, and for locks with
+  I(recursive=true), a I(path) that does not exist matches nothing.
+- The array serves these requests to an administrator whose access covers
+  the array. Purity//FB 4.8.8 refuses them to an administrator whose
+  access is limited to a realm, also for the file systems of that realm,
+  and the task fails with the array's message.
 - Requires FlashBlade REST API version 2.8 or later for locks and NLM
   reclamation, 2.10 or later for sessions and for clearing locks by file
   system, path or inode, 2.17 or later for open files and 2.22 or later for
@@ -64,6 +70,19 @@ options:
   file_system:
     description:
     - Name of the file system whose locks or open files to list or clear.
+    - A file system in a realm is named C(realm::name). The bare name matches
+      only a file system outside every realm.
+    - The array can answer a lock request narrowed to a file system in a
+      realm as if the file system did not exist. The task then fails with a
+      message that says the file system exists and names the realm it is in.
+    - Clearing locks by I(file_system) also needs I(path) or I(inode),
+      because the array does not clear locks by file system alone.
+      I(path=/) with I(recursive=true) covers the whole file system, within
+      the limits described for I(recursive).
+    - For open files the name is looked up first, because the array lists
+      no open files for a file system it does not have. When the array
+      refuses the lookup itself, the task warns and lists the open files
+      without the check.
     - Does not apply to sessions, which belong to a client, not a file system.
     type: str
   path:
@@ -203,6 +222,13 @@ EXAMPLES = r"""
     target: open_files
     file_system: projects
     path: /build/output.db
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: List the SMB open files on a file system in a realm
+  everpure.flashblade.purefb_fs_lock:
+    target: open_files
+    file_system: tenant1::projects
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
@@ -407,15 +433,90 @@ def _open_file_kwargs(module, protocols=None):
     return kwargs
 
 
+def _find_file_system(module, blade):
+    """Look up the file system named by file_system.
+
+    Returns the file system and None, or None and the array's reason for not
+    returning it (None when the array answered with no items).
+    """
+    res = blade.get_file_systems(
+        names=[module.params["file_system"]], **_context_kwargs(module)
+    )
+    if res.status_code != 200:
+        return None, get_error_message(res)
+    items = list(res.items)
+    return (items[0] if items else None), None
+
+
+def _realm_name(file_system):
+    """Name of the realm a file system is in, or None when it is in no realm."""
+    realms = getattr(file_system, "realms", None) or []
+    return _ref_name(realms[0]) if realms else None
+
+
+def fail_locks(module, blade, action, res):
+    """Fail a lock request the array refused.
+
+    The array can answer a lock request narrowed to a file system it has as
+    if the file system were missing; it does so for one in a realm. When it
+    says the file system does not exist the name is looked up, and a file
+    system that is there and not destroyed is reported as such, with the
+    realm it is in.
+    """
+    error = get_error_message(res)
+    msg = "Failed to {0} file locks. Error: {1}".format(action, error)
+    file_system = module.params["file_system"]
+    if file_system and "file system does not exist" in str(error).lower():
+        found = _find_file_system(module, blade)[0]
+        if found is not None and not getattr(found, "destroyed", False):
+            realm = _realm_name(found)
+            msg += (
+                " File system {0} does exist{1}: the array refused a lock "
+                "request narrowed to it.".format(
+                    file_system, ", in realm {0}".format(realm) if realm else ""
+                )
+            )
+    module.fail_json(msg=msg)
+
+
+def check_file_system(module, blade):
+    """Fail when the array says file_system names no file system.
+
+    The open-files GET does not check the name: it answers with no items for
+    a file system the array does not have, which would read as no open files.
+    The lookup is refused for a name the array does not have, and answered
+    with no items for a file system the identity cannot see, as one outside
+    the realm of an administrator limited to that realm. A lookup the array
+    refuses for any other reason does not show the name is wrong, so the task
+    warns and the open files are listed without the check.
+    """
+    name = module.params["file_system"]
+    file_system, error = _find_file_system(module, blade)
+    if file_system is not None:
+        return
+    if error is None:
+        module.fail_json(
+            msg="Failed to list open files. File system {0} was not found.".format(name)
+        )
+    if "does not exist" in str(error).lower():
+        module.fail_json(
+            msg="Failed to list open files. File system {0} was not found. "
+            "Error: {1}".format(name, error)
+        )
+    module.warn(
+        "Could not check that file system {0} exists. Error: {1}. The array "
+        "lists no open files for a file system it does not have, so an empty "
+        "result does not confirm the name.".format(name, str(error).rstrip("."))
+    )
+
+
 def list_locks(module, blade):
     """Return the matching locks keyed by lock name."""
     res = blade.get_file_systems_locks(
         **_lock_kwargs(module), **_context_kwargs(module)
     )
     if res.status_code != 200:
-        module.fail_json(
-            msg="Failed to list file locks. Error: {0}".format(get_error_message(res))
-        )
+        fail_locks(module, blade, "list", res)
     recursive = module.params["recursive"] and module.params["path"]
     locks = {}
     for lock in list(res.items):
@@ -483,6 +584,8 @@ def list_sessions(module, blade):
 
 def list_open_files(module, blade, protocols=None):
     """Return the matching open files keyed by open file ID."""
+    if module.params["file_system"]:
+        check_file_system(module, blade)
     res = blade.get_file_systems_open_files(**_open_file_kwargs(module, protocols))
     if res.status_code != 200:
         module.fail_json(
@@ -537,11 +640,7 @@ def clear_locks(module, blade):
             **_lock_kwargs(module, for_delete=True), **_context_kwargs(module)
         )
         if res.status_code != 200:
-            module.fail_json(
-                msg="Failed to clear file locks. Error: {0}".format(
-                    get_error_message(res)
-                )
-            )
+            fail_locks(module, blade, "clear", res)
     module.exit_json(changed=changed, locks=locks)
 
 
@@ -636,8 +735,15 @@ def check_options(module):
         module.fail_json(msg="context is not supported for open files")
     if state != "absent":
         return
-    if target == "locks" and not (params["client"] or params["file_system"]):
-        module.fail_json(msg="Clearing locks requires client or file_system")
+    if target == "locks":
+        if not (params["client"] or params["file_system"]):
+            module.fail_json(msg="Clearing locks requires client or file_system")
+        if params["file_system"] and not (params["path"] or params["inode"]):
+            module.fail_json(
+                msg="Clearing locks by file_system also requires path or inode: "
+                "the array does not clear locks by file system alone. Use "
+                "path=/ with recursive=true to cover the whole file system"
+            )
     if target == "sessions":
         if not supplied:
             module.fail_json(

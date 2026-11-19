@@ -88,6 +88,8 @@ MODULE = "plugins.modules.purefb_object_role"
 ACCOUNT = "acme"
 ROLE = "analytics"
 FULL = "acme/analytics"
+RACCOUNT = "realm1::acme"
+RFULL = "realm1::acme/analytics"
 READ = "pure:policy/object-read"
 LIST = "pure:policy/object-list"
 MISSING = "Object store account does not exist."
@@ -124,12 +126,12 @@ def _response(status=200, items=None):
     return response
 
 
-def _role(duration=3600000):
+def _role(duration=3600000, account=ACCOUNT):
     role = Mock()
-    role.name = FULL
+    role.name = account + "/" + ROLE
     role.account = Mock()
-    role.account.name = ACCOUNT
-    role.prn = "prn:pure:fb:test:role/" + FULL
+    role.account.name = account
+    role.prn = "prn:pure:fb:test:role/" + account + "/" + ROLE
     role.max_session_duration = duration
     role.trusted_entities = []
     return role
@@ -144,12 +146,62 @@ def _link(policy):
     return link
 
 
-def _blade(role=None, attached=(), account=True, policies_valid=True):
+def _account_id(name):
+    """One ID per account: the array resolves names without regard to case."""
+    return "id-" + name.lower()
+
+
+def _account(name, ids=True):
+    """An object store account as the array returns it, in its own spelling."""
+    account = Mock()
+    account.id = _account_id(name) if ids else None
+    account.name = name.lower()
+    return account
+
+
+def _policy(name, owners=None, ids=True):
+    """An access policy as the array returns it.
+
+    A built-in policy has an account reference without values. Any other
+    policy belongs to the account its name starts with, unless owners says
+    otherwise, and its account reference carries the ID and the name of
+    that account. ids=False leaves the ID out of the reference.
+    """
+    policy = Mock()
+    policy.name = name
+    if owners and name in owners:
+        owner = owners[name]
+    elif name.startswith("pure:policy/"):
+        owner = None
+    else:
+        owner = name.rpartition("/")[0]
+    policy.account = Mock()
+    policy.account.id = _account_id(owner) if owner and ids else None
+    policy.account.name = owner.lower() if owner else None
+    return policy
+
+
+def _blade(
+    role=None,
+    attached=(),
+    account=True,
+    policies_valid=True,
+    owners=None,
+    ids=True,
+    stored=(),
+):
+    """A client mock. stored lists policy names as the array spells them: a
+    lookup in any other case answers with that spelling."""
     blade = Mock()
+    spelling = {name.lower(): name for name in stored}
     blade.get_fleets.return_value = _response(400)
-    blade.get_object_store_accounts.return_value = _response(
-        200 if account else 400, [Mock()] if account else []
-    )
+
+    def account_lookup(names, **kwargs):
+        if not account:
+            return _response(400)
+        return _response(200, [_account(names[0], ids)])
+
+    blade.get_object_store_accounts.side_effect = account_lookup
     if role is None:
         blade.get_object_store_roles.return_value = _response(400)
     else:
@@ -157,9 +209,16 @@ def _blade(role=None, attached=(), account=True, policies_valid=True):
     blade.get_object_store_roles_object_store_access_policies.return_value = _response(
         200, [_link(policy) for policy in attached]
     )
-    blade.get_object_store_access_policies.return_value = _response(
-        200 if policies_valid else 400, [Mock()] if policies_valid else []
-    )
+
+    def lookup(names, **kwargs):
+        if not policies_valid:
+            return _response(400)
+        return _response(
+            200,
+            [_policy(spelling.get(name.lower(), name), owners, ids) for name in names],
+        )
+
+    blade.get_object_store_access_policies.side_effect = lookup
     blade.post_object_store_roles.return_value = _response(200)
     blade.patch_object_store_roles.return_value = _response(200)
     blade.delete_object_store_roles.return_value = _response(200)
@@ -647,7 +706,7 @@ class TestPurefbObjectRole:
 
     def test_remove_known_unattached_with_exclusive_detaches_only_extras(self):
         module = _module(
-            access_policies=[READ], remove_access_policies=["other/x"], exclusive=True
+            access_policies=[READ], remove_access_policies=["acme/x"], exclusive=True
         )
         blade = _blade(role=_role(), attached=[READ, LIST])
         blade.get_object_store_roles_object_store_access_policies.side_effect = [
@@ -659,7 +718,7 @@ class TestPurefbObjectRole:
 
         blade.get_object_store_access_policies.assert_called_once()
         assert blade.get_object_store_access_policies.call_args[1]["names"] == [
-            "other/x"
+            "acme/x"
         ]
         calls = (
             blade.delete_object_store_roles_object_store_access_policies.call_args_list
@@ -870,3 +929,618 @@ class TestPurefbObjectRole:
         assert module.params["context"] == "fb-local"
         kwargs = blade.get_object_store_roles.call_args[1]
         assert kwargs["context_names"] == ["fb-local"]
+
+
+def _assert_nothing_written(blade):
+    blade.post_object_store_roles.assert_not_called()
+    blade.patch_object_store_roles.assert_not_called()
+    blade.delete_object_store_roles.assert_not_called()
+    blade.post_object_store_roles_object_store_access_policies.assert_not_called()
+    blade.delete_object_store_roles_object_store_access_policies.assert_not_called()
+
+
+class TestRealmChecks:
+    """Accounts in a realm, a qualifier on the role name, policies of another account"""
+
+    # ---------------- qualifier on the role name ----------------
+
+    @pytest.mark.parametrize(
+        "account, name",
+        [
+            (ACCOUNT, "realm1::analytics"),
+            (RACCOUNT, "realm1::analytics"),
+            (ACCOUNT, "acme/analytics"),
+            (RACCOUNT, "realm1::acme/analytics"),
+        ],
+    )
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_qualified_role_name_fails_before_any_call(
+        self, check_mode, state, account, name
+    ):
+        module = _module(check_mode=check_mode, state=state, account=account, name=name)
+        blade = _blade(role=None)
+
+        _run_main(module, blade)
+
+        module.exit_json.assert_not_called()
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Invalid role name " in msg and name in msg
+        assert "realm::account" in msg
+        assert blade.mock_calls == []
+
+    # ---------------- policy of another account ----------------
+
+    @pytest.mark.parametrize(
+        "account, policy, owner",
+        [
+            (RACCOUNT, "acme/reports", "acme"),
+            (RACCOUNT, "realm1::other/reports", "realm1::other"),
+            (RACCOUNT, "realm2::acme/reports", "realm2::acme"),
+            (ACCOUNT, "realm1::acme/reports", "realm1::acme"),
+            (ACCOUNT, "other/reports", "other"),
+        ],
+    )
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_attach_policy_of_another_account_fails_before_any_write(
+        self, check_mode, account, policy, owner
+    ):
+        module = _module(
+            check_mode=check_mode,
+            account=account,
+            max_session_duration="2h",
+            access_policies=[READ, policy],
+        )
+        blade = _blade(role=_role(account=account), attached=[])
+
+        _run_main(module, blade)
+
+        module.exit_json.assert_not_called()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert (
+            "Access policy {0} belongs to object store account {1}, not to {2}.".format(
+                policy, owner, account
+            )
+            in msg
+        )
+        assert "(" + account + "/policy)" in msg
+        _assert_nothing_written(blade)
+
+    @pytest.mark.parametrize("key", ["access_policies", "remove_access_policies"])
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_create_with_policy_of_another_account_fails_before_post(
+        self, check_mode, key
+    ):
+        module = _module(
+            check_mode=check_mode, account=RACCOUNT, **{key: ["acme/reports"]}
+        )
+        blade = _blade(role=None)
+
+        _run_main(module, blade)
+
+        module.exit_json.assert_not_called()
+        assert (
+            "belongs to object store account acme, not to realm1::acme"
+            in module.fail_json.call_args[1]["msg"]
+        )
+        _assert_nothing_written(blade)
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_remove_policy_of_another_account_fails(self, check_mode):
+        module = _module(
+            check_mode=check_mode,
+            account=RACCOUNT,
+            remove_access_policies=["acme/reports"],
+        )
+        blade = _blade(
+            role=_role(account=RACCOUNT), attached=[RACCOUNT + "/reports", READ]
+        )
+
+        _run_main(module, blade)
+
+        module.exit_json.assert_not_called()
+        assert (
+            "belongs to object store account acme, not to realm1::acme"
+            in module.fail_json.call_args[1]["msg"]
+        )
+        _assert_nothing_written(blade)
+
+    def test_missing_policy_named_without_the_realm_prefix_gets_a_hint(self):
+        module = _module(
+            check_mode=True, account=RACCOUNT, access_policies=["Acme/reports"]
+        )
+        blade = _blade(role=_role(account=RACCOUNT), policies_valid=False)
+
+        _run_main(module, blade)
+
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Access policy Acme/reports does not exist. Policies of the "
+            "account realm1::acme are named realm1::acme/policy."
+        )
+        _assert_nothing_written(blade)
+
+    @pytest.mark.parametrize(
+        "account, policy, looked_up",
+        [
+            (RACCOUNT, "pure:policy/no-such", "pure:policy/no-such"),
+            (RACCOUNT, "no-such", "realm1::acme/no-such"),
+            (RACCOUNT, "other/no-such", "other/no-such"),
+            (ACCOUNT, "other/no-such", "other/no-such"),
+        ],
+    )
+    def test_missing_policy_message_has_no_hint_otherwise(
+        self, account, policy, looked_up
+    ):
+        module = _module(account=account, access_policies=[policy])
+        blade = _blade(role=_role(account=account), policies_valid=False)
+
+        _run_main(module, blade)
+
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Access policy {0} does not exist.".format(looked_up)
+        )
+        _assert_nothing_written(blade)
+
+    # ---------------- what the array accepts stays accepted ----------------
+
+    def test_realm_account_create_uses_qualified_names(self):
+        module = _module(
+            account=RACCOUNT,
+            max_session_duration="2h",
+            access_policies=["reports", RACCOUNT + "/audit", READ],
+        )
+        blade = _blade(role=None)
+        blade.get_object_store_roles.side_effect = [
+            _response(400),
+            _response(200, [_role(7200000, RACCOUNT)]),
+        ]
+
+        _run_main(module, blade)
+
+        wanted = [[RACCOUNT + "/reports"], [RACCOUNT + "/audit"], [READ]]
+        assert blade.get_object_store_accounts.call_args[1]["names"] == [RACCOUNT]
+        assert blade.post_object_store_roles.call_args[1]["names"] == [RFULL]
+        lookups = blade.get_object_store_access_policies.call_args_list
+        assert [c[1]["names"] for c in lookups] == wanted
+        links = (
+            blade.post_object_store_roles_object_store_access_policies.call_args_list
+        )
+        assert [c[1]["policy_names"] for c in links] == wanted
+        assert all(c[1]["member_names"] == [RFULL] for c in links)
+        result = module.exit_json.call_args[1]
+        assert result["changed"] is True
+        assert result["role"]["name"] == RFULL
+        assert result["role"]["account"] == RACCOUNT
+
+    def test_realm_account_update_and_detach_use_qualified_names(self):
+        module = _module(
+            account=RACCOUNT,
+            max_session_duration="2h",
+            remove_access_policies=["reports"],
+        )
+        blade = _blade(role=_role(account=RACCOUNT), attached=[RACCOUNT + "/reports"])
+
+        _run_main(module, blade)
+
+        assert blade.patch_object_store_roles.call_args[1]["names"] == [RFULL]
+        kwargs = blade.delete_object_store_roles_object_store_access_policies.call_args[
+            1
+        ]
+        assert kwargs["member_names"] == [RFULL]
+        assert kwargs["policy_names"] == [RACCOUNT + "/reports"]
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_realm_account_absent_deletes_qualified_name(self):
+        module = _module(account=RACCOUNT, state="absent")
+        blade = _blade(role=_role(account=RACCOUNT))
+
+        _run_main(module, blade)
+
+        assert blade.delete_object_store_roles.call_args[1]["names"] == [RFULL]
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_realm_account_create_check_mode_reports_qualified_names(self):
+        module = _module(
+            check_mode=True, account=RACCOUNT, access_policies=["reports", READ]
+        )
+        blade = _blade(role=None)
+
+        _run_main(module, blade)
+
+        _assert_nothing_written(blade)
+        result = module.exit_json.call_args[1]
+        assert result["changed"] is True
+        assert result["role"]["name"] == RFULL
+        assert result["role"]["account"] == RACCOUNT
+        assert result["role"]["access_policies"] == [RACCOUNT + "/reports", READ]
+
+    def test_role_name_with_the_characters_the_array_allows_is_not_refused(self):
+        name = "a+b=c,d.e@f_g-h"
+        module = _module(account=RACCOUNT, name=name)
+        blade = _blade(role=None)
+
+        _run_main(module, blade)
+
+        assert blade.post_object_store_roles.call_args[1]["names"] == [
+            RACCOUNT + "/" + name
+        ]
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_account_and_policy_in_another_spelling_are_accepted(self):
+        """The array resolves names without regard to case and answers with
+        its own spelling: the references still name the same account."""
+        module = _module(
+            account="Realm1::Acme", access_policies=["REALM1::ACME/reports"]
+        )
+        blade = _blade(role=_role(account=RACCOUNT))
+
+        _run_main(module, blade)
+
+        blade.post_object_store_roles_object_store_access_policies.assert_called_once()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_owner_id_decides_when_the_names_are_spelled_differently(self):
+        """Defensive, not an observed array shape: the same account ID is the
+        same account, however the two references spell its name."""
+        module = _module(account=RACCOUNT, access_policies=[RACCOUNT + "/reports"])
+        blade = _blade(role=_role(account=RACCOUNT))
+        policy = _policy(RACCOUNT + "/reports")
+        policy.account.name = "acme"
+        blade.get_object_store_access_policies.side_effect = None
+        blade.get_object_store_access_policies.return_value = _response(200, [policy])
+
+        _run_main(module, blade)
+
+        blade.post_object_store_roles_object_store_access_policies.assert_called_once()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    # References without an ID were not seen on the array. The names are
+    # the fallback and are compared without regard to case.
+
+    @pytest.mark.parametrize(
+        "account, policy",
+        [
+            (RACCOUNT, RACCOUNT + "/reports"),
+            ("Realm1::Acme", "REALM1::ACME/reports"),
+            (ACCOUNT, ACCOUNT + "/reports"),
+        ],
+    )
+    def test_without_ids_own_policy_is_accepted_by_name(self, account, policy):
+        module = _module(account=account, access_policies=[policy])
+        blade = _blade(role=_role(account=account.lower()), ids=False)
+
+        _run_main(module, blade)
+
+        blade.post_object_store_roles_object_store_access_policies.assert_called_once()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    @pytest.mark.parametrize(
+        "account, policy, owner",
+        [
+            (RACCOUNT, "acme/reports", "acme"),
+            (ACCOUNT, "realm1::acme/reports", "realm1::acme"),
+        ],
+    )
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_without_ids_policy_of_another_account_fails_by_name(
+        self, check_mode, account, policy, owner
+    ):
+        module = _module(
+            check_mode=check_mode, account=account, access_policies=[policy]
+        )
+        blade = _blade(role=_role(account=account), ids=False)
+
+        _run_main(module, blade)
+
+        module.exit_json.assert_not_called()
+        assert (
+            "belongs to object store account {0}, not to {1}.".format(owner, account)
+            in module.fail_json.call_args[1]["msg"]
+        )
+        _assert_nothing_written(blade)
+
+    @pytest.mark.parametrize("reference", ["empty", "missing"])
+    def test_policy_without_an_owning_account_is_accepted(self, reference):
+        module = _module(account=RACCOUNT, access_policies=["shared/reports"])
+        blade = _blade(role=_role(account=RACCOUNT), owners={"shared/reports": None})
+        if reference == "missing":
+            policy = Mock()
+            policy.name = "shared/reports"
+            policy.account = None
+            blade.get_object_store_access_policies.side_effect = None
+            blade.get_object_store_access_policies.return_value = _response(
+                200, [policy]
+            )
+
+        _run_main(module, blade)
+
+        blade.post_object_store_roles_object_store_access_policies.assert_called_once()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    # ---------------- added in review ----------------
+
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_qualified_role_name_fails_before_the_login(self, check_mode, state):
+        """get_system() logs in, which is the first request to the array: the
+        role name is refused before it."""
+        module = _module(check_mode=check_mode, state=state, name="realm1::analytics")
+        with ExitStack() as stack:
+            stack.enter_context(patch(MODULE + ".AnsibleModule", return_value=module))
+            login = stack.enter_context(patch(MODULE + ".get_system"))
+            version = stack.enter_context(patch(MODULE + ".get_rest_api_version"))
+            stack.enter_context(patch(MODULE + ".HAS_PYPURECLIENT", True))
+            with pytest.raises(SystemExit):
+                main()
+
+        login.assert_not_called()
+        version.assert_not_called()
+        module.exit_json.assert_not_called()
+        assert "Invalid role name " in module.fail_json.call_args[1]["msg"]
+
+    @pytest.mark.parametrize("given", [RACCOUNT, "REALM1::ACME"])
+    def test_without_ids_the_spelling_of_the_array_is_compared_without_case(
+        self, given
+    ):
+        """No IDs, and the array spells the account with capitals in both
+        references: it is still the role's own account."""
+        module = _module(account=given, access_policies=[given + "/reports"])
+        blade = _blade(role=_role(account=RACCOUNT), ids=False)
+        account = _account(given, ids=False)
+        account.name = "Realm1::Acme"
+        blade.get_object_store_accounts.side_effect = None
+        blade.get_object_store_accounts.return_value = _response(200, [account])
+        policy = _policy(given + "/reports", ids=False)
+        policy.account.name = "Realm1::Acme"
+        blade.get_object_store_access_policies.side_effect = None
+        blade.get_object_store_access_policies.return_value = _response(200, [policy])
+
+        _run_main(module, blade)
+
+        module.fail_json.assert_not_called()
+        blade.post_object_store_roles_object_store_access_policies.assert_called_once()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+
+class TestSpelling:
+    """A policy or an account given in another case than the array stores it.
+
+    The array resolves a name without regard to case and answers with its
+    own spelling. Asked to attach an attached policy again it refuses with
+    "Policy has already been added to the role."
+    """
+
+    OWN = RACCOUNT + "/reports"
+
+    @pytest.mark.parametrize(
+        "account, policy, attached",
+        [
+            (RACCOUNT, "REALM1::ACME/REPORTS", OWN),
+            ("REALM1::ACME", "reports", OWN),
+            (RACCOUNT, "Reports", OWN),
+            (RACCOUNT, "PURE:POLICY/OBJECT-READ", READ),
+        ],
+    )
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_attached_policy_in_another_spelling_is_not_attached_again(
+        self, check_mode, account, policy, attached
+    ):
+        module = _module(
+            check_mode=check_mode, account=account, access_policies=[policy]
+        )
+        blade = _blade(
+            role=_role(account=RACCOUNT), attached=[attached], stored=[attached]
+        )
+
+        _run_main(module, blade)
+
+        module.fail_json.assert_not_called()
+        _assert_nothing_written(blade)
+        result = module.exit_json.call_args[1]
+        assert result["changed"] is False
+        assert result["role"]["access_policies"] == [attached]
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_removal_in_another_spelling_detaches_the_attached_policy(self, check_mode):
+        module = _module(
+            check_mode=check_mode,
+            account=RACCOUNT,
+            remove_access_policies=["REALM1::ACME/REPORTS"],
+        )
+        blade = _blade(
+            role=_role(account=RACCOUNT), attached=[self.OWN, READ], stored=[self.OWN]
+        )
+        blade.get_object_store_roles_object_store_access_policies.side_effect = [
+            _response(200, [_link(self.OWN), _link(READ)]),
+            _response(200, [_link(READ)]),
+        ]
+
+        _run_main(module, blade)
+
+        detach = blade.delete_object_store_roles_object_store_access_policies
+        if check_mode:
+            detach.assert_not_called()
+        else:
+            detach.assert_called_once()
+            assert detach.call_args[1]["policy_names"] == [self.OWN]
+        blade.post_object_store_roles_object_store_access_policies.assert_not_called()
+        result = module.exit_json.call_args[1]
+        assert result["changed"] is True
+        assert result["role"]["access_policies"] == [READ]
+
+    def test_exclusive_keeps_the_wanted_policy_in_another_spelling(self):
+        module = _module(
+            account=RACCOUNT, access_policies=["REALM1::ACME/REPORTS"], exclusive=True
+        )
+        blade = _blade(
+            role=_role(account=RACCOUNT), attached=[self.OWN, READ], stored=[self.OWN]
+        )
+        blade.get_object_store_roles_object_store_access_policies.side_effect = [
+            _response(200, [_link(self.OWN), _link(READ)]),
+            _response(200, [_link(self.OWN)]),
+        ]
+
+        _run_main(module, blade)
+
+        blade.post_object_store_roles_object_store_access_policies.assert_not_called()
+        calls = (
+            blade.delete_object_store_roles_object_store_access_policies.call_args_list
+        )
+        assert [c[1]["policy_names"] for c in calls] == [[READ]]
+        result = module.exit_json.call_args[1]
+        assert result["changed"] is True
+        assert result["role"]["access_policies"] == [self.OWN]
+
+    def test_new_policy_is_attached_under_the_name_of_the_array(self):
+        module = _module(account=RACCOUNT, access_policies=["REPORTS"])
+        blade = _blade(role=_role(account=RACCOUNT), attached=[READ], stored=[self.OWN])
+
+        _run_main(module, blade)
+
+        attach = blade.post_object_store_roles_object_store_access_policies
+        attach.assert_called_once()
+        assert attach.call_args[1]["policy_names"] == [self.OWN]
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_create_attaches_under_the_names_of_the_array(self, check_mode):
+        module = _module(
+            check_mode=check_mode,
+            account="REALM1::ACME",
+            access_policies=["Reports", "PURE:POLICY/OBJECT-READ", "reports"],
+        )
+        blade = _blade(role=None, stored=[self.OWN, READ])
+        blade.get_object_store_roles.side_effect = [
+            _response(400),
+            _response(200, [_role(account=RACCOUNT)]),
+        ]
+
+        _run_main(module, blade)
+
+        module.fail_json.assert_not_called()
+        attach = blade.post_object_store_roles_object_store_access_policies
+        if check_mode:
+            _assert_nothing_written(blade)
+            result = module.exit_json.call_args[1]
+            assert result["role"]["name"] == RFULL
+            assert result["role"]["account"] == RACCOUNT
+            assert result["role"]["access_policies"] == [self.OWN, READ]
+        else:
+            # the role is created and addressed under the account's stored name
+            assert blade.post_object_store_roles.call_args[1]["names"] == [RFULL]
+            assert [c[1]["member_names"] for c in attach.call_args_list] == [
+                [RFULL],
+                [RFULL],
+            ]
+            assert [c[1]["policy_names"] for c in attach.call_args_list] == [
+                [self.OWN],
+                [READ],
+            ]
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_existing_role_is_addressed_under_its_stored_name(self):
+        """The array attaches a policy only to a role named as it stores it."""
+        module = _module(
+            account="REALM1::ACME",
+            name="ANALYTICS",
+            max_session_duration="2h",
+            access_policies=[LIST],
+            remove_access_policies=[READ],
+        )
+        blade = _blade(role=_role(account=RACCOUNT), attached=[READ])
+
+        _run_main(module, blade)
+
+        module.fail_json.assert_not_called()
+        assert blade.patch_object_store_roles.call_args[1]["names"] == [RFULL]
+        attach = blade.post_object_store_roles_object_store_access_policies
+        assert attach.call_args[1]["member_names"] == [RFULL]
+        detach = blade.delete_object_store_roles_object_store_access_policies
+        assert detach.call_args[1]["member_names"] == [RFULL]
+        listing = blade.get_object_store_roles_object_store_access_policies
+        assert listing.call_args[1]["member_names"] == [RFULL]
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_absent_deletes_the_role_under_its_stored_name(self):
+        module = _module(account="REALM1::ACME", name="ANALYTICS", state="absent")
+        blade = _blade(role=_role(account=RACCOUNT))
+
+        _run_main(module, blade)
+
+        assert blade.delete_object_store_roles.call_args[1]["names"] == [RFULL]
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_another_name_from_the_array_is_not_taken_over(self):
+        """Only a difference in case is adopted from the array's answer."""
+        module = _module(account=ACCOUNT, access_policies=[READ])
+        blade = _blade(role=None)
+        account = _account(ACCOUNT)
+        account.name = "somebody-else"
+        blade.get_object_store_accounts.side_effect = None
+        blade.get_object_store_accounts.return_value = _response(200, [account])
+
+        _run_main(module, blade)
+
+        assert blade.post_object_store_roles.call_args[1]["names"] == [FULL]
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_clash_is_found_under_the_names_of_the_array(self, check_mode):
+        module = _module(
+            check_mode=check_mode,
+            account=RACCOUNT,
+            access_policies=[self.OWN],
+            remove_access_policies=["REALM1::ACME/REPORTS"],
+        )
+        blade = _blade(
+            role=_role(account=RACCOUNT), attached=[self.OWN], stored=[self.OWN]
+        )
+
+        _run_main(module, blade)
+
+        module.exit_json.assert_not_called()
+        assert "both access_policies" in module.fail_json.call_args[1]["msg"]
+        _assert_nothing_written(blade)
+
+    def test_requested_policies_uses_the_names_of_the_array(self):
+        module = _module(access_policies=["Reports", "reports", READ])
+        names = {"acme/Reports": "acme/reports"}
+        assert _requested_policies(module, "access_policies", names) == [
+            "acme/reports",
+            READ,
+        ]
+
+    def test_desired_policy_changes_uses_the_names_of_the_array(self):
+        module = _module(
+            access_policies=["Reports"], remove_access_policies=[LIST.upper()]
+        )
+        names = {"acme/Reports": "acme/reports", LIST.upper(): LIST}
+        to_attach, to_detach = _desired_policy_changes(
+            module, ["acme/reports", LIST], names
+        )
+        assert to_attach == []
+        assert to_detach == [LIST]
+
+    @pytest.mark.parametrize("role", [None, "existing"])
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_policy_lookup_error_is_not_reported_as_missing(self, check_mode, role):
+        """Only the array's "does not exist" answer means a missing policy."""
+        module = _module(
+            check_mode=check_mode,
+            account=RACCOUNT,
+            max_session_duration="2h",
+            access_policies=["acme/reports"],
+        )
+        blade = _blade(
+            role=_role(account=RACCOUNT) if role else None, policies_valid=False
+        )
+        if not role:
+            blade.get_object_store_roles.return_value = _response(200, [])
+
+        _run_main(module, blade, error="Internal error")
+
+        module.exit_json.assert_not_called()
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Failed to look up access policy acme/reports. Error: Internal error"
+        )
+        _assert_nothing_written(blade)

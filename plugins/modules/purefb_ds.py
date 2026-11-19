@@ -126,8 +126,11 @@ options:
       managed is C(realm::server_nfs).
     - A realm-scoped administrator must use the realm-qualified name; a bare
       name is not placed in, or resolved to, the administrator's realm.
-    - If not set, or set to C(_array_server), the NFS directory service of
-      the default server is managed, which is the array-level C(nfs).
+    - If not set or empty, or set to C(_array_server), the NFS directory
+      service of the default server is managed, which is the array-level
+      C(nfs).
+    - The value is the name of one server. A value that holds a comma is
+      refused, because the array reads it as a list of names.
     - Only used when I(dstype) is C(nfs).
     type: str
     version_added: 1.23.0
@@ -610,6 +613,17 @@ def main():
     )
     if not HAS_PYPURECLIENT:
         module.fail_json(msg="py-pure-client sdk is required for this module")
+
+    nfs_server = module.params["nfs_server"]
+    if module.params["dstype"] == "nfs" and nfs_server and "," in nfs_server:
+        # The array reads a name that holds a comma as a list of names, so
+        # the read and the change would address more than one directory
+        # service, the array-level ones included.
+        module.fail_json(
+            msg="nfs_server must be the name of one server and {0} holds a "
+            "comma. The array reads such a name as a list of names, so the "
+            "task would address more than one directory service.".format(nfs_server)
+        )
 
     state = module.params["state"]
     blade = get_system(module)

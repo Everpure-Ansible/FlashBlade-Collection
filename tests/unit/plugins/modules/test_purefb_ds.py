@@ -208,41 +208,55 @@ def _blade(*services):
 
     services are the directory services the caller is shown. Any other name
     answers 400 "Directory service does not exist.". Names match without
-    regard to letter case. A PATCH changes the state, so a second run reads
-    it back; an empty URI clears the URI list, as on the array.
+    regard to letter case, and a name that holds a comma is read as a list
+    of names: every one of them is addressed, sorted by name, and one that
+    is not shown fails the request. A PATCH changes the state, so a second
+    run reads it back; an empty URI clears the URI list, as on the array.
     """
     store = dict((svc.name.lower(), svc) for svc in services)
     blade = Mock()
     blade.store = store
 
+    def _addressed(kwargs):
+        names = ",".join(kwargs["names"]).lower().split(",")
+        found = [store.get(name) for name in names]
+        if None in found:
+            return None
+        return sorted(found, key=lambda svc: svc.name)
+
     def _get(**kwargs):
-        svc = store.get(kwargs["names"][0].lower())
-        if svc is None:
+        found = _addressed(kwargs)
+        if found is None:
             return _error()
-        return _ok([svc])
+        return _ok(found)
 
     def _patch(**kwargs):
-        svc = store.get(kwargs["names"][0].lower())
-        if svc is None:
+        found = _addressed(kwargs)
+        if found is None:
             return _error()
         body = kwargs["directory_service"]
-        if "uris" in body:
-            svc.uris = [uri for uri in body["uris"] if uri]
-        for key in ("base_dn", "bind_user", "enabled"):
-            if key in body:
-                setattr(svc, key, body[key])
-        if "nfs" in body:
-            svc.nfs.nis_domains = list(body["nfs"]["nis_domains"])
-            svc.nfs.nis_servers = list(body["nfs"]["nis_servers"])
-        if "smb" in body:
-            svc.smb.join_ou = body["smb"]["join_ou"]
+        for svc in found:
+            if "uris" in body:
+                svc.uris = [uri for uri in body["uris"] if uri]
+            for key in ("base_dn", "bind_user", "enabled"):
+                if key in body:
+                    setattr(svc, key, body[key])
+            if "nfs" in body:
+                svc.nfs.nis_domains = list(body["nfs"]["nis_domains"])
+                svc.nfs.nis_servers = list(body["nfs"]["nis_servers"])
+            if "smb" in body:
+                svc.smb.join_ou = body["smb"]["join_ou"]
         return _ok()
 
     def _test(**kwargs):
-        svc = store.get(kwargs["names"][0].lower())
-        if svc is None:
+        found = _addressed(kwargs)
+        if found is None:
             return _error()
-        return _ok([_test_result(svc.name), _test_result(svc.name, success=False)])
+        results = []
+        for svc in found:
+            results.append(_test_result(svc.name))
+            results.append(_test_result(svc.name, success=False))
+        return _ok(results)
 
     blade.get_directory_services.side_effect = _get
     blade.patch_directory_services.side_effect = _patch
@@ -391,6 +405,44 @@ class TestMissingService:
             "msg": "Directory Service tenant1::nosuch_nfs does not exist",
         }
         assert _patches(blade) == []
+
+
+class TestOneServer:
+    """nfs_server names one server: the array reads a comma as a list of names."""
+
+    @pytest.mark.parametrize("state", ["present", "absent", "test"])
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_comma_in_the_server_name_is_refused(self, state, check_mode):
+        # Without the refusal the array-level nfs service sorts first, is
+        # the one compared, and the change goes to both services.
+        blade = _blade(_ds("nfs", enabled=True, **LDAP), _nis_ds(REALM_DS))
+        module = _module(
+            check_mode=check_mode, state=state, nfs_server="nfs," + REALM_SERVER
+        )
+        _run(module, blade)
+        msg = _failure(module)
+        assert "name of one server" in msg
+        assert "nfs," + REALM_SERVER in msg
+        blade.get_directory_services.assert_not_called()
+        blade.get_directory_services_test.assert_not_called()
+        assert _patches(blade) == []
+        assert blade.store["nfs"].uris == LDAP["uri"]
+        assert blade.store[REALM_DS.lower()].nfs.nis_domains == ["example.com"]
+
+    def test_comma_with_new_values_is_refused(self):
+        blade = _blade(_ds("management", enabled=True, **LDAP), _ds(ARRAY_DS))
+        module = _module(nfs_server="management," + ARRAY_SERVER, enable=False)
+        _run(module, blade)
+        assert "name of one server" in _failure(module)
+        assert _patches(blade) == []
+        assert blade.store["management"].enabled is True
+
+    def test_comma_is_not_looked_at_for_management(self):
+        blade = _blade(_ds("management", enabled=True, **LDAP))
+        module = _module(dstype="management", nfs_server="a,b", enable=True)
+        _run(module, blade)
+        assert _result(module) == {"changed": False}
+        assert set(_read_names(blade)) == {"management"}
 
 
 class TestFailedRead:

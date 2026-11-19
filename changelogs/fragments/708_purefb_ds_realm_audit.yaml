@@ -7,3 +7,5 @@ bugfixes:
   - purefb_ds - ``state=absent`` in check mode reports changed only when there is something to
     clear, as the run does.
   - purefb_ds - ``nfs_server`` set to ``_array_server`` is recognised in any letter case.
+  - purefb_ds - an ``nfs_server`` that holds a comma is refused. The array reads such a name as a
+    list of names, so the task addressed more than one directory service.

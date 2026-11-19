@@ -2426,6 +2426,7 @@ class TestPurefbInfo:
             "share1": {
                 "local": True,
                 "enabled": True,
+                "realms": [],
                 "rules": [
                     {
                         "name": "share1/rule1",
@@ -6581,6 +6582,7 @@ class TestGenerateEvictionPoliciesDict:
                 "local": True,
                 "enabled": True,
                 "keep_size": 107374182400,
+                "realms": [],
                 "file_systems": ["project_data"],
             }
         }
@@ -7761,3 +7763,1430 @@ class TestPurefbInfoSoftwareSupport:
         info = mock_module.exit_json.call_args[1]["purefb_info"]
         assert info["software"] == {"packages": {}}
         assert info["support"] == {"manifest": {}}
+
+
+# Realm read-back. The answers used below are the ones Purity//FB 4.8.8
+# (REST 2.30) gives. To an administrator whose management access policy is
+# scoped to one realm the array refuses the array-wide reads with HTTP 400
+# "Operation not permitted.", fails GET /keytabs with HTTP 500 "Unexpected
+# error." and serves every other read with the objects of that realm.
+
+import re
+
+import pytest
+
+REFUSED_TO_A_REALM_ADMIN = (
+    "get_admins_settings",
+    "get_alert_watchers",
+    "get_api_clients",
+    "get_array_connections_path",
+    "get_array_connections_performance_replication",
+    "get_arrays_eula",
+    "get_arrays_http_specific_performance",
+    "get_arrays_nfs_specific_performance",
+    "get_arrays_performance",
+    "get_arrays_performance_replication",
+    "get_arrays_s3_specific_performance",
+    "get_arrays_space",
+    "get_blades",
+    "get_buckets_performance",
+    "get_buckets_s3_specific_performance",
+    "get_directory_services_roles",
+    "get_drives",
+    "get_file_systems_locks",
+    "get_file_systems_locks_clients",
+    "get_file_systems_open_files",
+    "get_file_systems_performance",
+    "get_file_systems_sessions",
+    "get_fleets",
+    "get_fleets_members",
+    "get_hardware",
+    "get_kmip",
+    "get_link_aggregation_groups",
+    "get_management_access_policies",
+    "get_management_access_policies_members",
+    "get_management_access_policies_roles",
+    "get_management_authentication_policies",
+    "get_management_authentication_policies_members",
+    "get_network_access_policies",
+    "get_network_interfaces_connectors",
+    "get_network_interfaces_connectors_performance",
+    "get_network_interfaces_connectors_settings",
+    "get_network_interfaces_neighbors",
+    "get_network_interfaces_network_connection_statistics",
+    "get_presets_workload",
+    "get_public_keys",
+    "get_public_keys_uses",
+    "get_quotas_settings",
+    "get_rapid_data_locking",
+    "get_remote_arrays",
+    "get_resource_accesses",
+    "get_smtp_servers",
+    "get_snmp_agents",
+    "get_snmp_managers",
+    "get_software",
+    "get_software_bundle",
+    "get_software_check",
+    "get_software_installation_steps",
+    "get_software_installations",
+    "get_software_patches",
+    "get_software_versions",
+    "get_ssh_certificate_authority_policies",
+    "get_ssh_certificate_authority_policies_members",
+    "get_storage_classes_members",
+    "get_support",
+    "get_support_diagnostics",
+    "get_support_diagnostics_settings",
+    "get_support_system_manifest",
+    "get_support_verification_keys",
+    "get_syslog_servers",
+    "get_syslog_servers_settings",
+    "get_targets_performance_replication",
+    "get_telemetry_metrics_collections",
+    "get_telemetry_metrics_collections_metrics",
+    "get_telemetry_metrics_policies",
+    "get_telemetry_metrics_policies_arrays",
+    "get_telemetry_targets",
+    "get_topology_groups",
+    "get_topology_groups_members",
+    "get_workloads",
+    "get_workloads_performance",
+    "get_workloads_tags",
+)
+
+# every subset but clients, whose reads were not probed as a realm identity
+SUBSETS_FOR_A_REALM_ADMIN = (
+    "all",
+    "minimum",
+    "config",
+    "performance",
+    "capacity",
+    "network",
+    "subnets",
+    "lags",
+    "filesystems",
+    "snapshots",
+    "buckets",
+    "arrays",
+    "replication",
+    "policies",
+    "accounts",
+    "admins",
+    "ad",
+    "kerberos",
+    "drives",
+    "servers",
+    "fleet",
+    "realms",
+    "locks",
+    "support",
+    "legal_holds",
+    "connections",
+    "telemetry",
+    "software",
+)
+
+REALM_ID = "11111111-1111-4111-8111-111111111111"
+ARRAY_ID = "22222222-2222-4222-8222-222222222222"
+OTHER_ID = "33333333-3333-4333-8333-333333333333"
+
+
+class _SdkError(object):
+    """The SDK's ErrorResponse: a status code, errors and headers, no items"""
+
+    def __init__(self, status_code, message):
+        self.status_code = status_code
+        self.errors = [_Row(message=message, context=None)]
+        self.headers = None
+
+
+def _refused():
+    return _SdkError(400, "Operation not permitted.")
+
+
+def _listing(items=()):
+    items = list(items)
+    return _Row(status_code=200, items=items, total_item_count=len(items), headers=None)
+
+
+def _ref(name, ref_id=None, resource_type=None):
+    return _Row(name=name, id=ref_id, resource_type=resource_type)
+
+
+def _fake_client(reads):
+    """A client whose reads are methods of its class, as on the SDK client
+
+    ``reads`` maps a method name to the response it gives, or to a callable
+    that is handed the keyword arguments of the call. ``calls`` records
+    every read made.
+    """
+    calls = []
+
+    def method(name, answer):
+        def read(self, *args, **kwargs):
+            calls.append((name, kwargs))
+            return answer(**kwargs) if callable(answer) else answer
+
+        return read
+
+    namespace = {name: method(name, answer) for name, answer in reads.items()}
+    client = type("FakeClient", (object,), namespace)()
+    client.calls = calls
+    return client
+
+
+def _module_reads():
+    """Every GET the module makes, taken from its source"""
+    with open(purefb_info_module.__file__) as source:
+        return sorted(set(re.findall(r"blade\.(get_[a-z_0-9]+)", source.read())))
+
+
+def _realm_admin_client(**overrides):
+    """The array as an administrator scoped to realm realm1 reads it"""
+    reads = {}
+    for name in _module_reads():
+        reads[name] = _refused() if name in REFUSED_TO_A_REALM_ADMIN else _listing()
+    reads["get_hardware"] = _refused()
+    reads["get_keytabs"] = _SdkError(500, "Unexpected error.")
+    # the array leaves the array-wide settings out of what it reports about
+    # itself; a field it left out reads as None on the SDK model
+    reads["get_arrays"] = _listing(
+        [
+            _Row(
+                name="fb1",
+                version="4.8.8",
+                os="Purity//FB",
+                banner="",
+                idle_timeout=1800000,
+                time_zone="UTC",
+                product_type="FlashBlade//S200",
+                encryption=None,
+                network_access_policy=None,
+                ntp_servers=None,
+                smb_mode=None,
+                security_update=None,
+            )
+        ]
+    )
+    reads["get_realms"] = _listing(
+        [_Row(name="realm1", created=1735689600000, destroyed=False)]
+    )
+    reads.update(overrides)
+    return _fake_client(reads)
+
+
+def _run_main(client, subset, version="2.30"):
+    """Run main() for one subset; returns the module and the gathered info"""
+    module = Mock()
+    module.params = {"gather_subset": [subset]}
+    module.check_mode = False
+    with patch.multiple(
+        purefb_info_module,
+        AnsibleModule=Mock(return_value=module),
+        get_system=Mock(return_value=client),
+        get_rest_api_version=Mock(return_value=version),
+        LooseVersion=_Version,
+    ):
+        main()
+    module.fail_json.assert_not_called()
+    module.exit_json.assert_called_once()
+    assert module.exit_json.call_args[1]["changed"] is False
+    return module, module.exit_json.call_args[1]["purefb_info"]
+
+
+def _space_row(capacity, unique):
+    return _Row(
+        capacity=capacity,
+        space=_Row(
+            data_reduction=1.5,
+            snapshots=10,
+            total_physical=unique + 10,
+            unique=unique,
+            virtual=2 * unique,
+            total_provisioned=4 * unique,
+            available_provisioned=3 * unique,
+            available_ratio=0.75,
+            destroyed=0,
+            destroyed_virtual=0,
+            shared=0,
+        ),
+    )
+
+
+def _quota_rule(name, policy, uid):
+    return _Row(
+        name=name,
+        policy=policy,
+        quota_type="user",
+        subject=_Row(id=uid, name="", sid=None),
+        quota_limit=1073741824,
+        enforced=True,
+        notifications="none",
+        index=1,
+    )
+
+
+class TestPurefbInfoRealmReadBack:
+    """Read-back of realm objects, and as an identity scoped to a realm"""
+
+    # (a) an identity the array refuses the array-wide reads
+
+    @pytest.mark.parametrize("subset", SUBSETS_FOR_A_REALM_ADMIN)
+    def test_each_subset_is_gathered_for_a_realm_admin(self, subset):
+        """No subset ends in a traceback when the array refuses its reads."""
+        info = _run_main(_realm_admin_client(), subset)[1]
+        assert isinstance(info, dict)
+
+    def test_realms_subset_survives_refused_resource_accesses(self):
+        """The array refuses the resource accesses to a realm admin; the
+        realm it may read is still reported."""
+        info = _run_main(_realm_admin_client(), "realms")[1]
+        assert info["resource_accesses"] == []
+        assert list(info["realms"]) == ["realm1"]
+        assert info["realm_connections"] == {}
+        assert info["remote_realms"] == {}
+
+    def test_minimum_subset_for_a_realm_admin(self):
+        """Refused reads give null counts and empty entries; the reads the
+        array serves are reported as usual."""
+        module, info = _run_main(_realm_admin_client(), "minimum")
+        default = info["default"]
+        assert default["flashblade_name"] == "fb1"
+        assert default["purity_version"] == "4.8.8"
+        assert default["idle_timeout"] == 30
+        assert default["filesystems"] == 0
+        assert default["policies"] == 0
+        for key in (
+            "blades",
+            "total_capacity",
+            "syslog_servers",
+            "api_clients",
+            "EULA",
+            "max_login_attempts",
+            "min_password_length",
+            "kerberos_keytabs",
+        ):
+            assert default[key] is None, key
+        assert "lockout_duration" not in default
+        assert default["support_keys"] == {}
+        assert default["remote_assist"] == {}
+        assert default["encryption"] == {
+            "data_at_rest_enabled": None,
+            "data_at_rest_algorithms": None,
+            "data_at_rest_entropy_source": None,
+        }
+        assert default["network_access_policy"] == "None"
+        # the keytab read is a server error, not a refusal: it is reported
+        module.warn.assert_called_once()
+        assert "keytabs" in module.warn.call_args[0][0]
+        assert "Unexpected error." in module.warn.call_args[0][0]
+
+    def test_array_wide_subsets_are_empty_for_a_realm_admin(self):
+        client = _realm_admin_client()
+        assert _run_main(client, "capacity")[1]["capacity"] == {}
+        assert _run_main(client, "drives")[1]["drives"] == {}
+        assert _run_main(client, "kerberos")[1]["kerberos"] == {}
+        perf = _run_main(client, "performance")[1]["performance"]
+        for key in ("aggregate", "http", "s3", "nfs", "smb", "nfs_ops"):
+            assert perf[key] == {}, key
+        assert "file_replication" not in perf
+        telemetry = _run_main(client, "telemetry")[1]
+        assert telemetry == {
+            "telemetry_targets": {},
+            "telemetry_policies": {},
+            "telemetry_collections": {},
+        }
+        config = _run_main(client, "config")[1]["config"]
+        assert config["smtp"] == {}
+        assert config["alert_watchers"] == {}
+        assert config["directory_service_roles"] == {}
+        assert config["syslog_servers"] == {}
+        assert config["snmp_agents"] == {}
+        assert config["ntp"] is None
+        # no directory service is visible, so neither is its alias
+        assert "array_management" not in config
+        assert "management_directory_service" not in config
+
+    def test_keytab_failure_asks_once_whether_the_identity_is_restricted(self):
+        client = _realm_admin_client()
+        module = _run_main(client, "kerberos")[0]
+        assert [name for name, _kwargs in client.calls] == [
+            "get_keytabs",
+            "get_hardware",
+        ]
+        module.warn.assert_called_once()
+
+    def test_keytab_failure_is_not_hidden_from_an_array_admin(self):
+        """The same server error on an identity the array serves its
+        hardware to is left as the failure it is today."""
+        failure = _SdkError(500, "Unexpected error.")
+        client = _fake_client(
+            {
+                "get_keytabs": failure,
+                "get_hardware": _listing([_Row(name="CH1")]),
+            }
+        )
+        module = Mock()
+        purefb_info_module._guard_reads(module, client)
+        assert client.get_keytabs() is failure
+        module.warn.assert_not_called()
+        with pytest.raises(AttributeError):
+            purefb_info_module.generate_kerb_dict(client)
+
+    def test_guard_only_replaces_refused_reads(self):
+        served = _listing([_Row(name="dns1")])
+        not_enabled = _SdkError(400, "Congestion control is not enabled.")
+        missing = _SdkError(400, "File system does not exist.")
+        client = _fake_client(
+            {
+                "get_dns": served,
+                "get_network_interfaces_connectors_settings": not_enabled,
+                "get_file_systems": missing,
+                "get_blades": _refused(),
+                "get_access_token": "not-a-response",
+            }
+        )
+        module = Mock()
+        purefb_info_module._guard_reads(module, client)
+        assert client.get_dns() is served
+        assert client.get_network_interfaces_connectors_settings() is not_enabled
+        assert client.get_file_systems(names=["fs1"]) is missing
+        assert client.get_access_token() == "not-a-response"
+        refused = client.get_blades()
+        assert refused.status_code == 400
+        assert refused.items == []
+        assert refused.total_item_count is None
+        assert [error.message for error in refused.errors] == [
+            "Operation not permitted."
+        ]
+        assert client.calls[2] == ("get_file_systems", {"names": ["fs1"]})
+        module.warn.assert_not_called()
+
+    def test_capacity_for_an_array_admin_is_unchanged(self):
+        def space(**kwargs):
+            if kwargs.get("type") == "file-system":
+                return _listing([_space_row(1000, 30)])
+            if kwargs.get("type") == "object-store":
+                return _listing([_space_row(1000, 20)])
+            return _listing([_space_row(1000, 50)])
+
+        client = _fake_client({"get_arrays_space": space})
+        capacity = _run_main(client, "capacity")[1]["capacity"]
+        assert sorted(capacity) == ["aggregate", "file-system", "object-store", "total"]
+        assert capacity["total"] == 1000
+        assert capacity["aggregate"]["unique"] == 50
+        assert capacity["file-system"]["unique"] == 30
+        assert capacity["object-store"]["unique"] == 20
+        assert len(client.calls) == 3
+
+    def test_performance_rows_keep_their_keys_for_an_array_admin(self):
+        sample = _Row(
+            bytes_per_op=1,
+            bytes_per_read=2,
+            bytes_per_write=3,
+            read_bytes_per_sec=4,
+            reads_per_sec=5,
+            usec_per_other_op=6,
+            usec_per_read_op=7,
+            usec_per_write_op=8,
+            write_bytes_per_sec=9,
+            writes_per_sec=10,
+            others_per_sec=11,
+        )
+        blade = Mock()
+        blade.get_arrays_performance.return_value = _listing([sample])
+        blade.get_array_connections_performance_replication.return_value = _listing()
+        with patch.object(
+            purefb_info_module, "generate_perf_breakdown_dict", return_value={}
+        ):
+            perf = generate_perf_dict(blade)
+        for key in ("aggregate", "http", "s3", "nfs"):
+            assert perf[key] == {
+                "bytes_per_op": 1,
+                "bytes_per_read": 2,
+                "bytes_per_write": 3,
+                "read_bytes_per_sec": 4,
+                "reads_per_sec": 5,
+                "usec_per_other_op": 6,
+                "usec_per_read_op": 7,
+                "usec_per_write_op": 8,
+                "write_bytes_per_sec": 9,
+                "writes_per_sec": 10,
+            }
+
+    # (b) junctions
+
+    def test_junction_in_a_realm_reports_realm_file_systems(self):
+        """The array names the file systems of a junction bare; a realm
+        junction and an array-level one on file systems of the same name
+        must not read the same."""
+
+        def junction(name, origin_id, destination_id):
+            return _Row(
+                name=name,
+                origin_file_system=_ref("projects", origin_id, "file-systems"),
+                destination_file_system=_ref("alpha", destination_id, "file-systems"),
+                junction_origin_path="/alpha",
+                status="CONNECTED",
+            )
+
+        blade = Mock()
+        blade.get_file_system_junctions.return_value = _listing(
+            [
+                junction("realm1::projects-alpha", REALM_ID, OTHER_ID),
+                junction("projects-alpha", ARRAY_ID, OTHER_ID),
+            ]
+        )
+
+        result = generate_fs_junctions_dict(blade)
+
+        assert result["realm1::projects-alpha"] == {
+            "origin": "realm1::projects",
+            "destination": "realm1::alpha",
+            "path": "/alpha",
+            "status": "CONNECTED",
+        }
+        assert result["projects-alpha"] == {
+            "origin": "projects",
+            "destination": "alpha",
+            "path": "/alpha",
+            "status": "CONNECTED",
+        }
+
+    def test_realm_qualified(self):
+        qualify = purefb_info_module._realm_qualified
+        assert qualify("fs1", "realm1::junction") == "realm1::fs1"
+        assert qualify("realm1::fs1", "realm1::junction") == "realm1::fs1"
+        assert qualify("fs1", "junction") == "fs1"
+        assert qualify(None, "realm1::junction") is None
+        assert qualify("fs1", None) == "fs1"
+
+    # (c) quota policies
+
+    @staticmethod
+    def _quota_policy(name, policy_id, realm=None):
+        return _Row(
+            name=name,
+            id=policy_id,
+            is_local=True,
+            enabled=True,
+            location=_ref("fb1"),
+            realms=[_ref(realm, resource_type="realms")] if realm else [],
+        )
+
+    def test_quota_rules_stay_with_their_policy_after_a_bare_rename(self):
+        """After a bare rename the array names the rule of a realm policy,
+        and the policy it refers to, without the realm. An array-level
+        policy of that name keeps its own rule only."""
+        blade = Mock()
+        blade.get_user_group_quota_policies.return_value = _listing(
+            [
+                self._quota_policy("realm1::gold", REALM_ID, "realm1"),
+                self._quota_policy("gold", ARRAY_ID),
+            ]
+        )
+        blade.get_user_group_quota_policies_rules.return_value = _listing(
+            [
+                _quota_rule("gold.1", _ref("gold", REALM_ID), 1001),
+                _quota_rule("gold.1", _ref("gold", ARRAY_ID), 3003),
+            ]
+        )
+        blade.get_user_group_quota_policies_members.return_value = _listing()
+
+        result = generate_quota_policies_dict(blade)
+
+        assert [rule["subject"]["id"] for rule in result["realm1::gold"]["rules"]] == [
+            1001
+        ]
+        assert [rule["subject"]["id"] for rule in result["gold"]["rules"]] == [3003]
+        assert result["realm1::gold"]["realms"] == ["realm1"]
+        assert result["gold"]["realms"] == []
+
+    def test_quota_members_stay_with_their_policy(self):
+        """The array can list the attachment of a realm policy under bare
+        names. It belongs to the realm policy and to the realm file system,
+        not to the array-level policy of the same name."""
+        blade = Mock()
+        blade.get_user_group_quota_policies.return_value = _listing(
+            [
+                self._quota_policy("realm1::gold", REALM_ID, "realm1"),
+                self._quota_policy("gold", ARRAY_ID),
+            ]
+        )
+        blade.get_user_group_quota_policies_rules.return_value = _listing()
+        blade.get_user_group_quota_policies_members.return_value = _listing(
+            [_Row(policy=_ref("gold", REALM_ID), member=_ref("fs1", OTHER_ID))]
+        )
+
+        result = generate_quota_policies_dict(blade)
+
+        assert result["realm1::gold"]["members"] == ["realm1::fs1"]
+        assert result["gold"]["members"] == []
+
+    def test_quota_policy_rows_matched_by_id_for_array_level_policies(self):
+        """Array-level policies read the same whether their rows are matched
+        by id or by name; a row of an unlisted policy is dropped."""
+        blade = Mock()
+        blade.get_user_group_quota_policies.return_value = _listing(
+            [self._quota_policy("gold", ARRAY_ID)]
+        )
+        blade.get_user_group_quota_policies_rules.return_value = _listing(
+            [
+                _quota_rule("gold.1", _ref("gold", ARRAY_ID), 3003),
+                _quota_rule("other.1", _ref("other", OTHER_ID), 4004),
+            ]
+        )
+        blade.get_user_group_quota_policies_members.return_value = _listing(
+            [
+                _Row(policy=_ref("gold", ARRAY_ID), member=_ref("fs1")),
+                _Row(policy=_ref("other", OTHER_ID), member=_ref("fs2")),
+            ]
+        )
+
+        result = generate_quota_policies_dict(blade)
+
+        assert list(result) == ["gold"]
+        assert [rule["name"] for rule in result["gold"]["rules"]] == ["gold.1"]
+        assert result["gold"]["members"] == ["fs1"]
+
+    def test_policy_name_of(self):
+        name_of = purefb_info_module._policy_name_of
+        names = {REALM_ID: "realm1::gold", ARRAY_ID: "gold"}
+        assert name_of(_ref("gold", REALM_ID), names) == "realm1::gold"
+        assert name_of(_ref("gold", ARRAY_ID), names) == "gold"
+        # a row of a policy that is not listed is not attributed by name
+        assert name_of(_ref("gold", OTHER_ID), names) is None
+        # rows or listings without ids fall back to the exact name
+        assert name_of(_ref("gold"), names) == "gold"
+        assert name_of(_ref("gold", REALM_ID), {}) == "gold"
+        assert name_of(None, names) is None
+
+    # (d) realms of the policies
+
+    def test_eviction_policies_report_realms_and_keep_their_members(self):
+        blade = Mock()
+        blade.get_data_eviction_policies.return_value = _listing(
+            [
+                _Row(
+                    name="realm1::cache",
+                    id=REALM_ID,
+                    is_local=True,
+                    enabled=True,
+                    keep_size=1073741824,
+                    realms=[_ref("realm1", resource_type="realms")],
+                ),
+                _Row(
+                    name="cache",
+                    id=ARRAY_ID,
+                    is_local=True,
+                    enabled=True,
+                    keep_size=2147483648,
+                    realms=[],
+                ),
+            ]
+        )
+        blade.get_data_eviction_policies_file_systems.return_value = _listing(
+            [
+                _Row(policy=_ref("cache", REALM_ID), member=_ref("fs1")),
+                _Row(policy=_ref("cache", ARRAY_ID), member=_ref("fs2")),
+            ]
+        )
+
+        result = purefb_info_module.generate_eviction_policies_dict(blade)
+
+        assert result == {
+            "realm1::cache": {
+                "local": True,
+                "enabled": True,
+                "keep_size": 1073741824,
+                "realms": ["realm1"],
+                "file_systems": ["realm1::fs1"],
+            },
+            "cache": {
+                "local": True,
+                "enabled": True,
+                "keep_size": 2147483648,
+                "realms": [],
+                "file_systems": ["fs2"],
+            },
+        }
+
+    @pytest.mark.parametrize(
+        "generator, read",
+        [
+            ("generate_policies_dict", "get_policies"),
+            ("generate_all_policies_dict", "get_policies_all"),
+            (
+                "generate_object_store_access_policies_dict",
+                "get_object_store_access_policies",
+            ),
+            ("generate_nfs_export_policies_dict", "get_nfs_export_policies"),
+            ("generate_smb_client_policies_dict", "get_smb_client_policies"),
+            ("generate_smb_share_policies_dict", "get_smb_share_policies"),
+            ("generate_network_access_policies_dict", "get_network_access_policies"),
+            ("generate_worm_data_policies_dict", "get_worm_data_policies"),
+            ("generate_tls_policies_dict", "get_tls_policies"),
+            (
+                "generate_ssh_ca_policies_dict",
+                "get_ssh_certificate_authority_policies",
+            ),
+            ("generate_s3_export_policies_dict", "get_s3_export_policies"),
+            ("generate_password_policies_dict", "get_password_policies"),
+        ],
+    )
+    def test_policy_entries_report_their_realms(self, generator, read):
+        def policy(name, policy_id, realms):
+            row = MagicMock()
+            row.name = name
+            row.id = policy_id
+            row.rules = []
+            row.realms = realms
+            return row
+
+        blade = MagicMock()
+        getattr(blade, read).return_value.items = [
+            policy("realm1::gold", REALM_ID, [_ref("realm1", resource_type="realms")]),
+            policy("gold", ARRAY_ID, []),
+        ]
+        with patch.multiple(
+            purefb_info_module,
+            get_rest_api_version=Mock(return_value="2.30"),
+            LooseVersion=_Version,
+        ):
+            result = getattr(purefb_info_module, generator)(blade)
+
+        assert result["realm1::gold"]["realms"] == ["realm1"]
+        assert result["gold"]["realms"] == []
+
+    def test_bucket_policies_report_their_realms(self):
+        policy = MagicMock()
+        policy.name = "realm1::acct/bucket1/policy"
+        policy.rules = []
+        policy.realms = [_ref("realm1", resource_type="realms")]
+        blade = MagicMock()
+        blade.get_buckets.return_value.items = [_Row(name="realm1::acct/bucket1")]
+        blade.get_buckets_bucket_access_policies.return_value = Mock(
+            status_code=200, total_item_count=1, items=[policy]
+        )
+        blade.get_buckets_cross_origin_resource_sharing_policies.return_value = Mock(
+            status_code=200, items=[policy]
+        )
+
+        access = generate_bucket_access_policies_dict(blade)
+        cors = generate_bucket_cross_object_policies_dict(blade)
+
+        assert access["realm1::acct/bucket1/policy"]["realms"] == ["realm1"]
+        assert cors["realm1::acct/bucket1/policy"]["realms"] == ["realm1"]
+
+    def test_realm_names(self):
+        names = purefb_info_module._realm_names
+        assert names(_Row(realms=[_ref("realm1"), {"name": "realm2"}])) == [
+            "realm1",
+            "realm2",
+        ]
+        assert names(_Row(realms=[])) == []
+        assert names(_Row(realms=None)) == []
+        assert names(_Row()) == []
+
+    # (e) realm connection keys
+
+    def test_realm_connection_keys_report_times_never_the_key(self):
+        def keys(realm_names=None):
+            if realm_names == ["realm1"]:
+                return _listing(
+                    [
+                        _Row(
+                            connection_key="****",
+                            created=1735689600000,
+                            expires=1735696800000,
+                            realm=_ref("realm1", resource_type="realms"),
+                        ),
+                        _Row(
+                            connection_key="****",
+                            created=1735690000000,
+                            expires=1735697200000,
+                            realm=_ref("realm1", resource_type="realms"),
+                        ),
+                    ]
+                )
+            if realm_names == ["realm2"]:
+                return _listing()
+            return _SdkError(400, "Realm has been destroyed.")
+
+        client = _fake_client({"get_realm_connections_connection_key": keys})
+
+        result = purefb_info_module.generate_realm_connection_keys_dict(
+            client, {"realm1": {}, "realm2": {}, "realm3": {}}
+        )
+
+        assert result == {
+            "realm1": [
+                {"created": 1735689600000, "expires": 1735696800000},
+                {"created": 1735690000000, "expires": 1735697200000},
+            ],
+            "realm2": [],
+        }
+        assert "****" not in repr(result)
+        assert "connection_key" not in repr(result)
+        assert client.calls == [
+            ("get_realm_connections_connection_key", {"realm_names": [name]})
+            for name in ("realm1", "realm2", "realm3")
+        ]
+
+    def test_realms_subset_lists_connection_keys_from_rest_2_25(self):
+        key = _Row(
+            connection_key="****",
+            created=1735689600000,
+            expires=1735696800000,
+            realm=_ref("realm1", resource_type="realms"),
+        )
+        client = _realm_admin_client(
+            get_realm_connections_connection_key=_listing([key])
+        )
+
+        info = _run_main(client, "realms")[1]
+
+        assert info["realm_connection_keys"] == {
+            "realm1": [{"created": 1735689600000, "expires": 1735696800000}]
+        }
+        assert (
+            "get_realm_connections_connection_key",
+            {"realm_names": ["realm1"]},
+        ) in client.calls
+
+        older = _realm_admin_client(
+            get_realm_connections_connection_key=_listing([key])
+        )
+        info = _run_main(older, "realms", version="2.24")[1]
+        assert "realm_connection_keys" not in info
+        assert "realm_connections" not in info
+        assert not [call for call in older.calls if "connection_key" in call[0]]
+
+
+# Read-back for an identity whose custom role grants one resource type. For
+# a role with "file-systems: get" on the array Purity//FB 4.8.8 serves GET
+# /file-systems and refuses GET /arrays, /hardware, /admins and /audits with
+# HTTP 400 "Operation not permitted. Authorization for 'get' on
+# 'purestorage.com/api/v2/<endpoint>' is required.". The other reads were not
+# probed for such an identity; they are modelled as refused in the same way.
+
+
+def _refused_for_role(read):
+    return _SdkError(
+        400,
+        "Operation not permitted. Authorization for 'get' on "
+        "'purestorage.com/api/v2/{0}' is required.".format(read[4:].replace("_", "-")),
+    )
+
+
+def _file_system_row(name):
+    return _Row(
+        name=name,
+        id="44444444-4444-4444-8444-444444444444",
+        fast_remove_directory_enabled=False,
+        snapshot_directory_enabled=False,
+        provisioned=1073741824,
+        destroyed=False,
+        http=_Row(enabled=False),
+        hard_limit_enabled=False,
+        promotion_status="promoted",
+        requested_promotion_state="promoted",
+        writable=True,
+        default_group_quota=0,
+        default_user_quota=0,
+    )
+
+
+def _custom_role_client(**overrides):
+    """The array as an identity that may only read file systems reads it"""
+    reads = {name: _refused_for_role(name) for name in _module_reads()}
+    reads["get_hardware"] = _refused_for_role("get_hardware")
+    reads["get_file_systems"] = _listing([_file_system_row("fs1")])
+    reads.update(overrides)
+    return _fake_client(reads)
+
+
+class TestPurefbInfoRefusedReads:
+    """No refused read ends in a traceback, the array record included"""
+
+    @pytest.mark.parametrize("subset", SUBSETS_FOR_A_REALM_ADMIN + ("clients",))
+    def test_each_subset_is_gathered_with_a_custom_role(self, subset):
+        module, info = _run_main(_custom_role_client(), subset)
+        assert isinstance(info, dict)
+        # every read is refused, none fails: nothing to warn about
+        module.warn.assert_not_called()
+
+    @pytest.mark.parametrize("subset", SUBSETS_FOR_A_REALM_ADMIN + ("clients",))
+    def test_each_subset_is_gathered_when_every_read_is_refused(self, subset):
+        client = _custom_role_client(
+            get_file_systems=_refused_for_role("get_file_systems")
+        )
+        info = _run_main(client, subset)[1]
+        assert isinstance(info, dict)
+
+    def test_minimum_subset_without_the_array_record(self):
+        """GET /arrays is refused: the entries read from the array record
+        are null and the read the role grants is still counted."""
+        default = _run_main(_custom_role_client(), "minimum")[1]["default"]
+        assert default["filesystems"] == 1
+        for key in (
+            "flashblade_name",
+            "purity_version",
+            "banner",
+            "idle_timeout",
+            "timezone",
+            "smb_mode",
+            "security_update",
+            "blades",
+            "policies",
+            "kerberos_keytabs",
+            "total_capacity",
+        ):
+            assert default[key] is None, key
+        assert default["product_type"] == "Unknown"
+        assert default["network_access_policy"] == "None"
+        assert default["api_versions"] == "2.30"
+        assert default["remote_assist"] == {}
+        assert default["maintenance_window"] == []
+
+    def test_file_systems_are_reported_with_a_custom_role(self):
+        """The per-file-system reads the role does not grant leave their
+        entries empty."""
+        info = _run_main(_custom_role_client(), "filesystems")[1]
+        assert list(info["filesystems"]) == ["fs1"]
+        fsys = info["filesystems"]["fs1"]
+        assert fsys["provisioned"] == 1073741824
+        assert fsys["user_quotas"] == {}
+        assert fsys["group_quotas"] == {}
+        assert fsys["quota_policy"] is None
+        assert fsys["policy_quotas"] == {"users": [], "groups": []}
+        assert fsys["worm_policy"] is None
+        assert info["file_system_exports"] == []
+        assert info["junctions"] == {}
+
+    def test_config_and_drives_without_the_array_record(self):
+        client = _custom_role_client()
+        config = _run_main(client, "config")[1]["config"]
+        assert config["ntp"] is None
+        assert config["dns"] == {}
+        assert config["ssl_certs"] == {}
+        assert _run_main(client, "drives")[1]["drives"] == {}
+
+    def test_refusal_is_recognised_with_and_without_its_detail(self):
+        refused = purefb_info_module._read_refused
+        assert refused(_refused())
+        assert refused(_refused_for_role("get_arrays"))
+        assert not refused(_SdkError(400, "File system does not exist."))
+        assert not refused(_SdkError(500, "Unexpected error."))
+        assert not refused(_listing())
+        # one error of a response that is not a refusal keeps it a failure
+        mixed = _refused()
+        mixed.errors.append(_Row(message="Unexpected error.", context=None))
+        assert not refused(mixed)
+
+
+# Attachments of a policy to a file system in a realm, as Purity//FB 4.8.8
+# lists them: GET /worm-data-policies/members and GET
+# /file-systems/worm-data-policies name the file system of a realm policy
+# bare ("fs1" under policy "realm1::keep"), with the id of the realm file
+# system. An array-level file system of the same name has its own row.
+
+FS_REALM_ID = "55555555-5555-4555-8555-555555555555"
+FS_ARRAY_ID = "66666666-6666-4666-8666-666666666666"
+
+
+def _array_admin_client(**overrides):
+    """An array every read of which is served, empty unless overridden"""
+    reads = {name: _listing() for name in _module_reads()}
+    reads.update(overrides)
+    return _fake_client(reads)
+
+
+def _file_system_with_id(name, fs_id):
+    row = _file_system_row(name)
+    row.id = fs_id
+    return row
+
+
+def _worm_policy_row(name, policy_id, realm=None):
+    return _Row(
+        name=name,
+        id=policy_id,
+        is_local=True,
+        enabled=True,
+        mode="compliance",
+        retention_lock="unlocked",
+        default_retention=3600000,
+        min_retention=60000,
+        max_retention=86400000,
+        policy_type="worm",
+        location=_ref("fb1"),
+        realms=[_ref(realm, resource_type="realms")] if realm else [],
+    )
+
+
+def _worm_attachment_rows():
+    return [
+        _Row(
+            policy=_ref("realm1::keep", REALM_ID, "worm-data-policies"),
+            member=_ref("fs1", FS_REALM_ID, "file-systems"),
+        ),
+        _Row(
+            policy=_ref("keep", ARRAY_ID, "worm-data-policies"),
+            member=_ref("fs1", FS_ARRAY_ID, "file-systems"),
+        ),
+    ]
+
+
+def _worm_policy_rows():
+    return [
+        _worm_policy_row("realm1::keep", REALM_ID, "realm1"),
+        _worm_policy_row("keep", ARRAY_ID),
+    ]
+
+
+class TestPurefbInfoRealmAttachments:
+    """A file system in a realm and an array-level one of the same name
+    each report their own policy, and each policy its own file system"""
+
+    def _worm_policies(self, rows):
+        blade = Mock()
+        blade.get_worm_data_policies.return_value = _listing(_worm_policy_rows())
+        blade.get_worm_data_policies_members.return_value = _listing(rows)
+        with patch.multiple(
+            purefb_info_module,
+            get_rest_api_version=Mock(return_value="2.30"),
+            LooseVersion=_Version,
+        ):
+            return generate_worm_data_policies_dict(blade)
+
+    def test_worm_policy_in_a_realm_lists_realm_file_systems(self):
+        result = self._worm_policies(_worm_attachment_rows())
+
+        assert result["realm1::keep"]["members"] == ["realm1::fs1"]
+        assert result["realm1::keep"]["realms"] == ["realm1"]
+        assert result["keep"]["members"] == ["fs1"]
+        assert result["keep"]["realms"] == []
+
+    def test_worm_members_are_matched_by_policy_id(self):
+        """A row that names the policy of a realm bare belongs to the realm
+        policy, not to the array-level policy of that name; a row of a
+        policy that is not listed is dropped."""
+        result = self._worm_policies(
+            [
+                _Row(policy=_ref("keep", REALM_ID), member=_ref("fs1", FS_REALM_ID)),
+                _Row(policy=_ref("keep", OTHER_ID), member=_ref("fs2")),
+            ]
+        )
+
+        assert result["realm1::keep"]["members"] == ["realm1::fs1"]
+        assert result["keep"]["members"] == []
+
+    def test_fs_worm_policies_are_keyed_by_file_system_id(self):
+        blade = Mock()
+        blade.get_file_systems_worm_data_policies.return_value = _listing(
+            _worm_attachment_rows()
+        )
+
+        assert generate_fs_worm_policies_dict(blade) == {
+            FS_REALM_ID: "realm1::keep",
+            FS_ARRAY_ID: "keep",
+        }
+
+    def test_file_systems_report_their_own_worm_policy(self):
+        """main(), filesystems subset: the bare name the array lists must
+        not hand the realm policy to the array-level file system."""
+        client = _array_admin_client(
+            get_file_systems=_listing(
+                [
+                    _file_system_with_id("realm1::fs1", FS_REALM_ID),
+                    _file_system_with_id("fs1", FS_ARRAY_ID),
+                    _file_system_with_id("fs2", OTHER_ID),
+                ]
+            ),
+            get_file_systems_worm_data_policies=_listing(_worm_attachment_rows()),
+        )
+
+        filesystems = _run_main(client, "filesystems")[1]["filesystems"]
+
+        assert filesystems["realm1::fs1"]["worm_policy"] == "realm1::keep"
+        assert filesystems["fs1"]["worm_policy"] == "keep"
+        assert filesystems["fs2"]["worm_policy"] is None
+
+    def test_file_systems_report_their_own_quota_policy(self):
+        """The array can list the attachment of a realm quota policy under
+        bare names. It belongs to the realm file system and names the realm
+        policy; the array-level file system of that name has none."""
+        client = _array_admin_client(
+            get_file_systems=_listing(
+                [
+                    _file_system_with_id("realm1::fs1", FS_REALM_ID),
+                    _file_system_with_id("fs1", FS_ARRAY_ID),
+                    _file_system_with_id("realm1::fs2", OTHER_ID),
+                ]
+            ),
+            get_file_systems_user_group_quota_policies=_listing(
+                [
+                    _Row(
+                        policy=_ref("gold", REALM_ID),
+                        member=_ref("fs1", FS_REALM_ID),
+                    ),
+                    _Row(
+                        policy=_ref("realm1::silver", ARRAY_ID),
+                        member=_ref("realm1::fs2", OTHER_ID),
+                    ),
+                ]
+            ),
+        )
+
+        filesystems = _run_main(client, "filesystems")[1]["filesystems"]
+
+        assert filesystems["realm1::fs1"]["quota_policy"] == "realm1::gold"
+        assert filesystems["fs1"]["quota_policy"] is None
+        assert filesystems["realm1::fs2"]["quota_policy"] == "realm1::silver"
+
+    def test_policies_subset_qualifies_file_systems_of_a_realm_worm_policy(self):
+        """main(), policies subset: worm_data_policies and the members of
+        the policies view name the realm file system."""
+        client = _array_admin_client(
+            get_worm_data_policies=_listing(_worm_policy_rows()),
+            get_worm_data_policies_members=_listing(_worm_attachment_rows()),
+            get_policies_all=_listing(_worm_policy_rows()),
+            get_policies_all_members=_listing(_worm_attachment_rows()),
+        )
+
+        info = _run_main(client, "policies")[1]
+
+        assert info["worm_data_policies"]["realm1::keep"]["members"] == ["realm1::fs1"]
+        assert info["worm_data_policies"]["keep"]["members"] == ["fs1"]
+        assert info["policies"]["realm1::keep"]["members"] == [
+            {"name": "realm1::fs1", "resource_type": "file-systems"}
+        ]
+        assert info["policies"]["keep"]["members"] == [
+            {"name": "fs1", "resource_type": "file-systems"}
+        ]
+
+    def test_policies_view_qualifies_file_system_members_only(self):
+        policies = [_worm_policy_row("realm1::keep", REALM_ID, "realm1")]
+        blade = Mock()
+        blade.get_policies_all_members.return_value = _listing(
+            [
+                _Row(
+                    policy=_ref("realm1::keep", REALM_ID),
+                    member=_ref("realm1::fs2", OTHER_ID, "file-systems"),
+                ),
+                _Row(
+                    policy=_ref("realm1::keep", REALM_ID),
+                    member=_ref("realm1", None, "realms"),
+                ),
+                _Row(
+                    policy=_ref("realm1::keep", REALM_ID),
+                    member=_ref("eth0", None, "network-interfaces"),
+                ),
+            ]
+        )
+
+        members = purefb_info_module._policy_members_by_name(blade, policies)
+
+        assert members == {
+            "realm1::keep": [
+                {"name": "realm1::fs2", "resource_type": "file-systems"},
+                {"name": "realm1", "resource_type": "realms"},
+                {"name": "eth0", "resource_type": "network-interfaces"},
+            ]
+        }
+
+    def test_attached_policy(self):
+        attached = purefb_info_module._attached_policy
+        realm_fs = _file_system_with_id("realm1::fs1", FS_REALM_ID)
+        array_fs = _file_system_with_id("fs1", FS_ARRAY_ID)
+        by_id = {FS_REALM_ID: "realm1::keep", FS_ARRAY_ID: "keep"}
+        assert attached(by_id, realm_fs) == "realm1::keep"
+        assert attached(by_id, array_fs) == "keep"
+        # the policy of a file system in a realm is in that realm
+        assert attached({FS_REALM_ID: "keep"}, realm_fs) == "realm1::keep"
+        # a map keyed by name is read by name, and a bare name is not the
+        # file system in the realm
+        assert attached({"fs1": "keep"}, array_fs) == "keep"
+        assert attached({"fs1": "keep"}, realm_fs) is None
+        assert attached({"realm1::fs1": "realm1::keep"}, realm_fs) == "realm1::keep"
+        assert attached({}, array_fs) is None
+        # a file system the SDK returns without an id is read by name
+        assert attached({"fs1": "keep"}, _Row(name="fs1")) == "keep"
+
+    def test_attachment_key(self):
+        key = purefb_info_module._attachment_key
+        assert key(_ref("fs1", FS_REALM_ID)) == FS_REALM_ID
+        assert key(_ref("fs1")) == "fs1"
+        assert key(_ref("fs1", "")) == "fs1"
+        assert key(None) is None
+
+
+# GET /policies-all/members on Purity//FB 4.8.8: the listing of every policy
+# at once is refused (HTTP 400) once the array holds more than about ten
+# object store users with an access policy; a query that names at most ten
+# policies is served.
+
+MEMBERS_QUERY_REFUSED = (
+    "Querying is only supported for a maximum of ten users or ten policies per query."
+)
+
+
+def _policy_id(index):
+    return "00000000-0000-4000-8000-{0:012d}".format(index)
+
+
+def _listed_policy(index):
+    return _Row(
+        name="policy{0}".format(index),
+        id=_policy_id(index),
+        enabled=True,
+        is_local=True,
+        location=_ref("fb1"),
+        policy_type="object-store-access",
+        realms=[],
+    )
+
+
+def _member_of(index):
+    return _Row(
+        policy=_ref("policy{0}".format(index), _policy_id(index)),
+        member=_ref("acc/user{0}".format(index), None, "object-store-users"),
+    )
+
+
+def _members_served_ten_at_a_time(gone=(), broken=()):
+    """GET policies-all/members as the array answers it with many users"""
+
+    def read(policy_ids=None, **kwargs):
+        if policy_ids is None or len(policy_ids) > 10:
+            return _SdkError(400, MEMBERS_QUERY_REFUSED)
+        if any(policy_id in broken for policy_id in policy_ids):
+            return _SdkError(500, "Unexpected error.")
+        if any(policy_id in gone for policy_id in policy_ids):
+            return _SdkError(400, "Policy does not exist.")
+        return _listing(
+            [
+                _member_of(index)
+                for index in range(1, 24)
+                if _policy_id(index) in policy_ids
+            ]
+        )
+
+    return read
+
+
+class TestPurefbInfoPolicyMembers:
+    """The members of the policies view when the array refuses to list the
+    members of every policy in one query"""
+
+    POLICIES = [_listed_policy(index) for index in range(1, 24)]
+
+    def _client(self, **kwargs):
+        return _array_admin_client(
+            get_policies_all=_listing(self.POLICIES),
+            get_policies_all_members=_members_served_ten_at_a_time(**kwargs),
+        )
+
+    @staticmethod
+    def _member_queries(client):
+        return [
+            call[1].get("policy_ids")
+            for call in client.calls
+            if call[0] == "get_policies_all_members"
+        ]
+
+    def test_members_are_read_ten_policies_at_a_time(self):
+        """main(), policies subset: no traceback, every policy keeps its
+        member, and no query names more than ten policies."""
+        client = self._client()
+
+        info = _run_main(client, "policies")[1]
+
+        assert len(info["policies"]) == 23
+        for index in range(1, 24):
+            assert info["policies"]["policy{0}".format(index)]["members"] == [
+                {
+                    "name": "acc/user{0}".format(index),
+                    "resource_type": "object-store-users",
+                }
+            ]
+        ids = [policy.id for policy in self.POLICIES]
+        assert self._member_queries(client) == [None, ids[:10], ids[10:20], ids[20:]]
+
+    def test_all_subset_is_gathered_when_the_full_listing_is_refused(self):
+        info = _run_main(self._client(), "all")[1]
+
+        assert info["policies"]["policy23"]["members"][0]["name"] == "acc/user23"
+
+    def test_one_query_when_the_array_serves_the_full_listing(self):
+        client = _array_admin_client(
+            get_policies_all=_listing(self.POLICIES),
+            get_policies_all_members=_listing([_member_of(1), _member_of(23)]),
+        )
+
+        info = _run_main(client, "policies")[1]
+
+        assert info["policies"]["policy1"]["members"][0]["name"] == "acc/user1"
+        assert info["policies"]["policy2"]["members"] == []
+        assert self._member_queries(client) == [None]
+
+    def test_policy_removed_while_reading_is_skipped(self):
+        """A policy deleted after it was listed fails the query of its ten;
+        the others of that query are read one by one."""
+        client = self._client(gone=(_policy_id(12),))
+
+        info = _run_main(client, "policies")[1]
+
+        assert info["policies"]["policy12"]["members"] == []
+        for index in (1, 10, 11, 13, 20, 21, 23):
+            assert info["policies"]["policy{0}".format(index)]["members"] == [
+                {
+                    "name": "acc/user{0}".format(index),
+                    "resource_type": "object-store-users",
+                }
+            ]
+        ids = [policy.id for policy in self.POLICIES]
+        assert self._member_queries(client) == (
+            [None, ids[:10], ids[10:20]] + [[one] for one in ids[10:20]] + [ids[20:]]
+        )
+
+    def test_another_failure_is_not_taken_for_an_empty_listing(self):
+        """A query the array fails for another reason is not read as a
+        policy without members."""
+        blade = Mock()
+        blade.get_policies_all_members.side_effect = _members_served_ten_at_a_time(
+            broken=(_policy_id(5),)
+        )
+
+        with pytest.raises(AttributeError):
+            purefb_info_module._policy_members_by_name(blade, self.POLICIES)
+        # raised by the query that names the failing policy alone
+        assert blade.get_policies_all_members.call_args[1] == {
+            "policy_ids": [_policy_id(5)]
+        }
+
+    def test_refused_identity_makes_one_query(self):
+        """An identity the array refuses the read gets no members and is
+        not asked again policy by policy."""
+        client = _realm_admin_client(
+            get_policies_all=_listing(self.POLICIES),
+            get_policies_all_members=_refused(),
+        )
+
+        info = _run_main(client, "policies")[1]
+
+        assert info["policies"]["policy1"]["members"] == []
+        assert self._member_queries(client) == [None]
+
+    def test_refusals_are_told_apart(self):
+        too_wide = purefb_info_module._query_too_wide
+        gone = purefb_info_module._named_object_gone
+        assert too_wide(_SdkError(400, MEMBERS_QUERY_REFUSED))
+        assert not too_wide(_refused())
+        assert not too_wide(_SdkError(400, "Policy does not exist."))
+        assert not too_wide(_SdkError(500, "Unexpected error."))
+        assert not too_wide(_listing())
+        assert gone(_SdkError(400, "Policy does not exist."))
+        assert gone(_SdkError(400, "Member does not exist."))
+        assert not gone(_SdkError(400, MEMBERS_QUERY_REFUSED))
+        assert not gone(_SdkError(500, "Unexpected error."))
+        assert not gone(_listing())
+
+    # roles: GET /object-store-roles/object-store-access-policies is refused
+    # in the same way once the array holds more than ten roles; a query that
+    # names at most ten roles is served
+
+    @staticmethod
+    def _role(index):
+        return _Row(
+            name="acc/role{0}".format(index),
+            account=_ref("acc"),
+            created=1735689600000,
+            max_session_duration=3600000,
+            prn="prn::iam:array-id/local:obj-account-id/1:role/role{0}".format(index),
+            trusted_entities=[],
+        )
+
+    @staticmethod
+    def _role_policies_served_ten_at_a_time(gone=(), broken=()):
+        def read(member_names=None, **kwargs):
+            if member_names is None or len(member_names) > 10:
+                return _SdkError(400, MEMBERS_QUERY_REFUSED)
+            if any(name in broken for name in member_names):
+                return _SdkError(500, "Unexpected error.")
+            if any(name in gone for name in member_names):
+                return _SdkError(400, "Member does not exist.")
+            return _listing(
+                [
+                    _Row(
+                        member=_ref(name),
+                        policy=_ref("pure:policy/bucket-list"),
+                    )
+                    for name in member_names
+                ]
+            )
+
+        return read
+
+    def _roles_client(self, **kwargs):
+        return _array_admin_client(
+            get_object_store_roles=_listing(
+                [self._role(index) for index in range(1, 13)]
+            ),
+            get_object_store_roles_object_store_access_policies=(
+                self._role_policies_served_ten_at_a_time(**kwargs)
+            ),
+        )
+
+    @staticmethod
+    def _role_queries(client):
+        return [
+            call[1].get("member_names")
+            for call in client.calls
+            if call[0] == "get_object_store_roles_object_store_access_policies"
+        ]
+
+    def test_role_policies_are_read_ten_roles_at_a_time(self):
+        """main(), accounts subset: with more than ten roles every role
+        still reports its policy instead of none."""
+        client = self._roles_client()
+
+        roles = _run_main(client, "accounts")[1]["object_store_roles"]
+
+        assert len(roles) == 12
+        for index in range(1, 13):
+            assert roles["acc/role{0}".format(index)]["access_policies"] == [
+                "pure:policy/bucket-list"
+            ]
+        names = ["acc/role{0}".format(index) for index in range(1, 13)]
+        assert self._role_queries(client) == [None, names[:10], names[10:]]
+
+    def test_role_removed_while_reading_is_skipped(self):
+        client = self._roles_client(gone=("acc/role3",))
+
+        roles = _run_main(client, "accounts")[1]["object_store_roles"]
+
+        assert roles["acc/role3"]["access_policies"] == []
+        for index in (1, 2, 4, 10, 11, 12):
+            assert roles["acc/role{0}".format(index)]["access_policies"] == [
+                "pure:policy/bucket-list"
+            ]
+
+    def test_role_policies_that_cannot_be_read_stay_empty(self):
+        """As before, a failed read of the role policies does not fail the
+        accounts subset."""
+        client = self._roles_client(broken=("acc/role3",))
+        roles = _run_main(client, "accounts")[1]["object_store_roles"]
+        assert roles["acc/role3"]["access_policies"] == []
+        assert roles["acc/role4"]["access_policies"] == ["pure:policy/bucket-list"]
+
+        client = _array_admin_client(
+            get_object_store_roles=_listing([self._role(1)]),
+            get_object_store_roles_object_store_access_policies=_SdkError(
+                500, "Unexpected error."
+            ),
+        )
+        roles = _run_main(client, "accounts")[1]["object_store_roles"]
+        assert roles["acc/role1"]["access_policies"] == []
+        assert self._role_queries(client) == [None]

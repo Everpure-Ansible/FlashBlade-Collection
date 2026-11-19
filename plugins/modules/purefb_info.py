@@ -40,7 +40,8 @@ options:
       - The C(accounts) subset also returns C(object_store_roles), the
         object store roles with their maximum session duration, PRN,
         trusted entities and attached access policies, on REST API 2.17
-        and later.
+        and later. Roles of an account in a realm are keyed
+        C(realm::account/role).
       - The C(performance) subset reports array-wide performance per protocol
         (C(aggregate), C(http), C(s3), C(nfs), C(smb)), the protocol-specific
         operation breakdowns (C(nfs_ops), C(s3_ops), C(http_ops)), replication
@@ -116,13 +117,17 @@ options:
         dictionary of file system junctions, keyed by junction name with
         the origin and destination file systems, the junction path and
         the junction status. Requires REST API 2.25 (Purity//FB 4.8.0+).
+        The file systems of a junction in a realm are reported with the
+        realm prefix, as C(realm::filesystem).
       - On arrays running REST 2.25 or later (Purity//FB 4.8.0) the
         C(policies) subset adds C(quota_policies), the user-group quota
         policies with their rules and attached file systems, and the
         C(filesystems) subset adds C(quota_policy) and C(policy_quotas)
         to every file system, the attached quota policy and the per-user
         and per-group usage with the policy rule limiting each. Both are
-        omitted on older arrays.
+        omitted on older arrays. A quota policy in a realm is keyed
+        C(realm::policy) and lists its file systems as
+        C(realm::filesystem).
       - The C(arrays) subset reports C(connection_paths) for every array
         connection, one entry per network path with its C(source),
         C(destination), C(status), C(status_details) and C(type).
@@ -132,7 +137,11 @@ options:
         the local and remote file systems. Snapshot policies in
         C(snapshot_policies) carry the same C(members). TLS policies
         report C(array_wide), true when the policy applies to the array
-        as a whole.
+        as a whole. Every policy entry reports C(realms), the names of
+        the realms the policy belongs to, which is empty for an
+        array-level policy. The file systems of a WORM data policy in a
+        realm are reported as C(realm::filesystem), in
+        C(worm_data_policies) and in C(members).
       - The C(minimum) subset key C(network_access_protocol) holds the
         name of the array network access policy and is misspelt. Use
         C(network_access_policy) instead; the misspelt key is kept for
@@ -151,14 +160,26 @@ options:
         API 2.23 or later (workload space and performance from 4.8.8 /
         2.30), C(tgroups) on 4.8.1 / 2.26 or later and
         C(storage_class_members) on 4.8.3 / 2.27 or later. The C(realms)
-        subset also returns C(realm_connections) and C(remote_realms) on
-        4.8.0 / 2.25 or later. All of these are read from the local array
+        subset also returns C(realm_connections), C(remote_realms) and
+        C(realm_connection_keys) on 4.8.0 / 2.25 or later.
+        C(realm_connection_keys) lists, per realm, when each outstanding
+        realm connection key was created and when it expires, never the
+        key itself. All of these are read from the local array
         only. C(fleet), its member detail, C(presets), C(workloads) and
         C(tgroups) are empty on an array that is not in a fleet and when
         the credentials used lack the fleet rights those endpoints require;
         C(storage_class_members) lists the local array itself when it is
         not in a fleet; C(realm_connections) and C(remote_realms) are
         empty when no realm is connected.
+      - The array refuses the reads the credentials in use are not allowed
+        to make. An administrator whose access is limited to a realm is
+        refused the array-wide reads (hardware, array space and
+        performance, support, software and so on), and a custom role is
+        refused every read it does not grant. The entries built from a
+        refused read are returned empty or null instead of failing the
+        module. Keytabs, which the array fails to list for an
+        administrator limited to a realm, are reported empty with a
+        warning.
     required: false
     type: list
     elements: str
@@ -270,6 +291,14 @@ purefb_info:
       returned: connections subset on Purity//FB with REST API 2.18 or higher
       type: list
       elements: dict
+      version_added: '1.30.0'
+    realm_connection_keys:
+      description:
+        - Outstanding realm connection keys keyed by realm name. Each key is
+          listed with the time it was created and the time it expires, in
+          milliseconds since the UNIX epoch. The key itself is not returned.
+      returned: realms subset on Purity//FB with REST API 2.25 or higher
+      type: dict
       version_added: '1.30.0'
 """
 
@@ -416,6 +445,244 @@ def _reference_names(references):
     ]
 
 
+def _realm_names(resource):
+    """Names of the realms a resource reports ([] outside a realm)"""
+    realms = getattr(resource, "realms", None)
+    if not isinstance(realms, list):
+        return []
+    return [_ref_name(realm) for realm in realms]
+
+
+def _realm_qualified(name, owner):
+    """Return ``name`` carrying the realm prefix of ``owner``
+
+    The array reports some references (the file systems of a junction, the
+    file system of a policy attachment) by their bare name even when the
+    object lives in a realm. An object in a realm only references objects
+    of its own realm, so the prefix of the owner's name is the realm of the
+    reference. A name that already carries a prefix and a reference of an
+    array-level owner are returned as they are.
+    """
+    if (
+        isinstance(name, str)
+        and isinstance(owner, str)
+        and "::" in owner
+        and "::" not in name
+    ):
+        return owner.split("::", 1)[0] + "::" + name
+    return name
+
+
+def _policy_name_of(reference, names_by_id):
+    """Name of the listed policy a rule or member row belongs to
+
+    Rows are attributed by policy id. The array can report the policy of a
+    row by its bare name although the policy lives in a realm, and an
+    array-level policy may hold that same name. A row that carries no id is
+    attributed by its exact name.
+    """
+    policy_id = getattr(reference, "id", None)
+    if names_by_id and isinstance(policy_id, str) and policy_id:
+        return names_by_id.get(policy_id)
+    return getattr(reference, "name", None)
+
+
+def _attachment_key(reference):
+    """Key of the file system of an attachment row: its id, or its name for
+    a row that carries no id"""
+    reference_id = getattr(reference, "id", None)
+    if isinstance(reference_id, str) and reference_id:
+        return reference_id
+    return getattr(reference, "name", None)
+
+
+def _attached_policy(attachments, fsystem):
+    """Name of the policy attached to ``fsystem``, from a map of attachments
+
+    The array can list the file system of an attachment by its bare name
+    although it lives in a realm, and an array-level file system may hold
+    that same name. The map is therefore keyed by file system id; a map
+    keyed by name is read by name. The policy of a file system in a realm
+    is in that realm.
+    """
+    fs_id = getattr(fsystem, "id", None)
+    policy_name = None
+    if isinstance(fs_id, str) and fs_id:
+        policy_name = attachments.get(fs_id)
+    if policy_name is None:
+        policy_name = attachments.get(fsystem.name)
+    return _realm_qualified(policy_name, fsystem.name)
+
+
+# What the array answers to a read the identity in use may not make. An
+# administrator whose access is limited to a realm gets it for every
+# array-wide read (hardware, array space and performance, support, ...).
+READ_REFUSED_MESSAGE = "operation not permitted"
+# Reads the array fails with a server error, instead of refusing them, for
+# an identity it refuses the array-wide reads.
+READS_FAILING_WHEN_RESTRICTED = ("get_keytabs",)
+
+
+class _RefusedRead(object):
+    """Stand-in for the answer to a read the array did not serve
+
+    It reads as a listing without items and with an unknown item count, so
+    the entry built from it comes back empty or null. The status code and
+    the errors of the real response are kept for the callers that check
+    them.
+    """
+
+    def __init__(self, response):
+        self.status_code = getattr(response, "status_code", None)
+        self.errors = getattr(response, "errors", None)
+        self.headers = getattr(response, "headers", None)
+        self.items = []
+        self.total_item_count = None
+
+
+def _error_messages(response):
+    """The error messages of a failed response as a list of strings"""
+    errors = getattr(response, "errors", None)
+    if not isinstance(errors, (list, tuple)):
+        return []
+    return [
+        error.message
+        for error in errors
+        if isinstance(getattr(error, "message", None), str)
+    ]
+
+
+def _read_failed(response):
+    """True for a response that carries a status code other than 200"""
+    status = getattr(response, "status_code", None)
+    return isinstance(status, int) and status != 200
+
+
+def _read_refused(response):
+    """True when the array refused a read for lack of permission"""
+    if not _read_failed(response):
+        return False
+    messages = _error_messages(response)
+    return bool(messages) and all(
+        READ_REFUSED_MESSAGE in message.lower() for message in messages
+    )
+
+
+def _guard_reads(module, blade):
+    """Make the reads the array refuses this identity come back empty
+
+    An administrator whose access is limited to a realm is refused the
+    array-wide reads. A refused response carries no items, so the subset
+    that reads it would end in a traceback. Every GET of the client is
+    wrapped: a refused read answers as an empty listing, and so does, with
+    a warning, a read the array is known to fail for such an identity. Any
+    other response is passed on untouched, so an administrator of the whole
+    array gets the results, and the failures, of the unguarded client.
+    """
+    probe = getattr(blade, "get_hardware", None)
+    restricted = []
+    warned = set()
+
+    def is_restricted():
+        # asked once, and only after a read that fails for a restricted
+        # identity has failed
+        if not restricted:
+            restricted.append(callable(probe) and _read_refused(probe()))
+        return restricted[0]
+
+    def guarded(name, method):
+        def read(*args, **kwargs):
+            response = method(*args, **kwargs)
+            if _read_refused(response):
+                return _RefusedRead(response)
+            if (
+                name in READS_FAILING_WHEN_RESTRICTED
+                and _read_failed(response)
+                and is_restricted()
+            ):
+                if name not in warned:
+                    warned.add(name)
+                    module.warn(
+                        "Failed to read {0}; the result is reported empty. "
+                        "Error: {1}".format(
+                            name[4:].replace("_", " "),
+                            "; ".join(_error_messages(response))
+                            or response.status_code,
+                        )
+                    )
+                return _RefusedRead(response)
+            return response
+
+        return read
+
+    for name in dir(blade.__class__):
+        method = getattr(blade, name, None) if name.startswith("get_") else None
+        if callable(method):
+            setattr(blade, name, guarded(name, method))
+
+
+# What the array answers to a listing of object store users, roles or
+# policy members that would cover more than one query may name: "Querying
+# is only supported for a maximum of ten users or ten policies per query."
+QUERY_TOO_WIDE_MESSAGE = "per query"
+# Members or policies one such query may name
+MEMBERSHIP_QUERY_SIZE = 10
+
+
+def _query_too_wide(response):
+    """True when the array refused a listing for covering too much"""
+    if not _read_failed(response):
+        return False
+    messages = _error_messages(response)
+    return bool(messages) and all(
+        QUERY_TOO_WIDE_MESSAGE in message.lower() for message in messages
+    )
+
+
+def _named_object_gone(response):
+    """True when a read failed because what it names no longer exists"""
+    messages = _error_messages(response)
+    return bool(messages) and all(
+        "does not exist" in message.lower() for message in messages
+    )
+
+
+def _listing_in_tens(read, key, values, strict=True):
+    """Rows of a membership listing, read for ten values of ``key`` at a time
+
+    For a listing the array refuses to give in one query. One value that no
+    longer exists fails the query of its ten, which are then read one by
+    one; a policy or member removed since it was listed is skipped. Any
+    other failed read is passed on, or skipped when ``strict`` is false.
+    """
+    rows = []
+    for start in range(0, len(values), MEMBERSHIP_QUERY_SIZE):
+        chunk = values[start : start + MEMBERSHIP_QUERY_SIZE]
+        res = read(**{key: chunk})
+        if not _read_failed(res):
+            rows.extend(res.items)
+            continue
+        for value in chunk:
+            res = read(**{key: [value]})
+            if _read_failed(res) and (_named_object_gone(res) or not strict):
+                continue
+            rows.extend(res.items)
+    return rows
+
+
+def _first_item(response):
+    """First item of a listing, or None when it holds none"""
+    items = list(response.items)
+    return items[0] if items else None
+
+
+def _listed(response):
+    """Number of items a listing holds; None when the array refused the read"""
+    if isinstance(response, _RefusedRead):
+        return None
+    return len(response.items)
+
+
 def generate_directory_service_roles_dict(blade, api_version):
     """Return the directory service role mappings
 
@@ -474,9 +741,11 @@ def generate_default_dict(blade):
     # get_rest_api_version()/LooseVersion migration makes these gates evaluate
     # correctly, so the gated sections can now appear where they never did.
     api_version = get_rest_api_version(blade)
-    defaults = list(blade.get_arrays().items)[0]
-    default_info["flashblade_name"] = defaults.name
-    default_info["purity_version"] = defaults.version
+    # The array record is refused to an identity whose role does not grant
+    # it; the entries read from it are then null.
+    defaults = _first_item(blade.get_arrays())
+    default_info["flashblade_name"] = getattr(defaults, "name", None)
+    default_info["purity_version"] = getattr(defaults, "version", None)
     # the login (MOTD) banner, so purefb_banner changes can be read back
     default_info["banner"] = getattr(defaults, "banner", None)
     default_info["filesystems"] = blade.get_file_systems().total_item_count
@@ -488,7 +757,9 @@ def generate_default_dict(blade):
     )
     default_info["blades"] = blade.get_blades().total_item_count
     default_info["certificates"] = blade.get_certificates().total_item_count
-    default_info["total_capacity"] = list(blade.get_arrays_space().items)[0].capacity
+    default_info["total_capacity"] = getattr(
+        _first_item(blade.get_arrays_space()), "capacity", None
+    )
     default_info["api_versions"] = api_version
     default_info["policies"] = blade.get_policies_all().total_item_count
     # Count policies by type
@@ -526,32 +797,46 @@ def generate_default_dict(blade):
     default_info["connected_arrays"] = blade.get_array_connections().total_item_count
     default_info["targets"] = blade.get_targets().total_item_count
     default_info["kerberos_keytabs"] = blade.get_keytabs().total_item_count
-    default_info["syslog_servers"] = len(blade.get_syslog_servers().items)
-    default_info["object_store_virtual_hosts"] = len(
-        blade.get_object_store_virtual_hosts().items
+    default_info["syslog_servers"] = _listed(blade.get_syslog_servers())
+    default_info["object_store_virtual_hosts"] = _listed(
+        blade.get_object_store_virtual_hosts()
     )
-    default_info["api_clients"] = len(blade.get_api_clients().items)
-    default_info["idle_timeout"] = int(defaults.idle_timeout / 60000)
-    if list(blade.get_arrays_eula().items)[0].signature.accepted:
+    default_info["api_clients"] = _listed(blade.get_api_clients())
+    idle_timeout = getattr(defaults, "idle_timeout", None)
+    default_info["idle_timeout"] = (
+        int(idle_timeout / 60000) if idle_timeout is not None else None
+    )
+    # The EULA, the admin settings and the support settings are array-wide:
+    # an identity the array refuses them to gets null or empty entries.
+    eula = _first_item(blade.get_arrays_eula())
+    if eula is None:
+        default_info["EULA"] = None
+    elif eula.signature.accepted:
         default_info["EULA"] = "Signed"
     else:
         default_info["EULA"] = "Not Signed"
-    admin_settings = list(blade.get_admins_settings().items)[0]
-    default_info["max_login_attempts"] = admin_settings.max_login_attempts
-    default_info["min_password_length"] = admin_settings.min_password_length
-    if admin_settings.lockout_duration:
+    admin_settings = _first_item(blade.get_admins_settings())
+    default_info["max_login_attempts"] = getattr(
+        admin_settings, "max_login_attempts", None
+    )
+    default_info["min_password_length"] = getattr(
+        admin_settings, "min_password_length", None
+    )
+    if getattr(admin_settings, "lockout_duration", None):
         default_info["lockout_duration"] = (
             str(admin_settings.lockout_duration / 1000) + " seconds"
         )
     default_info["smb_mode"] = getattr(defaults, "smb_mode", None)
-    default_info["timezone"] = defaults.time_zone
+    default_info["timezone"] = getattr(defaults, "time_zone", None)
     default_info["product_type"] = getattr(defaults, "product_type", "Unknown")
     if LooseVersion(SECURITY_API_VERSION) <= LooseVersion(api_version):
-        dar = defaults.encryption.data_at_rest
+        # read defensively: the array does not report its encryption
+        # settings to every identity
+        dar = getattr(getattr(defaults, "encryption", None), "data_at_rest", None)
         default_info["encryption"] = {
-            "data_at_rest_enabled": dar.enabled,
-            "data_at_rest_algorithms": dar.algorithms,
-            "data_at_rest_entropy_source": dar.entropy_source,
+            "data_at_rest_enabled": getattr(dar, "enabled", None),
+            "data_at_rest_algorithms": getattr(dar, "algorithms", None),
+            "data_at_rest_entropy_source": getattr(dar, "entropy_source", None),
         }
         keys = list(blade.get_support_verification_keys().items)
         default_info["support_keys"] = {}
@@ -561,33 +846,39 @@ def generate_default_dict(blade):
         default_info["security_update"] = getattr(defaults, "security_update", None)
     if LooseVersion(NAP_API_VERSION) <= LooseVersion(api_version):
         default_info["network_access_protocol"] = getattr(
-            defaults.network_access_policy, "name", "None"
+            getattr(defaults, "network_access_policy", None), "name", "None"
         )
         # the key above is misspelt; it is kept for backwards compatibility
         default_info["network_access_policy"] = default_info["network_access_protocol"]
-    ra_info = list(blade.get_support().items)[0]
-    if ra_info.remote_assist_active:
-        ra_expires = datetime.fromtimestamp(
-            int(ra_info.remote_assist_expires) / 1000
-        ).strftime("%Y-%m-%d %H:%M:%S")
-        ra_opened = datetime.fromtimestamp(
-            int(ra_info.remote_assist_opened) / 1000
-        ).strftime("%Y-%m-%d %H:%M:%S")
-    else:
-        ra_expires = ra_opened = None
-    default_info["remote_assist"] = {
-        "phonehome_enabled": ra_info.phonehome_enabled,
-        "proxy": ra_info.proxy,
-        "ra_active": ra_info.remote_assist_active,
-        "ra_expires": ra_expires,
-        "ra_opened": ra_opened,
-        "ra_status": ra_info.remote_assist_status,
-    }
-    if LooseVersion(RA_DURATION_API_VERSION) <= LooseVersion(api_version):
-        default_info["remote_assist"]["ra_duration"] = ra_info.remote_assist_duration
+    ra_info = _first_item(blade.get_support())
+    default_info["remote_assist"] = {}
+    if ra_info is not None:
+        if ra_info.remote_assist_active:
+            ra_expires = datetime.fromtimestamp(
+                int(ra_info.remote_assist_expires) / 1000
+            ).strftime("%Y-%m-%d %H:%M:%S")
+            ra_opened = datetime.fromtimestamp(
+                int(ra_info.remote_assist_opened) / 1000
+            ).strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            ra_expires = ra_opened = None
+        default_info["remote_assist"] = {
+            "phonehome_enabled": ra_info.phonehome_enabled,
+            "proxy": ra_info.proxy,
+            "ra_active": ra_info.remote_assist_active,
+            "ra_expires": ra_expires,
+            "ra_opened": ra_opened,
+            "ra_status": ra_info.remote_assist_status,
+        }
+        if LooseVersion(RA_DURATION_API_VERSION) <= LooseVersion(api_version):
+            default_info["remote_assist"][
+                "ra_duration"
+            ] = ra_info.remote_assist_duration
     if LooseVersion(MAINTENANCE_API_VERSION) <= LooseVersion(api_version):
         default_info["maintenance_window"] = _maintenance_window_list(blade)
-    if LooseVersion(EDGE_API_VERSION) <= LooseVersion(api_version):
+    if ra_info is not None and LooseVersion(EDGE_API_VERSION) <= LooseVersion(
+        api_version
+    ):
         # Pure1 Edge Services opt-ins, set by purefb_phonehome
         default_info["remote_assist"]["edge_management_enabled"] = getattr(
             ra_info, "edge_management_enabled", None
@@ -825,61 +1116,36 @@ def generate_clients_dict(blade, api_version):
     return clients_info
 
 
+# Metrics of the array-wide rows of the performance subset
+ARRAY_PERF_FIELDS = (
+    "bytes_per_op",
+    "bytes_per_read",
+    "bytes_per_write",
+    "read_bytes_per_sec",
+    "reads_per_sec",
+    "usec_per_other_op",
+    "usec_per_read_op",
+    "usec_per_write_op",
+    "write_bytes_per_sec",
+    "writes_per_sec",
+)
+
+
 def generate_perf_dict(blade):
     perf_info = {}
-    total_perf = list(blade.get_arrays_performance().items)[0]
-    http_perf = list(blade.get_arrays_performance(protocol="http").items)[0]
-    s3_perf = list(blade.get_arrays_performance(protocol="s3").items)[0]
-    nfs_perf = list(blade.get_arrays_performance(protocol="nfs").items)[0]
-    perf_info["aggregate"] = {
-        "bytes_per_op": total_perf.bytes_per_op,
-        "bytes_per_read": total_perf.bytes_per_read,
-        "bytes_per_write": total_perf.bytes_per_write,
-        "read_bytes_per_sec": total_perf.read_bytes_per_sec,
-        "reads_per_sec": total_perf.reads_per_sec,
-        "usec_per_other_op": total_perf.usec_per_other_op,
-        "usec_per_read_op": total_perf.usec_per_read_op,
-        "usec_per_write_op": total_perf.usec_per_write_op,
-        "write_bytes_per_sec": total_perf.write_bytes_per_sec,
-        "writes_per_sec": total_perf.writes_per_sec,
-    }
-    perf_info["http"] = {
-        "bytes_per_op": http_perf.bytes_per_op,
-        "bytes_per_read": http_perf.bytes_per_read,
-        "bytes_per_write": http_perf.bytes_per_write,
-        "read_bytes_per_sec": http_perf.read_bytes_per_sec,
-        "reads_per_sec": http_perf.reads_per_sec,
-        "usec_per_other_op": http_perf.usec_per_other_op,
-        "usec_per_read_op": http_perf.usec_per_read_op,
-        "usec_per_write_op": http_perf.usec_per_write_op,
-        "write_bytes_per_sec": http_perf.write_bytes_per_sec,
-        "writes_per_sec": http_perf.writes_per_sec,
-    }
-    perf_info["s3"] = {
-        "bytes_per_op": s3_perf.bytes_per_op,
-        "bytes_per_read": s3_perf.bytes_per_read,
-        "bytes_per_write": s3_perf.bytes_per_write,
-        "read_bytes_per_sec": s3_perf.read_bytes_per_sec,
-        "reads_per_sec": s3_perf.reads_per_sec,
-        "usec_per_other_op": s3_perf.usec_per_other_op,
-        "usec_per_read_op": s3_perf.usec_per_read_op,
-        "usec_per_write_op": s3_perf.usec_per_write_op,
-        "write_bytes_per_sec": s3_perf.write_bytes_per_sec,
-        "writes_per_sec": s3_perf.writes_per_sec,
-    }
-    perf_info["nfs"] = {
-        "bytes_per_op": nfs_perf.bytes_per_op,
-        "bytes_per_read": nfs_perf.bytes_per_read,
-        "bytes_per_write": nfs_perf.bytes_per_write,
-        "read_bytes_per_sec": nfs_perf.read_bytes_per_sec,
-        "reads_per_sec": nfs_perf.reads_per_sec,
-        "usec_per_other_op": nfs_perf.usec_per_other_op,
-        "usec_per_read_op": nfs_perf.usec_per_read_op,
-        "usec_per_write_op": nfs_perf.usec_per_write_op,
-        "write_bytes_per_sec": nfs_perf.write_bytes_per_sec,
-        "writes_per_sec": nfs_perf.writes_per_sec,
-    }
-    if blade.get_array_connections_performance_replication().total_item_count > 0:
+    # array-wide performance is refused to an identity scoped to a realm;
+    # the rows it cannot read come back empty
+    total_perf = _first_item(blade.get_arrays_performance())
+    http_perf = _first_item(blade.get_arrays_performance(protocol="http"))
+    s3_perf = _first_item(blade.get_arrays_performance(protocol="s3"))
+    nfs_perf = _first_item(blade.get_arrays_performance(protocol="nfs"))
+    perf_info["aggregate"] = _perf_fields(total_perf, ARRAY_PERF_FIELDS)
+    perf_info["http"] = _perf_fields(http_perf, ARRAY_PERF_FIELDS)
+    perf_info["s3"] = _perf_fields(s3_perf, ARRAY_PERF_FIELDS)
+    perf_info["nfs"] = _perf_fields(nfs_perf, ARRAY_PERF_FIELDS)
+    if (
+        blade.get_array_connections_performance_replication().total_item_count or 0
+    ) > 0:
         file_repl_perf = list(
             blade.get_array_connections_performance_replication(
                 type="file-system"
@@ -991,13 +1257,15 @@ def generate_config_dict(blade):
                 "join_ou": ds_service.smb.join_ou,
                 "uris": ds_service.uris,
             }
-    # Forward backwards compatability
-    config_info["array_management"] = config_info["management_directory_service"]
+    # Forward backwards compatability. The management directory service is
+    # not visible to an identity scoped to a realm.
+    if "management_directory_service" in config_info:
+        config_info["array_management"] = config_info["management_directory_service"]
 
     config_info["directory_service_roles"] = generate_directory_service_roles_dict(
         blade, api_version
     )
-    config_info["ntp"] = list(blade.get_arrays().items)[0].ntp_servers
+    config_info["ntp"] = getattr(_first_item(blade.get_arrays()), "ntp_servers", None)
     certs = list(blade.get_certificates().items)
     config_info["ssl_certs"] = {}
     for cert in certs:
@@ -1678,9 +1946,12 @@ def _capacity_space(space, api_version):
 
 def generate_capacity_dict(blade, api_version):
     capacity_info = {}
-    total_cap = list(blade.get_arrays_space().items)[0]
-    file_cap = list(blade.get_arrays_space(type="file-system").items)[0]
-    object_cap = list(blade.get_arrays_space(type="object-store").items)[0]
+    total_cap = _first_item(blade.get_arrays_space())
+    file_cap = _first_item(blade.get_arrays_space(type="file-system"))
+    object_cap = _first_item(blade.get_arrays_space(type="object-store"))
+    if total_cap is None or file_cap is None or object_cap is None:
+        # array space is refused to an identity scoped to a realm
+        return capacity_info
     capacity_info["total"] = total_cap.capacity
     # each block reports the figures of its own read
     capacity_info["aggregate"] = _capacity_space(total_cap.space, api_version)
@@ -1851,6 +2122,7 @@ def generate_policies_dict(blade):
             "enabled": policy.enabled,
             "retention_lock": getattr(policy, "retention_lock", None),
             "policy_type": policy.policy_type,
+            "realms": _realm_names(policy),
             "rules": {},
         }
         rules = getattr(policy, "rules", None)
@@ -1864,8 +2136,29 @@ def generate_policies_dict(blade):
     return policies_info
 
 
+def _policy_member_rows(blade, policies):
+    """Every row of GET policies-all/members
+
+    One query returns the members of every policy, unless the array holds
+    more object store users or roles than one query may cover; the members
+    are then read for ten policies at a time.
+    """
+    res = blade.get_policies_all_members()
+    if not _query_too_wide(res):
+        return list(res.items)
+    return _listing_in_tens(
+        blade.get_policies_all_members,
+        "policy_ids",
+        [
+            policy.id
+            for policy in policies
+            if isinstance(getattr(policy, "id", None), str)
+        ],
+    )
+
+
 def _policy_members_by_name(blade, policies):
-    """Map policy name -> members from one GET policies-all/members call.
+    """Map policy name -> members from GET policies-all/members.
 
     The endpoint covers every policy type (snapshot, access, telemetry,
     network, TLS ...) in a single response. Rows are attributed by policy
@@ -1875,7 +2168,7 @@ def _policy_members_by_name(blade, policies):
     """
     names_by_id = {policy.id: policy.name for policy in policies}
     members = {}
-    for row in blade.get_policies_all_members().items:
+    for row in _policy_member_rows(blade, policies):
         policy_ref = getattr(row, "policy", None)
         policy_name = names_by_id.get(
             getattr(policy_ref, "id", None), getattr(policy_ref, "name", None)
@@ -1885,6 +2178,10 @@ def _policy_members_by_name(blade, policies):
             "name": getattr(member_ref, "name", None),
             "resource_type": getattr(member_ref, "resource_type", None),
         }
+        if member["resource_type"] == "file-systems":
+            # the array lists the file system of a WORM data policy in a
+            # realm by its bare name
+            member["name"] = _realm_qualified(member["name"], policy_name)
         if member["resource_type"] == "file-system-replica-links":
             link = getattr(row, "link", None)
             member["link"] = {
@@ -1911,6 +2208,7 @@ def generate_all_policies_dict(blade):
             "is_local": getattr(policy, "is_local", None),
             "location": getattr(getattr(policy, "location", None), "name", None),
             "policy_type": policy.policy_type,
+            "realms": _realm_names(policy),
         }
     if LooseVersion(POLICY_MEMBERS_API_VERSION) <= LooseVersion(
         get_rest_api_version(blade)
@@ -2107,6 +2405,7 @@ def generate_bucket_access_policies_dict(blade):
                     "description": getattr(policy, "description", None),
                     "enabled": policy.enabled,
                     "local": policy.is_local,
+                    "realms": _realm_names(policy),
                     "rules": [],
                 }
 
@@ -2139,6 +2438,7 @@ def generate_bucket_cross_object_policies_dict(blade):
             policies_info[policy.name] = {
                 "enabled": getattr(policy, "enabled", None),
                 "local": getattr(policy, "is_local", None),
+                "realms": _realm_names(policy),
                 "rules": [],
             }
             rules = blade.get_buckets_cross_origin_resource_sharing_policies_rules(
@@ -2169,6 +2469,7 @@ def generate_object_store_access_policies_dict(blade):
             "description": policy.description,
             "enabled": policy.enabled,
             "local": policy.is_local,
+            "realms": _realm_names(policy),
             "rules": [],
         }
 
@@ -2197,6 +2498,7 @@ def generate_nfs_export_policies_dict(blade):
         policies_info[policy_name] = {
             "local": policy.is_local,
             "enabled": policy.enabled,
+            "realms": _realm_names(policy),
             "rules": [],
         }
 
@@ -2228,6 +2530,7 @@ def generate_smb_client_policies_dict(blade):
             "local": policy.is_local,
             "enabled": policy.enabled,
             "version": policy.version,
+            "realms": _realm_names(policy),
             "rules": [],
         }
 
@@ -2258,6 +2561,7 @@ def generate_smb_share_policies_dict(blade):
         policies_info[policy_name] = {
             "local": getattr(policy, "is_local", None),
             "enabled": getattr(policy, "enabled", None),
+            "realms": _realm_names(policy),
             "rules": [],
         }
 
@@ -2284,6 +2588,7 @@ def generate_network_access_policies_dict(blade):
             "local": getattr(policy, "is_local", None),
             "enabled": getattr(policy, "enabled", None),
             "version": getattr(policy, "version", None),
+            "realms": _realm_names(policy),
             "rules": [],
         }
 
@@ -2303,6 +2608,8 @@ def generate_network_access_policies_dict(blade):
 
 def generate_worm_data_policies_dict(blade):
     policies_info = {}
+    # attachments are matched to their policy by its id
+    names_by_id = {}
     api_version = get_rest_api_version(blade)
     has_autocommit = LooseVersion(WORM_AUTOCOMMIT_API_VERSION) <= LooseVersion(
         api_version
@@ -2317,8 +2624,11 @@ def generate_worm_data_policies_dict(blade):
             "default_retention": getattr(policy, "default_retention", None),
             "min_retention": getattr(policy, "min_retention", None),
             "max_retention": getattr(policy, "max_retention", None),
+            "realms": _realm_names(policy),
             "members": [],
         }
+        if isinstance(getattr(policy, "id", None), str):
+            names_by_id[policy.id] = policy.name
         if has_autocommit:
             # commit_mode and the autocommit configuration exist from REST
             # 2.29; delay_period is in milliseconds like the retentions.
@@ -2332,10 +2642,15 @@ def generate_worm_data_policies_dict(blade):
             }
 
     for member in blade.get_worm_data_policies_members().items:
-        policy_name = getattr(getattr(member, "policy", None), "name", None)
+        policy_name = _policy_name_of(getattr(member, "policy", None), names_by_id)
         if policy_name in policies_info:
+            # the array lists the file system of a policy in a realm by its
+            # bare name; it is in the realm of the policy
             policies_info[policy_name]["members"].append(
-                getattr(getattr(member, "member", None), "name", None)
+                _realm_qualified(
+                    getattr(getattr(member, "member", None), "name", None),
+                    policy_name,
+                )
             )
 
     return policies_info
@@ -2355,6 +2670,8 @@ def generate_quota_policies_dict(blade):
     Requires REST API 2.25+ (QUOTA_POLICY_API_VERSION); callers gate on it.
     """
     policies_info = {}
+    # rules and attachments are matched to their policy by its id
+    names_by_id = {}
 
     for policy in blade.get_user_group_quota_policies().items:
         policies_info[policy.name] = {
@@ -2368,9 +2685,11 @@ def generate_quota_policies_dict(blade):
             "rules": [],
             "members": [],
         }
+        if isinstance(getattr(policy, "id", None), str):
+            names_by_id[policy.id] = policy.name
 
     for rule in blade.get_user_group_quota_policies_rules().items:
-        policy_name = getattr(getattr(rule, "policy", None), "name", None)
+        policy_name = _policy_name_of(getattr(rule, "policy", None), names_by_id)
         if policy_name in policies_info:
             policies_info[policy_name]["rules"].append(
                 {
@@ -2385,10 +2704,15 @@ def generate_quota_policies_dict(blade):
             )
 
     for member in blade.get_user_group_quota_policies_members().items:
-        policy_name = getattr(getattr(member, "policy", None), "name", None)
+        policy_name = _policy_name_of(getattr(member, "policy", None), names_by_id)
         if policy_name in policies_info:
+            # a policy in a realm is only attached to file systems of its
+            # realm, which the array may list by their bare name
             policies_info[policy_name]["members"].append(
-                getattr(getattr(member, "member", None), "name", None)
+                _realm_qualified(
+                    getattr(getattr(member, "member", None), "name", None),
+                    policy_name,
+                )
             )
 
     return policies_info
@@ -2433,6 +2757,7 @@ def generate_tls_policies_dict(blade):
                 "name",
                 None,
             ),
+            "realms": _realm_names(policy),
             "network_interfaces": [],
         }
 
@@ -2472,6 +2797,7 @@ def generate_ssh_ca_policies_dict(blade):
                 policy, "static_authorized_principals", None
             )
             or [],
+            "realms": _realm_names(policy),
             "admins": [],
             "arrays": [],
         }
@@ -2498,6 +2824,7 @@ def generate_s3_export_policies_dict(blade):
         policies_info[policy_name] = {
             "local": getattr(policy, "is_local", None),
             "enabled": getattr(policy, "enabled", None),
+            "realms": _realm_names(policy),
             "rules": [],
         }
 
@@ -2643,6 +2970,7 @@ def generate_password_policies_dict(blade):
             "enforce_dictionary_check": getattr(
                 policy, "enforce_dictionary_check", None
             ),
+            "realms": _realm_names(policy),
         }
     return policies_info
 
@@ -2759,11 +3087,21 @@ def generate_object_store_roles_dict(blade):
             "access_policies": [],
         }
     links = blade.get_object_store_roles_object_store_access_policies()
+    rows = []
     if links.status_code == 200:
-        for link in list(links.items):
-            role_name = getattr(getattr(link, "member", None), "name", None)
-            if role_name in roles_info:
-                roles_info[role_name]["access_policies"].append(link.policy.name)
+        rows = list(links.items)
+    elif _query_too_wide(links):
+        # the array lists the policies of at most ten roles in one query
+        rows = _listing_in_tens(
+            blade.get_object_store_roles_object_store_access_policies,
+            "member_names",
+            list(roles_info),
+            strict=False,
+        )
+    for link in rows:
+        role_name = getattr(getattr(link, "member", None), "name", None)
+        if role_name in roles_info:
+            roles_info[role_name]["access_policies"].append(link.policy.name)
     return roles_info
 
 
@@ -2772,8 +3110,9 @@ def generate_fs_dict(blade, exports=None, api_version=None, worm_policies=None):
 
     ``exports`` is the array-wide File System Exports list (REST 2.16+),
     ``api_version`` enables the quota-policy view (REST 2.25+) and
-    ``worm_policies`` maps filesystem name to its WORM data policy (REST
-    2.15+, from generate_fs_worm_policies_dict). main() passes None for any
+    ``worm_policies`` maps a filesystem, by id or by name, to its WORM data
+    policy (REST 2.15+, from generate_fs_worm_policies_dict). main() passes
+    None for any
     of them when the array is too old and the matching keys are left out.
     """
     fs_info = {}
@@ -2787,9 +3126,9 @@ def generate_fs_dict(blade, exports=None, api_version=None, worm_policies=None):
         res = blade.get_file_systems_user_group_quota_policies()
         if res.status_code == 200:
             for attached in res.items:
-                member_name = getattr(getattr(attached, "member", None), "name", None)
-                if member_name:
-                    attached_policies[member_name] = getattr(
+                key = _attachment_key(getattr(attached, "member", None))
+                if key:
+                    attached_policies[key] = getattr(
                         getattr(attached, "policy", None), "name", None
                     )
     by_fs = {}
@@ -2878,11 +3217,13 @@ def generate_fs_dict(blade, exports=None, api_version=None, worm_policies=None):
                 "eradication_mode",
                 None,
             )
-            fs_info[share]["worm_policy"] = worm_policies.get(share)
+            fs_info[share]["worm_policy"] = _attached_policy(worm_policies, fsystem)
 
         if quota_view:
             # attached user-group quota policy and the usage it limits
-            fs_info[share]["quota_policy"] = attached_policies.get(share)
+            fs_info[share]["quota_policy"] = _attached_policy(
+                attached_policies, fsystem
+            )
             fs_info[share]["policy_quotas"] = {"users": [], "groups": []}
             res = blade.get_file_systems_users(file_system_names=[share])
             if res.status_code == 200:
@@ -2921,18 +3262,19 @@ def generate_fs_dict(blade, exports=None, api_version=None, worm_policies=None):
 
 
 def generate_fs_worm_policies_dict(blade):
-    """Map each filesystem name to the WORM data policy attached to it.
+    """Map each filesystem to the WORM data policy attached to it.
 
-    Requires REST API 2.15+ (WORM_API_VERSION); callers gate on the version
-    before invoking. Filesystems without a WORM data policy are absent.
+    The array lists a filesystem in a realm by its bare name here, so the
+    map is keyed by filesystem id, and by name only for a row without an
+    id; _attached_policy() reads it. Requires REST API 2.15+
+    (WORM_API_VERSION); callers gate on the version before invoking.
+    Filesystems without a WORM data policy are absent.
     """
     worm_policies = {}
     for member in blade.get_file_systems_worm_data_policies().items:
-        fs_name = getattr(getattr(member, "member", None), "name", None)
-        if fs_name and fs_name not in worm_policies:
-            worm_policies[fs_name] = getattr(
-                getattr(member, "policy", None), "name", None
-            )
+        key = _attachment_key(getattr(member, "member", None))
+        if key and key not in worm_policies:
+            worm_policies[key] = getattr(getattr(member, "policy", None), "name", None)
     return worm_policies
 
 
@@ -3021,12 +3363,18 @@ def generate_fs_junctions_dict(blade):
     if res.status_code != 200:
         return junctions_info
     for junction in list(res.items):
+        # The array reports both file systems by their bare name. They are
+        # in the realm of the junction, whose own name carries the prefix.
         junctions_info[junction.name] = {
-            "origin": getattr(
-                getattr(junction, "origin_file_system", None), "name", None
+            "origin": _realm_qualified(
+                getattr(getattr(junction, "origin_file_system", None), "name", None),
+                junction.name,
             ),
-            "destination": getattr(
-                getattr(junction, "destination_file_system", None), "name", None
+            "destination": _realm_qualified(
+                getattr(
+                    getattr(junction, "destination_file_system", None), "name", None
+                ),
+                junction.name,
             ),
             "path": getattr(junction, "junction_origin_path", None),
             "status": getattr(junction, "status", None),
@@ -3566,6 +3914,28 @@ def generate_remote_realms_dict(blade):
     return realms_info
 
 
+def generate_realm_connection_keys_dict(blade, realms):
+    """Return when the outstanding connection keys of each realm were made
+    and when they expire
+
+    The key itself is never reported. Keys are read realm by realm; a realm
+    whose keys cannot be read (a destroyed realm, for example) is left out.
+    """
+    keys_info = {}
+    for realm_name in realms:
+        res = blade.get_realm_connections_connection_key(realm_names=[realm_name])
+        if res.status_code != 200:
+            continue
+        keys_info[realm_name] = [
+            {
+                "created": getattr(key, "created", None),
+                "expires": getattr(key, "expires", None),
+            }
+            for key in list(res.items)
+        ]
+    return keys_info
+
+
 # File locks, lock clients, file sessions and SMB open files (the read-back
 # for purefb_fs_lock). Locks need REST 2.8, sessions 2.10, open files 2.17.
 FILE_LOCKS_API_VERSION = "2.8"
@@ -3722,6 +4092,8 @@ def generate_support_dict(blade):
 def generate_eviction_policies_dict(blade):
     """Data eviction policies (REST 2.21) with their attached file systems."""
     policies_info = {}
+    # attachments are matched to their policy by its id
+    names_by_id = {}
 
     res = blade.get_data_eviction_policies()
     if res.status_code != 200:
@@ -3731,16 +4103,22 @@ def generate_eviction_policies_dict(blade):
             "local": getattr(policy, "is_local", None),
             "enabled": getattr(policy, "enabled", None),
             "keep_size": getattr(policy, "keep_size", None),
+            "realms": _realm_names(policy),
             "file_systems": [],
         }
+        if isinstance(getattr(policy, "id", None), str):
+            names_by_id[policy.id] = policy.name
 
     res = blade.get_data_eviction_policies_file_systems()
     if res.status_code == 200:
         for member in list(res.items):
-            policy_name = getattr(getattr(member, "policy", None), "name", None)
+            policy_name = _policy_name_of(getattr(member, "policy", None), names_by_id)
             if policy_name in policies_info:
                 policies_info[policy_name]["file_systems"].append(
-                    getattr(getattr(member, "member", None), "name", None)
+                    _realm_qualified(
+                        getattr(getattr(member, "member", None), "name", None),
+                        policy_name,
+                    )
                 )
 
     return policies_info
@@ -3962,6 +4340,7 @@ def main():
     module = AnsibleModule(argument_spec, supports_check_mode=True)
 
     blade = get_system(module)
+    _guard_reads(module, blade)
     api_version = get_rest_api_version(blade)
 
     if not module.params["gather_subset"]:
@@ -4218,6 +4597,9 @@ def main():
     ) <= LooseVersion(api_version):
         info["realm_connections"] = generate_realm_connections_dict(blade)
         info["remote_realms"] = generate_remote_realms_dict(blade)
+        info["realm_connection_keys"] = generate_realm_connection_keys_dict(
+            blade, info.get("realms", {})
+        )
     module.exit_json(changed=False, purefb_info=info)
 
 

@@ -338,7 +338,7 @@ class TestPurefbInfo:
 
         # Verify all three generators were called
         mock_generate_config.assert_called_once_with(mock_blade)
-        mock_generate_capacity.assert_called_once_with(mock_blade)
+        mock_generate_capacity.assert_called_once_with(mock_blade, ANY)
         mock_generate_network.assert_called_once_with(mock_blade)
         mock_module.exit_json.assert_called_once()
         call_args = mock_module.exit_json.call_args[1]
@@ -3386,6 +3386,7 @@ class TestPurefbInfo:
         assert call_args["purefb_info"]["fleet"] == {"fleet1": {"members": {}}}
         assert "policies" not in call_args["purefb_info"]
 
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
     def test_generate_bucket_dict_reports_lifecycle_v2_fields(self):
         """Lifecycle rules report keep_previous_versions_count and tags.
 
@@ -3442,7 +3443,7 @@ class TestPurefbInfo:
         mock_blade.get_buckets.return_value.items = [bucket]
         mock_blade.get_lifecycle_rules.return_value.items = [rule, legacy_rule]
 
-        result = generate_bucket_dict(mock_blade)
+        result = generate_bucket_dict(mock_blade, "2.30")
 
         mock_blade.get_lifecycle_rules.assert_called_once_with(bucket_ids=["bkt-id"])
         rules = result["bkt"]["lifecycle_rules"]
@@ -6707,6 +6708,745 @@ class TestPurefbInfoPublicKeys:
         mock_generate_public_keys.assert_not_called()
         info = mock_module.exit_json.call_args[1]["purefb_info"]
         assert "public_keys" not in info
+
+
+from plugins.modules.purefb_info import (
+    generate_capacity_dict,
+    generate_object_store_accounts_dict,
+)
+
+
+class TestPurefbInfoSpace:
+    """Space figures of the capacity subset, file systems, buckets and object
+    store accounts, each returned from the REST version that reports it.
+
+    The space objects carry exactly the figures the SDK model of a REST
+    version has: one the array did not send is None, one the model does not
+    have raises AttributeError.
+    """
+
+    SPACE_2_0 = ("data_reduction", "snapshots", "total_physical", "unique", "virtual")
+    # the space of a bucket on REST 2.8 to 2.10
+    SPACE_EXTENDED_2_8 = SPACE_2_0 + ("total_provisioned",)
+    SPACE_2_11 = SPACE_2_0 + (
+        "total_provisioned",
+        "available_provisioned",
+        "available_ratio",
+        "destroyed",
+        "destroyed_virtual",
+    )
+    SPACE_2_15 = SPACE_2_11 + ("shared",)
+    SPACE_2_16 = SPACE_2_15 + ("total_used",)
+
+    # Space of GET /arrays/space, of its file-system and object-store types
+    # and of a bucket as a Purity//FB 4.8.8 array returns them. The array
+    # sends no provisioned figures here.
+    AGGREGATE = {
+        "data_reduction": 1.5,
+        "destroyed": 0,
+        "destroyed_virtual": 0,
+        "shared": 27354,
+        "snapshots": 0,
+        "total_physical": 178847773,
+        "total_used": 178847773,
+        "unique": 178820419,
+        "virtual": 273155759,
+    }
+    FILE_SYSTEM = {
+        "data_reduction": 1103.5,
+        "destroyed": 0,
+        "destroyed_virtual": 0,
+        "shared": 0,
+        "snapshots": 0,
+        "total_physical": 85521,
+        "total_used": 85521,
+        "unique": 85521,
+        "virtual": 94371840,
+    }
+    OBJECT_STORE = {
+        "data_reduction": 1.0,
+        "destroyed": 0,
+        "destroyed_virtual": 0,
+        "shared": 0,
+        "snapshots": 0,
+        "total_physical": 178734756,
+        "total_used": 178734756,
+        "unique": 178734756,
+        "virtual": 178783407,
+    }
+    BUCKET = {
+        "data_reduction": 2.1,
+        "destroyed": 0,
+        "destroyed_virtual": 0,
+        "shared": 0,
+        "snapshots": 0,
+        "total_physical": 2476,
+        "total_used": 2476,
+        "unique": 2476,
+        "virtual": 5120,
+    }
+    # A container with a hard limit also reports the provisioned figures
+    LIMITED = dict(
+        FILE_SYSTEM,
+        total_provisioned=1073741824,
+        available_provisioned=979369984,
+        available_ratio=0.912109375,
+    )
+
+    @staticmethod
+    def _space(fields, sent):
+        return SimpleNamespace(**{field: sent.get(field) for field in fields})
+
+    def _capacity_blade(self, fields, aggregate, file_system, object_store):
+        reads = {
+            None: aggregate,
+            "file-system": file_system,
+            "object-store": object_store,
+        }
+
+        def arrays_space(**kwargs):
+            response = Mock()
+            response.items = [
+                SimpleNamespace(
+                    capacity=197912092999680,
+                    space=self._space(fields, reads[kwargs.get("type")]),
+                )
+            ]
+            return response
+
+        blade = Mock()
+        blade.get_arrays_space.side_effect = arrays_space
+        return blade
+
+    @staticmethod
+    def _file_system(name, space):
+        return SimpleNamespace(
+            name=name,
+            fast_remove_directory_enabled=False,
+            snapshot_directory_enabled=False,
+            provisioned=1073741824,
+            destroyed=False,
+            nfs=SimpleNamespace(
+                rules=None, v3_enabled=True, v4_1_enabled=True, export_policy=None
+            ),
+            smb=None,
+            multi_protocol=None,
+            http=SimpleNamespace(enabled=False),
+            hard_limit_enabled=True,
+            promotion_status="promoted",
+            requested_promotion_state="promoted",
+            writable=True,
+            source=None,
+            default_group_quota=0,
+            default_user_quota=0,
+            space=space,
+        )
+
+    @staticmethod
+    def _fs_blade(file_systems):
+        blade = Mock()
+        blade.get_file_systems.return_value.items = file_systems
+        blade.get_quotas_groups.return_value.items = []
+        blade.get_quotas_users.return_value.items = []
+        return blade
+
+    @staticmethod
+    def _bucket(name, account, space):
+        return SimpleNamespace(
+            name=name,
+            id=name + "-id",
+            versioning="none",
+            object_count=3,
+            account=SimpleNamespace(name=account),
+            created=1700000000000,
+            destroyed=False,
+            retention_lock="unlocked",
+            quota_limit=None,
+            object_lock_config=SimpleNamespace(
+                enabled=False, freeze_locked_objects=False
+            ),
+            eradication_config=SimpleNamespace(manual_eradication="enabled"),
+            space=space,
+        )
+
+    @staticmethod
+    def _bucket_blade(buckets):
+        blade = Mock()
+        blade.get_buckets.return_value.items = buckets
+        blade.get_lifecycle_rules.return_value.items = []
+        return blade
+
+    @staticmethod
+    def _account_blade(accounts):
+        blade = Mock()
+        blade.get_object_store_accounts.return_value.items = accounts
+        blade.get_object_store_users.return_value.items = []
+        return blade
+
+    # ---------------- the version gates ----------------
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    def test_space_figures_follow_the_rest_version(self):
+        """A figure is returned from the REST version that has it and versions
+        compare as numbers, so 2.8 and 2.9 are older than 2.11."""
+        space = self._space(self.SPACE_2_16, self.LIMITED)
+        base = set(self.SPACE_2_0)
+        extended = set(self.SPACE_2_11)
+
+        for version in ("2.0", "2.7", "2.8", "2.9", "2.10"):
+            assert (
+                set(purefb_info_module._space_figures(space, version)) == base
+            ), version
+        for version in ("2.11", "2.14"):
+            assert (
+                set(purefb_info_module._space_figures(space, version)) == extended
+            ), version
+        assert set(purefb_info_module._space_figures(space, "2.15")) == extended | {
+            "shared"
+        }
+        for version in ("2.16", "2.30"):
+            figures = purefb_info_module._space_figures(space, version)
+            assert set(figures) == set(self.SPACE_2_16), version
+            assert figures == self.LIMITED
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    def test_space_figures_provisioned_gate_of_buckets_and_accounts(self):
+        """Buckets and object store accounts report total_provisioned from
+        REST 2.8, three versions before the other object types."""
+        space = self._space(self.SPACE_EXTENDED_2_8, self.LIMITED)
+        gate = purefb_info_module.SPACE_PROVISIONED_API_VERSION
+
+        assert gate == "2.8"
+        assert "total_provisioned" not in purefb_info_module._space_figures(
+            space, "2.7", gate
+        )
+        for version in ("2.8", "2.10"):
+            figures = purefb_info_module._space_figures(space, version, gate)
+            assert figures["total_provisioned"] == 1073741824, version
+            assert "available_provisioned" not in figures
+            assert "total_provisioned" not in purefb_info_module._space_figures(
+                space, version
+            )
+
+    def test_space_gate_constants(self):
+        assert purefb_info_module.SPACE_API_VERSION == "2.11"
+        assert purefb_info_module.SPACE_SHARED_API_VERSION == "2.15"
+        assert purefb_info_module.SPACE_TOTAL_USED_API_VERSION == "2.16"
+
+    # ---------------- capacity subset ----------------
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    def test_capacity_object_store_virtual_is_not_the_file_system_virtual(self):
+        """The object-store block reports the virtual space of the
+        object-store read and the per-type blocks the shared space of their
+        own read, where the array total differs from both."""
+        blade = self._capacity_blade(
+            self.SPACE_2_16, self.AGGREGATE, self.FILE_SYSTEM, self.OBJECT_STORE
+        )
+
+        result = generate_capacity_dict(blade, "2.30")
+
+        assert result["file-system"]["virtual"] == 94371840
+        assert result["object-store"]["virtual"] == 178783407
+        assert result["aggregate"]["virtual"] == 273155759
+        assert result["aggregate"]["shared"] == 27354
+        assert result["file-system"]["shared"] == 0
+        assert result["object-store"]["shared"] == 0
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    def test_capacity_blocks_report_their_own_read(self):
+        """Every block holds all the figures of its own array space read and
+        keeps the keys of the figures the array did not send."""
+        blade = self._capacity_blade(
+            self.SPACE_2_16, self.AGGREGATE, self.FILE_SYSTEM, self.OBJECT_STORE
+        )
+
+        result = generate_capacity_dict(blade, "2.30")
+
+        assert result["total"] == 197912092999680
+        for block, read in (
+            ("aggregate", self.AGGREGATE),
+            ("file-system", self.FILE_SYSTEM),
+            ("object-store", self.OBJECT_STORE),
+        ):
+            for field, figure in read.items():
+                assert result[block][field] == figure, (block, field)
+            # the array sent no provisioned figures; the keys stay, as null
+            for field in (
+                "total_provisioned",
+                "available_provisioned",
+                "available_ratio",
+            ):
+                assert field in result[block]
+                assert result[block][field] is None
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    def test_capacity_blocks_report_their_own_provisioned_figures(self):
+        """The provisioned and destroyed figures of a per-type block come
+        from the read of that type when the array sends them."""
+        aggregate = dict(
+            self.AGGREGATE,
+            total_provisioned=3000,
+            available_provisioned=1800,
+            available_ratio=0.6,
+            destroyed=30,
+            destroyed_virtual=60,
+        )
+        file_system = dict(
+            self.FILE_SYSTEM,
+            total_provisioned=1000,
+            available_provisioned=900,
+            available_ratio=0.9,
+            destroyed=10,
+            destroyed_virtual=20,
+        )
+        object_store = dict(
+            self.OBJECT_STORE,
+            total_provisioned=2000,
+            available_provisioned=900,
+            available_ratio=0.45,
+            destroyed=20,
+            destroyed_virtual=40,
+        )
+        blade = self._capacity_blade(
+            self.SPACE_2_16, aggregate, file_system, object_store
+        )
+
+        result = generate_capacity_dict(blade, "2.30")
+
+        assert result["aggregate"] == aggregate
+        assert result["file-system"] == file_system
+        assert result["object-store"] == object_store
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    def test_capacity_total_used_from_rest_2_16(self):
+        """total_used is added to every block from REST 2.16; shared, which
+        the blocks carry on every version, has a value from REST 2.15."""
+        blade = self._capacity_blade(
+            self.SPACE_2_15, self.AGGREGATE, self.FILE_SYSTEM, self.OBJECT_STORE
+        )
+        result = generate_capacity_dict(blade, "2.15")
+        for block in ("aggregate", "file-system", "object-store"):
+            assert "total_used" not in result[block]
+        assert result["aggregate"]["shared"] == 27354
+
+        blade = self._capacity_blade(
+            self.SPACE_2_16, self.AGGREGATE, self.FILE_SYSTEM, self.OBJECT_STORE
+        )
+        result = generate_capacity_dict(blade, "2.16")
+        assert result["aggregate"]["total_used"] == 178847773
+        assert result["file-system"]["total_used"] == 85521
+        assert result["object-store"]["total_used"] == 178734756
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    def test_capacity_before_rest_2_11_keeps_the_keys_null(self):
+        """The space of REST 2.10 and earlier has five figures. The blocks
+        keep their other keys, as null, instead of failing on a figure the
+        model does not have."""
+        blade = self._capacity_blade(
+            self.SPACE_2_0, self.AGGREGATE, self.FILE_SYSTEM, self.OBJECT_STORE
+        )
+
+        result = generate_capacity_dict(blade, "2.10")
+
+        assert result["object-store"] == {
+            "data_reduction": 1.0,
+            "snapshots": 0,
+            "total_physical": 178734756,
+            "unique": 178734756,
+            "virtual": 178783407,
+            "total_provisioned": None,
+            "available_provisioned": None,
+            "available_ratio": None,
+            "destroyed": None,
+            "destroyed_virtual": None,
+            "shared": None,
+        }
+        assert result["file-system"]["virtual"] == 94371840
+
+    # ---------------- file systems ----------------
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_info.get_rest_api_version",
+        Mock(return_value="2.30"),
+    )
+    def test_fs_dict_reports_space_and_data_reduction(self):
+        """A file system reports its space under the names the bucket entries
+        use, inside a realm and outside, and keeps its own keys."""
+        blade = self._fs_blade(
+            [
+                self._file_system("fs1", self._space(self.SPACE_2_16, self.LIMITED)),
+                self._file_system(
+                    "realm1::fs1", self._space(self.SPACE_2_16, self.FILE_SYSTEM)
+                ),
+            ]
+        )
+
+        result = generate_fs_dict(blade)
+
+        limited = result["fs1"]
+        assert limited["data_reduction"] == 1103.5
+        assert limited["snapshot_space"] == 0
+        assert limited["total_physical_space"] == 85521
+        assert limited["unique_space"] == 85521
+        assert limited["virtual_space"] == 94371840
+        assert limited["total_provisioned_space"] == 1073741824
+        assert limited["available_provisioned_space"] == 979369984
+        assert limited["available_ratio"] == 0.912109375
+        assert limited["destroyed_space"] == 0
+        assert limited["destroyed_virtual_space"] == 0
+        assert limited["shared_space"] == 0
+        assert limited["total_used_space"] == 85521
+        # the keys the entry had are not overwritten by a space figure
+        assert limited["destroyed"] is False
+        assert limited["provisioned"] == 1073741824
+        assert limited["hard_limit"] is True
+
+        in_realm = result["realm1::fs1"]
+        assert in_realm["data_reduction"] == 1103.5
+        assert in_realm["virtual_space"] == 94371840
+        assert in_realm["total_used_space"] == 85521
+        # figures of the REST version the array did not send are null
+        assert in_realm["total_provisioned_space"] is None
+        assert in_realm["available_provisioned_space"] is None
+        assert in_realm["available_ratio"] is None
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    def test_fs_dict_space_follows_the_rest_version(self):
+        """Only the figures the REST version of the array has are returned."""
+        base = {
+            "data_reduction",
+            "snapshot_space",
+            "total_physical_space",
+            "unique_space",
+            "virtual_space",
+        }
+        extended = {
+            "total_provisioned_space",
+            "available_provisioned_space",
+            "available_ratio",
+            "destroyed_space",
+            "destroyed_virtual_space",
+        }
+        later = extended | {"shared_space", "total_used_space"}
+        cases = (
+            ("2.0", self.SPACE_2_0, base),
+            ("2.10", self.SPACE_2_0, base),
+            ("2.11", self.SPACE_2_11, base | extended),
+            ("2.15", self.SPACE_2_15, base | extended | {"shared_space"}),
+            ("2.16", self.SPACE_2_16, base | later),
+        )
+        for version, fields, expected in cases:
+            blade = self._fs_blade(
+                [self._file_system("realm1::fs1", self._space(fields, self.LIMITED))]
+            )
+            with patch(
+                "plugins.modules.purefb_info.get_rest_api_version",
+                Mock(return_value=version),
+            ):
+                entry = generate_fs_dict(blade)["realm1::fs1"]
+            assert set(entry) & (base | later) == expected, version
+            assert entry["data_reduction"] == 1103.5, version
+            assert entry["virtual_space"] == 94371840, version
+            assert entry["destroyed"] is False, version
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_info.get_rest_api_version",
+        Mock(return_value="2.30"),
+    )
+    def test_fs_dict_without_space_reports_null_figures(self):
+        """A file system the array returns without a space keeps the keys."""
+        blade = self._fs_blade([self._file_system("fs1", None)])
+
+        entry = generate_fs_dict(blade)["fs1"]
+
+        assert entry["data_reduction"] is None
+        assert entry["total_used_space"] is None
+        assert entry["provisioned"] == 1073741824
+
+    # ---------------- buckets ----------------
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    def test_bucket_dict_reports_total_used_and_shared(self):
+        """A bucket adds shared_space and total_used_space to the figures it
+        had, for a bucket of a realm as for any other."""
+        blade = self._bucket_blade(
+            [
+                self._bucket(
+                    "bkt1", "acct1", self._space(self.SPACE_2_16, self.BUCKET)
+                ),
+                self._bucket(
+                    "realm1::bkt1",
+                    "realm1::acct1",
+                    self._space(self.SPACE_2_16, self.BUCKET),
+                ),
+            ]
+        )
+
+        result = generate_bucket_dict(blade, "2.30")
+
+        for name in ("bkt1", "realm1::bkt1"):
+            entry = result[name]
+            assert entry["data_reduction"] == 2.1
+            assert entry["snapshot_space"] == 0
+            assert entry["total_physical_space"] == 2476
+            assert entry["unique_space"] == 2476
+            assert entry["virtual_space"] == 5120
+            assert entry["destroyed_space"] == 0
+            assert entry["destroyed_virtual_space"] == 0
+            assert entry["shared_space"] == 0
+            assert entry["total_used_space"] == 2476
+            # not sent for a bucket without a hard limit
+            assert entry["total_provisioned_space"] is None
+            assert entry["available_provisioned_space"] is None
+            assert entry["available_ratio"] is None
+            # the destroyed flag of the bucket is not the destroyed space
+            assert entry["destroyed"] is False
+        assert result["realm1::bkt1"]["account_name"] == "realm1::acct1"
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    def test_bucket_dict_space_follows_the_rest_version(self):
+        """shared_space is returned from REST 2.15 and total_used_space from
+        2.16; the other space keys are returned on every version, null
+        before the version that reports them."""
+        entry = generate_bucket_dict(
+            self._bucket_blade(
+                [
+                    self._bucket(
+                        "bkt1", "acct1", self._space(self.SPACE_2_0, self.BUCKET)
+                    )
+                ]
+            ),
+            "2.7",
+        )["bkt1"]
+        assert entry["data_reduction"] == 2.1
+        assert entry["virtual_space"] == 5120
+        for key in (
+            "total_provisioned_space",
+            "available_provisioned_space",
+            "available_ratio",
+            "destroyed_space",
+            "destroyed_virtual_space",
+        ):
+            assert key in entry
+            assert entry[key] is None
+        assert "shared_space" not in entry
+        assert "total_used_space" not in entry
+
+        limited = dict(self.BUCKET, total_provisioned=1048576)
+        entry = generate_bucket_dict(
+            self._bucket_blade(
+                [
+                    self._bucket(
+                        "bkt1", "acct1", self._space(self.SPACE_EXTENDED_2_8, limited)
+                    )
+                ]
+            ),
+            "2.8",
+        )["bkt1"]
+        assert entry["total_provisioned_space"] == 1048576
+        assert entry["destroyed_space"] is None
+        assert "shared_space" not in entry
+
+        entry = generate_bucket_dict(
+            self._bucket_blade(
+                [self._bucket("bkt1", "acct1", self._space(self.SPACE_2_15, limited))]
+            ),
+            "2.15",
+        )["bkt1"]
+        assert entry["shared_space"] == 0
+        assert entry["destroyed_space"] == 0
+        assert "total_used_space" not in entry
+
+    # ---------------- object store accounts ----------------
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    def test_accounts_dict_reports_total_used_and_shared(self):
+        """An account adds shared_space and total_used_space to the figures
+        it had, for an account of a realm as for any other."""
+        accounts = [
+            SimpleNamespace(
+                name=name,
+                object_count=3,
+                space=self._space(self.SPACE_2_16, self.OBJECT_STORE),
+            )
+            for name in ("acct1", "realm1::acct1")
+        ]
+        blade = self._account_blade(accounts)
+
+        result = generate_object_store_accounts_dict(blade, "2.30")
+
+        for name in ("acct1", "realm1::acct1"):
+            entry = result[name]
+            assert entry["data_reduction"] == 1.0
+            assert entry["snapshots_space"] == 0
+            assert entry["total_physical_space"] == 178734756
+            assert entry["unique_space"] == 178734756
+            assert entry["virtual_space"] == 178783407
+            assert entry["destroyed_space"] == 0
+            assert entry["destroyed_virtual_space"] == 0
+            assert entry["shared_space"] == 0
+            assert entry["total_used_space"] == 178734756
+            assert entry["total_provisioned_space"] is None
+            assert entry["total_provisioned"] is None
+            assert entry["users"] == {}
+        blade.get_object_store_users.assert_any_call(filter='name="realm1::acct1/*"')
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    def test_accounts_dict_space_follows_the_rest_version(self):
+        """Before REST 2.15 an account has neither shared_space nor
+        total_used_space, and from 2.15 only the first."""
+        for version, fields, shared in (
+            ("2.14", self.SPACE_2_11, False),
+            ("2.15", self.SPACE_2_15, True),
+        ):
+            account = SimpleNamespace(
+                name="acct1",
+                object_count=3,
+                space=self._space(fields, self.OBJECT_STORE),
+            )
+            entry = generate_object_store_accounts_dict(
+                self._account_blade([account]), version
+            )["acct1"]
+            assert ("shared_space" in entry) is shared, version
+            assert "total_used_space" not in entry, version
+            assert entry["destroyed_space"] == 0, version
+            assert entry["virtual_space"] == 178783407, version
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    def test_accounts_dict_reads_a_dictionary_space(self):
+        """On REST 2.8 to 2.10 the SDK returns the space of an account as a
+        plain dictionary; its figures are read like those of a model."""
+        account = SimpleNamespace(
+            name="acct1",
+            object_count=3,
+            space={
+                "data_reduction": 1.0,
+                "snapshots": 0,
+                "total_physical": 178734756,
+                "unique": 178734756,
+                "virtual": 178783407,
+                "total_provisioned": 1073741824,
+            },
+        )
+
+        entry = generate_object_store_accounts_dict(
+            self._account_blade([account]), "2.10"
+        )["acct1"]
+
+        assert entry["data_reduction"] == 1.0
+        assert entry["snapshots_space"] == 0
+        assert entry["virtual_space"] == 178783407
+        assert entry["total_provisioned_space"] == 1073741824
+        assert entry["total_provisioned"] == 1073741824
+        assert entry["available_provisioned_space"] is None
+        assert "total_used_space" not in entry
+
+    # ---------------- namesakes ----------------
+
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_info.get_rest_api_version",
+        Mock(return_value="2.30"),
+    )
+    def test_namesakes_keep_their_own_figures(self):
+        """The same leaf name at array level and in two realms gives three
+        entries, each with the figures of its own object."""
+        names = ("same", "realm1::same", "realm2::same")
+        spaces = {
+            name: dict(self.BUCKET, virtual=1000 * step, total_used=100 * step)
+            for step, name in enumerate(names, start=1)
+        }
+
+        file_systems = generate_fs_dict(
+            self._fs_blade(
+                [
+                    self._file_system(name, self._space(self.SPACE_2_16, spaces[name]))
+                    for name in names
+                ]
+            )
+        )
+        buckets = generate_bucket_dict(
+            self._bucket_blade(
+                [
+                    self._bucket(
+                        name,
+                        name.replace("same", "acct"),
+                        self._space(self.SPACE_2_16, spaces[name]),
+                    )
+                    for name in names
+                ]
+            ),
+            "2.30",
+        )
+        accounts = generate_object_store_accounts_dict(
+            self._account_blade(
+                [
+                    SimpleNamespace(
+                        name=name,
+                        object_count=3,
+                        space=self._space(self.SPACE_2_16, spaces[name]),
+                    )
+                    for name in names
+                ]
+            ),
+            "2.30",
+        )
+
+        for entries in (file_systems, buckets, accounts):
+            assert sorted(entries) == sorted(names)
+            for step, name in enumerate(names, start=1):
+                assert entries[name]["virtual_space"] == 1000 * step, name
+                assert entries[name]["total_used_space"] == 100 * step, name
+        assert buckets["same"]["account_name"] == "acct"
+        assert buckets["realm2::same"]["account_name"] == "realm2::acct"
+
+    # ---------------- main ----------------
+
+    @patch("plugins.modules.purefb_info.generate_object_store_virtual_hosts_dict")
+    @patch("plugins.modules.purefb_info.generate_object_store_accounts_dict")
+    @patch("plugins.modules.purefb_info.generate_bucket_dict")
+    @patch("plugins.modules.purefb_info.generate_capacity_dict")
+    @patch("plugins.modules.purefb_info.get_system")
+    @patch("plugins.modules.purefb_info.AnsibleModule")
+    @patch("plugins.modules.purefb_info.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_info.get_rest_api_version",
+        Mock(return_value="2.15"),
+    )
+    def test_main_passes_the_rest_version_to_the_space_readers(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_generate_capacity,
+        mock_generate_bucket,
+        mock_generate_accounts,
+        mock_generate_virtual_hosts,
+    ):
+        """main() hands the REST version of the array to the capacity,
+        buckets and accounts readers, which gate their figures on it."""
+        mock_module = Mock()
+        mock_module.params = {"gather_subset": ["capacity", "buckets", "accounts"]}
+        mock_module.check_mode = False
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        mock_generate_capacity.return_value = {"total": 1}
+        mock_generate_bucket.return_value = {"bkt1": {}}
+        mock_generate_accounts.return_value = {"acct1": {}}
+        mock_generate_virtual_hosts.return_value = {}
+
+        main()
+
+        mock_generate_capacity.assert_called_once_with(mock_blade, "2.15")
+        mock_generate_bucket.assert_called_once_with(mock_blade, "2.15")
+        mock_generate_accounts.assert_called_once_with(mock_blade, "2.15")
+        info = mock_module.exit_json.call_args[1]["purefb_info"]
+        assert info["capacity"] == {"total": 1}
+        assert info["buckets"] == {"bkt1": {}}
+        assert info["accounts"] == {"acct1": {}}
 
 
 class TestPurefbInfoSoftwareSupport:

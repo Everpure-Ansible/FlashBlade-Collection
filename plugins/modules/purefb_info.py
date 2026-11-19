@@ -48,6 +48,22 @@ options:
         performance (array-wide, per array connection and per target under
         C(replication)) and point-in-time per-object samples keyed by name
         under C(filesystems) and C(buckets).
+      - The C(filesystems) subset reports the space of every file system
+        under the names the C(buckets) entries use, C(data_reduction) (the
+        data reduction ratio), C(snapshot_space), C(total_physical_space),
+        C(unique_space) and C(virtual_space), with
+        C(total_provisioned_space), C(available_provisioned_space),
+        C(available_ratio), C(destroyed_space) and
+        C(destroyed_virtual_space) on REST API 2.11 or later,
+        C(shared_space) on 2.15 or later and C(total_used_space) on 2.16
+        or later. The C(buckets) and C(accounts) entries add
+        C(shared_space) and C(total_used_space), and the C(aggregate),
+        C(file-system) and C(object-store) blocks of the C(capacity)
+        subset add C(total_used), from the same REST versions. These
+        figures are left out on an array whose REST version does not have
+        them and are C(null) when the array reports no value. Each block
+        of the C(capacity) subset holds the figures of its own array space
+        read.
       - The C(clients) subset lists per-client NFS and S3 performance from
         the array's client sample. Clients are reported as C(IP:PORT) and
         each list is capped at the first 100 entries the array returns.
@@ -309,7 +325,16 @@ DRIVES_API_VERSION = "2.5"
 SECURITY_API_VERSION = "2.7"
 BUCKET_API_VERSION = "2.8"
 SMB_CLIENT_API_VERSION = "2.10"
+# Space figures by the REST version that first reports them. The data
+# reduction ratio and the snapshot, total physical, unique and virtual
+# figures are part of every REST version. total_provisioned is reported for
+# buckets and object store accounts from SPACE_PROVISIONED_API_VERSION and
+# for file systems and the array from SPACE_API_VERSION, the version of
+# available_provisioned, available_ratio, destroyed and destroyed_virtual.
+SPACE_PROVISIONED_API_VERSION = "2.8"
 SPACE_API_VERSION = "2.11"
+SPACE_SHARED_API_VERSION = "2.15"
+SPACE_TOTAL_USED_API_VERSION = "2.16"
 PUBLIC_API_VERSION = "2.12"
 NAP_API_VERSION = "2.13"
 RA_DURATION_API_VERSION = "2.14"
@@ -1758,7 +1783,90 @@ def generate_connections_list(blade):
     return connections
 
 
-def generate_capacity_dict(blade):
+# Space figures every REST version reports
+SPACE_BASE_FIELDS = (
+    "data_reduction",
+    "snapshots",
+    "total_physical",
+    "unique",
+    "virtual",
+)
+# Space figures reported from SPACE_API_VERSION
+SPACE_EXTENDED_FIELDS = (
+    "available_provisioned",
+    "available_ratio",
+    "destroyed",
+    "destroyed_virtual",
+)
+# Key of each space figure in a file system entry, the names the bucket
+# entries use
+SPACE_ENTRY_KEYS = {
+    "data_reduction": "data_reduction",
+    "snapshots": "snapshot_space",
+    "total_physical": "total_physical_space",
+    "unique": "unique_space",
+    "virtual": "virtual_space",
+    "total_provisioned": "total_provisioned_space",
+    "available_provisioned": "available_provisioned_space",
+    "available_ratio": "available_ratio",
+    "destroyed": "destroyed_space",
+    "destroyed_virtual": "destroyed_virtual_space",
+    "shared": "shared_space",
+    "total_used": "total_used_space",
+}
+# Keys of a capacity subset block on every REST version
+CAPACITY_SPACE_KEYS = (
+    SPACE_BASE_FIELDS + ("total_provisioned",) + SPACE_EXTENDED_FIELDS + ("shared",)
+)
+
+
+def _space_figure(space, field):
+    """Return one figure of a space object, None when the array sent none
+
+    The SDK models the space of an object store account as a plain
+    dictionary on REST 2.8 to 2.10 and as an object everywhere else.
+    """
+    if isinstance(space, dict):
+        return space.get(field)
+    return getattr(space, field, None)
+
+
+def _space_figures(space, api_version, provisioned_version=SPACE_API_VERSION):
+    """Return the space figures the REST version of the array reports
+
+    The result is keyed by the REST field names. A figure the REST version
+    does not have is left out; one the array did not send is None.
+    ``provisioned_version`` is the REST version from which the object type
+    reports total_provisioned.
+    """
+    version = LooseVersion(api_version)
+    fields = list(SPACE_BASE_FIELDS)
+    if LooseVersion(provisioned_version) <= version:
+        fields.append("total_provisioned")
+    if LooseVersion(SPACE_API_VERSION) <= version:
+        fields.extend(SPACE_EXTENDED_FIELDS)
+    if LooseVersion(SPACE_SHARED_API_VERSION) <= version:
+        fields.append("shared")
+    if LooseVersion(SPACE_TOTAL_USED_API_VERSION) <= version:
+        fields.append("total_used")
+    return {field: _space_figure(space, field) for field in fields}
+
+
+def _capacity_space(space, api_version):
+    """Return one block of the capacity subset from its own array space read
+
+    The CAPACITY_SPACE_KEYS are returned on every REST version, null when
+    the version does not report them; total_used is only returned by an
+    array that has it.
+    """
+    figures = _space_figures(space, api_version)
+    block = {key: figures.get(key) for key in CAPACITY_SPACE_KEYS}
+    if "total_used" in figures:
+        block["total_used"] = figures["total_used"]
+    return block
+
+
+def generate_capacity_dict(blade, api_version):
     capacity_info = {}
     total_cap = _first_item(blade.get_arrays_space())
     file_cap = _first_item(blade.get_arrays_space(type="file-system"))
@@ -1767,45 +1875,10 @@ def generate_capacity_dict(blade):
         # array space is refused to an identity scoped to a realm
         return capacity_info
     capacity_info["total"] = total_cap.capacity
-    capacity_info["aggregate"] = {
-        "data_reduction": total_cap.space.data_reduction,
-        "snapshots": total_cap.space.snapshots,
-        "total_physical": total_cap.space.total_physical,
-        "unique": total_cap.space.unique,
-        "virtual": total_cap.space.virtual,
-        "total_provisioned": total_cap.space.total_provisioned,
-        "available_provisioned": total_cap.space.available_provisioned,
-        "available_ratio": total_cap.space.available_ratio,
-        "destroyed": total_cap.space.destroyed,
-        "destroyed_virtual": total_cap.space.destroyed_virtual,
-        "shared": getattr(total_cap.space, "shared", None),
-    }
-    capacity_info["file-system"] = {
-        "data_reduction": file_cap.space.data_reduction,
-        "snapshots": file_cap.space.snapshots,
-        "total_physical": file_cap.space.total_physical,
-        "unique": file_cap.space.unique,
-        "virtual": file_cap.space.virtual,
-        "total_provisioned": total_cap.space.total_provisioned,
-        "available_provisioned": total_cap.space.available_provisioned,
-        "available_ratio": total_cap.space.available_ratio,
-        "destroyed": total_cap.space.destroyed,
-        "destroyed_virtual": total_cap.space.destroyed_virtual,
-        "shared": getattr(total_cap.space, "shared", None),
-    }
-    capacity_info["object-store"] = {
-        "data_reduction": object_cap.space.data_reduction,
-        "snapshots": object_cap.space.snapshots,
-        "total_physical": object_cap.space.total_physical,
-        "unique": object_cap.space.unique,
-        "virtual": file_cap.space.virtual,
-        "total_provisioned": total_cap.space.total_provisioned,
-        "available_provisioned": total_cap.space.available_provisioned,
-        "available_ratio": total_cap.space.available_ratio,
-        "destroyed": total_cap.space.destroyed,
-        "destroyed_virtual": total_cap.space.destroyed_virtual,
-        "shared": getattr(total_cap.space, "shared", None),
-    }
+    # each block reports the figures of its own read
+    capacity_info["aggregate"] = _capacity_space(total_cap.space, api_version)
+    capacity_info["file-system"] = _capacity_space(file_cap.space, api_version)
+    capacity_info["object-store"] = _capacity_space(object_cap.space, api_version)
 
     return capacity_info
 
@@ -2043,29 +2116,30 @@ def generate_all_policies_dict(blade):
     return policies_info
 
 
-def generate_bucket_dict(blade):
+def generate_bucket_dict(blade, api_version):
     bucket_info = {}
     buckets = list(blade.get_buckets().items)
     for bucket in buckets:
         bucket_name = bucket.name
+        space = _space_figures(
+            getattr(bucket, "space", None), api_version, SPACE_PROVISIONED_API_VERSION
+        )
         bucket_info[bucket_name] = {
             "versioning": bucket.versioning,
             "bucket_type": getattr(bucket, "bucket_type", None),
             "object_count": bucket.object_count,
             "id": bucket.id,
             "account_name": bucket.account.name,
-            "data_reduction": getattr(bucket.space, "data_reduction", None),
-            "snapshot_space": bucket.space.snapshots,
-            "total_physical_space": bucket.space.total_physical,
-            "unique_space": bucket.space.unique,
-            "virtual_space": bucket.space.virtual,
-            "total_provisioned_space": getattr(bucket.space, "total_provisioned", None),
-            "available_provisioned_space": getattr(
-                bucket.space, "available_provisioned", None
-            ),
-            "available_ratio": getattr(bucket.space, "available_ratio", None),
-            "destroyed_space": getattr(bucket.space, "destroyed", None),
-            "destroyed_virtual_space": getattr(bucket.space, "destroyed_virtual", None),
+            "data_reduction": space.get("data_reduction"),
+            "snapshot_space": space.get("snapshots"),
+            "total_physical_space": space.get("total_physical"),
+            "unique_space": space.get("unique"),
+            "virtual_space": space.get("virtual"),
+            "total_provisioned_space": space.get("total_provisioned"),
+            "available_provisioned_space": space.get("available_provisioned"),
+            "available_ratio": space.get("available_ratio"),
+            "destroyed_space": space.get("destroyed"),
+            "destroyed_virtual_space": space.get("destroyed_virtual"),
             "created": bucket.created,
             "destroyed": bucket.destroyed,
             "time_remaining": getattr(bucket, "time_remaining", None),
@@ -2108,6 +2182,11 @@ def generate_bucket_dict(blade):
             },
             "lifecycle_rules": {},
         }
+        # only an array whose REST version has these figures reports them
+        if "shared" in space:
+            bucket_info[bucket_name]["shared_space"] = space["shared"]
+        if "total_used" in space:
+            bucket_info[bucket_name]["total_used_space"] = space["total_used"]
         if not bucket.destroyed:
             all_rules = list(blade.get_lifecycle_rules(bucket_ids=[bucket.id]).items)
             for rule in all_rules:
@@ -2784,30 +2863,32 @@ def generate_password_policies_dict(blade):
     return policies_info
 
 
-def generate_object_store_accounts_dict(blade):
+def generate_object_store_accounts_dict(blade, api_version):
     account_info = {}
 
     for account in blade.get_object_store_accounts().items:
         acc_name = account.name
-        space = account.space
+        space = _space_figures(
+            getattr(account, "space", None),
+            api_version,
+            SPACE_PROVISIONED_API_VERSION,
+        )
 
         account_info[acc_name] = {
             "object_count": account.object_count,
-            "data_reduction": space.data_reduction,
-            "snapshots_space": space.snapshots,
-            "total_physical_space": space.total_physical,
-            "unique_space": space.unique,
-            "virtual_space": space.virtual,
-            "total_provisioned_space": getattr(space, "total_provisioned", None),
-            "available_provisioned_space": getattr(
-                space, "available_provisioned", None
-            ),
-            "available_ratio": getattr(space, "available_ratio", None),
-            "destroyed_space": getattr(space, "destroyed", None),
-            "destroyed_virtual_space": getattr(space, "destroyed_virtual", None),
+            "data_reduction": space.get("data_reduction"),
+            "snapshots_space": space.get("snapshots"),
+            "total_physical_space": space.get("total_physical"),
+            "unique_space": space.get("unique"),
+            "virtual_space": space.get("virtual"),
+            "total_provisioned_space": space.get("total_provisioned"),
+            "available_provisioned_space": space.get("available_provisioned"),
+            "available_ratio": space.get("available_ratio"),
+            "destroyed_space": space.get("destroyed"),
+            "destroyed_virtual_space": space.get("destroyed_virtual"),
             "quota_limit": getattr(account, "quota_limit", None),
             "hard_limit_enabled": getattr(account, "hard_limit_enabled", None),
-            "total_provisioned": getattr(space, "total_provisioned", None),
+            "total_provisioned": space.get("total_provisioned"),
             "users": {},
             "bucket_defaults": {
                 "hard_limit_enabled": getattr(
@@ -2834,6 +2915,11 @@ def generate_object_store_accounts_dict(blade):
                 ),
             },
         }
+        # only an array whose REST version has these figures reports them
+        if "shared" in space:
+            account_info[acc_name]["shared_space"] = space["shared"]
+        if "total_used" in space:
+            account_info[acc_name]["total_used_space"] = space["total_used"]
 
         # Users for this account
         acc_users = blade.get_object_store_users(filter=f'name="{acc_name}/*"').items
@@ -2985,6 +3071,11 @@ def generate_fs_dict(blade, exports=None, api_version=None, worm_policies=None):
             ),
             "multi_protocol_safeguard_acls": getattr(multi, "safeguard_acls", None),
         }
+        # space figures under the names the bucket entries use; a figure the
+        # REST version of the array does not have is left out
+        space = _space_figures(getattr(fsystem, "space", None), array_api_version)
+        for field, figure in space.items():
+            fs_info[share][SPACE_ENTRY_KEYS[field]] = figure
         if LooseVersion(FS_STORAGE_CLASS_API_VERSION) <= LooseVersion(
             array_api_version
         ):
@@ -4176,7 +4267,7 @@ def main():
     if "config" in subset or "all" in subset:
         info["config"] = generate_config_dict(blade)
     if "capacity" in subset or "all" in subset:
-        info["capacity"] = generate_capacity_dict(blade)
+        info["capacity"] = generate_capacity_dict(blade, api_version)
     if "lags" in subset or "all" in subset:
         info["lag"] = generate_lag_dict(blade)
     if "network" in subset or "all" in subset:
@@ -4224,7 +4315,7 @@ def main():
     if "snapshots" in subset or "all" in subset:
         info["snapshots"] = generate_snap_dict(blade)
     if "buckets" in subset or "all" in subset:
-        info["buckets"] = generate_bucket_dict(blade)
+        info["buckets"] = generate_bucket_dict(blade, api_version)
         info["object_store_virtual_hosts"] = generate_object_store_virtual_hosts_dict(
             blade
         )
@@ -4246,7 +4337,7 @@ def main():
         info["remote_credentials"] = generate_remote_creds_dict(blade)
         info["targets"] = generate_targets_dict(blade)
     if "accounts" in subset or "all" in subset:
-        info["accounts"] = generate_object_store_accounts_dict(blade)
+        info["accounts"] = generate_object_store_accounts_dict(blade, api_version)
         if LooseVersion(S3_EXPORT_API_VERSION) <= LooseVersion(api_version):
             info["object_store_account_exports"] = (
                 generate_object_store_account_exports_dict(blade)

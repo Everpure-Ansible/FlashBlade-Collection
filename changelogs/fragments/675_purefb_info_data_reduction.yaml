@@ -1,0 +1,11 @@
+minor_changes:
+  - purefb_info - the ``filesystems`` subset reports the space of each file system, ``data_reduction``
+    included, under the names the bucket entries use.
+  - purefb_info - buckets and object store accounts report ``shared_space`` and ``total_used_space`` and
+    each ``capacity`` block ``total_used``; a space figure is returned from the REST version that has it.
+bugfixes:
+  - purefb_info - the ``file-system`` and ``object-store`` blocks of the ``capacity`` subset reported the
+    provisioned, destroyed and shared figures of the whole array, and ``object-store`` the virtual space
+    of the file systems. Each block now reports its own figures.
+  - purefb_info - the ``capacity`` subset no longer fails on arrays before REST 2.11, nor the
+    ``accounts`` subset on REST 2.8 to 2.10.

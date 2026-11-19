@@ -1125,6 +1125,50 @@ class TestResourceAccessCheckModePredictions:
         module.exit_json.assert_called_once_with(changed=True)
         module.fail_json.assert_not_called()
 
+    def test_realm_name_that_is_read_as_several_names(self):
+        # a name with a comma in it is read as a list of names, and the array
+        # answers with the realms of that list: none is the realm asked for
+        params = _params(
+            resource_type="dns", resource_name="dns1", scope_name="realm1,realm2"
+        )
+        blade, module = _check(
+            params,
+            {"dns": ["dns1"]},
+            get_realms=_listing(
+                [_named("realm1", destroyed=False), _named("realm2", destroyed=False)]
+            ),
+        )
+
+        blade.get_realms.assert_called_once_with(names=["realm1,realm2"])
+        module.warn.assert_called_once_with(
+            NOT_VERIFIED.format(
+                "realms realm1,realm2 and dns dns1",
+                "the array returned no realms realm1,realm2.",
+            )
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+        module.fail_json.assert_not_called()
+        _nothing_sent(blade)
+
+    @pytest.mark.parametrize("resource_type", ["dns", "subnets", "targets"])
+    def test_resource_name_that_is_read_as_several_names(self, resource_type):
+        params = _params(resource_type=resource_type, resource_name="other,name1")
+        answer = _listing([_named("other"), _named("name1")])
+        blade, module = _check(
+            params, {"realms": ["realm1"]}, **{NAME_READS[resource_type][0]: answer}
+        )
+
+        # the first object of the answer is not reported as the one asked for
+        module.warn.assert_called_once_with(
+            NOT_VERIFIED.format(
+                "realms realm1 and {0} other,name1".format(resource_type),
+                "the array returned no {0} other,name1.".format(resource_type),
+            )
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+        module.fail_json.assert_not_called()
+        _nothing_sent(blade)
+
     def test_error_without_a_full_stop_still_ends_the_sentence(self):
         blade, module = _check(
             _params(),

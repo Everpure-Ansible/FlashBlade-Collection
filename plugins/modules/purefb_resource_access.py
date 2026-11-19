@@ -102,8 +102,9 @@ notes:
   given. What these reads do not settle is reported with a warning and the
   change is predicted, because only the array decides it. This applies to a
   resource type or scope type other than the ones named here, a destroyed
-  realm, a subnet named in another case, a resource that belongs to a realm
-  and a read the array refuses.
+  realm, a subnet named in another case, a resource that belongs to a realm,
+  a read the array refuses and a read that does not return the name given,
+  as for a name with a comma in it.
 - Whether the array accepts a revoke is only known when the request is
   sent, and so is whether an administrator who may read the resource
   accesses may also change them.
@@ -275,16 +276,19 @@ def _not_verified(module, reason):
 def _read_by_name(module, blade, method, resource_type, name):
     """Read one end of a new resource access for check mode
 
-    Returns the object the array holds under the name, or None when the
-    read does not settle whether there is one. The array answers a create
-    that names a missing realm or resource with the error of this read, so
-    only that answer fails the task.
+    Returns the object the array holds under the name, whatever its case,
+    or None when the read does not settle whether there is one. The array
+    answers a create that names a missing realm or resource with the error
+    of this read, so only that answer fails the task.
     """
     res = getattr(blade, method)(names=[name])
     if res.status_code == 200:
-        items = list(res.items)
-        if items:
-            return items[0]
+        # Names are unique on the array whatever their case. A name with a
+        # comma in it is read as several names, so the answer can hold other
+        # objects than the one asked for: none of them is taken for it.
+        for item in list(res.items):
+            if (getattr(item, "name", None) or "").lower() == name.lower():
+                return item
         _not_verified(
             module, "the array returned no {0} {1}".format(resource_type, name)
         )

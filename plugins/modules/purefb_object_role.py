@@ -36,11 +36,16 @@ options:
   name:
     description:
     - Name of the role within the object store account.
+    - Give only the role name. A role lives in the realm of its account, so
+      a realm prefix goes on I(account). A name that contains C(::) or C(/)
+      is rejected.
     type: str
     required: true
   account:
     description:
     - Name of the object store account that owns the role.
+    - For an account that lives in a realm use the realm-qualified name
+      C(realm::account).
     - The account must already exist (see M(everpure.flashblade.purefb_s3acc)).
     type: str
     required: true
@@ -61,9 +66,13 @@ options:
   access_policies:
     description:
     - Object store access policies to attach to the role.
-    - Use the built-in C(pure:policy/...) names or account-scoped policies
-      in the form C(account/policy). A bare policy name is qualified with
-      I(account).
+    - Use the built-in C(pure:policy/...) names or policies of the role's
+      account in the form C(account/policy), or C(realm::account/policy)
+      when the account lives in a realm. A bare policy name is qualified
+      with I(account), including its realm prefix.
+    - A role can only use the built-in policies and the policies of its own
+      account. A policy of any other account is rejected before anything is
+      changed.
     - Policies already attached are left in place. Other policies attached
       to the role are only detached when listed in I(remove_access_policies)
       or when I(exclusive=true).
@@ -74,8 +83,9 @@ options:
     description:
     - Object store access policies to detach from the role.
     - Uses the same naming as I(access_policies).
-    - Every listed policy must exist. A policy that exists but is not
-      attached to the role is left alone.
+    - Every listed policy must exist and be a built-in policy or a policy of
+      the role's account. A policy that is not attached to the role is left
+      alone.
     type: list
     elements: str
   exclusive:
@@ -128,6 +138,16 @@ EXAMPLES = r"""
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
+- name: Create a role in an account that lives in a realm
+  everpure.flashblade.purefb_object_role:
+    account: realm1::acme
+    name: analytics
+    access_policies:
+      - pure:policy/object-list
+      - realm1::acme/reports-only
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
 - name: Detach a policy from a role
   everpure.flashblade.purefb_object_role:
     account: acme
@@ -163,11 +183,15 @@ role:
   type: dict
   contains:
     name:
-      description: Full name of the role in the form C(account/role).
+      description:
+      - Full name of the role in the form C(account/role), or
+        C(realm::account/role) when the account lives in a realm.
       type: str
       sample: acme/analytics
     account:
-      description: Name of the owning object store account.
+      description:
+      - Name of the owning object store account, in the form
+        C(realm::account) when it lives in a realm.
       type: str
       sample: acme
     prn:
@@ -184,7 +208,9 @@ role:
       elements: str
       sample: []
     access_policies:
-      description: Names of the access policies attached to the role.
+      description:
+      - Names of the access policies attached to the role. A policy of an
+        account that lives in a realm is named C(realm::account/policy).
       type: list
       elements: str
       sample: ["pure:policy/object-read", "pure:policy/object-list"]
@@ -270,6 +296,25 @@ def _full_role_name(module):
     return module.params["account"] + "/" + module.params["name"]
 
 
+def _check_role_name(module):
+    """Fail when the role name carries a realm prefix or an account name.
+
+    A role is placed by its account: account/role, or realm::account/role
+    for an account in a realm. The array accepts neither separator in a
+    role name, and its answer to a realm prefix on the role of an account
+    outside a realm is the misleading "Realm does not exist."
+    """
+    name = module.params["name"]
+    if "::" in name or "/" in name:
+        module.fail_json(
+            msg=(
+                "Invalid role name '{0}': a role name cannot contain '::' or "
+                "'/'. Give only the role name in name and put the realm "
+                "prefix on account (realm::account)."
+            ).format(name)
+        )
+
+
 def _qualify_policy(module, policy):
     """Built-in and account/policy names pass through; bare names get the account."""
     if "/" in policy:
@@ -282,18 +327,20 @@ def _not_found(res):
     return "does not exist" in str(get_error_message(res)).lower()
 
 
-def _account_exists(module, blade):
+def _get_account(module, blade):
+    """Return the object store account that owns the role, or None."""
     account = module.params["account"]
     res = blade.get_object_store_accounts(names=[account], **_context_kwargs(module))
     if res.status_code == 200:
-        return bool(list(res.items))
+        items = list(res.items)
+        return items[0] if items else None
     if not _not_found(res):
         module.fail_json(
             msg="Failed to look up object store account {0}. Error: {1}".format(
                 account, get_error_message(res)
             )
         )
-    return False
+    return None
 
 
 def _get_role(module, blade):
@@ -325,13 +372,56 @@ def _get_attached_policies(module, blade):
     return [link.policy.name for link in list(res.items)]
 
 
-def _check_policies_exist(module, blade, policies):
+def _realm_hint(module, policy):
+    """Hint for a policy named account/policy when the account is realm::account."""
+    account = module.params["account"]
+    short = account.rpartition("::")[2]
+    if short != account and policy.lower().startswith(short.lower() + "/"):
+        return " Policies of the account {0} are named {0}/policy.".format(account)
+    return ""
+
+
+def _check_policies_usable(module, blade, account, policies):
+    """Fail unless every policy exists and can be used by the role.
+
+    The array lets a role use the built-in policies, which belong to no
+    account, and the policies of its own account. A policy of any other
+    account, inside or outside a realm, is refused with "Cannot add policy
+    to role in a different account." The owning account is compared by ID.
+    Names are compared, without regard to case as the array resolves them,
+    only when an ID is missing.
+    """
+    account_name = module.params["account"]
+    account_id = getattr(account, "id", None)
+    account_names = [
+        name.lower() for name in (account_name, getattr(account, "name", None)) if name
+    ]
     for policy in policies:
         res = blade.get_object_store_access_policies(
             names=[policy], **_context_kwargs(module)
         )
-        if res.status_code != 200 or not list(res.items):
-            module.fail_json(msg="Access policy {0} does not exist.".format(policy))
+        items = list(res.items) if res.status_code == 200 else []
+        if not items:
+            module.fail_json(
+                msg="Access policy {0} does not exist.{1}".format(
+                    policy, _realm_hint(module, policy)
+                )
+            )
+        owner = getattr(items[0], "account", None)
+        owner_id = getattr(owner, "id", None)
+        owner_name = getattr(owner, "name", None)
+        if owner_id and account_id:
+            foreign = owner_id != account_id
+        else:
+            foreign = bool(owner_name) and owner_name.lower() not in account_names
+        if foreign:
+            module.fail_json(
+                msg=(
+                    "Access policy {0} belongs to object store account {1}, "
+                    "not to {2}. A role can only use the built-in policies "
+                    "and the policies of its own account ({2}/policy)."
+                ).format(policy, owner_name or owner_id, account_name)
+            )
 
 
 def _requested_policies(module, key):
@@ -429,11 +519,13 @@ def _role_facts(module, role, policies):
     }
 
 
-def create_role(module, blade, duration_ms):
+def create_role(module, blade, account, duration_ms):
     changed = True
     role_name = _full_role_name(module)
     wanted, _unused = _desired_policy_changes(module, [])
-    _check_policies_exist(module, blade, _policies_to_validate(module, [], wanted))
+    _check_policies_usable(
+        module, blade, account, _policies_to_validate(module, [], wanted)
+    )
     if module.check_mode:
         module.exit_json(
             changed=changed,
@@ -467,13 +559,16 @@ def create_role(module, blade, duration_ms):
     module.exit_json(changed=changed, role=_role_facts(module, role, policies))
 
 
-def update_role(module, blade, role, duration_ms):
+def update_role(module, blade, account, role, duration_ms):
     changed = False
     role_name = _full_role_name(module)
     current_policies = _get_attached_policies(module, blade)
     to_attach, to_detach = _desired_policy_changes(module, current_policies)
-    _check_policies_exist(
-        module, blade, _policies_to_validate(module, current_policies, to_attach)
+    _check_policies_usable(
+        module,
+        blade,
+        account,
+        _policies_to_validate(module, current_policies, to_attach),
     )
     if duration_ms is not None and duration_ms != getattr(
         role, "max_session_duration", None
@@ -543,6 +638,8 @@ def main():
     if not HAS_PYPURECLIENT:
         module.fail_json(msg="py-pure-client sdk is required for this module")
 
+    _check_role_name(module)
+
     blade = get_system(module)
     api_version = get_rest_api_version(blade)
     if LooseVersion(MIN_REQUIRED_API_VERSION) > LooseVersion(api_version):
@@ -564,7 +661,8 @@ def main():
         duration_ms = _duration_to_ms(module, module.params["max_session_duration"])
 
     state = module.params["state"]
-    if not _account_exists(module, blade):
+    account = _get_account(module, blade)
+    if account is None:
         if state == "absent":
             module.exit_json(changed=False)
         module.fail_json(
@@ -579,8 +677,8 @@ def main():
             delete_role(module, blade)
         module.exit_json(changed=False)
     if role:
-        update_role(module, blade, role, duration_ms)
-    create_role(module, blade, duration_ms)
+        update_role(module, blade, account, role, duration_ms)
+    create_role(module, blade, account, duration_ms)
 
 
 if __name__ == "__main__":

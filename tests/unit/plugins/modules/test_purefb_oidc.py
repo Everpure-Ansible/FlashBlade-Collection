@@ -159,6 +159,21 @@ def _run():
         pass
 
 
+def _array_lookup(*providers):
+    """get_sso_oidc_idps of an array that holds the given array-level providers.
+
+    The array answers a realm-qualified name like any other name that is not
+    configured: 400.
+    """
+    held = dict((idp.name, idp) for idp in providers)
+
+    def lookup(names):
+        idp = held.get(names[0])
+        return _response(200, [idp]) if idp else _response(400)
+
+    return lookup
+
+
 class TestPurefbOidcHelpers:
     """Helper-function unit tests"""
 
@@ -700,6 +715,146 @@ class TestPurefbOidcMain:
         assert "Failed to delete OIDC identity provider okta" in msg
         # the hint is phrased as a possibility; the array message precedes it
         assert "If an object store trust policy still references" in msg
+
+    # ---------------- realm-qualified names ----------------
+
+    @staticmethod
+    def _assert_realm_refusal(module, blade, mock_gs, option, value):
+        """The task failed on the realm-qualified name without contacting the array."""
+        mock_gs.assert_not_called()
+        blade.get_sso_oidc_idps.assert_not_called()
+        blade.post_sso_oidc_idps.assert_not_called()
+        blade.patch_sso_oidc_idps.assert_not_called()
+        blade.delete_sso_oidc_idps.assert_not_called()
+        module.exit_json.assert_not_called()
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Invalid {0} '{1}'".format(option, value) in msg
+        assert "array-wide" in msg
+        assert "Use the unqualified provider name" in msg
+        assert "purefb_resource_access" in msg
+        assert "resource_type sso/oidc/idps, scope_type realms" in msg
+
+    def test_realm_name_refused_on_create(self, mock_am, mock_gs, mock_lv):
+        params = _base_params(name="realm1::okta")
+        module, blade = self._setup(mock_am, mock_gs, mock_lv, params)
+        blade.get_sso_oidc_idps.side_effect = _array_lookup()
+        # the array rejects the create with its name rule, which allows only
+        # alphanumerics, underscores and hyphens
+        blade.post_sso_oidc_idps.return_value = _response(400)
+
+        _run()
+
+        self._assert_realm_refusal(module, blade, mock_gs, "name", "realm1::okta")
+
+    def test_realm_name_refused_on_create_in_check_mode(
+        self, mock_am, mock_gs, mock_lv
+    ):
+        """Check mode must not predict a create the array always refuses."""
+        params = _base_params(name="realm1::okta")
+        module, blade = self._setup(mock_am, mock_gs, mock_lv, params, check_mode=True)
+        blade.get_sso_oidc_idps.side_effect = _array_lookup()
+
+        _run()
+
+        self._assert_realm_refusal(module, blade, mock_gs, "name", "realm1::okta")
+
+    def test_realm_name_refused_for_absent(self, mock_am, mock_gs, mock_lv):
+        """Deleting realm1::okta must not pass as unchanged while okta stays."""
+        params = _base_params(name="realm1::okta", state="absent")
+        module, blade = self._setup(mock_am, mock_gs, mock_lv, params)
+        blade.get_sso_oidc_idps.side_effect = _array_lookup(_existing())
+
+        _run()
+
+        self._assert_realm_refusal(module, blade, mock_gs, "name", "realm1::okta")
+
+    def test_realm_name_refused_for_absent_in_check_mode(
+        self, mock_am, mock_gs, mock_lv
+    ):
+        params = _base_params(name="realm1::okta", state="absent")
+        module, blade = self._setup(mock_am, mock_gs, mock_lv, params, check_mode=True)
+        blade.get_sso_oidc_idps.side_effect = _array_lookup(_existing())
+
+        _run()
+
+        self._assert_realm_refusal(module, blade, mock_gs, "name", "realm1::okta")
+
+    def test_realm_name_refused_on_update(self, mock_am, mock_gs, mock_lv):
+        """An update through realm1::okta is not reported as a create without a URL."""
+        params = _base_params(name="realm1::okta", provider_url=None, enabled=False)
+        module, blade = self._setup(mock_am, mock_gs, mock_lv, params)
+        blade.get_sso_oidc_idps.side_effect = _array_lookup(_existing())
+
+        _run()
+
+        self._assert_realm_refusal(module, blade, mock_gs, "name", "realm1::okta")
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "provider_url is required" not in msg
+
+    def test_realm_rename_refused(self, mock_am, mock_gs, mock_lv):
+        params = _base_params(rename="realm1::okta-prod")
+        module, blade = self._setup(mock_am, mock_gs, mock_lv, params)
+        blade.get_sso_oidc_idps.side_effect = _array_lookup(_existing())
+        # the array rejects the new name with its name rule
+        blade.patch_sso_oidc_idps.return_value = _response(400)
+
+        _run()
+
+        self._assert_realm_refusal(
+            module, blade, mock_gs, "rename", "realm1::okta-prod"
+        )
+
+    def test_realm_rename_refused_in_check_mode(self, mock_am, mock_gs, mock_lv):
+        """Check mode must not predict a rename the array always refuses."""
+        params = _base_params(rename="realm1::okta-prod")
+        module, blade = self._setup(mock_am, mock_gs, mock_lv, params, check_mode=True)
+        blade.get_sso_oidc_idps.side_effect = _array_lookup(_existing())
+
+        _run()
+
+        self._assert_realm_refusal(
+            module, blade, mock_gs, "rename", "realm1::okta-prod"
+        )
+
+    def test_prn_given_as_name_is_refused(self, mock_am, mock_gs, mock_lv):
+        """A PRN embeds the separator as well; the answer is the unqualified name."""
+        params = _base_params(name=PRN, state="absent")
+        module, blade = self._setup(mock_am, mock_gs, mock_lv, params)
+        blade.get_sso_oidc_idps.side_effect = _array_lookup(_existing())
+
+        _run()
+
+        self._assert_realm_refusal(module, blade, mock_gs, "name", PRN)
+
+    def test_realm_rename_is_not_read_for_absent(self, mock_am, mock_gs, mock_lv):
+        """rename is unused by state=absent, so the delete goes ahead as before."""
+        params = _base_params(state="absent", rename="realm1::okta-prod")
+        module, blade = self._setup(mock_am, mock_gs, mock_lv, params)
+        blade.get_sso_oidc_idps.side_effect = _array_lookup(_existing())
+        blade.delete_sso_oidc_idps.return_value = _response(200)
+
+        _run()
+
+        module.fail_json.assert_not_called()
+        blade.delete_sso_oidc_idps.assert_called_once_with(names=["okta"])
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_single_colon_name_is_left_to_the_array(self, mock_am, mock_gs, mock_lv):
+        """Only the realm separator is refused here; other names go to the array."""
+        params = _base_params(name="ok:ta")
+        module, blade = self._setup(mock_am, mock_gs, mock_lv, params)
+        blade.get_sso_oidc_idps.side_effect = _array_lookup()
+        blade.post_sso_oidc_idps.return_value = _response(400)
+
+        _run()
+
+        blade.post_sso_oidc_idps.assert_called_once()
+        assert blade.post_sso_oidc_idps.call_args[1]["names"] == ["ok:ta"]
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Failed to create OIDC identity provider ok:ta" in msg
+        assert "array-wide" not in msg
 
     # ---------------- validation and gates ----------------
 

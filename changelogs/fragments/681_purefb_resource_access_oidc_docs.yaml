@@ -1,0 +1,6 @@
+bugfixes:
+  - purefb_resource_access - failure messages now name the scope type and name and the resource
+    type and name. A refused share of a realm-qualified resource name adds that shared resources
+    are named without a realm prefix.
+  - purefb_resource_access - documentation lists ``sso/oidc/idps`` (OIDC identity providers) among
+    the resources that can be shared with a realm and has an example for it.

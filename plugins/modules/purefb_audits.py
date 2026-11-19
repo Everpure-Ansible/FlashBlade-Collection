@@ -21,19 +21,28 @@ version_added: '1.30.0'
 short_description: List FlashBlade audit trail records
 description:
 - List the records of the FlashBlade management audit trail, optionally
-  narrowed to a time window, a user, a command, a user interface or a
-  correlation ID.
+  narrowed to a time window, a user, a command, a user interface, a
+  correlation ID or the scopes (realms and/or the array) a record affected.
 - Available on every FlashBlade REST API version (2.0 and later). The
   C(context), C(correlation_id) and C(system_event) fields of a record, the
   I(correlation_id) option, the system-event filtering behind
   I(include_system_events) and the fleet I(context) option require REST API
-  version 2.28 or later (Purity//FB 4.8.4+). The C(scopes) field requires
-  REST API version 2.20 or later (Purity//FB 4.6.3+).
+  version 2.28 or later (Purity//FB 4.8.4+). The C(scopes) field and the
+  I(scopes) option require REST API version 2.20 or later
+  (Purity//FB 4.6.3+).
+- The activity of a realm is identified by C(scopes), which lists the realms
+  and/or the array a record affected. A realm is listed under its current
+  name, while C(arguments) keeps the names used when the command was run, so
+  use I(scopes) rather than a match on C(arguments) to read the records of
+  one realm.
+- An identity whose management access is scoped to realms is only returned
+  the records of those realms, and the C(scopes) of each record then lists
+  only those realms.
 - Reading the audit trail never changes the array, so the module always
   reports C(changed=false) and performs the read in check mode as well.
-- The I(user), I(command) and I(correlation_id) values must not contain a
-  single quote, which the array query syntax cannot escape. Such a value is
-  refused before the array is contacted.
+- The I(user), I(command), I(correlation_id) and I(scopes) values must not
+  contain a single quote, which the array query syntax cannot escape. Such a
+  value is refused before the array is contacted.
 - Timezone names are resolved with the Python C(zoneinfo) module on the host
   running the module, which needs the system timezone database or the
   C(tzdata) Python package. C(UTC) works without either.
@@ -85,6 +94,24 @@ options:
       the triggered system actions as well.
     - Requires REST API version 2.28 or later.
     type: str
+  scopes:
+    description:
+    - Only return records that affected at least one of these scopes. A scope
+      is a realm or the array itself, so each entry is the name of a realm or
+      the name of the array.
+    - With several entries a record is returned when it affected any one of
+      them. Empty entries are ignored.
+    - The array treats C(*) in an entry as a wildcard, so C(tenant*) selects
+      the records of every realm whose name starts with C(tenant).
+    - The array matches the names without regard to case.
+    - The C(scopes) of each returned record then lists only the scopes that
+      matched, not every scope the record affected.
+    - A realm that has been eradicated cannot be selected, because the array
+      no longer holds its name. Its records are still returned when this
+      option is not used.
+    - Requires REST API version 2.20 or later.
+    type: list
+    elements: str
   include_system_events:
     description:
     - Whether records of system-initiated events are returned alongside the
@@ -127,6 +154,15 @@ EXAMPLES = r"""
 
 - name: List the 10 most recent records
   everpure.flashblade.purefb_audits:
+    newest_first: true
+    limit: 10
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: List the 10 most recent records of one realm
+  everpure.flashblade.purefb_audits:
+    scopes:
+      - realm1
     newest_first: true
     limit: 10
     fb_url: 10.10.10.2
@@ -218,6 +254,11 @@ purefb_audits:
     scopes:
       description:
         - The names of the realms and/or array the command affected.
+        - A realm is listed under its current name. A realm that has been
+          eradicated no longer has a name and is listed by its ID instead.
+        - Only the matching scopes are listed when I(scopes) is used, and
+          only the realms of the identity when the module runs as an identity
+          scoped to realms.
         - Available from REST API version 2.20.
       type: list
       elements: str
@@ -273,6 +314,9 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.version import
 # The fleet context parameter and the context, correlation_id and
 # system_event record fields all arrived together in REST 2.28.
 AUDIT_CONTEXT_VERSION = "2.28"
+# Records carry the realms and/or array they affected, and the array filters
+# on them, from REST 2.20.
+AUDIT_SCOPES_VERSION = "2.20"
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
@@ -331,6 +375,19 @@ def _to_timestamp(module, name, timezone):
     return int(localized.timestamp() * 1000)
 
 
+def _scope_names(module):
+    """Return the scope names to filter on, without empty entries or repeats.
+
+    An empty entry is not a filter, as with the other filter options, and a
+    name is sent to the array as given.
+    """
+    names = []
+    for name in module.params["scopes"] or []:
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
 def _validate_filter_values(module):
     """Refuse filter values the array query syntax cannot express.
 
@@ -343,6 +400,11 @@ def _validate_filter_values(module):
         if value and "'" in value:
             module.fail_json(
                 msg="{0} value {1} must not contain a single quote".format(key, value)
+            )
+    for name in _scope_names(module):
+        if "'" in name:
+            module.fail_json(
+                msg="scopes value {0} must not contain a single quote".format(name)
             )
 
 
@@ -367,6 +429,13 @@ def _build_filter(module, api_version, timezone):
             parts.append("{0}='{1}'".format(key, module.params[key]))
     if module.params["correlation_id"]:
         parts.append("correlation_id='{0}*'".format(module.params["correlation_id"]))
+    scopes = _scope_names(module)
+    if scopes:
+        # A record matches when any one of the names is among its scopes.
+        # The alternatives are parenthesised so that they join the other
+        # parts of the filter as one condition.
+        clause = " or ".join("scopes.name='{0}'".format(name) for name in scopes)
+        parts.append("({0})".format(clause) if len(scopes) > 1 else clause)
     if not module.params["include_system_events"] and LooseVersion(
         AUDIT_CONTEXT_VERSION
     ) <= LooseVersion(api_version):
@@ -377,6 +446,22 @@ def _build_filter(module, api_version, timezone):
     if parts:
         return " and ".join(parts)
     return None
+
+
+def _format_scopes(audit):
+    """Return the scopes of an SDK audit record as a list of strings.
+
+    A scope is reported by its name. The array drops the name of a realm once
+    the realm is eradicated and keeps only its ID, so such a scope is reported
+    by that ID, which stays the same on every read. An entry with neither is
+    left out rather than returned as a null.
+    """
+    labels = []
+    for scope in getattr(audit, "scopes", None) or []:
+        label = getattr(scope, "name", None) or getattr(scope, "id", None)
+        if label:
+            labels.append(label)
+    return labels
 
 
 def _format_audit(audit, timezone):
@@ -394,7 +479,6 @@ def _format_audit(audit, timezone):
     system_event = getattr(audit, "system_event", None)
     if system_event is None:
         system_event = False
-    scopes = getattr(audit, "scopes", None) or []
     return {
         "name": getattr(audit, "name", None),
         "time": event_time,
@@ -407,7 +491,7 @@ def _format_audit(audit, timezone):
         "arguments": getattr(audit, "arguments", None),
         "origin": getattr(getattr(audit, "origin", None), "name", None),
         "context": getattr(getattr(audit, "context", None), "name", None),
-        "scopes": [getattr(scope, "name", None) for scope in scopes],
+        "scopes": _format_scopes(audit),
         "system_event": system_event,
         "correlation_id": getattr(audit, "correlation_id", None),
     }
@@ -424,6 +508,7 @@ def main():
             command=dict(type="str"),
             user_interface=dict(type="str", choices=["CLI", "GUI", "REST"]),
             correlation_id=dict(type="str"),
+            scopes=dict(type="list", elements="str"),
             include_system_events=dict(type="bool", default=False),
             newest_first=dict(type="bool", default=False),
             limit=dict(type="int"),
@@ -439,6 +524,15 @@ def main():
 
     blade = get_system(module)
     api_version = get_rest_api_version(blade)
+    if _scope_names(module) and LooseVersion(AUDIT_SCOPES_VERSION) > LooseVersion(
+        api_version
+    ):
+        module.fail_json(
+            msg=(
+                "The scopes option requires FlashBlade REST version {0} "
+                "or later (Purity//FB 4.6.3+)"
+            ).format(AUDIT_SCOPES_VERSION)
+        )
     if LooseVersion(AUDIT_CONTEXT_VERSION) > LooseVersion(api_version):
         for option in ("context", "correlation_id"):
             if module.params[option]:

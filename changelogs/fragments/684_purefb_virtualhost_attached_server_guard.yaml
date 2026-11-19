@@ -1,0 +1,5 @@
+bugfixes:
+  - purefb_virtualhost - a virtual host is no longer created or left without an attached object store
+    server (REST 2.20 and later). An empty ``servers`` list is refused, a create names the default
+    object store server when ``servers`` is omitted and is refused when there is none, and new
+    servers are attached before others are detached.

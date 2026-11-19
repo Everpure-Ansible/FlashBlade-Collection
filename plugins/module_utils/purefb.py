@@ -68,11 +68,15 @@ def _login_error(target, exc):
     Returns:
         str: Failure message that tells an unreachable or wrong address
         (a urllib3 transport error) apart from a login the array or the
-        SDK refused
+        SDK refused. An error whose text does not name it (any but the
+        PureError of the SDK) is reported with its type
     """
     if HAS_URLLIB3 and isinstance(exc, urllib3.exceptions.HTTPError):
         return "Failed to connect to FlashBlade {0}. Error: {1}".format(target, exc)
-    return "Failed to log in to FlashBlade {0}. Error: {1}".format(target, exc)
+    detail = str(exc)
+    if not detail.startswith(type(exc).__name__):
+        detail = "{0}: {1}".format(type(exc).__name__, detail)
+    return "Failed to log in to FlashBlade {0}. Error: {1}".format(target, detail)
 
 
 def get_system(module):

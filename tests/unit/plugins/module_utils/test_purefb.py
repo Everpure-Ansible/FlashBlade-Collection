@@ -8,6 +8,7 @@ from __future__ import absolute_import, division, print_function
 __metaclass__ = type
 
 import importlib.util
+import json
 import sys
 from unittest.mock import Mock, patch, MagicMock
 
@@ -67,8 +68,8 @@ REFUSED_LOGINS = pytest.mark.parametrize(
 )
 
 
-class FakePureError(Exception):
-    """pypureclient.PureError, which is mocked in this file: same text."""
+class PureError(Exception):
+    """pypureclient.PureError, which is mocked in this file: same name and text."""
 
     def __init__(self, reason=None):
         self.reason = reason
@@ -531,7 +532,7 @@ class TestGetSystemLogin:
         """The SDK raises while it creates the client for bad credentials."""
         mock_environ.get.return_value = None
         mock_module = login_module(credentials)
-        mock_client_class.side_effect = FakePureError(reason)
+        mock_client_class.side_effect = PureError(reason)
 
         with pytest.raises(SystemExit):
             get_system(mock_module)
@@ -543,6 +544,7 @@ class TestGetSystemLogin:
             "Error: PureError: "
         )
         assert detail in msg
+        assert "PureError: PureError" not in msg
         assert "Failed to connect" not in msg
 
     @AUTH_MODES
@@ -584,8 +586,10 @@ class TestGetSystemLogin:
 
         mock_module.fail_json.assert_called_once()
         msg = mock_module.fail_json.call_args[1]["msg"]
-        assert msg.startswith("Failed to log in to FlashBlade flashblade.example.com.")
-        assert "No compatible REST version" in msg
+        assert msg.startswith(
+            "Failed to log in to FlashBlade flashblade.example.com. "
+            "Error: ValueError: No compatible REST version"
+        )
 
     @API_CLIENT_MODES
     def test_unwritable_token_cache_fails_cleanly(
@@ -603,8 +607,11 @@ class TestGetSystemLogin:
 
         mock_module.fail_json.assert_called_once()
         msg = mock_module.fail_json.call_args[1]["msg"]
-        assert msg.startswith("Failed to log in to FlashBlade flashblade.example.com.")
-        assert "Permission denied: 'oauth21.0token.access_token'" in msg
+        assert msg == (
+            "Failed to log in to FlashBlade flashblade.example.com. Error: "
+            "PermissionError: [Errno 13] Permission denied: "
+            "'oauth21.0token.access_token'"
+        )
 
     def test_connection_error_without_urllib3(self, mock_client_class, mock_environ):
         """Without urllib3 every failure is reported as a failed login."""
@@ -617,7 +624,41 @@ class TestGetSystemLogin:
                 get_system(mock_module)
 
         msg = mock_module.fail_json.call_args[1]["msg"]
-        assert msg.startswith("Failed to log in to FlashBlade flashblade.example.com.")
+        assert msg == (
+            "Failed to log in to FlashBlade flashblade.example.com. "
+            "Error: FakeHTTPError: connection refused"
+        )
+
+    @pytest.mark.parametrize(
+        "error, detail",
+        [
+            (
+                json.JSONDecodeError("Expecting value", "<html></html>", 0),
+                "JSONDecodeError: Expecting value: line 1 column 1 (char 0)",
+            ),
+            (KeyError("x-auth-token"), "KeyError: 'x-auth-token'"),
+            (
+                AttributeError("module 'jwt' has no attribute 'encode'"),
+                "AttributeError: module 'jwt' has no attribute 'encode'",
+            ),
+        ],
+        ids=["not_json", "no_session_token", "wrong_jwt_package"],
+    )
+    def test_error_that_does_not_name_itself_is_named(
+        self, mock_client_class, mock_environ, error, detail
+    ):
+        """Only the PureError of the SDK says in its text what it is."""
+        mock_environ.get.return_value = None
+        mock_module = login_module(API_TOKEN)
+        mock_client_class.side_effect = error
+
+        with pytest.raises(SystemExit):
+            get_system(mock_module)
+
+        mock_module.fail_json.assert_called_once()
+        assert mock_module.fail_json.call_args[1]["msg"] == (
+            "Failed to log in to FlashBlade flashblade.example.com. Error: " + detail
+        )
 
     def test_missing_credentials_are_not_a_login_failure(
         self, mock_client_class, mock_environ

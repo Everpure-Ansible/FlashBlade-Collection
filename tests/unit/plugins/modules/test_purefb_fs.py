@@ -7060,6 +7060,128 @@ class TestPurefbFs:
         assert "discard_snaps" in mock_module.fail_json.call_args.kwargs["msg"]
         assert self._writes(mock_blade) == []
 
+    # ---- snapshot policy of a destroyed filesystem ----
+
+    DESTROYED_MESSAGE = (
+        "Name belongs to a file system that has been destroyed and is "
+        "pending eradication."
+    )
+
+    def _destroyed_member(self, member):
+        """Answers of the array for a destroyed filesystem.
+
+        Its snapshot policy membership is not listed and cannot be changed
+        while it is destroyed. Once the filesystem is recovered the
+        membership it had (``member``) is listed again.
+        """
+
+        def prepare(mock_blade):
+            state = {"destroyed": True}
+
+            def recover(**kwargs):
+                state["destroyed"] = False
+                return self._ok()
+
+            def members(**kwargs):
+                if state["destroyed"] or not member:
+                    return self._ok()
+                return self._ok(Mock())
+
+            def change(**kwargs):
+                if state["destroyed"]:
+                    return self._refused(self.DESTROYED_MESSAGE)
+                return self._ok()
+
+            mock_blade.patch_file_systems.side_effect = recover
+            mock_blade.get_policies_file_systems.side_effect = members
+            mock_blade.post_policies_file_systems.side_effect = change
+            mock_blade.delete_policies_file_systems.side_effect = change
+
+        return prepare
+
+    def test_destroyed_filesystem_is_recovered_before_the_attach(self):
+        """The array refuses to attach a policy to a destroyed filesystem,
+        so the recovery is sent first and the membership afterwards."""
+        for name, policy in self.SCOPES:
+            mock_module, mock_blade, models = self._modify(
+                self._existing_fs(name=name, destroyed=True),
+                prepare=self._destroyed_member(False),
+                policy=policy,
+            )
+
+            mock_module.fail_json.assert_not_called()
+            assert self._writes(mock_blade) == [
+                "patch_file_systems",
+                "post_policies_file_systems",
+            ]
+            models["FileSystemPatch"].assert_called_once_with(destroyed=False)
+            mock_blade.post_policies_file_systems.assert_called_once_with(
+                policy_names=[policy], member_names=[name]
+            )
+            mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_destroyed_filesystem_is_recovered_before_the_detach(self):
+        """The membership of a destroyed filesystem is only listed again
+        after the recovery, so one run recovers and detaches."""
+        for name, policy in self.SCOPES:
+            mock_module, mock_blade, models = self._modify(
+                self._existing_fs(name=name, destroyed=True),
+                prepare=self._destroyed_member(True),
+                policy=policy,
+                policy_state="absent",
+            )
+
+            mock_module.fail_json.assert_not_called()
+            assert self._writes(mock_blade) == [
+                "patch_file_systems",
+                "delete_policies_file_systems",
+            ]
+            mock_blade.delete_policies_file_systems.assert_called_once_with(
+                policy_names=[policy], member_names=[name]
+            )
+            mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_destroyed_filesystem_keeps_the_policy_it_had(self):
+        """A recovered filesystem that is still a member of the policy is
+        not attached a second time."""
+        mock_module, mock_blade, models = self._modify(
+            self._existing_fs(name="rz::fs1", destroyed=True),
+            prepare=self._destroyed_member(True),
+            policy="rz::snap",
+        )
+
+        mock_module.fail_json.assert_not_called()
+        assert self._writes(mock_blade) == ["patch_file_systems"]
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_destroyed_filesystem_with_policy_check_mode_sends_nothing(self):
+        """Check mode reports the recovery and sends nothing."""
+        for policy_state, member in (("present", False), ("absent", True)):
+            mock_module, mock_blade, models = self._modify(
+                self._existing_fs(name="rz::fs1", destroyed=True),
+                check_mode=True,
+                prepare=self._destroyed_member(member),
+                policy="rz::snap",
+                policy_state=policy_state,
+            )
+
+            mock_module.fail_json.assert_not_called()
+            assert self._writes(mock_blade) == []
+            mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_destroyed_filesystem_with_a_policy_of_another_scope_is_not_recovered(
+        self,
+    ):
+        """The checks of the policy run before the recovery is sent."""
+        mock_module, mock_blade, models = self._modify(
+            self._existing_fs(name="rz::fs1", destroyed=True),
+            prepare=self._destroyed_member(False),
+            policy="snap",
+        )
+
+        mock_module.fail_json.assert_called_once()
+        assert self._writes(mock_blade) == []
+
     # ---- WORM data policy of an existing filesystem ----
 
     def _worm_endpoint(self, *memberships):

@@ -202,6 +202,9 @@ options:
         policy of a realm by its full name C(realm::policy); I(realm) does not
         qualify this name. A policy to attach that does not exist, or is in
         another realm, fails the task before anything is changed.
+      - A destroyed filesystem is recovered before the policy is attached or
+        detached, as the array does not change the policies of a destroyed
+        filesystem.
     required: false
     type: str
   policy_state:
@@ -462,7 +465,7 @@ EXAMPLES = """
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
-- name: the iss that ven thou hth ansible Eradicate filesystem named foo
+- name: Eradicate filesystem named foo
   everpure.flashblade.purefb_fs:
     name: foo
     state: absent
@@ -481,6 +484,7 @@ EXAMPLES = """
   everpure.flashblade.purefb_fs:
     name: foo
     promote: false
+    discard_snaps: true
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
@@ -1385,28 +1389,28 @@ def modify_fs(module, blade):
     change_go = False
     change_sc = False
     change_rules = False
+    policy_wanted = None
     policy_action = None
     # A filesystem is in a realm when its name is realm::name; main() has
     # resolved the realm option into the name.
     fs_name = module.params["name"]
     realm_name = _realm_of(fs_name) or None
     api_version = get_rest_api_version(blade)
-    # Snapshot policy membership is decided here and written further down,
-    # after every other check has passed and never in check mode.
+    # What the task asks of the snapshot policy is checked here. The
+    # membership is read and written further down, after every other check
+    # has passed and after a destroyed filesystem has been recovered.
     if module.params["policy"] and module.params["policy_state"] == "present":
         _check_policy_scope(module, fs_name, "policy")
         _check_policy_exists(module, blade, api_version)
-        if not _policy_attached(module, blade, fs_name, api_version):
-            policy_action = "attach"
+        policy_wanted = "attach"
     if module.params["policy"] and module.params["policy_state"] == "absent":
         res = blade.get_policies(
             names=[module.params["policy"]], **_context_kwargs(module, api_version)
         )
         if res.status_code == 200:
-            # A 200 with no items means the policy is not attached, so a
-            # second policy_state=absent run must be a no-op.
-            if _policy_attached(module, blade, fs_name, api_version):
-                policy_action = "detach"
+            # A policy that does not exist has no members, so a
+            # policy_state=absent run for it is a no-op.
+            policy_wanted = "detach"
         elif not _is_missing(res):
             module.fail_json(
                 msg="Failed to read policy {0}. Error: {1}".format(
@@ -1511,42 +1515,53 @@ def modify_fs(module, blade):
                 )
     recover = new_fsys["destroyed"] != fsys.destroyed
     patch_body = _patch_body(before, new_fsys)
+    context_kwargs = _context_kwargs(module, api_version)
+    if recover:
+        changed = True
+        if not module.check_mode:
+            res = blade.patch_file_systems(
+                names=[fs_name],
+                file_system=FileSystemPatch(destroyed=new_fsys["destroyed"]),
+                **context_kwargs
+            )
+            if res.status_code != 200:
+                module.fail_json(
+                    msg="Failed to update filesystem {0} deleted status. Error {1}".format(
+                        fs_name, get_error_message(res)
+                    )
+                )
+    if policy_wanted:
+        # Read after the recovery: the array neither lists nor changes the
+        # policies of a destroyed filesystem, and lists them again once it
+        # is recovered. In check mode a destroyed filesystem stays destroyed
+        # and the task reports the recovery as its change.
+        attached = _policy_attached(module, blade, fs_name, api_version)
+        if policy_wanted == "attach" and not attached:
+            policy_action = "attach"
+        elif policy_wanted == "detach" and attached:
+            policy_action = "detach"
     if policy_action:
         changed = True
         if not module.check_mode:
             _change_policy_membership(
                 module, blade, fs_name, api_version, policy_action
             )
-    if recover or patch_body:
+    if patch_body:
         changed = True
         if not module.check_mode:
-            context_kwargs = _context_kwargs(module, api_version)
-            if recover:
-                res = blade.patch_file_systems(
-                    names=[fs_name],
-                    file_system=FileSystemPatch(destroyed=new_fsys["destroyed"]),
-                    **context_kwargs
-                )
-                if res.status_code != 200:
-                    module.fail_json(
-                        msg="Failed to update filesystem {0} deleted status. Error {1}".format(
-                            fs_name, get_error_message(res)
-                        )
+            res = blade.patch_file_systems(
+                names=[fs_name],
+                file_system=FileSystemPatch(**patch_body),
+                discard_non_snapshotted_data=module.params["discard_snaps"],
+                ignore_usage=module.params["ignore_usage"],
+                **context_kwargs
+            )
+            if res.status_code != 200:
+                module.fail_json(
+                    msg="Failed to update filesystem {0}. Error {1}".format(
+                        fs_name, get_error_message(res)
                     )
-            if patch_body:
-                res = blade.patch_file_systems(
-                    names=[fs_name],
-                    file_system=FileSystemPatch(**patch_body),
-                    discard_non_snapshotted_data=module.params["discard_snaps"],
-                    ignore_usage=module.params["ignore_usage"],
-                    **context_kwargs
                 )
-                if res.status_code != 200:
-                    module.fail_json(
-                        msg="Failed to update filesystem {0}. Error {1}".format(
-                            fs_name, get_error_message(res)
-                        )
-                    )
     if failover in ("quiesce", "skip_quiesce", "abort_quiesce"):
         changed = True
         if not module.check_mode:

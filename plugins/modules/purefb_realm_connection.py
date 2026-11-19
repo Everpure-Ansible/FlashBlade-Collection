@@ -75,6 +75,9 @@ options:
     description:
     - Whether the realm connection between I(realm) and I(remote_realm)
       should exist.
+    - With C(absent), a I(realm) that does not exist or is destroyed is
+      reported as unchanged. The task fails when the FlashBlade cannot
+      answer the lookup of I(realm).
     - Not used when I(generate_key) or I(invalidate_keys) is set.
     type: str
     default: present
@@ -150,15 +153,6 @@ EXAMPLES = r"""
   register: remote_key
   no_log: true
 
-- name: Generate a connection key as an administrator scoped to realm finance-dr
-  everpure.flashblade.purefb_realm_connection:
-    realm: finance-dr
-    generate_key: true
-    fb_url: 10.10.10.20
-    api_token: T-3c1d9e2f-6b4a-4f0e-8d7c-5a9b1e2f3c4d
-  register: realm_admin_key
-  no_log: true
-
 - name: Connect local realm finance with the key generated above
   everpure.flashblade.purefb_realm_connection:
     realm: finance
@@ -166,6 +160,15 @@ EXAMPLES = r"""
     connection_key: "{{ remote_key.key.connection_key }}"
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+  no_log: true
+
+- name: Generate a connection key as an administrator scoped to realm finance-dr
+  everpure.flashblade.purefb_realm_connection:
+    realm: finance-dr
+    generate_key: true
+    fb_url: 10.10.10.20
+    api_token: T-3c1d9e2f-6b4a-4f0e-8d7c-5a9b1e2f3c4d
+  register: realm_admin_key
   no_log: true
 
 - name: Invalidate all outstanding connection keys of realm finance-dr
@@ -275,6 +278,9 @@ VERSION = "1.5"
 USER_AGENT_BASE = "Ansible"
 MIN_REQUIRED_API_VERSION = "2.25"
 WAIT_INTERVAL = 5
+# HTTP status of a realm lookup that says the realm is not there (missing,
+# destroyed or hidden from the user).
+REALM_NOT_THERE_CODES = (400, 404)
 
 
 def _user_agent():
@@ -291,11 +297,24 @@ def _user_agent():
 
 
 def _realm_error(module, blade):
-    """Return None for a live local realm, else the FlashBlade's reason."""
+    """Return (None, None) for a live local realm, else the status code and reason."""
     res = blade.get_realms(destroyed=False, names=[module.params["realm"]])
     if res.status_code == 200:
-        return None
-    return str(get_error_message(res) or "Unknown error")
+        return None, None
+    return res.status_code, str(get_error_message(res) or "Unknown error")
+
+
+def _realm_not_there(status_code, reason):
+    """Whether a failed realm lookup says the realm is missing, destroyed or hidden.
+
+    False means the lookup itself failed and says nothing about the realm.
+    """
+    reason = reason.lower()
+    return (
+        status_code in REALM_NOT_THERE_CODES
+        or "does not exist" in reason
+        or "destroyed" in reason
+    )
 
 
 def _connection_filter(module):
@@ -606,9 +625,13 @@ def main():
             )
         )
 
-    realm_error = _realm_error(module, blade)
+    realm_status, realm_error = _realm_error(module, blade)
     if realm_error is not None:
-        if state == "absent" and not key_operation:
+        if (
+            state == "absent"
+            and not key_operation
+            and _realm_not_there(realm_status, realm_error)
+        ):
             module.exit_json(changed=False, connection=None)
         msg = "Realm {0} is not available. Error: {1}".format(
             module.params["realm"], realm_error

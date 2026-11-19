@@ -84,6 +84,8 @@ REALM_MISSING = "Realm does not exist."
 REALM_DESTROYED = "Realm has been destroyed."
 REMOTE_REALM_MISSING = "Remote Realm does not exist."
 NO_MATCHING_KEY = "Cannot find any connection that matches realm and key"
+# What the SDK reports for an error whose body is not JSON (not an array text)
+NO_JSON_BODY = "Response is not a valid JSON"
 
 
 class _Version:
@@ -190,6 +192,7 @@ def _blade(
     remote_realm_visible=True,
     realm_error=REALM_MISSING,
     array_connections=None,
+    realm_status=400,
 ):
     """A FlashBlade as an array administrator sees it, unless told otherwise.
 
@@ -201,7 +204,7 @@ def _blade(
     if realm_exists:
         blade.get_realms.return_value = _response(items=[Mock()])
     else:
-        blade.get_realms.return_value = _response(400, error=realm_error)
+        blade.get_realms.return_value = _response(realm_status, error=realm_error)
     blade.get_realm_connections.return_value = _response(items=connections or [])
     if remote_realm_visible:
         blade.get_remote_realms.return_value = _response(items=[Mock()])
@@ -1119,6 +1122,117 @@ class TestPurefbRealmConnection:
             _run()
 
         blade.post_realm_connections_connection_key.assert_not_called()
+        module.fail_json.assert_called_once_with(
+            msg="Realm finance is not available. Error: Operation not permitted."
+        )
+
+    # ---------------- state=absent when the realm lookup itself fails ----------------
+
+    def test_main_absent_fails_when_the_realm_lookup_gets_no_answer(self):
+        """state=absent is not reported as unchanged when the lookup itself fails
+
+        The text is what the SDK reports for an error body that is not JSON;
+        with the status it stands for any server-side failure. It was not
+        taken from an array.
+        """
+        module = _module(state="absent")
+        blade = _blade(realm_exists=False, realm_status=503, realm_error=NO_JSON_BODY)
+        with _patched_main(module, blade):
+            _run()
+
+        module.exit_json.assert_not_called()
+        blade.get_realm_connections.assert_not_called()
+        blade.delete_realm_connections.assert_not_called()
+        module.fail_json.assert_called_once_with(
+            msg="Realm finance is not available. Error: Response is not a valid JSON"
+        )
+
+    def test_main_absent_check_mode_fails_when_the_realm_lookup_gets_no_answer(self):
+        """Check mode reports the failed lookup like the real run"""
+        module = _module(check_mode=True, state="absent")
+        blade = _blade(realm_exists=False, realm_status=503, realm_error=NO_JSON_BODY)
+        with _patched_main(module, blade):
+            _run()
+
+        module.exit_json.assert_not_called()
+        blade.delete_realm_connections.assert_not_called()
+        module.fail_json.assert_called_once_with(
+            msg="Realm finance is not available. Error: Response is not a valid JSON"
+        )
+
+    def test_main_absent_failed_lookup_without_error_text(self):
+        """A failed lookup that carries no error text still stops state=absent"""
+        module = _module(state="absent")
+        blade = _blade(realm_exists=False, realm_status=500, realm_error=None)
+        with _patched_main(module, blade):
+            _run()
+
+        module.exit_json.assert_not_called()
+        module.fail_json.assert_called_once_with(
+            msg="Realm finance is not available. Error: Unknown error"
+        )
+
+    def test_main_absent_is_noop_for_a_404_realm_lookup(self):
+        """A 404 for the realm is read like the 400 the FlashBlade answers
+
+        Purity//FB 4.8.8 answers 400 for a missing realm. 404 is accepted in
+        case another version answers it; it has not been seen on an array.
+        """
+        module = _module(state="absent")
+        blade = _blade(realm_exists=False, realm_status=404)
+        with _patched_main(module, blade):
+            _run()
+
+        module.fail_json.assert_not_called()
+        blade.delete_realm_connections.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False, connection=None)
+
+    def test_main_absent_is_noop_when_only_the_text_says_the_realm_is_missing(self):
+        """The FlashBlade's words keep state=absent a no-op whatever the status
+
+        A missing realm with a status other than 400 or 404 has not been seen
+        on an array; the no-op must not depend on the status alone.
+        """
+        module = _module(state="absent")
+        blade = _blade(realm_exists=False, realm_status=403)
+        with _patched_main(module, blade):
+            _run()
+
+        module.fail_json.assert_not_called()
+        blade.delete_realm_connections.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False, connection=None)
+
+    def test_main_absent_is_noop_when_only_the_text_says_the_realm_is_destroyed(self):
+        """A destroyed realm keeps state=absent a no-op whatever the status
+
+        The status is made up; the FlashBlade answered 400 for a destroyed realm.
+        """
+        module = _module(state="absent")
+        blade = _blade(
+            realm_exists=False, realm_status=409, realm_error=REALM_DESTROYED
+        )
+        with _patched_main(module, blade):
+            _run()
+
+        module.fail_json.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False, connection=None)
+
+    def test_main_absent_fails_on_a_refusal_that_is_not_about_the_realm(self):
+        """A status and a text that say nothing about the realm stop state=absent
+
+        The text is the FlashBlade's usual refusal; it has not been seen with
+        this status on the realm lookup.
+        """
+        module = _module(state="absent")
+        blade = _blade(
+            realm_exists=False,
+            realm_status=403,
+            realm_error="Operation not permitted.",
+        )
+        with _patched_main(module, blade):
+            _run()
+
+        module.exit_json.assert_not_called()
         module.fail_json.assert_called_once_with(
             msg="Realm finance is not available. Error: Operation not permitted."
         )

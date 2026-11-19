@@ -12,6 +12,8 @@ import multiprocessing
 import ctypes
 from unittest.mock import Mock, patch, MagicMock
 
+import pytest
+
 # Mock multiprocessing context for Windows
 if sys.platform == "win32":
     original_get_context = multiprocessing.get_context
@@ -94,6 +96,7 @@ from plugins.modules.purefb_fs import (
     eradicate_fs,
     modify_fs,
     _check_create_only_options,
+    _resolve_name,
 )
 from plugins.module_utils.version import LooseVersion as RealLooseVersion
 
@@ -5173,8 +5176,8 @@ class TestPurefbFs:
         """Test modifying a filesystem that has a realm association works correctly
 
         This test verifies that filesystems with realm associations can still be
-        modified (e.g., size changes) without issues. The realm parameter is only
-        used during creation and is ignored during modifications.
+        modified (e.g., size changes) without issues. The realm parameter only
+        resolves a short name to realm::name; it is not part of the request.
         """
         # This is a documentation test that verifies realm doesn't break modifications
         # The actual modify_fs logic doesn't need special handling for realms
@@ -5225,8 +5228,8 @@ class TestPurefbFs:
         mock_get_system.return_value = mock_blade
 
         # Mock get_filesystem behavior:
-        # First call with name='prod-fs' returns None (not found)
-        # Second call with name='production-realm::prod-fs' returns the filesystem
+        # name='prod-fs' (outside the realm) returns None (not found)
+        # name='production-realm::prod-fs' returns the filesystem
         mock_fs = Mock()
         mock_fs.name = "production-realm::prod-fs"
         mock_fs.provisioned = 1099511627776
@@ -6271,3 +6274,423 @@ class TestPurefbFs:
         assert "Storage classes are not supported on this product." in msg
         assert "test-fs" in msg
         mock_module.exit_json.assert_not_called()
+
+    # ==== realm option with a short name: a namesake outside the realm ====
+
+    REALM_FS = "production-realm::prod-fs"
+    GIB = 1073741824
+
+    def _realm_params(self, **overrides):
+        """Default params for the short name prod-fs in production-realm."""
+        params = self.get_default_params()
+        params.update({"name": "prod-fs", "realm": "production-realm"})
+        params.update(overrides)
+        return params
+
+    def _namesakes(self, array_level=None, in_realm=None):
+        """The filesystems on the array, keyed by name. ``array_level`` and
+        ``in_realm`` are _existing_fs overrides; None leaves that one out.
+        """
+        found = {}
+        if array_level is not None:
+            found["prod-fs"] = self._existing_fs(name="prod-fs", **array_level)
+        if in_realm is not None:
+            found[self.REALM_FS] = self._existing_fs(name=self.REALM_FS, **in_realm)
+        return found
+
+    @patch("plugins.modules.purefb_fs.FileSystemPatch")
+    @patch("plugins.modules.purefb_fs.get_filesystem")
+    @patch("plugins.modules.purefb_fs.get_system")
+    @patch("plugins.modules.purefb_fs.AnsibleModule")
+    @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.30"),
+    )
+    def _run_main_on(
+        self,
+        params,
+        found,
+        mock_ansible_module,
+        mock_get_system,
+        mock_get_filesystem,
+        mock_fs_patch,
+        check_mode=False,
+    ):
+        """Run main() against an array holding the filesystems in ``found``
+        (name -> mock filesystem). exit_json and fail_json end the run as
+        they do in Ansible. Returns (module, blade, lookups, fs_patch):
+        ``lookups`` lists every filesystem name the module read, in order,
+        and ``fs_patch`` is the patched FileSystemPatch class.
+        """
+        mock_module = Mock()
+        mock_module.check_mode = check_mode
+        mock_module.params = params
+        mock_module.exit_json.side_effect = SystemExit(0)
+        mock_module.fail_json.side_effect = SystemExit(1)
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_get_system.return_value = mock_blade
+        ok = Mock()
+        ok.status_code = 200
+        for write in ("post_file_systems", "patch_file_systems", "delete_file_systems"):
+            getattr(mock_blade, write).return_value = ok
+        mock_blade.get_realms.return_value = ok
+        lookups = []
+
+        def by_name(module, blade):
+            lookups.append(module.params["name"])
+            return found.get(module.params["name"])
+
+        def by_filter(**kwargs):
+            wanted = kwargs["filter"][len("name='") : -1]
+            lookups.append(wanted)
+            res = Mock()
+            res.status_code = 200
+            res.items = [fs for name, fs in found.items() if name == wanted]
+            return res
+
+        mock_get_filesystem.side_effect = by_name
+        mock_blade.get_file_systems.side_effect = by_filter
+        try:
+            main()
+        except SystemExit:
+            pass
+        return mock_module, mock_blade, lookups, mock_fs_patch
+
+    def _written_names(self, mock_blade):
+        """Every filesystem name a write request was sent for."""
+        names = []
+        for write in ("post_file_systems", "patch_file_systems", "delete_file_systems"):
+            for call in getattr(mock_blade, write).call_args_list:
+                names.extend(call.kwargs["names"])
+        return names
+
+    def test_resolve_name_short_name_with_realm_is_qualified(self):
+        mock_module = Mock()
+        mock_module.params = {"name": "prod-fs", "realm": "production-realm"}
+        assert _resolve_name(mock_module) == self.REALM_FS
+        mock_module.fail_json.assert_not_called()
+
+    def test_resolve_name_without_realm_is_unchanged(self):
+        """No realm option: a short name stays short (outside every realm)
+        and a qualified name is used as it is."""
+        for name, realm in (
+            ("prod-fs", None),
+            ("prod-fs", ""),
+            (self.REALM_FS, None),
+        ):
+            mock_module = Mock()
+            mock_module.params = {"name": name, "realm": realm}
+            assert _resolve_name(mock_module) == name
+            mock_module.fail_json.assert_not_called()
+
+    def test_resolve_name_qualified_name_agreeing_with_realm(self):
+        mock_module = Mock()
+        mock_module.params = {"name": self.REALM_FS, "realm": "production-realm"}
+        assert _resolve_name(mock_module) == self.REALM_FS
+        mock_module.fail_json.assert_not_called()
+
+    def test_resolve_name_realm_spelled_in_another_case_agrees(self):
+        """The realm in the name and the realm option are compared without
+        regard to case, and the name is used as it was given."""
+        mock_module = Mock()
+        mock_module.params = {
+            "name": "Production-Realm::prod-fs",
+            "realm": "production-realm",
+        }
+        assert _resolve_name(mock_module) == "Production-Realm::prod-fs"
+        mock_module.fail_json.assert_not_called()
+
+    def test_resolve_name_qualified_name_in_another_realm_fails(self):
+        mock_module = Mock()
+        mock_module.params = {
+            "name": "other-realm::prod-fs",
+            "realm": "production-realm",
+        }
+        mock_module.fail_json.side_effect = SystemExit(1)
+        with pytest.raises(SystemExit):
+            _resolve_name(mock_module)
+        msg = mock_module.fail_json.call_args.kwargs["msg"]
+        assert "other-realm::prod-fs" in msg
+        assert "production-realm" in msg
+
+    def test_main_realm_short_name_is_compared_with_the_realm_fs(self):
+        """Both names exist. The request matches the namesake outside the
+        realm (2G, snapshot directory and hard limit on) but not the realm
+        filesystem (1G, both off): the realm filesystem is the one read,
+        and the PATCH carries its own flags, not the namesake's.
+        """
+        found = self._namesakes(
+            array_level={
+                "provisioned": 2 * self.GIB,
+                "snapshot_directory_enabled": True,
+                "hard_limit_enabled": True,
+            },
+            in_realm={"provisioned": self.GIB},
+        )
+        mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(
+            self._realm_params(size="2G"), found
+        )
+
+        assert lookups and set(lookups) == {self.REALM_FS}
+        mock_blade.patch_file_systems.assert_called_once()
+        assert self._written_names(mock_blade) == [self.REALM_FS]
+        kwargs = mock_fs_patch.call_args.kwargs
+        assert kwargs["provisioned"] == 2 * self.GIB
+        assert kwargs["snapshot_directory_enabled"] is False
+        assert kwargs["hard_limit_enabled"] is False
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_main_realm_short_name_matching_the_realm_fs_is_noop(self):
+        """Both names exist and the request matches the realm filesystem:
+        nothing is sent, whatever the namesake outside the realm looks like,
+        in check mode as well."""
+        for check_mode in (False, True):
+            found = self._namesakes(
+                array_level={"provisioned": 2 * self.GIB, "hard_limit_enabled": True},
+                in_realm={"provisioned": self.GIB},
+            )
+            mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(
+                self._realm_params(size="1G"), found, check_mode=check_mode
+            )
+
+            assert set(lookups) == {self.REALM_FS}
+            assert self._written_names(mock_blade) == []
+            mock_module.exit_json.assert_called_once_with(changed=False)
+
+    def test_main_realm_short_name_creates_when_only_the_namesake_exists(self):
+        """Only the filesystem outside the realm exists: state=present
+        creates realm::name instead of modifying through the namesake."""
+        found = self._namesakes(array_level={"provisioned": 2 * self.GIB})
+        mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(
+            self._realm_params(size="1G"), found
+        )
+
+        assert set(lookups) == {self.REALM_FS}
+        mock_blade.post_file_systems.assert_called_once()
+        written = self._written_names(mock_blade)
+        assert written and set(written) == {self.REALM_FS}
+        mock_blade.delete_file_systems.assert_not_called()
+        mock_module.fail_json.assert_not_called()
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_main_realm_short_name_create_check_mode_writes_nothing(self):
+        found = self._namesakes(array_level={"provisioned": 2 * self.GIB})
+        mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(
+            self._realm_params(size="1G"), found, check_mode=True
+        )
+
+        assert set(lookups) == {self.REALM_FS}
+        assert self._written_names(mock_blade) == []
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_main_realm_short_name_absent_when_only_the_namesake_exists(self):
+        """Only the filesystem outside the realm exists: state=absent has
+        nothing to delete and must not send a delete for realm::name, with
+        or without eradicate and in check mode."""
+        for overrides, check_mode in (
+            ({}, False),
+            ({"eradicate": True}, False),
+            ({}, True),
+        ):
+            found = self._namesakes(array_level={"provisioned": 2 * self.GIB})
+            mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(
+                self._realm_params(state="absent", **overrides),
+                found,
+                check_mode=check_mode,
+            )
+
+            assert set(lookups) == {self.REALM_FS}
+            assert self._written_names(mock_blade) == []
+            mock_module.fail_json.assert_not_called()
+            mock_module.exit_json.assert_called_once_with(changed=False)
+
+    def test_main_realm_short_name_absent_ignores_a_destroyed_namesake(self):
+        """The namesake outside the realm is destroyed, the realm filesystem
+        is live: state=absent destroys the realm filesystem, and with
+        eradicate=true destroys and then eradicates it. The destroyed
+        namesake does not turn the request into a no-op or a bare eradicate.
+        """
+        for eradicate in (False, True):
+            found = self._namesakes(array_level={"destroyed": True}, in_realm={})
+            mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(
+                self._realm_params(state="absent", eradicate=eradicate), found
+            )
+
+            assert set(lookups) == {self.REALM_FS}
+            mock_blade.patch_file_systems.assert_called_once()
+            assert mock_fs_patch.call_args.kwargs["destroyed"] is True
+            written = [self.REALM_FS, self.REALM_FS] if eradicate else [self.REALM_FS]
+            assert self._written_names(mock_blade) == written
+            assert mock_blade.delete_file_systems.call_count == int(eradicate)
+            mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_main_realm_short_name_eradicates_the_destroyed_realm_fs(self):
+        """The namesake outside the realm is live, the realm filesystem is
+        destroyed: eradicate=true eradicates the realm filesystem only, and
+        the live namesake does not turn the request into a destroy."""
+        found = self._namesakes(array_level={}, in_realm={"destroyed": True})
+        mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(
+            self._realm_params(state="absent", eradicate=True), found
+        )
+
+        assert set(lookups) == {self.REALM_FS}
+        mock_blade.patch_file_systems.assert_not_called()
+        mock_blade.delete_file_systems.assert_called_once_with(names=[self.REALM_FS])
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_main_realm_short_name_recovers_the_destroyed_realm_fs(self):
+        """The namesake outside the realm is live, the realm filesystem is
+        destroyed: state=present recovers the realm filesystem."""
+        found = self._namesakes(array_level={}, in_realm={"destroyed": True})
+        mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(
+            self._realm_params(), found
+        )
+
+        assert set(lookups) == {self.REALM_FS}
+        written = self._written_names(mock_blade)
+        assert written and set(written) == {self.REALM_FS}
+        assert mock_fs_patch.call_args_list[0].kwargs == {"destroyed": False}
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_main_short_name_without_realm_never_reads_the_realm_fs(self):
+        """No realm option: the short name means the filesystem outside
+        every realm, also when a realm holds a filesystem of that name."""
+        found = self._namesakes(
+            array_level={"provisioned": 2 * self.GIB, "hard_limit_enabled": True},
+            in_realm={"provisioned": self.GIB},
+        )
+        params = self.get_default_params()
+        params.update({"name": "prod-fs", "size": "1G"})
+        mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(
+            params, found
+        )
+
+        assert lookups and set(lookups) == {"prod-fs"}
+        assert self._written_names(mock_blade) == ["prod-fs"]
+        kwargs = mock_fs_patch.call_args.kwargs
+        assert kwargs["provisioned"] == self.GIB
+        assert kwargs["hard_limit_enabled"] is True
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_main_short_name_without_realm_when_only_the_realm_fs_exists(self):
+        """No realm option and only the realm filesystem exists: the short
+        name is not found, so state=absent is a no-op and state=present
+        creates the filesystem outside every realm."""
+        found = self._namesakes(in_realm={"provisioned": self.GIB})
+        params = self.get_default_params()
+        params.update({"name": "prod-fs", "state": "absent", "eradicate": True})
+        mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(
+            params, found
+        )
+
+        assert set(lookups) == {"prod-fs"}
+        assert self._written_names(mock_blade) == []
+        mock_module.exit_json.assert_called_once_with(changed=False)
+
+        found = self._namesakes(in_realm={"provisioned": self.GIB})
+        params = self.get_default_params()
+        params.update({"name": "prod-fs", "size": "1G"})
+        mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(
+            params, found
+        )
+
+        assert set(lookups) == {"prod-fs"}
+        mock_blade.post_file_systems.assert_called_once()
+        assert set(self._written_names(mock_blade)) == {"prod-fs"}
+        mock_blade.get_realms.assert_not_called()
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_main_qualified_name_agreeing_with_realm_is_accepted(self):
+        """realm::name together with the same realm option addresses the
+        realm filesystem, like the short name does."""
+        found = self._namesakes(
+            array_level={"provisioned": 2 * self.GIB},
+            in_realm={"provisioned": self.GIB},
+        )
+        mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(
+            self._realm_params(name=self.REALM_FS, size="2G"), found
+        )
+
+        assert lookups and set(lookups) == {self.REALM_FS}
+        assert self._written_names(mock_blade) == [self.REALM_FS]
+        mock_module.fail_json.assert_not_called()
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_main_qualified_name_in_another_realm_fails_before_any_lookup(self):
+        """A realm-qualified name that names another realm than the realm
+        option is refused before the array is contacted, in check mode as
+        well."""
+        for state, check_mode in (
+            ("present", False),
+            ("present", True),
+            ("absent", False),
+        ):
+            found = self._namesakes(array_level={}, in_realm={})
+            found["other-realm::prod-fs"] = self._existing_fs()
+            mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(
+                self._realm_params(name="other-realm::prod-fs", state=state),
+                found,
+                check_mode=check_mode,
+            )
+
+            mock_module.fail_json.assert_called_once()
+            msg = mock_module.fail_json.call_args.kwargs["msg"]
+            assert "other-realm::prod-fs" in msg
+            assert "production-realm" in msg
+            assert lookups == []
+            assert mock_blade.mock_calls == []
+            mock_module.exit_json.assert_not_called()
+
+    def test_main_realm_short_name_ignores_a_namesake_in_another_realm(self):
+        """The short name also exists outside every realm and in another
+        realm, but not in the realm of the task: state=present creates it
+        in that realm and state=absent has nothing to delete. Neither
+        namesake is read or written."""
+        for state, written in (("present", {self.REALM_FS}), ("absent", set())):
+            found = self._namesakes(array_level={"provisioned": 2 * self.GIB})
+            found["other-realm::prod-fs"] = self._existing_fs(
+                name="other-realm::prod-fs", provisioned=3 * self.GIB
+            )
+            mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(
+                self._realm_params(state=state, size="1G"), found
+            )
+
+            assert set(lookups) == {self.REALM_FS}
+            assert set(self._written_names(mock_blade)) == written
+            mock_module.fail_json.assert_not_called()
+            mock_module.exit_json.assert_called_once_with(changed=state == "present")
+
+    def test_main_realm_short_name_check_mode_change_writes_nothing(self):
+        """Both names exist and the request differs from the realm
+        filesystem but not from the namesake: check mode reports the change
+        a real run makes and sends nothing."""
+        found = self._namesakes(
+            array_level={"provisioned": 2 * self.GIB},
+            in_realm={"provisioned": self.GIB},
+        )
+        mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(
+            self._realm_params(size="2G"), found, check_mode=True
+        )
+
+        assert set(lookups) == {self.REALM_FS}
+        assert self._written_names(mock_blade) == []
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_main_realm_short_name_absent_check_mode_writes_nothing(self):
+        """The namesake outside the realm is destroyed, the realm filesystem
+        is live: state=absent in check mode reports the destroy a real run
+        makes, with and without eradicate, and sends nothing."""
+        for eradicate in (False, True):
+            found = self._namesakes(array_level={"destroyed": True}, in_realm={})
+            mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(
+                self._realm_params(state="absent", eradicate=eradicate),
+                found,
+                check_mode=True,
+            )
+
+            assert set(lookups) == {self.REALM_FS}
+            assert self._written_names(mock_blade) == []
+            mock_module.exit_json.assert_called_once_with(changed=True)

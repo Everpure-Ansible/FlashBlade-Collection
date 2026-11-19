@@ -282,6 +282,15 @@ class TestPurefbSshCaPolicy:
                 pass
             assert "exempt" in _fail_msg(module)
 
+    def test_validate_admins_rejects_duplicates_in_another_case(self):
+        """The array resolves admin names without regard to case"""
+        module = _make_module(_base_params(admins=["alice", "ALICE"]))
+        try:
+            _validate_admins(module)
+        except SystemExit:
+            pass
+        assert "Duplicate" in _fail_msg(module)
+
     def test_get_policy_returns_first_item(self):
         """_get_policy returns the policy when the GET has an item"""
         policy = _policy()
@@ -360,6 +369,14 @@ class TestPurefbSshCaPolicy:
         assert to_add == set()
         assert to_remove == {("array", "myblade")}
 
+    def test_desired_member_changes_admins_ignore_case(self):
+        """Admins are matched without regard to case; a detach uses the array spelling"""
+        module = _make_module(_base_params(admins=["ALICE", "carol"]))
+        current = {("admin", "Alice"), ("admin", "Bob"), ("admin", "IR")}
+        to_add, to_remove = _desired_member_changes(module, _blade(), current)
+        assert to_add == {("admin", "carol")}
+        assert to_remove == {("admin", "Bob")}
+
     # ---------------- main(): version gates ----------------
 
     def test_main_fails_below_minimum_version(self):
@@ -429,6 +446,27 @@ class TestPurefbSshCaPolicy:
         assert kwargs["policy"] == {
             "signing_authority": {"name": "corp-ca", "resource_type": "certificates"}
         }
+
+    def test_main_create_realm_certificate_signer(self):
+        """A certificate that lives in a realm is sent under its realm::name"""
+        blade = _blade()
+        module = _run_main(
+            _base_params(
+                signing_authority="realm1::corp-ca",
+                signing_authority_type="certificate",
+            ),
+            blade,
+        )
+        blade.post_ssh_certificate_authority_policies.assert_called_once_with(
+            names=["ssh-ca"],
+            policy={
+                "signing_authority": {
+                    "name": "realm1::corp-ca",
+                    "resource_type": "certificates",
+                }
+            },
+        )
+        module.exit_json.assert_called_once_with(changed=True)
 
     def test_main_create_requires_signing_authority(self):
         """Creating without a signer fails before the POST"""
@@ -580,6 +618,122 @@ class TestPurefbSshCaPolicy:
             "signing_authority": {"name": "ca-key", "resource_type": "certificates"}
         }
 
+    def test_main_update_signer_case_is_not_a_change(self):
+        """The signer name is compared without regard to case, its type still counts"""
+        for signer_type, check_mode in (
+            (None, False),
+            ("public_key", False),
+            (None, True),
+            ("public_key", True),
+        ):
+            blade = _blade(existing=_policy(signer="ca-key"))
+            module = _run_main(
+                _base_params(
+                    signing_authority="CA-Key", signing_authority_type=signer_type
+                ),
+                blade,
+                check_mode=check_mode,
+            )
+            blade.patch_ssh_certificate_authority_policies.assert_not_called()
+            module.exit_json.assert_called_once_with(changed=False)
+
+        blade = _blade(existing=_policy(signer="ca-key"))
+        module = _run_main(
+            _base_params(
+                signing_authority="CA-Key", signing_authority_type="certificate"
+            ),
+            blade,
+        )
+        blade.patch_ssh_certificate_authority_policies.assert_called_once_with(
+            names=["ssh-ca"],
+            policy={
+                "signing_authority": {"name": "CA-Key", "resource_type": "certificates"}
+            },
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_main_update_realm_signer_case_is_not_a_change(self):
+        """A realm certificate named in another case sends no PATCH"""
+        for desired in (
+            "realm1::corp-ca",
+            "REALM1::corp-ca",
+            "realm1::CORP-CA",
+            "Realm1::Corp-Ca",
+        ):
+            blade = _blade(
+                existing=_policy(signer="realm1::corp-ca", signer_type="certificates")
+            )
+            module = _run_main(_base_params(signing_authority=desired), blade)
+            blade.patch_ssh_certificate_authority_policies.assert_not_called()
+            module.exit_json.assert_called_once_with(changed=False)
+
+    def test_main_update_realm_signer_case_check_mode(self):
+        """Check mode reports no change for a realm certificate in another case"""
+        blade = _blade(
+            existing=_policy(signer="realm1::corp-ca", signer_type="certificates"),
+            members=[_member("alice", "admins")],
+        )
+        module = _run_main(
+            _base_params(
+                signing_authority="REALM1::Corp-CA",
+                signing_authority_type="certificate",
+            ),
+            blade,
+            check_mode=True,
+        )
+        blade.patch_ssh_certificate_authority_policies.assert_not_called()
+        module.warn.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+    def test_main_update_realm_prefix_of_signer_counts(self):
+        """Only the case is ignored: the same leaf name outside the realm is another signer"""
+        existing = _policy(signer="realm1::corp-ca", signer_type="certificates")
+        blade = _blade(existing=existing)
+        module = _run_main(_base_params(signing_authority="REALM1::CORP-CA"), blade)
+        blade.patch_ssh_certificate_authority_policies.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+        for desired in ("corp-ca", "CORP-CA", "realm2::corp-ca"):
+            blade = _blade(existing=existing)
+            module = _run_main(_base_params(signing_authority=desired), blade)
+            blade.patch_ssh_certificate_authority_policies.assert_called_once_with(
+                names=["ssh-ca"],
+                policy={
+                    "signing_authority": {
+                        "name": desired,
+                        "resource_type": "certificates",
+                    }
+                },
+            )
+            module.exit_json.assert_called_once_with(changed=True)
+
+    def test_main_update_array_signer_to_realm_signer(self):
+        """The certificate of the same leaf name inside a realm is another signer"""
+        for desired, check_mode in (
+            ("realm1::corp-ca", False),
+            ("REALM1::CORP-CA", False),
+            ("realm1::corp-ca", True),
+        ):
+            blade = _blade(
+                existing=_policy(signer="corp-ca", signer_type="certificates")
+            )
+            module = _run_main(
+                _base_params(signing_authority=desired), blade, check_mode=check_mode
+            )
+            if check_mode:
+                blade.patch_ssh_certificate_authority_policies.assert_not_called()
+            else:
+                blade.patch_ssh_certificate_authority_policies.assert_called_once_with(
+                    names=["ssh-ca"],
+                    policy={
+                        "signing_authority": {
+                            "name": desired,
+                            "resource_type": "certificates",
+                        }
+                    },
+                )
+            module.exit_json.assert_called_once_with(changed=True)
+
     def test_main_update_clears_principals(self):
         """An empty list clears principals that are currently set"""
         blade = _blade(existing=_policy(principals=["ops"]))
@@ -661,6 +815,56 @@ class TestPurefbSshCaPolicy:
         blade.post_ssh_certificate_authority_policies_admins.assert_not_called()
         blade.delete_ssh_certificate_authority_policies_admins.assert_not_called()
         module.exit_json.assert_called_once_with(changed=True)
+
+    def test_main_members_admin_case_is_not_a_change(self):
+        """An attached admin named in another case is neither detached nor attached again"""
+        for check_mode in (False, True):
+            blade = _blade(existing=_policy(), members=[_member("alice", "admins")])
+            module = _run_main(
+                _base_params(admins=["ALICE"]), blade, check_mode=check_mode
+            )
+            blade.post_ssh_certificate_authority_policies_admins.assert_not_called()
+            blade.delete_ssh_certificate_authority_policies_admins.assert_not_called()
+            blade.get_admins.assert_not_called()
+            module.exit_json.assert_called_once_with(changed=False)
+
+    def test_main_members_detach_uses_array_spelling(self):
+        """Only the unlisted admin is detached, by the name the array reports"""
+        blade = _blade(
+            existing=_policy(),
+            members=[_member("Alice", "admins"), _member("Bob", "admins")],
+        )
+        module = _run_main(_base_params(admins=["alice", "Carol"]), blade)
+        blade.delete_ssh_certificate_authority_policies_admins.assert_called_once_with(
+            policy_names=["ssh-ca"], member_names=["Bob"]
+        )
+        blade.get_admins.assert_called_once_with(names=["Carol"])
+        blade.post_ssh_certificate_authority_policies_admins.assert_called_once_with(
+            policy_names=["ssh-ca"], member_names=["Carol"]
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_main_rejects_admin_duplicate_in_another_case(self):
+        """The same admin in two spellings is refused before any API call"""
+        blade = _blade(existing=_policy())
+        module = _run_main(_base_params(admins=["alice", "Alice"]), blade)
+        assert "Duplicate" in _fail_msg(module)
+        blade.get_ssh_certificate_authority_policies.assert_not_called()
+        blade.post_ssh_certificate_authority_policies_admins.assert_not_called()
+
+    def test_main_members_realm_qualified_admin_is_another_name(self):
+        """Admins are array-level: realm::admin is not the attached admin of that leaf name"""
+        for check_mode in (False, True):
+            blade = _blade(existing=_policy(), members=[_member("alice", "admins")])
+            # The array answers a realm-qualified admin name as a missing admin.
+            blade.get_admins.return_value = _resp(400)
+            module = _run_main(
+                _base_params(admins=["realm1::alice"]), blade, check_mode=check_mode
+            )
+            assert "Admin realm1::alice does not exist" in _fail_msg(module)
+            blade.get_admins.assert_called_once_with(names=["realm1::alice"])
+            blade.delete_ssh_certificate_authority_policies_admins.assert_not_called()
+            blade.post_ssh_certificate_authority_policies_admins.assert_not_called()
 
     def test_main_array_detach(self):
         """array=false detaches the array and leaves admins alone"""

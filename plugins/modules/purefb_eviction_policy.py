@@ -37,6 +37,8 @@ options:
   name:
     description:
     - Name of the data eviction policy.
+    - A policy in a realm is named C(realm::policy). The realm is part of
+      the name and is set when the policy is created.
     type: str
     required: true
   state:
@@ -62,9 +64,17 @@ options:
   rename:
     description:
     - New name for the policy.
+    - A rename cannot move a policy into or out of a realm. For a policy in
+      a realm give the new name as C(realm::policy) with the realm of
+      I(name), or as a bare name, which is taken as a name in that realm.
+      A new name in another realm, or a realm on the new name of a policy
+      that is not in one, is refused.
+    - If I(name) exists and another policy already has the new name, the
+      rename is refused.
     - Only takes effect when the policy already exists. If I(name) no
-      longer exists but I(rename) does, the rename is treated as already
-      applied and the policy is managed under its new name.
+      longer exists but a policy with the new name exists in the same
+      realm, the rename is treated as already applied and that policy is
+      managed under its new name.
     type: str
   file_systems:
     description:
@@ -74,6 +84,10 @@ options:
     - Omit to leave existing attachments untouched. Use an empty list to
       detach the policy from every file system.
     - The array only accepts Rapid Replica target file systems.
+    - A policy can only be attached to file systems of its own realm. For
+      a policy in a realm name each file system C(realm::filesystem). A
+      file system of another realm or of no realm is refused, and so is a
+      file system in a realm for a policy that is not in one.
     type: list
     elements: str
   context:
@@ -100,6 +114,15 @@ EXAMPLES = r"""
     name: edge_cache
     file_systems:
       - project_data
+    fb_url: 10.10.10.2
+    api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
+
+- name: Create a policy in a realm and attach a file system of that realm
+  everpure.flashblade.purefb_eviction_policy:
+    name: tenant1::edge_cache
+    keep_size: 500G
+    file_systems:
+      - tenant1::project_data
     fb_url: 10.10.10.2
     api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
 
@@ -155,12 +178,19 @@ policy:
       description: Names of the file systems the policy is attached to.
       type: list
       elements: str
+    realms:
+      description:
+      - Names of the realms the policy belongs to. Empty for a policy that
+        is not in a realm.
+      type: list
+      elements: str
   sample:
     name: edge_cache
     enabled: true
     keep_size: 536870912000
     file_systems:
       - project_data
+    realms: []
 """
 
 HAS_PYPURECLIENT = True
@@ -196,6 +226,70 @@ def _context_kwargs(module):
     if module.params["context"]:
         return {"context_names": [module.params["context"]]}
     return {}
+
+
+def _realm(name):
+    """Return the realm prefix of a realm-scoped name, or an empty string."""
+    if name and "::" in name:
+        return name.split("::", 1)[0]
+    return ""
+
+
+def _leaf(name):
+    """Return a name without its realm prefix."""
+    if name and "::" in name:
+        return name.split("::", 1)[1]
+    return name or ""
+
+
+def _check_realms(module):
+    """Keep the request inside the realm of the policy it names.
+
+    A policy is in a realm when it is named realm::policy, and neither a
+    rename nor an attachment can cross that boundary: the array refuses a
+    new name with a different realm prefix ("Realm can't be changed with
+    rename.") and a file system from another realm or from outside the
+    realm ("Filesystem and policy should be from the same realm."). Both
+    are settled here, before any read or write, so check mode agrees with
+    a real run and the rename-already-applied lookup cannot resolve to a
+    policy with the same name in another scope. A bare new name for a
+    policy in a realm is taken as a name in that realm. The array matches
+    names without regard to case, so the realms are compared that way. It
+    does refuse a new name whose realm is not spelled exactly as in the name
+    the policy is addressed by, so the new name is given the realm as the
+    name option spells it.
+    """
+    name = module.params["name"]
+    realm = _realm(name)
+    rename = module.params["rename"]
+    if rename:
+        if "::" in rename and _realm(rename).lower() != realm.lower():
+            module.fail_json(
+                msg=(
+                    "Cannot rename data eviction policy {0} to {1}: a rename "
+                    "cannot move a policy into or out of a realm."
+                ).format(name, rename)
+            )
+        if realm:
+            module.params["rename"] = "{0}::{1}".format(realm, _leaf(rename))
+    for fs_name in module.params["file_systems"] or []:
+        if _realm(fs_name).lower() == realm.lower():
+            continue
+        if realm:
+            module.fail_json(
+                msg=(
+                    "File system {0} is not in realm {1}. Data eviction policy "
+                    "{2} can only be attached to file systems of its own realm, "
+                    "named {1}::<file system>."
+                ).format(fs_name, realm, name)
+            )
+        module.fail_json(
+            msg=(
+                "File system {0} is in a realm. Data eviction policy {1} is not "
+                "in a realm and can only be attached to file systems that are "
+                "not in one either."
+            ).format(fs_name, name)
+        )
 
 
 def _keep_size_bytes(module):
@@ -244,7 +338,14 @@ def _get_policy(module, blade, name):
 
 
 def _get_members(module, blade):
-    """Return the sorted names of the file systems the policy is attached to."""
+    """Return the sorted names of the file systems the policy is attached to.
+
+    Attachments never cross a realm boundary, so a member of a policy in a
+    realm that the array reports without the realm prefix is qualified with
+    the realm of the policy. The names then compare, attach and detach the
+    same way whichever form the array returns.
+    """
+    realm = _realm(module.params["name"])
     res = blade.get_data_eviction_policies_file_systems(
         policy_names=[module.params["name"]], **_context_kwargs(module)
     )
@@ -258,6 +359,8 @@ def _get_members(module, blade):
     for item in list(res.items):
         member_name = getattr(getattr(item, "member", None), "name", None)
         if member_name:
+            if realm and "::" not in member_name:
+                member_name = "{0}::{1}".format(realm, member_name)
             names.append(member_name)
     return sorted(names)
 
@@ -272,6 +375,11 @@ def _policy_facts(module, blade):
         "enabled": getattr(policy, "enabled", None),
         "keep_size": getattr(policy, "keep_size", None),
         "file_systems": _get_members(module, blade),
+        "realms": [
+            realm.name
+            for realm in (getattr(policy, "realms", None) or [])
+            if getattr(realm, "name", None)
+        ],
     }
 
 
@@ -328,8 +436,12 @@ def _reconcile_members(module, blade):
     """
     desired = sorted(set(module.params["file_systems"]))
     current = _get_members(module, blade)
-    to_attach = [name for name in desired if name not in current]
-    to_detach = [name for name in current if name not in desired]
+    # The array matches names without regard to case, so a file system
+    # listed in another case than the array reports is the attached one.
+    current_keys = set(name.lower() for name in current)
+    desired_keys = set(name.lower() for name in desired)
+    to_attach = [name for name in desired if name.lower() not in current_keys]
+    to_detach = [name for name in current if name.lower() not in desired_keys]
     if not (to_attach or to_detach):
         return False
     if not module.check_mode:
@@ -413,10 +525,26 @@ def update_policy(module, blade, policy):
     if keep_size is not None and keep_size != getattr(policy, "keep_size", None):
         patch_kwargs["keep_size"] = keep_size
 
-    if module.params["rename"] and module.params["rename"] != getattr(
-        policy, "name", None
-    ):
-        patch_kwargs["name"] = module.params["rename"]
+    rename = module.params["rename"]
+    if rename and _leaf(rename) != _leaf(getattr(policy, "name", None)):
+        # _check_realms keeps the new name in the scope of the policy, so
+        # only the part after the realm can differ. The array does not
+        # refuse every new name that another policy already has: inside a
+        # realm it can end up with two policies under one name. Such a
+        # rename is refused here, before any write and in check mode too.
+        # A lookup that returns this policy itself is a rename that only
+        # changes the case of the name.
+        taken = _get_policy(module, blade, rename)
+        if taken is not None and getattr(taken, "id", None) != getattr(
+            policy, "id", None
+        ):
+            module.fail_json(
+                msg=(
+                    "Cannot rename data eviction policy {0} to {1}: a data "
+                    "eviction policy named {1} already exists."
+                ).format(module.params["name"], rename)
+            )
+        patch_kwargs["name"] = rename
 
     if module.params["file_systems"] is not None:
         # Reconcile under the current name; a rename is applied afterwards
@@ -472,18 +600,23 @@ def main():
         )
 
     state = module.params["state"]
+    if state == "present":
+        _check_realms(module)
     policy = _get_policy(module, blade, module.params["name"])
 
     if state == "present" and policy is None and module.params["rename"]:
         # The rename may already have happened on an earlier run: when a
         # policy with the new name exists, manage it under that name and
         # treat the rename as done so a repeated rename task is idempotent.
+        # _check_realms has put the new name in the realm of the old one,
+        # so a policy with the same name in another scope is never picked.
         policy = _get_policy(module, blade, module.params["rename"])
         if policy is None:
             module.fail_json(
-                msg="Cannot rename data eviction policy {0}: policy does not exist.".format(
-                    module.params["name"]
-                )
+                msg=(
+                    "Cannot rename data eviction policy {0}: policy does not "
+                    "exist, and neither does a policy named {1}."
+                ).format(module.params["name"], module.params["rename"])
             )
         module.params["name"] = module.params["rename"]
 

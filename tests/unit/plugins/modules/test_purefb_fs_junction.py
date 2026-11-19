@@ -78,11 +78,15 @@ from plugins.modules.purefb_fs_junction import (
     _leaf,
     _qualify,
     _same_fs,
+    _same_name,
     _get_junction,
     _junction_facts,
     _name_holders,
     _name_refused,
+    _stored_realm,
 )
+
+REALM_REFUSED = "Realms for File system (projects) and File system (alpha) don't match"
 
 NAME_REFUSED = "Cannot create the filesystem junction since it already exists"
 
@@ -1357,3 +1361,491 @@ class TestPurefbFsJunction:
         module.fail_json.assert_not_called()
         assert blade.get_file_system_junctions.call_count == 2
         assert module.exit_json.call_args[1]["changed"] is True
+
+    # ---------------- names compared as the array does ----------------
+
+    def test_same_name_ignores_case(self):
+        assert _same_name("realm1", "REALM1")
+        assert _same_name("", "")
+        assert not _same_name("realm1", "realm2")
+        assert not _same_name("realm1", "")
+
+    def test_same_fs_ignores_the_case_of_a_file_system_name(self):
+        assert _same_fs("fs1", "FS1")
+        assert _same_fs("realm1::fs1", "REALM1::Fs1")
+        assert _same_fs("realm1::FS1", "realm1::fs1")
+        assert not _same_fs("fs1", "FS2")
+        assert not _same_fs("realm1::fs1", "realm1::FS2")
+
+    @patch("plugins.modules.purefb_fs_junction.LooseVersion")
+    @patch("plugins.modules.purefb_fs_junction.get_system")
+    @patch("plugins.modules.purefb_fs_junction.AnsibleModule")
+    @patch("plugins.modules.purefb_fs_junction.HAS_PYPURECLIENT", True)
+    def test_main_unchanged_when_a_file_system_is_spelled_in_another_case(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        """The array resolves a file system name in any case to the same
+        file system, so it is not drift: nothing fails without recreate and
+        nothing is deleted and re-created with it, at array level and in a
+        realm, in a real run and in check mode"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        cases = [
+            # junction on the array, requested name, origin and destination
+            (_junction(), "PROJECTS-ALPHA", "PROJECTS", "Alpha"),
+            (
+                _junction(name="realm1::projects-alpha"),
+                "realm1::projects-alpha",
+                "realm1::PROJECTS",
+                "realm1::ALPHA",
+            ),
+            (
+                _junction(name="realm1::projects-alpha"),
+                "Realm1::Projects-Alpha",
+                "REALM1::Projects",
+                "realm1::alphA",
+            ),
+        ]
+        for existing, name, origin, destination in cases:
+            for recreate in (False, True):
+                for check_mode in (False, True):
+                    module = _module(
+                        _base_params(
+                            name=name,
+                            origin_fs=origin,
+                            destination_fs=destination,
+                            recreate=recreate,
+                        ),
+                        check_mode=check_mode,
+                    )
+                    mock_ansible_module.return_value = module
+                    blade = _blade(existing=existing)
+                    mock_get_system.return_value = blade
+
+                    _run_main()
+
+                    blade.delete_file_system_junctions.assert_not_called()
+                    blade.post_file_system_junctions.assert_not_called()
+                    module.fail_json.assert_not_called()
+                    result = module.exit_json.call_args[1]
+                    assert result["changed"] is False
+                    # the spelling the array stores is returned
+                    prefix = "realm1::" if "::" in existing.name else ""
+                    assert result["junction"] == {
+                        "name": prefix + "projects-alpha",
+                        "origin_fs": prefix + "projects",
+                        "destination_fs": prefix + "alpha",
+                        "path": "/alpha",
+                        "status": "CONNECTED",
+                    }
+
+    @patch("plugins.modules.purefb_fs_junction.LooseVersion")
+    @patch("plugins.modules.purefb_fs_junction.Reference")
+    @patch("plugins.modules.purefb_fs_junction.FileSystemJunction")
+    @patch("plugins.modules.purefb_fs_junction.get_system")
+    @patch("plugins.modules.purefb_fs_junction.AnsibleModule")
+    @patch("plugins.modules.purefb_fs_junction.HAS_PYPURECLIENT", True)
+    def test_main_realm_prefixes_that_differ_only_in_case_are_one_realm(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_fsj,
+        mock_reference,
+        mock_loose_version,
+    ):
+        """The array accepts a realm prefix in any case, so the module does
+        not refuse three names whose prefixes differ only in case; the names
+        are sent as they were given"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        module = _module(
+            _base_params(
+                name="REALM1::projects-alpha",
+                origin_fs="realm1::projects",
+                destination_fs="Realm1::alpha",
+            )
+        )
+        mock_ansible_module.return_value = module
+        blade = _blade()
+        blade.post_file_system_junctions.return_value.items = [
+            _junction(name="realm1::projects-alpha")
+        ]
+        mock_get_system.return_value = blade
+
+        _run_main()
+
+        module.fail_json.assert_not_called()
+        blade.post_file_system_junctions.assert_called_once()
+        kwargs = blade.post_file_system_junctions.call_args[1]
+        assert kwargs["names"] == ["REALM1::projects-alpha"]
+        assert kwargs["origin_file_system_names"] == ["realm1::projects"]
+        mock_reference.assert_called_once_with(name="Realm1::alpha")
+        result = module.exit_json.call_args[1]
+        assert result["changed"] is True
+        assert result["junction"]["name"] == "realm1::projects-alpha"
+        assert result["junction"]["origin_fs"] == "realm1::projects"
+        assert result["junction"]["destination_fs"] == "realm1::alpha"
+
+    @patch("plugins.modules.purefb_fs_junction.LooseVersion")
+    @patch("plugins.modules.purefb_fs_junction.get_system")
+    @patch("plugins.modules.purefb_fs_junction.AnsibleModule")
+    @patch("plugins.modules.purefb_fs_junction.HAS_PYPURECLIENT", True)
+    def test_main_realms_that_differ_in_more_than_case_are_still_refused(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        cases = [
+            ("REALM1::projects-alpha", "realm1::projects", "realm2::alpha"),
+            ("REALM2::projects-alpha", "realm1::projects", "Realm1::alpha"),
+            ("projects-alpha", "realm1::projects", "REALM1::alpha"),
+            ("realm1::projects-alpha", "projects", "alpha"),
+        ]
+        for name, origin, destination in cases:
+            module = _module(
+                _base_params(name=name, origin_fs=origin, destination_fs=destination)
+            )
+            mock_ansible_module.return_value = module
+            blade = _blade()
+            mock_get_system.return_value = blade
+
+            _run_main()
+
+            blade.post_file_system_junctions.assert_not_called()
+            module.exit_json.assert_not_called()
+            module.fail_json.assert_called_once()
+
+    @patch("plugins.modules.purefb_fs_junction.get_error_message")
+    @patch("plugins.modules.purefb_fs_junction.LooseVersion")
+    @patch("plugins.modules.purefb_fs_junction.Reference")
+    @patch("plugins.modules.purefb_fs_junction.FileSystemJunction")
+    @patch("plugins.modules.purefb_fs_junction.get_system")
+    @patch("plugins.modules.purefb_fs_junction.AnsibleModule")
+    @patch("plugins.modules.purefb_fs_junction.HAS_PYPURECLIENT", True)
+    def test_main_a_holder_spelled_in_another_case_is_named_as_it_is_stored(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_fsj,
+        mock_reference,
+        mock_loose_version,
+        mock_get_error_message,
+    ):
+        """The search of the other scopes ignores case on the array, so the
+        junction in the way may be spelled differently from the request; the
+        message gives its stored name, in check mode and in a real run"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_get_error_message.return_value = NAME_REFUSED
+        expected = (
+            "File system junction PROJECTS-ALPHA cannot be created because "
+            "junction realm1::projects-alpha already uses the name "
+            "projects-alpha. A junction name must be unique across the array "
+            "and all of its realms."
+        )
+        for check_mode in (True, False):
+            module = _module(_base_params(name="PROJECTS-ALPHA"), check_mode=check_mode)
+            mock_ansible_module.return_value = module
+            blade = _blade(holders=[_junction(name="realm1::projects-alpha")])
+            blade.post_file_system_junctions.return_value = Mock(status_code=400)
+            mock_get_system.return_value = blade
+
+            _run_main()
+
+            module.exit_json.assert_not_called()
+            module.fail_json.assert_called_once_with(msg=expected)
+
+    @patch("plugins.modules.purefb_fs_junction.get_error_message")
+    @patch("plugins.modules.purefb_fs_junction.LooseVersion")
+    @patch("plugins.modules.purefb_fs_junction.Reference")
+    @patch("plugins.modules.purefb_fs_junction.FileSystemJunction")
+    @patch("plugins.modules.purefb_fs_junction.get_system")
+    @patch("plugins.modules.purefb_fs_junction.AnsibleModule")
+    @patch("plugins.modules.purefb_fs_junction.HAS_PYPURECLIENT", True)
+    def test_main_the_requested_name_in_another_case_is_not_another_scope(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_fsj,
+        mock_reference,
+        mock_loose_version,
+        mock_get_error_message,
+    ):
+        """A search that only finds the requested name, however it is
+        spelled, found no junction of another scope: check mode reports the
+        create and a refused create is relayed in the array's words"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_get_error_message.return_value = NAME_REFUSED
+
+        module = _module(_base_params(name="Projects-Alpha"), check_mode=True)
+        mock_ansible_module.return_value = module
+        mock_get_system.return_value = _blade(holders=[_junction()])
+
+        _run_main()
+
+        module.fail_json.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+        module = _module(_base_params(name="Projects-Alpha"))
+        mock_ansible_module.return_value = module
+        blade = _blade(holders=[_junction()])
+        blade.post_file_system_junctions.return_value = Mock(status_code=400)
+        mock_get_system.return_value = blade
+
+        _run_main()
+
+        module.exit_json.assert_not_called()
+        module.fail_json.assert_called_once_with(
+            msg="Failed to create file system junction Projects-Alpha. Error: "
+            + NAME_REFUSED
+        )
+
+    # ---------------- the spelling the array stores ----------------
+
+    def test_stored_realm_reads_the_origin_file_system(self):
+        module = Mock()
+        module.params = _base_params(origin_fs="REALM1::projects", context="member1")
+        blade = Mock()
+        stored = Mock(spec=["name"])
+        stored.name = "realm1::projects"
+        blade.get_file_systems.return_value = Mock(status_code=200, items=[stored])
+
+        assert _stored_realm(module, blade) == "realm1"
+        blade.get_file_systems.assert_called_once_with(
+            names=["REALM1::projects"], context_names=["member1"]
+        )
+
+        blade.get_file_systems.return_value = Mock(status_code=200, items=[])
+        assert _stored_realm(module, blade) is None
+        blade.get_file_systems.return_value = Mock(status_code=400, items=[stored])
+        assert _stored_realm(module, blade) is None
+
+    @patch("plugins.modules.purefb_fs_junction.LooseVersion")
+    @patch("plugins.modules.purefb_fs_junction.Reference")
+    @patch("plugins.modules.purefb_fs_junction.FileSystemJunction")
+    @patch("plugins.modules.purefb_fs_junction.get_system")
+    @patch("plugins.modules.purefb_fs_junction.AnsibleModule")
+    @patch("plugins.modules.purefb_fs_junction.HAS_PYPURECLIENT", True)
+    def test_main_recreate_keeps_the_name_the_array_stores(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_fsj,
+        mock_reference,
+        mock_loose_version,
+    ):
+        """The array finds a junction under a name in any case but refuses
+        a new junction whose realm prefix is not spelled as it stores the
+        realm. A junction found under another spelling is therefore deleted
+        and re-created under its stored name, never under the requested one,
+        which would leave it deleted"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        params = dict(
+            name="REALM1::Projects-Alpha",
+            origin_fs="REALM1::projects",
+            destination_fs="REALM1::beta",
+            recreate=True,
+        )
+
+        module = _module(_base_params(**params), check_mode=True)
+        mock_ansible_module.return_value = module
+        blade = _blade(existing=_junction(name="realm1::projects-alpha"))
+        mock_get_system.return_value = blade
+
+        _run_main()
+
+        blade.delete_file_system_junctions.assert_not_called()
+        blade.post_file_system_junctions.assert_not_called()
+        result = module.exit_json.call_args[1]
+        assert result["changed"] is True
+        assert result["junction"]["name"] == "realm1::projects-alpha"
+
+        module = _module(_base_params(**params))
+        mock_ansible_module.return_value = module
+        blade = _blade(existing=_junction(name="realm1::projects-alpha"))
+        blade.post_file_system_junctions.return_value.items = [
+            _junction(name="realm1::projects-alpha", dest="beta")
+        ]
+        mock_get_system.return_value = blade
+
+        _run_main()
+
+        blade.delete_file_system_junctions.assert_called_once_with(
+            names=["realm1::projects-alpha"]
+        )
+        blade.post_file_system_junctions.assert_called_once()
+        kwargs = blade.post_file_system_junctions.call_args[1]
+        assert kwargs["names"] == ["realm1::projects-alpha"]
+        assert kwargs["origin_file_system_names"] == ["REALM1::projects"]
+        # same origin and path: the directory left behind is reused
+        assert kwargs["use_existing_directory"] is True
+        module.fail_json.assert_not_called()
+        result = module.exit_json.call_args[1]
+        assert result["changed"] is True
+        assert result["junction"]["name"] == "realm1::projects-alpha"
+        assert result["junction"]["destination_fs"] == "realm1::beta"
+
+    @patch("plugins.modules.purefb_fs_junction.get_error_message")
+    @patch("plugins.modules.purefb_fs_junction.LooseVersion")
+    @patch("plugins.modules.purefb_fs_junction.Reference")
+    @patch("plugins.modules.purefb_fs_junction.FileSystemJunction")
+    @patch("plugins.modules.purefb_fs_junction.get_system")
+    @patch("plugins.modules.purefb_fs_junction.AnsibleModule")
+    @patch("plugins.modules.purefb_fs_junction.HAS_PYPURECLIENT", True)
+    def test_main_recreate_failure_names_the_stored_junction(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_fsj,
+        mock_reference,
+        mock_loose_version,
+        mock_get_error_message,
+    ):
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_get_error_message.return_value = "File system does not exist."
+        module = _module(
+            _base_params(name="PROJECTS-ALPHA", destination_fs="beta", recreate=True)
+        )
+        mock_ansible_module.return_value = module
+        blade = _blade(existing=_junction())
+        blade.post_file_system_junctions.return_value = Mock(status_code=400)
+        mock_get_system.return_value = blade
+
+        _run_main()
+
+        blade.delete_file_system_junctions.assert_called_once_with(
+            names=["projects-alpha"]
+        )
+        module.fail_json.assert_called_once_with(
+            msg="File system junction projects-alpha was deleted but re-creating "
+            "it failed. Error: File system does not exist."
+        )
+
+    @patch("plugins.modules.purefb_fs_junction.LooseVersion")
+    @patch("plugins.modules.purefb_fs_junction.get_system")
+    @patch("plugins.modules.purefb_fs_junction.AnsibleModule")
+    @patch("plugins.modules.purefb_fs_junction.HAS_PYPURECLIENT", True)
+    def test_main_absent_deletes_under_the_name_the_array_stores(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        module = _module(_base_params(name="REALM1::PROJECTS-ALPHA", state="absent"))
+        mock_ansible_module.return_value = module
+        blade = _blade(existing=_junction(name="realm1::projects-alpha"))
+        mock_get_system.return_value = blade
+
+        _run_main()
+
+        blade.delete_file_system_junctions.assert_called_once_with(
+            names=["realm1::projects-alpha"]
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    @patch("plugins.modules.purefb_fs_junction.get_error_message")
+    @patch("plugins.modules.purefb_fs_junction.LooseVersion")
+    @patch("plugins.modules.purefb_fs_junction.Reference")
+    @patch("plugins.modules.purefb_fs_junction.FileSystemJunction")
+    @patch("plugins.modules.purefb_fs_junction.get_system")
+    @patch("plugins.modules.purefb_fs_junction.AnsibleModule")
+    @patch("plugins.modules.purefb_fs_junction.HAS_PYPURECLIENT", True)
+    def test_main_create_explains_a_realm_prefix_the_array_stores_otherwise(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_fsj,
+        mock_reference,
+        mock_loose_version,
+        mock_get_error_message,
+    ):
+        """The array refuses a new junction whose realm prefix is not in the
+        spelling it stores, in words about the file systems. The module
+        names the stored spelling when it differs from the request in case
+        only, and relays the array's words in every other case"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        plain = "Failed to create file system junction {0}. Error: {1}"
+        upper = dict(
+            name="REALM1::projects-alpha",
+            origin_fs="REALM1::projects",
+            destination_fs="REALM1::alpha",
+        )
+        stored = dict(
+            name="realm1::projects-alpha",
+            origin_fs="realm1::projects",
+            destination_fs="realm1::alpha",
+        )
+        cases = [
+            # request, array error, stored origin name, status of its read,
+            # reads of the file system, expected message
+            (
+                upper,
+                REALM_REFUSED,
+                "realm1::projects",
+                200,
+                1,
+                plain.format(upper["name"], REALM_REFUSED)
+                + ". The array stores the realm as realm1 and accepts only that "
+                "spelling in the name of a new junction: use "
+                "realm1::projects-alpha.",
+            ),
+            # the prefix is spelled as stored: the array's words stand
+            (
+                stored,
+                REALM_REFUSED,
+                "realm1::projects",
+                200,
+                1,
+                plain.format(stored["name"], REALM_REFUSED),
+            ),
+            # the file system cannot be read or is not found
+            (
+                upper,
+                REALM_REFUSED,
+                "realm1::projects",
+                400,
+                1,
+                plain.format(upper["name"], REALM_REFUSED),
+            ),
+            (
+                upper,
+                REALM_REFUSED,
+                None,
+                200,
+                1,
+                plain.format(upper["name"], REALM_REFUSED),
+            ),
+            # another cause: the file system is not read
+            (
+                upper,
+                "File system does not exist.",
+                "realm1::projects",
+                200,
+                0,
+                plain.format(upper["name"], "File system does not exist."),
+            ),
+            # array level: no realm prefix to explain
+            (
+                {},
+                REALM_REFUSED,
+                "projects",
+                200,
+                0,
+                plain.format("projects-alpha", REALM_REFUSED),
+            ),
+        ]
+        for params, error, stored_name, status, reads, expected in cases:
+            mock_get_error_message.return_value = error
+            module = _module(_base_params(**params))
+            mock_ansible_module.return_value = module
+            blade = _blade()
+            blade.post_file_system_junctions.return_value = Mock(status_code=400)
+            origin = Mock(spec=["name"])
+            origin.name = stored_name
+            blade.get_file_systems.return_value = Mock(
+                status_code=status, items=[origin] if stored_name else []
+            )
+            mock_get_system.return_value = blade
+
+            _run_main()
+
+            blade.post_file_system_junctions.assert_called_once()
+            assert blade.get_file_systems.call_count == reads
+            # the search of the other scopes is for a taken name only
+            assert blade.get_file_system_junctions.call_count == 1
+            module.exit_json.assert_not_called()
+            module.fail_json.assert_called_once_with(msg=expected)

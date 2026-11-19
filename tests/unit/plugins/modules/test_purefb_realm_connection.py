@@ -75,6 +75,7 @@ from plugins.modules.purefb_realm_connection import (
     main,
     get_connection,
     connection_to_dict,
+    _realm_not_there,
 )
 
 MODULE = "plugins.modules.purefb_realm_connection"
@@ -84,6 +85,12 @@ REALM_MISSING = "Realm does not exist."
 REALM_DESTROYED = "Realm has been destroyed."
 REMOTE_REALM_MISSING = "Remote Realm does not exist."
 NO_MATCHING_KEY = "Cannot find any connection that matches realm and key"
+# What the FlashBlade answers, with status 400 as well, to a user whose role
+# may not read realms
+REALM_READ_REFUSED = (
+    "Operation not permitted. Authorization for 'get' on "
+    "'purestorage.com/api/v2/realms' is required."
+)
 # What the SDK reports for an error whose body is not JSON (not an array text)
 NO_JSON_BODY = "Response is not a valid JSON"
 
@@ -1173,13 +1180,14 @@ class TestPurefbRealmConnection:
         )
 
     def test_main_absent_is_noop_for_a_404_realm_lookup(self):
-        """A 404 for the realm is read like the 400 the FlashBlade answers
+        """A 404 for the realm says by its status that the realm is not there
 
-        Purity//FB 4.8.8 answers 400 for a missing realm. 404 is accepted in
-        case another version answers it; it has not been seen on an array.
+        Purity//FB 4.8.8 answers 400 for a missing realm, where the text
+        decides. 404 is accepted in case another version answers it; neither
+        the status nor the text used here has been seen on an array.
         """
         module = _module(state="absent")
-        blade = _blade(realm_exists=False, realm_status=404)
+        blade = _blade(realm_exists=False, realm_status=404, realm_error="Not found.")
         with _patched_main(module, blade):
             _run()
 
@@ -1236,6 +1244,59 @@ class TestPurefbRealmConnection:
         module.fail_json.assert_called_once_with(
             msg="Realm finance is not available. Error: Operation not permitted."
         )
+
+    def test_main_absent_fails_on_a_refused_realm_lookup(self):
+        """A refused lookup stops state=absent although its status is 400
+
+        Purity//FB 4.8.8 answers 400 with this text to a user whose role may
+        not read realms: the status it also answers for a missing realm. Such
+        a user may still be allowed to read and delete realm connections.
+        """
+        module = _module(state="absent")
+        blade = _blade(realm_exists=False, realm_error=REALM_READ_REFUSED)
+        with _patched_main(module, blade):
+            _run()
+
+        module.exit_json.assert_not_called()
+        blade.get_realm_connections.assert_not_called()
+        blade.delete_realm_connections.assert_not_called()
+        module.fail_json.assert_called_once_with(
+            msg="Realm finance is not available. Error: " + REALM_READ_REFUSED
+        )
+
+    def test_main_absent_check_mode_fails_on_a_refused_realm_lookup(self):
+        """Check mode reports the refused lookup like the real run"""
+        module = _module(check_mode=True, state="absent")
+        blade = _blade(realm_exists=False, realm_error=REALM_READ_REFUSED)
+        with _patched_main(module, blade):
+            _run()
+
+        module.exit_json.assert_not_called()
+        blade.get_realm_connections.assert_not_called()
+        module.fail_json.assert_called_once_with(
+            msg="Realm finance is not available. Error: " + REALM_READ_REFUSED
+        )
+
+    def test_main_refused_realm_lookup_has_no_recover_hint(self):
+        """A refused lookup is relayed for a key operation, without the purefb_realm hint"""
+        module = _module(remote_realm=None, invalidate_keys=True)
+        blade = _blade(realm_exists=False, realm_error=REALM_READ_REFUSED)
+        with _patched_main(module, blade):
+            _run()
+
+        blade.get_realm_connections_connection_key.assert_not_called()
+        module.fail_json.assert_called_once_with(
+            msg="Realm finance is not available. Error: " + REALM_READ_REFUSED
+        )
+
+    def test_realm_not_there_reads_the_text_of_a_400(self):
+        """Status 400 alone says nothing: the FlashBlade's text decides"""
+        assert _realm_not_there(400, REALM_MISSING)
+        assert _realm_not_there(400, REALM_DESTROYED)
+        assert not _realm_not_there(400, REALM_READ_REFUSED)
+        assert not _realm_not_there(400, "Unknown error")
+        assert _realm_not_there(404, "Not found.")
+        assert not _realm_not_there(503, NO_JSON_BODY)
 
     # ---------------- realm-qualified values ----------------
 

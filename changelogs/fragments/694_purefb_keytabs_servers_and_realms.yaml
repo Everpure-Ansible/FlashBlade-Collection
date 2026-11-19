@@ -10,5 +10,8 @@ bugfixes:
     only when one of its entries is missing from the keytabs of the prefix.
   - purefb_keytabs - an import leaves no copy of the keytab in the temporary directory, and an
     exported file is readable by its owner only.
+  - purefb_keytabs - a prefix or a name that names the default server (``_array_server::prefix``)
+    addresses the keytabs of the plain prefix, and ``state=absent`` refuses a list of names
+    instead of reporting keytabs absent that still exist.
   - purefb_keytabs - documented the ``server::prefix`` and ``realm::server::prefix`` forms of a
     keytab prefix and name.

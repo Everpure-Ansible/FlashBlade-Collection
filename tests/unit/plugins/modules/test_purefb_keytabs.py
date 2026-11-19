@@ -195,7 +195,10 @@ def _blade(tmp_path, servers=(DEFAULT_SERVER, ARRAY_SERVER, REALM_SERVER), accou
     file, numbered after the slots the prefix already has, and answers with
     the uploaded file, which the SDK saves in its temporary directory
     (blade.tmp). A download answers with a keytab file of the named slots.
-    Names match without regard to case and a missing name answers 400.
+    Names match without regard to case, a name that holds a comma is a list
+    of names and a missing name answers 400. A delete takes one name. The
+    keytabs of the default server are stored under the plain prefix, also
+    when the prefix names it, and are not found under a name that names it.
 
     blade.saved lists (path, mode) of every file the SDK saved.
     blade.quirks makes a request fail: keytabs, download, upload, delete,
@@ -224,12 +227,15 @@ def _blade(tmp_path, servers=(DEFAULT_SERVER, ARRAY_SERVER, REALM_SERVER), accou
                 return slot
         return None
 
+    def _each(names):
+        return [name for element in names for name in element.split(",")]
+
     def _get_keytabs(**kwargs):
         if "keytabs" in blade.quirks:
             return _error(*blade.quirks["keytabs"])
         if kwargs.get("names") is not None:
-            slot = _find(kwargs["names"][0])
-            return _response([slot]) if slot else _error(400, NOT_FOUND)
+            named = [_find(name) for name in _each(kwargs["names"])]
+            return _error(400, NOT_FOUND) if None in named else _response(named)
         found = list(slots.values())
         if kwargs.get("filter") and not blade.quirks.get("loose_filter"):
             wanted = re.match(r"prefix='(.*)'$", kwargs["filter"]).group(1)
@@ -243,6 +249,8 @@ def _blade(tmp_path, servers=(DEFAULT_SERVER, ARRAY_SERVER, REALM_SERVER), accou
         data = kwargs["keytab_file"][1]
         if _server_of(prefix) not in servers:
             return _error(400, SERVER_NOT_FOUND)
+        if _server_of(prefix) == DEFAULT_SERVER:
+            prefix = prefix.rpartition("::")[2]
         used = [slot.suffix for slot in slots.values() if slot.prefix == prefix]
         for number, raw in enumerate(_split(data), start=max(used + [0]) + 1):
             slot = _named("{0}.{1}".format(prefix, number))
@@ -256,7 +264,7 @@ def _blade(tmp_path, servers=(DEFAULT_SERVER, ARRAY_SERVER, REALM_SERVER), accou
     def _download(**kwargs):
         if "download" in blade.quirks:
             return _error(*blade.quirks["download"])
-        found = [_find(name) for name in kwargs["keytab_names"]]
+        found = [_find(name) for name in _each(kwargs["keytab_names"])]
         if None in found:
             return _error(400, NOT_FOUND)
         return _response([_save(_keytab(*[slot.raw for slot in found]))])
@@ -264,6 +272,8 @@ def _blade(tmp_path, servers=(DEFAULT_SERVER, ARRAY_SERVER, REALM_SERVER), accou
     def _delete(**kwargs):
         if "delete" in blade.quirks:
             return _error(*blade.quirks["delete"])
+        if len(_each(kwargs["names"])) > 1:
+            return _error(400, "Cannot process more than one name at a time.")
         if kwargs["names"][0] not in slots:
             return _error(400, NOT_FOUND)
         del slots[kwargs["names"][0]]
@@ -554,6 +564,43 @@ class TestImport:
         assert _changed(_import(blade, path, prefix="KT")) is False
         assert sorted(blade.slots) == ["kt.1"]
 
+    def test_default_server_named_in_the_prefix_is_the_plain_prefix(self, tmp_path):
+        """The array stores the keytabs of _array_server::kt under kt"""
+        blade = _blade(tmp_path)
+        path = _keytab_file(tmp_path, _keytab(ENTRY_Z))
+        _import(blade, path)
+        blade.get_keytabs.reset_mock()
+        named = DEFAULT_SERVER + "::" + ARRAY_PREFIX
+        assert _changed(_import(blade, path, prefix=named, check_mode=True)) is False
+        assert _changed(_import(blade, path, prefix=named)) is False
+        blade.get_keytabs.assert_called_with(filter="prefix='kt'")
+        assert blade.post_keytabs_upload.call_count == 1
+        assert sorted(blade.slots) == ["kt.1"]
+
+    def test_import_naming_the_default_server_adds_no_slot_twice(self, tmp_path):
+        blade = _blade(tmp_path)
+        data = _keytab(ENTRY_Z)
+        path = _keytab_file(tmp_path, data)
+        named = DEFAULT_SERVER + "::KT"
+        assert _changed(_import(blade, path, prefix=named)) is True
+        blade.post_keytabs_upload.assert_called_once_with(
+            name_prefixes=named, keytab_file=("in.keytab", data)
+        )
+        assert _changed(_import(blade, path, prefix=named, check_mode=True)) is False
+        assert _changed(_import(blade, path, prefix=named)) is False
+        assert _changed(_import(blade, path, prefix=ARRAY_PREFIX)) is False
+        assert blade.post_keytabs_upload.call_count == 1
+        assert sorted(blade.slots) == ["KT.1"]
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_empty_prefix_is_refused_in_both_modes(self, tmp_path, check_mode):
+        blade = _blade(tmp_path)
+        path = _keytab_file(tmp_path, _keytab(ENTRY_Z))
+        module = _import(blade, path, prefix="", check_mode=check_mode)
+        assert _failure(module) == "prefix must not be empty for state=import"
+        blade.get_keytabs.assert_not_called()
+        blade.post_keytabs_upload.assert_not_called()
+
     def test_realm_server_prefix_and_its_namesakes(self, tmp_path):
         """The same leaf prefix on three servers: each import is its own"""
         blade = _blade(tmp_path)
@@ -789,6 +836,44 @@ class TestAbsent:
         assert _changed(module) is True
         blade.delete_keytabs.assert_called_once_with(names=["realm1::srv1::kt.2"])
 
+    @pytest.mark.parametrize("check_mode", [True, False])
+    @pytest.mark.parametrize("name", ["KT.1,kt.2", "kt.9,kt.2", "kt.1,nosrv::kt.1"])
+    def test_name_that_names_several_keytabs_is_refused(
+        self, tmp_path, check_mode, name
+    ):
+        """The array reads a comma as a list and deletes one keytab in a request.
+
+        It answers "does not exist" for a list with one name that is gone,
+        which is not taken for the absence of the other keytab.
+        """
+        blade = self._array(tmp_path)
+        module = _run(blade, check_mode=check_mode, state="absent", name=name)
+        assert _failure(module) == (
+            name + " names more than one keytab. "
+            "state=absent deletes one keytab: name one."
+        )
+        blade.delete_keytabs.assert_not_called()
+        assert len(blade.slots) == 6
+
+    def test_name_ending_in_a_comma_is_one_name(self, tmp_path):
+        blade = self._array(tmp_path)
+        blade.get_keytabs.side_effect = None
+        blade.get_keytabs.return_value = _response([blade.slots["kt.1"]])
+        module = _run(blade, state="absent", name="KT.1,")
+        assert _changed(module) is True
+        blade.delete_keytabs.assert_called_once_with(names=["kt.1"])
+
+    def test_default_server_named_in_the_name_is_the_plain_name(self, tmp_path):
+        """The array does not find kt.1 as _array_server::kt.1"""
+        blade = self._array(tmp_path)
+        name = "_ARRAY_SERVER::kt.1"
+        assert _changed(_run(blade, check_mode=True, state="absent", name=name)) is True
+        assert _changed(_run(blade, state="absent", name=name)) is True
+        blade.get_keytabs.assert_called_with(names=["kt.1"])
+        blade.delete_keytabs.assert_called_once_with(names=["kt.1"])
+        assert _changed(_run(blade, state="absent", name=name)) is False
+        assert "kt.1" not in blade.slots and len(blade.slots) == 5
+
     @pytest.mark.parametrize(
         "name", ["kt.9", "nosrv::kt.1", "realm1::nosrv::kt.1", "norealm::srv1::kt.1"]
     )
@@ -848,6 +933,25 @@ class TestExport:
         download_file = module.exit_json.call_args[1]["download_file"]
         with open(download_file, "rb") as exported:
             assert exported.read() == _keytab(ENTRY_A)
+
+    def test_default_server_named_in_the_name_is_the_plain_name(self, tmp_path):
+        blade = self._array(tmp_path)
+        module = _run(blade, state="export", name="_array_server::kt.2")
+        blade.get_keytabs_download.assert_called_once_with(keytab_names=["kt.2"])
+        download_file = module.exit_json.call_args[1]["download_file"]
+        with open(download_file, "rb") as exported:
+            assert exported.read() == _keytab(ENTRY_A)
+
+    def test_name_holding_a_comma_exports_every_keytab_it_names(self, tmp_path):
+        blade = self._array(tmp_path)
+        module = _run(blade, state="export", name="kt.2,KT.1")
+        assert _changed(module) is False
+        blade.get_keytabs_download.assert_called_once_with(
+            keytab_names=["kt.2", "kt.1"]
+        )
+        download_file = module.exit_json.call_args[1]["download_file"]
+        with open(download_file, "rb") as exported:
+            assert exported.read() == _keytab(ENTRY_A, ENTRY_Z)
 
     @posix_only
     def test_exported_file_is_private(self, tmp_path):

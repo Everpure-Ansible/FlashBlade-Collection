@@ -47,6 +47,8 @@ options:
     - The prefix carries the server of the keytab, for example C(example.3) on
       the default server, C(server::example.3) on another server and
       C(realm::server::example.3) on a server in a realm.
+    - A name that names the default server, C(_array_server::example.3), is
+      read as C(example.3).
     - Required for I(state=absent) and I(state=export).
     type: str
   prefix:
@@ -59,6 +61,8 @@ options:
       C(server::prefix) to create them on another server and
       C(realm::server::prefix) to create them on a server in a realm. The
       server must exist.
+    - A prefix that names the default server, C(_array_server::prefix), is the
+      plain C(prefix).
     - The text before the last C(::) is always read as the name of a server, so
       a realm name without a server (C(realm::prefix)) does not address a realm.
     - If not provided for I(state=rotate) the name of the Active Directory
@@ -205,6 +209,8 @@ DOWNLOAD_BATCH = 50
 # A filter has wildcards and no escape for a quote, so only a prefix of these
 # characters is used in one. Any other prefix is matched in the module.
 FILTER_SAFE = re.compile(r"^[A-Za-z0-9_.:-]+$")
+# The server of a keytab whose prefix names no server
+DEFAULT_SERVER = "_array_server"
 
 
 def _is_missing(res):
@@ -216,18 +222,32 @@ def _is_missing(res):
     return "does not exist" in str(get_error_message(res, "")).lower()
 
 
-def _get_keytab(module, blade, name):
-    """Return the keytab called name, or None when the array has no such keytab.
+def _stored_name(name):
+    """Return a prefix or a keytab name as the array stores it.
 
-    Any answer other than the keytab or "does not exist" fails the task with
-    the message of the array.
+    The keytabs of the default server are stored under the plain prefix,
+    also when the prefix of an import names that server, and the array does
+    not find them under a name that names it.
     """
-    res = blade.get_keytabs(names=[name])
+    server, leaf = name.rpartition("::")[0::2]
+    if server.lower() == DEFAULT_SERVER:
+        return leaf
+    return name
+
+
+def _get_keytabs(module, blade, name):
+    """Return the keytabs the array has for name, none when there is no such keytab.
+
+    The array matches a name without regard to case and reads a name that
+    holds a comma as a list of names, so every keytab it returns is one the
+    task names and none of them is left out. Any answer other than keytabs
+    or "does not exist" fails the task with the message of the array.
+    """
+    res = blade.get_keytabs(names=[_stored_name(name)])
     if res.status_code == 200:
-        items = list(res.items)
-        return items[0] if items else None
+        return list(res.items)
     if _is_missing(res):
-        return None
+        return []
     module.fail_json(
         msg="Failed to read keytab {0}. Error: {1}".format(name, get_error_message(res))
     )
@@ -387,7 +407,7 @@ def _already_imported(module, blade, data):
     wanted = _keytab_entries(data)
     if not wanted:
         return False
-    prefix = module.params["prefix"]
+    prefix = _stored_name(module.params["prefix"])
     kwargs = {}
     if FILTER_SAFE.match(prefix):
         kwargs["filter"] = "prefix='{0}'".format(prefix)
@@ -483,11 +503,21 @@ def rotate_keytab(module, blade):
 def delete_keytab(module, blade):
     """Delete keytab"""
     changed = False
-    keytab = _get_keytab(module, blade, module.params["name"])
-    if keytab:
+    name = module.params["name"]
+    keytabs = _get_keytabs(module, blade, name)
+    if len(keytabs) > 1 or len([part for part in name.split(",") if part.strip()]) > 1:
+        # The array reads a comma in a name as a separator, deletes one keytab
+        # in a request and answers "does not exist" for a list with one name
+        # that is gone. Deleting the first keytab only, or taking that answer
+        # for the whole list, would report keytabs absent that are still there.
+        module.fail_json(
+            msg="{0} names more than one keytab. state=absent deletes one "
+            "keytab: name one.".format(name)
+        )
+    if keytabs:
         changed = True
         if not module.check_mode:
-            res = blade.delete_keytabs(names=[keytab.name])
+            res = blade.delete_keytabs(names=[keytabs[0].name])
             if res.status_code != 200:
                 module.fail_json(
                     msg="Failed to delete keytab {0}. Error: {1}".format(
@@ -499,6 +529,8 @@ def delete_keytab(module, blade):
 
 def import_keytab(module, blade):
     """Import keytab"""
+    if not module.params["prefix"]:
+        module.fail_json(msg="prefix must not be empty for state=import")
     keytab_data = _read_keytab_file(module)
     _check_server(module, blade)
     changed = not _already_imported(module, blade, keytab_data)
@@ -527,9 +559,12 @@ def export_keytab(module, blade):
     # Exporting is a read; it never changes the array.
     changed = False
     download_file = ""
-    keytab = _get_keytab(module, blade, module.params["name"])
-    if keytab and not module.check_mode:
-        res = _private_call(blade.get_keytabs_download, keytab_names=[keytab.name])
+    keytabs = _get_keytabs(module, blade, module.params["name"])
+    if keytabs and not module.check_mode:
+        res = _private_call(
+            blade.get_keytabs_download,
+            keytab_names=[keytab.name for keytab in keytabs],
+        )
         if res.status_code != 200:
             module.fail_json(
                 msg="Failed to export keytab {0}. Error: {1}".format(

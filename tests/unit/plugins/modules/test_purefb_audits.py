@@ -728,6 +728,53 @@ class TestPurefbAudits:
             ["array1", "realm1"],
         ]
 
+    def test_main_scopes_gate_is_the_same_in_check_mode(self):
+        """Check mode refuses the option before REST 2.20 as a real run does"""
+        module = _module(check_mode=True, scopes=["realm1"])
+        blade = _blade()
+        _run_main(module, blade, api_version="2.19")
+
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "scopes option requires FlashBlade REST version 2.20" in msg
+        module.exit_json.assert_not_called()
+        blade.get_arrays.assert_not_called()
+        blade.get_audits.assert_not_called()
+
+    def test_main_rejects_quoted_scope_without_logging_in(self):
+        """A quoted scope name is refused before the login, in check mode too"""
+        for check_mode in (False, True):
+            module = _module(check_mode=check_mode, scopes=["realm1", "o'realm"])
+            with patch(MODULE + ".AnsibleModule", return_value=module), patch(
+                MODULE + ".get_system"
+            ) as get_system, patch(MODULE + ".get_rest_api_version") as get_version:
+                try:
+                    main()
+                except SystemExit:
+                    pass
+
+            module.fail_json.assert_called_once_with(
+                msg="scopes value o'realm must not contain a single quote"
+            )
+            module.exit_json.assert_not_called()
+            get_system.assert_not_called()
+            get_version.assert_not_called()
+
+    def test_main_scoped_read_refused_by_the_array_fails(self):
+        """A scope filter the array refuses fails; no unfiltered read follows"""
+        module = _module(scopes=["realm1"], newest_first=True, limit=5)
+        blade = _blade(status=400)
+        _run_main(module, blade)
+
+        blade.get_audits.assert_called_once_with(
+            filter="scopes.name='realm1' and system_event='false'",
+            limit=5,
+            sort=["time-"],
+        )
+        module.fail_json.assert_called_once()
+        assert "Failed to get audit records" in module.fail_json.call_args[1]["msg"]
+        module.exit_json.assert_not_called()
+
     def test_main_rejects_limit_below_one(self):
         """limit must be at least 1"""
         module = _module(limit=0)

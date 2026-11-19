@@ -24,6 +24,12 @@ description:
 - A FlashBlade supports a maximum of 10 Object Store Virtual Hosts.
 - The built-in I(s3.amazonaws.com) virtual host cannot be deleted or
   modified by this module.
+- From Purity//FB 4.6.3 (REST 2.20) a virtual host is attached to object
+  store servers. Following Everpure support guidance for Purity//FB a
+  virtual host must stay attached to at least one object store server, so
+  this module never creates a virtual host without an attached server and
+  never detaches the last server from one. Use I(state=absent) to remove a
+  virtual host.
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
@@ -52,11 +58,22 @@ options:
     description:
     - Exact list of object store servers allowed to use this virtual host.
     - Servers are attached and detached so that the attached set matches
-      this list. An empty list detaches every server.
-    - When omitted on creation the array attaches the default object store
-      server. When omitted for an existing virtual host the attached servers
-      are left unchanged.
-    - Requires Purity//FB 4.6.3 or higher (REST 2.20).
+      this list. New servers are attached before any other is detached.
+    - Server names are not case sensitive.
+    - A virtual host must stay attached to at least one object store
+      server, so an empty list is refused. List the servers that should
+      stay attached, or use I(state=absent) to remove the virtual host.
+    - When omitted on creation the module attaches the default object
+      store server. That is C(_array_server) for an array-scoped virtual
+      host and the default object store server of the realm for a
+      realm-scoped one (see I(default_object_server) of
+      M(everpure.flashblade.purefb_realm)). The virtual host is not created
+      when there is no default object store server.
+    - When omitted for an existing virtual host the attached servers are
+      left unchanged. An existing virtual host that has no attached server
+      is not modified until I(servers) names a server to attach.
+    - Requires Purity//FB 4.6.3 or higher (REST 2.20). Earlier versions
+      have no attached servers and are not affected.
     type: list
     elements: str
     version_added: '1.30.0'
@@ -88,7 +105,7 @@ extends_documentation_fragment:
 """
 
 EXAMPLES = r"""
-- name: Add Object Store Virtual Host
+- name: Add Object Store Virtual Host attached to the default object store server
   everpure.flashblade.purefb_virtualhost:
     name: "s3.acme.com"
     fb_url: 10.10.10.2
@@ -104,10 +121,23 @@ EXAMPLES = r"""
     fb_url: 10.10.10.2
     api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
 
-- name: Detach all servers from an Object Store Virtual Host
+- name: Add realm-scoped Object Store Virtual Host attached to a server of the realm
+  everpure.flashblade.purefb_virtualhost:
+    name: "tenant1::acme-s3"
+    hostname: "s3.tenant1.acme.com"
+    servers:
+      - "tenant1::s3srv"
+    fb_url: 10.10.10.2
+    api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
+
+# A virtual host must stay attached to at least one object store server, so
+# an empty servers list is refused. List the servers that should stay
+# attached, or delete the virtual host.
+- name: Leave only tenant_a attached to an Object Store Virtual Host
   everpure.flashblade.purefb_virtualhost:
     name: "acme-s3"
-    servers: []
+    servers:
+      - tenant_a
     fb_url: 10.10.10.2
     api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
 
@@ -156,6 +186,11 @@ MAX_HOST_COUNT = 10
 CONTEXT_API_VERSION = "2.17"
 SERVER_API_VERSION = "2.20"
 RESERVED_HOST = "s3.amazonaws.com"
+ARRAY_DEFAULT_SERVER = "_array_server"
+WILDCARD_SERVER = "*"
+# Everpure support guidance for Purity//FB. Every request this module sends
+# is built so that the rule holds before, between and after the requests.
+ATTACH_RULE = "A virtual host must stay attached to at least one object store server"
 
 
 def _context_kwargs(module, api_version):
@@ -191,6 +226,316 @@ def _patch_host(module, blade, body, ctx, what):
         )
 
 
+def _server_names(vhost):
+    """Return the names of the servers attached to a virtual host as a set.
+
+    A virtual host that reports no attached servers, or no attached_servers
+    attribute at all, gives an empty set.
+    """
+    attached = getattr(vhost, "attached_servers", None) or []
+    return set(
+        srv_name
+        for srv_name in (getattr(srv, "name", None) for srv in attached)
+        if srv_name
+    )
+
+
+def _references(servers):
+    """Return the server names as a list of references for a request body."""
+    return [Reference(name=srv) for srv in servers]
+
+
+def _unique(servers):
+    """Return the server names once each, in the order given.
+
+    Server names are not case sensitive on the array, so names that differ
+    only in case are the same server.
+    """
+    seen = set()
+    unique = []
+    for srv in servers:
+        if srv.lower() not in seen:
+            seen.add(srv.lower())
+            unique.append(srv)
+    return unique
+
+
+def _validate_servers(module):
+    """Refuse a servers list that names no server."""
+    servers = module.params["servers"]
+    if servers is None:
+        return
+    if not servers:
+        module.fail_json(
+            msg="servers cannot be an empty list for Object Store Virtual Host "
+            "{0}. {1}: list the servers that should stay attached, or use "
+            "state=absent to remove the virtual host.".format(
+                module.params["name"], ATTACH_RULE
+            )
+        )
+    if [srv for srv in servers if not str(srv).strip()]:
+        module.fail_json(
+            msg="servers cannot contain an empty server name for Object Store "
+            "Virtual Host {0}. {1}.".format(module.params["name"], ATTACH_RULE)
+        )
+
+
+def _require_servers(module, blade, servers, ctx):
+    """Fail unless every server named for a new virtual host exists.
+
+    A virtual host is only created with servers the array is known to have,
+    so the create request cannot end with nothing attached because a name
+    did not resolve. The wildcard is not a server object and is left to the
+    array.
+    """
+    names = [srv for srv in servers if srv != WILDCARD_SERVER]
+    if not names:
+        return
+    res = blade.get_servers(names=names, **ctx)
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Object Store Virtual Host {0} was not created: servers {1} "
+            "could not all be found. Error: {2}".format(
+                module.params["name"], ", ".join(names), get_error_message(res)
+            )
+        )
+    if len(list(res.items)) < len(names):
+        module.fail_json(
+            msg="Object Store Virtual Host {0} was not created: servers {1} "
+            "could not all be found.".format(module.params["name"], ", ".join(names))
+        )
+
+
+def _default_server(module, blade, ctx):
+    """Return the server a new virtual host is attached to when servers is
+    not given, and fail when there is none.
+
+    The array attaches its default object store server to a virtual host
+    created without attached servers, and attaches nothing when no default
+    is configured. The module therefore resolves the default itself and
+    names it in the create request: _array_server for an array-scoped
+    virtual host, the default object store server of the realm for a
+    realm-scoped one.
+    """
+    name = module.params["name"]
+    if "::" in name:
+        realm = name.rsplit("::", 1)[0]
+        res = blade.get_realms_defaults(realm_names=[realm], **ctx)
+        if res.status_code != 200:
+            module.fail_json(
+                msg="Object Store Virtual Host {0} was not created: the default "
+                "object store server of realm {1} could not be read. Pass "
+                "servers with at least one server of the realm. Error: "
+                "{2}".format(name, realm, get_error_message(res))
+            )
+        defaults = next(iter(res.items), None)
+        object_store = getattr(defaults, "object_store", None) or []
+        server = None
+        if object_store:
+            server = getattr(getattr(object_store[0], "server", None), "name", None)
+        if not server:
+            module.fail_json(
+                msg="Object Store Virtual Host {0} was not created: realm {1} has "
+                "no default object store server, so the virtual host would have "
+                "no attached server. {2}. Pass servers with at least one server "
+                "of the realm, or set the default object store server of the "
+                "realm first (default_object_server of purefb_realm).".format(
+                    name, realm, ATTACH_RULE
+                )
+            )
+    else:
+        server = ARRAY_DEFAULT_SERVER
+    res = blade.get_servers(names=[server], **ctx)
+    if res.status_code != 200 or not list(res.items):
+        error = ""
+        if res.status_code != 200:
+            error = " Error: {0}".format(get_error_message(res))
+        module.fail_json(
+            msg="Object Store Virtual Host {0} was not created: the default "
+            "object store server {1} was not found, so the virtual host would "
+            "have no attached server. {2}. Pass servers with at least one "
+            "server.{3}".format(name, server, ATTACH_RULE, error)
+        )
+    return server
+
+
+def _verify_created(module, blade, ctx):
+    """Confirm a new virtual host has an attached server, else remove it.
+
+    The create request always names at least one existing server, so this
+    should never find anything wrong. If the read-back cannot confirm an
+    attached server, the safest state is the one before the task: the
+    virtual host was created by this task and nothing can depend on it yet,
+    so it is deleted again rather than left for an attach that may never
+    happen.
+    """
+    name = module.params["name"]
+    vhost = _get_host(blade, name, ctx)
+    if vhost is not None and _server_names(vhost):
+        return
+    res = blade.delete_object_store_virtual_hosts(names=[name], **ctx)
+    if res.status_code == 200:
+        module.fail_json(
+            msg="Object Store Virtual Host {0} was created but an attached "
+            "server could not be confirmed, so it was deleted again. "
+            "{1}.".format(name, ATTACH_RULE)
+        )
+    module.fail_json(
+        msg="Object Store Virtual Host {0} was created but an attached server "
+        "could not be confirmed, and deleting it again failed. Attach a server "
+        "to it or delete it. {1}. Error: {2}".format(
+            name, ATTACH_RULE, get_error_message(res)
+        )
+    )
+
+
+def _fail_create(module, blade, ctx, servers, res):
+    """Fail after a create request that the array answered with an error.
+
+    Such a request normally creates nothing, and only the error is
+    reported. The virtual host is looked up once more all the same. If it
+    now exists without an attached server, the servers named in the request
+    are attached to it. It is not deleted: after a failed request there is
+    no proof that this task created it, and attaching a server is the
+    repair that is right for a virtual host of any origin.
+    """
+    name = module.params["name"]
+    error = get_error_message(res)
+    vhost = _get_host(blade, name, ctx)
+    if vhost is None or _server_names(vhost):
+        module.fail_json(
+            msg="Failed to add Object Store Virtual Host {0}. Error: {1}".format(
+                name, error
+            )
+        )
+    res = blade.patch_object_store_virtual_hosts(
+        names=[name],
+        object_store_virtual_host=ObjectStoreVirtualHostPatch(
+            add_attached_servers=_references(servers)
+        ),
+        **ctx
+    )
+    if res.status_code == 200:
+        check = _get_host(blade, name, ctx)
+        if check is not None and _server_names(check):
+            module.fail_json(
+                msg="Failed to add Object Store Virtual Host {0}. A virtual host "
+                "of that name was found without an attached server, so {1} was "
+                "attached to it. {2}. Check the virtual host and run the task "
+                "again. Error: {3}".format(name, ", ".join(servers), ATTACH_RULE, error)
+            )
+    module.fail_json(
+        msg="Failed to add Object Store Virtual Host {0}. A virtual host of that "
+        "name was found without an attached server and attaching one failed. "
+        "Attach a server to it or delete it. {1}. Error: {2}".format(
+            name, ATTACH_RULE, error
+        )
+    )
+
+
+def _verify_attached(module, blade, ctx, previous, wanted):
+    """Confirm a virtual host still has an attached server after a change.
+
+    The requests sent by _change_servers cannot empty the attached set, so
+    this should never find anything wrong. If the virtual host nevertheless
+    reports no attached server, the servers it had before the task are
+    attached again, because they are known to be attachable to it, and
+    failing that the requested servers. When neither list can be attached
+    as a whole, for instance because one of its servers no longer exists,
+    the servers are tried one at a time: one attached server is enough to
+    satisfy the rule. An existing virtual host is never deleted by this
+    repair: it was not created by this task, so removing it stays the
+    operator's decision. The task fails in every case so that the result is
+    noticed.
+    """
+    name = module.params["name"]
+    vhost = _get_host(blade, name, ctx)
+    if vhost is None:
+        module.fail_json(
+            msg="Object Store Virtual Host {0} could not be read back after its "
+            "attached servers were changed. Check that it is attached to at "
+            "least one object store server.".format(name)
+        )
+    if _server_names(vhost):
+        return
+    candidates = [sorted(previous), sorted(wanted)]
+    candidates += [[srv] for srv in sorted(set(previous) | set(wanted))]
+    tried = []
+    for candidate in candidates:
+        if not candidate or candidate in tried:
+            continue
+        tried.append(candidate)
+        res = blade.patch_object_store_virtual_hosts(
+            names=[name],
+            object_store_virtual_host=ObjectStoreVirtualHostPatch(
+                add_attached_servers=_references(candidate)
+            ),
+            **ctx
+        )
+        if res.status_code != 200:
+            continue
+        check = _get_host(blade, name, ctx)
+        if check is not None and _server_names(check):
+            module.fail_json(
+                msg="Object Store Virtual Host {0} had no attached server after "
+                "its attached servers were changed, so {1} was attached again. "
+                "{2}. Check the virtual host and run the task again.".format(
+                    name, ", ".join(candidate), ATTACH_RULE
+                )
+            )
+    module.fail_json(
+        msg="Object Store Virtual Host {0} has no attached server and attaching "
+        "one again failed. Attach a server to it or delete it. {1}.".format(
+            name, ATTACH_RULE
+        )
+    )
+
+
+def _change_servers(module, blade, ctx, current, add, remove):
+    """Attach and detach servers without ever emptying the attached set.
+
+    New servers are attached in a first request and the others detached in
+    a second one, so at least one server stays attached whatever order the
+    array applies a request in and whichever request fails. Right before
+    the detach the virtual host is read again, and the detach is only sent
+    when a server remains attached after it. The result is then read back.
+    """
+    name = module.params["name"]
+    if add:
+        _patch_host(
+            module,
+            blade,
+            ObjectStoreVirtualHostPatch(add_attached_servers=_references(add)),
+            ctx,
+            "update attached servers (attach {0})".format(", ".join(add)),
+        )
+    if remove:
+        vhost = _get_host(blade, name, ctx)
+        if vhost is None:
+            module.fail_json(
+                msg="Object Store Virtual Host {0} could not be read again "
+                "before detaching {1}, so nothing was detached. Run the task "
+                "again.".format(name, ", ".join(remove))
+            )
+        remove_keys = set(srv.lower() for srv in remove)
+        if not [srv for srv in _server_names(vhost) if srv.lower() not in remove_keys]:
+            module.fail_json(
+                msg="Detaching {0} would leave Object Store Virtual Host {1} "
+                "without an attached server, so nothing was detached. "
+                "{2}.".format(", ".join(remove), name, ATTACH_RULE)
+            )
+        _patch_host(
+            module,
+            blade,
+            ObjectStoreVirtualHostPatch(remove_attached_servers=_references(remove)),
+            ctx,
+            "update attached servers (detach {0})".format(", ".join(remove)),
+        )
+    _verify_attached(
+        module, blade, ctx, current, (set(current) | set(add)) - set(remove)
+    )
+
+
 def delete_host(module, blade, ctx):
     """Delete Object Store Virtual Host"""
     changed = False
@@ -216,39 +561,55 @@ def delete_host(module, blade, ctx):
 def add_host(module, blade, api_version, ctx):
     """Add Object Store Virtual Host"""
     changed = True
+    name = module.params["name"]
     hostname = module.params["hostname"]
     servers = module.params["servers"]
-    if not module.check_mode:
-        if LooseVersion(SERVER_API_VERSION) <= LooseVersion(api_version) and (
-            hostname is not None or servers is not None
-        ):
-            body = {}
-            if hostname is not None:
-                body["hostname"] = hostname
-            if servers is not None:
-                body["attached_servers"] = [Reference(name=srv) for srv in servers]
-            res = blade.post_object_store_virtual_hosts(
-                names=[module.params["name"]],
-                object_store_virtual_host=ObjectStoreVirtualHost(**body),
-                **ctx
-            )
-        else:
-            # Without hostname or servers the array sets hostname=name and
-            # attaches the default object store server itself.
-            res = blade.post_object_store_virtual_hosts(
-                names=[module.params["name"]], **ctx
-            )
-        if res.status_code != 200:
-            module.fail_json(
-                msg="Failed to add Object Store Virtual Host {0}. Error: {1}".format(
-                    module.params["name"], get_error_message(res)
+    if LooseVersion(SERVER_API_VERSION) > LooseVersion(api_version):
+        # Before REST 2.20 a virtual host has no attached servers: the name
+        # is the hostname and nothing else can be sent.
+        if not module.check_mode:
+            res = blade.post_object_store_virtual_hosts(names=[name], **ctx)
+            if res.status_code != 200:
+                module.fail_json(
+                    msg="Failed to add Object Store Virtual Host {0}. Error: {1}".format(
+                        name, get_error_message(res)
+                    )
                 )
+        module.exit_json(changed=changed)
+
+    # The create request always names the servers to attach, so the result
+    # never depends on a default the array may not have. Every refusal
+    # below happens before the request, in check mode as well.
+    _validate_servers(module)
+    if servers is None:
+        servers = [_default_server(module, blade, ctx)]
+    else:
+        servers = _unique(servers)
+        _require_servers(module, blade, servers, ctx)
+    if not servers:
+        # Not reachable: the last check before the request is built.
+        module.fail_json(
+            msg="Object Store Virtual Host {0} was not created. {1}.".format(
+                name, ATTACH_RULE
             )
+        )
+    if not module.check_mode:
+        body = {"attached_servers": _references(servers)}
+        if hostname is not None:
+            body["hostname"] = hostname
+        res = blade.post_object_store_virtual_hosts(
+            names=[name],
+            object_store_virtual_host=ObjectStoreVirtualHost(**body),
+            **ctx
+        )
+        if res.status_code != 200:
+            _fail_create(module, blade, ctx, servers, res)
+        _verify_created(module, blade, ctx)
     module.exit_json(changed=changed)
 
 
-def update_host(module, blade, vhost, ctx):
-    """Modify hostname, attached servers and name of an existing virtual host"""
+def update_host(module, blade, vhost, api_version, ctx):
+    """Modify attached servers, hostname and name of an existing virtual host"""
     changed = False
     name = module.params["name"]
     hostname = module.params["hostname"]
@@ -256,12 +617,7 @@ def update_host(module, blade, vhost, ctx):
     rename = module.params["rename"]
     # Before REST 2.20 the name is the hostname
     current_hostname = getattr(vhost, "hostname", None) or vhost.name
-    attached = getattr(vhost, "attached_servers", None) or []
-    current_servers = set(
-        srv_name
-        for srv_name in (getattr(srv, "name", None) for srv in attached)
-        if srv_name is not None
-    )
+    current_servers = _server_names(vhost)
 
     if name == RESERVED_HOST:
         if (
@@ -274,7 +630,68 @@ def update_host(module, blade, vhost, ctx):
             )
         module.exit_json(changed=False)
 
-    if hostname is not None and hostname != current_hostname:
+    new_hostname = hostname is not None and hostname != current_hostname
+    new_name = bool(rename and rename != name)
+    add = []
+    remove = []
+    # Attached servers exist from REST 2.20; before it there is nothing to
+    # guard and none of hostname, servers and rename can be given.
+    if LooseVersion(SERVER_API_VERSION) <= LooseVersion(api_version):
+        _validate_servers(module)
+        if WILDCARD_SERVER in current_servers:
+            if servers is not None:
+                # The wildcard pseudo-server is not attachable or detachable
+                module.warn(
+                    "Object Store Virtual Host {0} is attached to all servers (*); "
+                    "attached servers are not managed".format(name)
+                )
+        else:
+            if servers is not None:
+                # Attaching an already attached server, or detaching one
+                # that is not attached, is rejected by the array, so only
+                # the exact delta is sent. attached_servers (full replace)
+                # must never be combined with the add/remove lists. Server
+                # names are not case sensitive on the array: a name that
+                # differs only in case is the attached server, not a new
+                # one, and must not be attached and then detached.
+                wanted = _unique(servers)
+                current_keys = set(srv.lower() for srv in current_servers)
+                wanted_keys = set(srv.lower() for srv in wanted)
+                add = sorted(srv for srv in wanted if srv.lower() not in current_keys)
+                remove = sorted(
+                    srv for srv in current_servers if srv.lower() not in wanted_keys
+                )
+            # Every refusal happens here, before any request and in check
+            # mode as well.
+            if not current_servers and not add:
+                if new_hostname or new_name:
+                    module.fail_json(
+                        msg="Object Store Virtual Host {0} has no attached server "
+                        "and is not modified until one is attached. {1}: name a "
+                        "server to attach with servers, or use state=absent to "
+                        "remove the virtual host.".format(name, ATTACH_RULE)
+                    )
+                module.warn(
+                    "Object Store Virtual Host {0} has no attached server. {1}: "
+                    "name a server to attach with servers, or use state=absent "
+                    "to remove the virtual host.".format(name, ATTACH_RULE)
+                )
+            elif not (current_servers | set(add)) - set(remove):
+                module.fail_json(
+                    msg="Detaching {0} would leave Object Store Virtual Host {1} "
+                    "without an attached server. {2}: list the servers that "
+                    "should stay attached, or use state=absent to remove the "
+                    "virtual host.".format(", ".join(remove), name, ATTACH_RULE)
+                )
+
+    # Servers first, so that no later request is sent for a virtual host
+    # that has no attached server.
+    if add or remove:
+        changed = True
+        if not module.check_mode:
+            _change_servers(module, blade, ctx, current_servers, add, remove)
+
+    if new_hostname:
         changed = True
         if not module.check_mode:
             _patch_host(
@@ -285,42 +702,7 @@ def update_host(module, blade, vhost, ctx):
                 "set hostname",
             )
 
-    if servers is not None:
-        if "*" in current_servers:
-            # The wildcard pseudo-server is not attachable or detachable
-            module.warn(
-                "Object Store Virtual Host {0} is attached to all servers (*); "
-                "attached servers are not managed".format(name)
-            )
-        else:
-            wanted = set(servers)
-            add = sorted(wanted - current_servers)
-            remove = sorted(current_servers - wanted)
-            # Attaching an already attached server, or detaching one that
-            # is not attached, is rejected by the array, so only the exact
-            # delta is sent. attached_servers (full replace) must never be
-            # combined with the add/remove lists.
-            if add or remove:
-                changed = True
-                if not module.check_mode:
-                    body = {}
-                    if add:
-                        body["add_attached_servers"] = [
-                            Reference(name=srv) for srv in add
-                        ]
-                    if remove:
-                        body["remove_attached_servers"] = [
-                            Reference(name=srv) for srv in remove
-                        ]
-                    _patch_host(
-                        module,
-                        blade,
-                        ObjectStoreVirtualHostPatch(**body),
-                        ctx,
-                        "update attached servers",
-                    )
-
-    if rename and rename != name:
+    if new_name:
         changed = True
         if not module.check_mode:
             _patch_host(
@@ -397,7 +779,7 @@ def main():
             )
         add_host(module, blade, api_version, ctx)
     elif vhost and state == "present":
-        update_host(module, blade, vhost, ctx)
+        update_host(module, blade, vhost, api_version, ctx)
 
     module.exit_json(changed=False)
 

@@ -1502,3 +1502,199 @@ class TestPurefbS3accRealms:
         blade.get_buckets.assert_not_called()
         blade.delete_object_store_accounts.assert_not_called()
         assert module.exit_json.call_args[1]["changed"] is False
+
+
+def _members_of(account, pattern, members):
+    """A filtered read as the array answers it: the filter text is taken as it is.
+
+    A name lookup ignores blanks around a name and reads a comma as a
+    separator, a filter does neither, so only the exact text finds members.
+    """
+
+    def answer(**kwargs):
+        if kwargs.get("filter") == pattern.format(account):
+            return _response(200, members)
+        return _response(200, [])
+
+    return answer
+
+
+class TestPurefbS3accOneName:
+    """Blanks around a name, lists of names and empty names"""
+
+    def test_one_name_drops_the_blanks_around_a_name(self):
+        module = _module(_base_params())
+        assert s3acc._one_name(module, "name", " realm1::acme\n") == "realm1::acme"
+        module.fail_json.assert_not_called()
+
+    @pytest.mark.parametrize("value", ["", "  "])
+    def test_one_name_refuses_an_empty_name(self, value):
+        module = _module(_base_params())
+        assert _helper("_one_name", module, "name", value)
+        assert "name must not be empty" in _fail_msg(module)
+
+    @pytest.mark.parametrize("value", ["acme,acme", "acme,", ",acme", "acme, other"])
+    def test_one_name_refuses_a_list_of_names(self, value):
+        module = _module(_base_params())
+        assert _helper("_one_name", module, "name", value)
+        msg = _fail_msg(module)
+        assert "name {0} names more than one object".format(value) in msg
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    @pytest.mark.parametrize(
+        "name", ["realm1::acme,realm1::acme", "realm1::acme,", "acme,other", "", " "]
+    )
+    def test_a_list_or_an_empty_name_fails_before_anything_is_read(
+        self, name, state, check_mode
+    ):
+        blade = _blade(account=_realm_account())
+        module, models = _main(
+            _base_params(name=name, state=state, quota="1G"),
+            blade,
+            check_mode=check_mode,
+        )
+
+        assert "name" in _fail_msg(module)
+        blade.get_object_store_accounts.assert_not_called()
+        blade.get_object_store_users.assert_not_called()
+        blade.post_object_store_accounts.assert_not_called()
+        blade.patch_object_store_accounts.assert_not_called()
+        blade.delete_object_store_accounts.assert_not_called()
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize(
+        "name", ["realm1::acme ", " realm1::acme", "REALM1::Acme\n"]
+    )
+    def test_delete_blanks_around_the_name_do_not_pass_the_user_check(
+        self, name, check_mode
+    ):
+        blade = _blade(account=_realm_account())
+        user = Mock()
+        user.name = "realm1::acme/joe"
+        blade.get_object_store_users.side_effect = _members_of(
+            "realm1::acme", "name='{0}/*'", [user]
+        )
+        module, models = _main(
+            _base_params(name=name, state="absent"), blade, check_mode=check_mode
+        )
+
+        assert "Remove all Users" in _fail_msg(module)
+        blade.get_object_store_accounts.assert_called_once_with(names=["realm1::acme"])
+        blade.delete_object_store_accounts.assert_not_called()
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_delete_blanks_around_the_name_do_not_pass_the_bucket_check(
+        self, check_mode
+    ):
+        blade = _blade(account=_realm_account())
+        bucket = Mock()
+        bucket.name = "realm1::bucket1"
+        blade.get_buckets.side_effect = _members_of(
+            "realm1::acme", "account.name='{0}'", [bucket]
+        )
+        module, models = _main(
+            _base_params(name="realm1::acme ", state="absent"),
+            blade,
+            check_mode=check_mode,
+        )
+
+        assert "Remove all Buckets" in _fail_msg(module)
+        blade.delete_object_store_accounts.assert_not_called()
+
+    def test_delete_uses_the_name_without_blanks(self):
+        blade = _blade(account=_account())
+        module, models = _main(_base_params(name=" acme ", state="absent"), blade)
+
+        blade.get_object_store_users.assert_called_once_with(filter="name='acme/*'")
+        blade.get_buckets.assert_called_once_with(filter="account.name='acme'")
+        blade.delete_object_store_accounts.assert_called_once_with(names=["acme"])
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_create_uses_the_names_without_blanks(self):
+        blade = _blade()
+        module, models = _main(
+            _base_params(
+                name=" realm1::acme ",
+                quota="1G",
+                account_exports=[{"server": " fb-01 "}],
+            ),
+            blade,
+        )
+
+        assert blade.post_object_store_accounts.call_args[1]["names"] == [
+            "realm1::acme"
+        ]
+        models["reference"].assert_called_once_with(name="realm1::fb-01")
+        for request in blade.patch_object_store_accounts.call_args_list:
+            assert request[1]["names"] == ["realm1::acme"]
+        module.fail_json.assert_not_called()
+
+    def test_update_uses_the_name_without_blanks(self):
+        blade = _blade(account=_realm_account())
+        blade.get_object_store_account_exports.return_value = _response(
+            200, [_realm_export()]
+        )
+        module, models = _main(
+            _base_params(
+                name="realm1::acme ", quota="1G", account_exports=[{"server": "fb-01 "}]
+            ),
+            blade,
+        )
+
+        blade.get_object_store_account_exports.assert_called_once_with(
+            filter="member.name='realm1::acme'"
+        )
+        module.warn.assert_not_called()
+        blade.patch_object_store_accounts.assert_called_once()
+        assert blade.patch_object_store_accounts.call_args[1]["names"] == [
+            "realm1::acme"
+        ]
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("name", ["acme", "realm1::acme"])
+    @pytest.mark.parametrize(
+        "server,reason",
+        [
+            ("", "must not be empty"),
+            ("  ", "must not be empty"),
+            ("fb-01,fb-02", "names more than one object"),
+            ("_array_server,_array_server", "names more than one object"),
+        ],
+    )
+    def test_create_empty_server_or_list_of_servers_fails_before_anything_is_read(
+        self, server, reason, name, check_mode
+    ):
+        blade = _blade()
+        module, models = _main(
+            _base_params(name=name, account_exports=[{"server": server}]),
+            blade,
+            check_mode=check_mode,
+        )
+
+        msg = _fail_msg(module)
+        assert "account_exports server" in msg
+        assert reason in msg
+        blade.get_object_store_accounts.assert_not_called()
+        blade.get_servers.assert_not_called()
+        blade.post_object_store_accounts.assert_not_called()
+
+    def test_existing_account_empty_server_fails_too(self):
+        blade = _blade(account=_realm_account())
+        module, models = _main(_realm_params(account_exports=[{"server": ""}]), blade)
+
+        assert "account_exports server must not be empty" in _fail_msg(module)
+        blade.get_object_store_account_exports.assert_not_called()
+
+    def test_hard_limit_message_names_both_ways_out(self):
+        module = _module(_realm_params())
+        assert _helper("_check_hard_limits", module, "", True, "", False)
+        msg = _fail_msg(module)
+        assert "Set quota as well, or set hard_limit to false." in msg
+
+    def test_default_hard_limit_message_names_both_ways_out(self):
+        module = _module(_realm_params())
+        assert _helper("_check_hard_limits", module, "", False, "", True)
+        msg = _fail_msg(module)
+        assert "or set default_hard_limit to false." in msg

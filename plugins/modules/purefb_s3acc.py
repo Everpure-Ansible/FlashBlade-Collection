@@ -40,6 +40,8 @@ options:
     - An account in a realm is named C(realm::account).
     - A realm-scoped administrator must use the realm-qualified name; a bare
       name is not placed in, or resolved to, the administrator's realm.
+    - A task manages one account. Blanks around the name are ignored and a
+      comma-separated list of names is refused.
     type: str
     required: true
   quota:
@@ -225,6 +227,27 @@ def _realm_of(name):
     return name.rpartition("::")[0]
 
 
+def _one_name(module, option, value):
+    """Return a name without the blanks around it; fail on a list or no name.
+
+    Where the array looks an object up by name it ignores blanks around the
+    name and reads a comma as a separator of names. The filters that find
+    the users, buckets and exports of an account take their text as it is.
+    A name the array reads differently from those filters would get past
+    the checks made with them, so the blanks are dropped here and an empty
+    name or a list of names is refused before anything is read.
+    """
+    name = value.strip()
+    if not name:
+        module.fail_json(msg="{0} must not be empty.".format(option))
+    if "," in name:
+        module.fail_json(
+            msg="{0} {1} names more than one object: the array reads a comma as "
+            "a separator of names. Give one name.".format(option, name)
+        )
+    return name
+
+
 def _context_kwargs(module):
     """Build context_names kwargs only when a context is supplied."""
     if module.params["context"]:
@@ -314,13 +337,14 @@ def _check_hard_limits(module, quota, hard_limit, default_quota, default_hard_li
     if hard_limit and not quota:
         module.fail_json(
             msg="Object Store Account {0} cannot have hard_limit set to true "
-            "while its quota is unlimited. Set quota as well.".format(name)
+            "while its quota is unlimited. Set quota as well, or set hard_limit "
+            "to false.".format(name)
         )
     if default_hard_limit and not default_quota:
         module.fail_json(
             msg="Object Store Account {0} cannot have default_hard_limit set to "
             "true while its default_quota is unlimited. Set default_quota as "
-            "well.".format(name)
+            "well, or set default_hard_limit to false.".format(name)
         )
 
 
@@ -344,7 +368,9 @@ def _requested_export_servers(module):
     if module.params["account_exports"] is None:
         return None
     return [
-        _qualify_server(module, export["server"])
+        _qualify_server(
+            module, _one_name(module, "account_exports server", export["server"])
+        )
         for export in module.params["account_exports"]
     ]
 
@@ -760,6 +786,7 @@ def main():
     module = AnsibleModule(argument_spec, supports_check_mode=True)
 
     state = module.params["state"]
+    module.params["name"] = _one_name(module, "name", module.params["name"])
     blade = get_system(module)
     api_version = get_rest_api_version(blade)
     if (

@@ -9,3 +9,6 @@ bugfixes:
   - purefb_s3acc - a read of the account, its users or its buckets that the array refuses now fails
     with the error of the array instead of being taken for a missing account or an account without
     users.
+  - purefb_s3acc - blanks around ``name`` or a comma-separated list of names got past the check for
+    users before an account is deleted. The blanks are now dropped and an empty name or a list of
+    names is refused.

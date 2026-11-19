@@ -77,6 +77,7 @@ from plugins.modules.purefb_fs_junction import (
     _realm,
     _leaf,
     _qualify,
+    _same_fs,
     _get_junction,
     _junction_facts,
     _name_holders,
@@ -1208,3 +1209,151 @@ class TestPurefbFsJunction:
             assert blade.get_file_system_junctions.call_count == lookups
             module.exit_json.assert_not_called()
             module.fail_json.assert_called_once_with(msg=expected)
+
+    # ---------------- review repairs ----------------
+
+    def test_same_fs_compares_inside_the_realm_of_the_junction(self):
+        assert _same_fs("fs1", "fs1")
+        assert _same_fs("realm1::fs1", "realm1::fs1")
+        # the realm is the junction's, however the request spells its prefix
+        assert _same_fs("realm1::fs1", "REALM1::fs1")
+        assert not _same_fs("realm1::fs2", "realm1::fs1")
+        assert not _same_fs("fs2", "fs1")
+        assert not _same_fs(None, "fs1")
+        assert not _same_fs("fs1", None)
+        assert _same_fs(None, None)
+
+    def test_name_holders_does_not_search_for_a_name_no_junction_can_have(self):
+        """A wildcard or a quote never reaches the filter"""
+        for name in ("proj*", "realm1::proj*", "it's", "two words", "realm1::"):
+            module = Mock()
+            module.params = _base_params(name=name)
+            blade = _blade(holders=[_junction(name="projects-alpha")])
+
+            assert _name_holders(module, blade) is None
+            blade.get_file_system_junctions.assert_not_called()
+
+    @patch("plugins.modules.purefb_fs_junction.LooseVersion")
+    @patch("plugins.modules.purefb_fs_junction.get_system")
+    @patch("plugins.modules.purefb_fs_junction.AnsibleModule")
+    @patch("plugins.modules.purefb_fs_junction.HAS_PYPURECLIENT", True)
+    def test_main_unchanged_when_the_realm_prefix_is_spelled_in_another_case(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        """A junction the array returns under the stored spelling of its realm
+        is not drift, so recreate does not delete it"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        module = _module(
+            _base_params(
+                name="REALM1::projects-alpha",
+                origin_fs="REALM1::projects",
+                destination_fs="REALM1::alpha",
+                recreate=True,
+            )
+        )
+        mock_ansible_module.return_value = module
+        blade = _blade(existing=_junction(name="realm1::projects-alpha"))
+        mock_get_system.return_value = blade
+
+        _run_main()
+
+        blade.delete_file_system_junctions.assert_not_called()
+        blade.post_file_system_junctions.assert_not_called()
+        module.fail_json.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
+        assert module.exit_json.call_args[1]["junction"] == {
+            "name": "realm1::projects-alpha",
+            "origin_fs": "realm1::projects",
+            "destination_fs": "realm1::alpha",
+            "path": "/alpha",
+            "status": "CONNECTED",
+        }
+
+    @patch("plugins.modules.purefb_fs_junction.LooseVersion")
+    @patch("plugins.modules.purefb_fs_junction.get_system")
+    @patch("plugins.modules.purefb_fs_junction.AnsibleModule")
+    @patch("plugins.modules.purefb_fs_junction.HAS_PYPURECLIENT", True)
+    def test_main_drift_in_a_realm_spelled_in_another_case_is_still_drift(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        """Only the realm prefix is exempt from the comparison"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        module = _module(
+            _base_params(
+                name="REALM1::projects-alpha",
+                origin_fs="REALM1::projects",
+                destination_fs="REALM1::beta",
+            )
+        )
+        mock_ansible_module.return_value = module
+        blade = _blade(existing=_junction(name="realm1::projects-alpha"))
+        mock_get_system.return_value = blade
+
+        _run_main()
+
+        blade.delete_file_system_junctions.assert_not_called()
+        blade.post_file_system_junctions.assert_not_called()
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "destination_fs realm1::alpha -> REALM1::beta" in msg
+        assert "origin_fs" not in msg
+
+    @patch("plugins.modules.purefb_fs_junction.LooseVersion")
+    @patch("plugins.modules.purefb_fs_junction.Reference")
+    @patch("plugins.modules.purefb_fs_junction.FileSystemJunction")
+    @patch("plugins.modules.purefb_fs_junction.get_system")
+    @patch("plugins.modules.purefb_fs_junction.AnsibleModule")
+    @patch("plugins.modules.purefb_fs_junction.HAS_PYPURECLIENT", True)
+    def test_main_create_asks_the_array_before_any_search(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_fsj,
+        mock_reference,
+        mock_loose_version,
+    ):
+        """A real run never refuses a name itself: a create the array accepts
+        succeeds without the search of the other scopes"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        module = _module(_base_params())
+        mock_ansible_module.return_value = module
+        blade = _blade(holders=[_junction(name="realm1::projects-alpha")])
+        mock_get_system.return_value = blade
+
+        _run_main()
+
+        blade.post_file_system_junctions.assert_called_once()
+        blade.get_file_system_junctions.assert_called_once_with(
+            names=["projects-alpha"]
+        )
+        module.fail_json.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    @patch("plugins.modules.purefb_fs_junction.LooseVersion")
+    @patch("plugins.modules.purefb_fs_junction.get_system")
+    @patch("plugins.modules.purefb_fs_junction.AnsibleModule")
+    @patch("plugins.modules.purefb_fs_junction.HAS_PYPURECLIENT", True)
+    def test_main_create_check_mode_cannot_see_a_holder_outside_the_realm(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        """A user limited to a realm gets an empty search, so check mode
+        reports the create although the array would refuse the name"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        module = _module(
+            _base_params(
+                name="realm1::projects-alpha",
+                origin_fs="realm1::projects",
+                destination_fs="realm1::alpha",
+            ),
+            check_mode=True,
+        )
+        mock_ansible_module.return_value = module
+        blade = _blade(holders=[])
+        mock_get_system.return_value = blade
+
+        _run_main()
+
+        blade.post_file_system_junctions.assert_not_called()
+        module.fail_json.assert_not_called()
+        assert blade.get_file_system_junctions.call_count == 2
+        assert module.exit_json.call_args[1]["changed"] is True

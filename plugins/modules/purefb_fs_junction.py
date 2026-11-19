@@ -49,6 +49,9 @@ options:
     - A junction name is unique across the array and all of its realms,
       whatever the realm prefix. C(realm1::junction1) cannot be created
       while C(junction1) or C(realm2::junction1) exists.
+    - Check mode reports this conflict only when the other junction is
+      visible to the user. A user who is limited to a realm does not see
+      the junctions outside that realm.
     type: str
     required: true
   state:
@@ -209,6 +212,7 @@ except ImportError:
     HAS_PYPURECLIENT = False
 
 
+import re
 from ansible.module_utils.basic import AnsibleModule
 from ansible_collections.everpure.flashblade.plugins.module_utils.purefb import (
     get_system,
@@ -265,6 +269,20 @@ def _qualify(fs_name, realm):
     if fs_name and realm and "::" not in fs_name:
         return "{0}::{1}".format(realm, fs_name)
     return fs_name
+
+
+def _same_fs(current, requested):
+    """Compare a file system of an existing junction with the requested one.
+
+    Both are in the realm of the junction: the request is validated to
+    carry the realm prefix of the junction name, and the junction was found
+    by that name. The names are therefore compared without the prefix, so
+    a realm prefix that the array returns in another case than the request
+    spells it is not reported as drift.
+    """
+    if current is None or requested is None:
+        return current == requested
+    return _leaf(current) == _leaf(requested)
 
 
 def _junction_facts(junction):
@@ -363,11 +381,15 @@ def _name_holders(module, blade):
     create with "already exists" although the requested name is not in use.
     A caller that is limited to a realm sees only the junctions of that
     realm. Returns None when the lookup fails, which leaves the array as
-    the only judge of the request.
+    the only judge of the request. The same applies to a name with a
+    character that no junction name can hold: a filter has no escape for
+    a quote, and a wildcard would match the names of other junctions.
     """
+    leaf = _leaf(module.params["name"])
+    if not re.match(r"[A-Za-z0-9_-]+\Z", leaf):
+        return None
     res = blade.get_file_system_junctions(
-        filter="name='{0}' or name='*::{0}'".format(_leaf(module.params["name"])),
-        **_context_kwargs(module)
+        filter="name='{0}' or name='*::{0}'".format(leaf), **_context_kwargs(module)
     )
     if res.status_code != 200:
         return None
@@ -470,7 +492,7 @@ def create_junction(module, blade):
 def update_junction(module, blade, junction):
     current = _junction_facts(junction)
     drift = []
-    same_origin = current["origin_fs"] == module.params["origin_fs"]
+    same_origin = _same_fs(current["origin_fs"], module.params["origin_fs"])
     same_path = _norm_path(current["path"]) == _norm_path(module.params["path"])
     if not same_origin:
         drift.append(
@@ -478,7 +500,7 @@ def update_junction(module, blade, junction):
                 current["origin_fs"], module.params["origin_fs"]
             )
         )
-    if current["destination_fs"] != module.params["destination_fs"]:
+    if not _same_fs(current["destination_fs"], module.params["destination_fs"]):
         drift.append(
             "destination_fs {0} -> {1}".format(
                 current["destination_fs"], module.params["destination_fs"]

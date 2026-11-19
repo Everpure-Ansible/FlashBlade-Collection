@@ -28,6 +28,10 @@ options:
   name:
     description:
       - Filesystem Name.
+      - A filesystem in a realm is named C(realm::name). Give that name, or
+        give the short name together with I(realm).
+      - Without I(realm) the name is sent to the array as it is given. The
+        module never adds a realm to it.
     required: true
     type: str
   state:
@@ -341,9 +345,15 @@ options:
     description:
     - Name of the realm to associate the filesystem with.
     - Requires Purity//FB 4.6.1+ (REST API 2.19+).
-    - Can only be set at filesystem creation time.
+    - The realm of a filesystem can only be set when the filesystem is created.
     - To move a filesystem to a different realm, the filesystem must be destroyed and recreated.
     - If the realm has a QoS policy, the filesystem will inherit it unless overridden.
+    - With I(realm) set, a short I(name) always means the filesystem
+      C(realm::name), for every I(state). A filesystem with the same short
+      name outside the realm is never read or changed.
+    - I(name) may already be realm-qualified. The realm in I(name) must then
+      be the same as I(realm), ignoring case, otherwise the module fails
+      before anything is sent to the array.
     type: str
     version_added: "1.25.0"
 extends_documentation_fragment:
@@ -387,8 +397,17 @@ EXAMPLES = """
     state: present
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
-  # Note: Use full realm::filesystem name for modifications
+  # The short name with realm: production-realm addresses the same filesystem
   # Realm association cannot be changed after creation
+
+- name: Delete filesystem prod-fs in realm production-realm
+  everpure.flashblade.purefb_fs:
+    name: prod-fs
+    realm: production-realm
+    state: absent
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+  # A filesystem named prod-fs outside the realm is not touched
 
 - name: Delete filesystem named foo
   everpure.flashblade.purefb_fs:
@@ -643,6 +662,33 @@ def _patch_failover(module, blade, fs_name, action):
                 action, fs_name, get_error_message(res)
             )
         )
+
+
+def _resolve_name(module):
+    """Return the one name every request uses for the filesystem.
+
+    A filesystem is in a realm when it is named ``realm::name``. With the
+    ``realm`` option set, a short ``name`` is resolved inside that realm
+    only. A ``name`` that is already realm-qualified is used as it is, and
+    must name the same realm as the ``realm`` option when both are given.
+    The two realm names are compared without regard to case, so that a
+    spelling the array may resolve to the same realm is not refused.
+    """
+    name = module.params["name"]
+    realm = module.params.get("realm")
+    if not realm:
+        return name
+    if "::" not in name:
+        return "{0}::{1}".format(realm, name)
+    name_realm = name.split("::")[0]
+    if name_realm.lower() != realm.lower():
+        module.fail_json(
+            msg="Filesystem name {0} is in realm {1}, but realm is set to {2}. "
+            "Use the same realm in both, or give only one of them.".format(
+                name, name_realm, realm
+            )
+        )
+    return name
 
 
 def create_fs(module, blade):
@@ -1878,6 +1924,11 @@ def main():
     module = AnsibleModule(argument_spec, supports_check_mode=True)
 
     state = module.params["state"]
+    # Resolve the name once, before anything is read. With realm set a short
+    # name means realm::name and nothing else, so a filesystem of the same
+    # name outside the realm is never read, compared against or changed.
+    # Every later read and write uses module.params["name"].
+    module.params["name"] = _resolve_name(module)
     blade = get_system(module)
     api_version = get_rest_api_version(blade)
     if module.params.get("quiesce") is not None or module.params.get("abort_quiesce"):
@@ -1912,19 +1963,8 @@ def main():
         if fleet_res.status_code == 200 and list(fleet_res.items):
             module.params["context"] = list(blade.get_arrays().items)[0].name
 
-    # Check if filesystem exists
-    # If realm is provided and filesystem name doesn't include realm prefix,
-    # also check for realm::filesystem format
+    # Check if filesystem exists, under the name resolved above
     fsys = get_filesystem(module, blade)
-    if not fsys and module.params.get("realm") and "::" not in module.params["name"]:
-        # Try looking for realm::filesystem format
-        original_name = module.params["name"]
-        qualified_name = "{0}::{1}".format(module.params["realm"], original_name)
-        module.params["name"] = qualified_name
-        fsys = get_filesystem(module, blade)
-        # If not found with qualified name, restore original name for creation
-        if not fsys:
-            module.params["name"] = original_name
 
     if module.params["eradicate"] and state == "present":
         module.warn("Eradicate flag ignored without state=absent")

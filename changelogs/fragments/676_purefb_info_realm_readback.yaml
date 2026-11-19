@@ -1,0 +1,12 @@
+bugfixes:
+  - purefb_info - reads the array refuses to the identity in use, such as the array-wide reads for
+    an administrator limited to a realm, no longer end in a traceback; the entries they feed are
+    returned empty or null.
+  - purefb_info - ``junctions`` reports the file systems of a junction in a realm as
+    ``realm::filesystem``, and ``quota_policies`` and ``eviction_policies`` match rules and file
+    systems to their policy by policy ID, so a realm policy and an array-level policy of the same
+    name no longer mix.
+minor_changes:
+  - purefb_info - every policy entry of the ``policies`` subset reports ``realms``, and the
+    ``realms`` subset adds ``realm_connection_keys`` with the creation and expiry time of each
+    outstanding realm connection key, never the key.

@@ -1,0 +1,5 @@
+bugfixes:
+  - purefb_fs - with ``realm`` set and a short ``name``, a filesystem of the same name outside the
+    realm was read instead of ``realm::name``, so the task crashed, failed or compared against the
+    wrong filesystem. The name is now resolved inside the realm for every state, and a
+    realm-qualified ``name`` in another realm than ``realm`` is refused.

@@ -179,9 +179,10 @@ def _realm_of(name):
 def _same_name(first, second):
     """Return True when the array reads both names as the same name
 
-    The array matches names without regard to case.
+    The array matches names without regard to case. A name the array did
+    not return is the same as no name.
     """
-    return first.lower() == second.lower()
+    return (first or "").lower() == (second or "").lower()
 
 
 def _check_same_realm(module):
@@ -562,6 +563,13 @@ def main():
             msg="Selected local bucket {0} does not exist.".format(
                 module.params["name"]
             )
+        )
+    if not local_replica_link and local_bucket.destroyed:
+        # The array refuses a new replica link for a destroyed bucket, so the
+        # create is refused before anything is written, in check mode too.
+        module.fail_json(
+            msg="Selected local bucket {0} is destroyed. Recover the bucket "
+            "before creating a replica link.".format(module.params["name"])
         )
 
     if local_replica_link and local_replica_link.status == "unhealthy":

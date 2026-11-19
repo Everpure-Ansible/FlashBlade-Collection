@@ -86,6 +86,13 @@ def _ref(name):
     return ref
 
 
+def _bucket(name, destroyed=False):
+    """A bucket as GET /buckets returns it, destroyed ones included"""
+    bucket = _ref(name)
+    bucket.destroyed = destroyed
+    return bucket
+
+
 STATUS_DETAILS = (
     "Replica link set-up issue. Please enable versioning on the target bucket."
 )
@@ -137,7 +144,7 @@ def _module(params, check_mode=False):
 def _blade(link=None, patch_status=200):
     blade = Mock()
     blade.get_bucket_replica_links.return_value = _response([link] if link else [])
-    blade.get_buckets.return_value = _response([_ref("foo")])
+    blade.get_buckets.return_value = _response([_bucket("foo")])
     blade.get_object_store_remote_credentials.return_value = _response(
         [_ref(REMOTE + "/" + CRED)]
     )
@@ -532,7 +539,7 @@ def _message(response, default="Unknown error"):
 def _realm_blade(link=None):
     """The array holding bucket realm1::foo and credential realm1::cred_1"""
     blade = _blade(link=link)
-    blade.get_buckets.return_value = _response([_ref(REALM_BUCKET)])
+    blade.get_buckets.return_value = _response([_bucket(REALM_BUCKET)])
     blade.get_object_store_remote_credentials.return_value = _response(
         [_ref(REMOTE + "/" + REALM_CRED)]
     )
@@ -952,3 +959,77 @@ class TestPurefbBucketReplicaRealm:
         assert "Failed to get targets." in msg
         assert "Operation not permitted." in msg
         _no_write(blade)
+
+    # ---------------- destroyed bucket ----------------
+
+    def test_main_create_refuses_destroyed_bucket(self):
+        """No link is sent for a destroyed bucket"""
+        blade = _blade()
+        blade.get_buckets.return_value = _response([_bucket("foo", destroyed=True)])
+        module, mocks = _main(
+            params=_base_params(target=REMOTE, credential=CRED), blade=blade
+        )
+
+        assert _failure(module).startswith("Selected local bucket foo is destroyed.")
+        _no_write(blade)
+        module.exit_json.assert_not_called()
+
+    def test_main_create_refuses_destroyed_bucket_in_check_mode(self):
+        """Check mode reports the refusal instead of a change"""
+        blade = _realm_blade()
+        blade.get_buckets.return_value = _response(
+            [_bucket(REALM_BUCKET, destroyed=True)]
+        )
+        module, mocks = _main(
+            params=_base_params(
+                name=REALM_BUCKET, target=REMOTE, credential=REALM_CRED
+            ),
+            blade=blade,
+            check_mode=True,
+        )
+
+        assert _failure(module).startswith(
+            "Selected local bucket realm1::foo is destroyed."
+        )
+        _no_write(blade)
+        module.exit_json.assert_not_called()
+
+    def test_main_existing_link_of_destroyed_bucket_is_still_managed(self):
+        """Only a new link is refused for a destroyed bucket"""
+        blade = _blade(link=_link())
+        blade.get_buckets.return_value = _response([_bucket("foo", destroyed=True)])
+        module, mocks = _main(params=_base_params(paused=True), blade=blade)
+
+        module.fail_json.assert_not_called()
+        blade.patch_bucket_replica_links.assert_called_once()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    # ---------------- names the array does not return ----------------
+
+    def test_same_name(self):
+        """Names are compared without regard to case; no name matches no name"""
+        from plugins.modules.purefb_bucket_replica import _same_name
+
+        assert _same_name("Realm1", "realm1")
+        assert _same_name("", "")
+        assert not _same_name("realm1", "")
+        assert not _same_name(None, "arrayb")
+        assert not _same_name("arrayb", None)
+
+    def test_main_connection_without_a_name_is_no_match(self):
+        """A connection returned without a remote name is passed over"""
+        blade = _blade()
+        nameless = Mock()
+        nameless.remote = _ref(None)
+        nameless.status = "connected"
+        connection = Mock()
+        connection.remote = _ref(REMOTE)
+        connection.status = "connected"
+        blade.get_array_connections.return_value = _response([nameless, connection])
+        module, mocks = _main(
+            params=_base_params(target=REMOTE, credential=CRED, target_bucket="bar"),
+            blade=blade,
+        )
+
+        module.fail_json.assert_not_called()
+        blade.post_bucket_replica_links.assert_called_once()

@@ -104,11 +104,29 @@ def _base_params(**overrides):
     return params
 
 
-def _response(status_code=200, items=None):
+def _response(status_code=200, items=None, message=None):
+    """An SDK response: the items of a 200, the error of the array otherwise."""
     res = Mock()
     res.status_code = status_code
     res.items = items if items is not None else []
+    if status_code != 200:
+        error = Mock(spec=["message"])
+        error.message = message or "Internal error."
+        res.errors = [error]
     return res
+
+
+def _absent():
+    """What GET /servers answers for a name that matches no server."""
+    return _response(400, message="Server does not exist.")
+
+
+def _error_message(response, default="Unknown error"):
+    """get_error_message of module_utils.common, which is mocked here."""
+    errors = getattr(response, "errors", None)
+    if isinstance(errors, list) and errors:
+        return errors[0].message
+    return default
 
 
 def _ref(name):
@@ -140,6 +158,7 @@ def _server(
             "dns",
             "directory_services",
             "local_directory_service",
+            "realms",
         ]
     )
     server.id = server_id
@@ -148,7 +167,18 @@ def _server(
     server.dns = [_ref(name) for name in dns]
     server.directory_services = [_ref(name) for name in directory_services]
     server.local_directory_service = _ref(lds) if lds else None
+    server.realms = [_ref(name.rpartition("::")[0])] if "::" in name else []
     return server
+
+
+def _realm_server(dns=("rzaudit::dns1",), lds=None):
+    """Server rzaudit::srv as the array returns a server in a realm."""
+    return _server(
+        dns=dns,
+        directory_services=("rzaudit::srv_nfs",),
+        lds=lds,
+        name="rzaudit::srv",
+    )
 
 
 def _attached(name, ref_id=None):
@@ -203,6 +233,8 @@ def _run_main(params, blade, api_version="2.30", check_mode=False, has_sdk=True)
     ), patch(
         "plugins.modules.purefb_server.get_rest_api_version", return_value=api_version
     ), patch(
+        "plugins.modules.purefb_server.get_error_message", _error_message
+    ), patch(
         "plugins.modules.purefb_server.LooseVersion", _Version
     ), patch(
         "plugins.modules.purefb_server.HAS_PYPURECLIENT", has_sdk
@@ -223,7 +255,7 @@ class TestPurefbServer:
     def test_lds_options_are_mutually_exclusive(self):
         """The two local directory service options are declared mutually exclusive"""
         blade = Mock()
-        blade.get_servers.return_value = _response(400)
+        blade.get_servers.return_value = _absent()
         blade.post_servers.return_value = _response(200)
 
         module = _run_main(_base_params(), blade)
@@ -241,7 +273,7 @@ class TestPurefbServer:
         """create_local_directory_service goes to POST as a query kwarg, never
         as the ServerPost local_directory_service body reference"""
         blade = Mock()
-        blade.get_servers.return_value = _response(400)
+        blade.get_servers.return_value = _absent()
         blade.post_servers.return_value = _response(200)
 
         module = _run_main(
@@ -261,7 +293,7 @@ class TestPurefbServer:
     def test_create_without_create_lds_omits_query_parameter(self, mock_server_post):
         """A plain create does not send create_local_directory_service at all"""
         blade = Mock()
-        blade.get_servers.return_value = _response(400)
+        blade.get_servers.return_value = _absent()
         blade.post_servers.return_value = _response(200)
 
         module = _run_main(_base_params(dns=["mydns"]), blade)
@@ -279,7 +311,7 @@ class TestPurefbServer:
     ):
         """local_directory_service attaches an existing LDS through the body"""
         blade = Mock()
-        blade.get_servers.return_value = _response(400)
+        blade.get_servers.return_value = _absent()
         blade.post_servers.return_value = _response(200)
 
         _run_main(_base_params(local_directory_service="myserver_local"), blade)
@@ -294,7 +326,7 @@ class TestPurefbServer:
     def test_create_check_mode_skips_post(self):
         """Check mode reports a change without calling POST"""
         blade = Mock()
-        blade.get_servers.return_value = _response(400)
+        blade.get_servers.return_value = _absent()
 
         module = _run_main(
             _base_params(create_local_directory_service="myserver_local"),
@@ -309,7 +341,7 @@ class TestPurefbServer:
     def test_create_fails_on_api_error(self):
         """A failed POST surfaces as fail_json naming the server"""
         blade = Mock()
-        blade.get_servers.return_value = _response(400)
+        blade.get_servers.return_value = _absent()
         blade.post_servers.return_value = _response(400)
 
         module = _run_main(
@@ -453,7 +485,7 @@ class TestPurefbServer:
     def test_delete_nonexistent_is_noop(self):
         """Deleting a server that is already gone reports no change"""
         blade = Mock()
-        blade.get_servers.return_value = _response(400)
+        blade.get_servers.return_value = _absent()
 
         module = _run_main(_base_params(state="absent"), blade)
 
@@ -1048,7 +1080,7 @@ class TestPurefbServer:
     def test_plain_create_allowed_below_rest_2_24(self):
         """Without either LDS option the module works on REST 2.16"""
         blade = Mock()
-        blade.get_servers.return_value = _response(400)
+        blade.get_servers.return_value = _absent()
         blade.post_servers.return_value = _response(200)
 
         module = _run_main(_base_params(), blade, api_version="2.16")
@@ -1062,7 +1094,7 @@ class TestPurefbServer:
         """create_local_directory_service: "" is treated as omitted, so it
         passes the 2.24 gate and is never sent to POST"""
         blade = Mock()
-        blade.get_servers.return_value = _response(400)
+        blade.get_servers.return_value = _absent()
         blade.post_servers.return_value = _response(200)
 
         module = _run_main(
@@ -1101,3 +1133,638 @@ class TestPurefbServer:
         module.fail_json.assert_called_once()
         assert "py-pure-client" in module.fail_json.call_args[1]["msg"]
         blade.get_servers.assert_not_called()
+
+    # ---------------- reading the server ----------------
+
+    def test_refused_read_is_reported_and_creates_nothing(self):
+        """A read the array refuses is not taken for an absent server"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(
+            403, message="Operation not permitted."
+        )
+
+        module = _run_main(_base_params(dns=["mydns"]), blade)
+
+        blade.post_servers.assert_not_called()
+        module.exit_json.assert_not_called()
+        module.fail_json.assert_called_once()
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Failed to read server myserver. Error: Operation not permitted."
+        )
+
+    def test_refused_read_fails_state_absent_in_check_mode(self):
+        """A failed read is not reported as a server that is already gone"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(500, message="Internal error.")
+
+        module = _run_main(_base_params(state="absent"), blade, check_mode=True)
+
+        blade.delete_servers.assert_not_called()
+        module.exit_json.assert_not_called()
+        module.fail_json.assert_called_once()
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Failed to read server myserver. Error: Internal error."
+        )
+
+    def test_answer_without_a_server_means_absent(self):
+        """Should the array answer 200 and list no server, the server is
+        absent and is created"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [])
+        blade.post_servers.return_value = _response(200)
+
+        module = _run_main(_base_params(), blade)
+
+        blade.post_servers.assert_called_once()
+        blade.patch_servers.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_update_reads_the_server_once(self):
+        """The update works on the server the first read returned"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_server()])
+
+        module = _run_main(_base_params(dns=["management"]), blade)
+
+        blade.get_servers.assert_called_once_with(names=["myserver"])
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    # ---------------- directory_service ----------------
+
+    def test_directory_service_matching_is_unchanged(self):
+        """Naming the directory service of the server sends nothing"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_server()])
+
+        module = _run_main(_base_params(directory_service=["myserver_nfs"]), blade)
+
+        blade.patch_servers.assert_not_called()
+        module.fail_json.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    def test_directory_service_in_another_case_is_unchanged(self):
+        """The array matches names whatever their case, so does the module"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_server()])
+
+        module = _run_main(_base_params(directory_service=["MyServer_NFS"]), blade)
+
+        blade.patch_servers.assert_not_called()
+        module.fail_json.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    def test_directory_service_bare_name_on_realm_server_is_unchanged(self):
+        """On a server in a realm a name without a realm is compared in the
+        realm of the server"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_realm_server()])
+
+        module = _run_main(
+            _base_params(name="rzaudit::srv", directory_service=["srv_nfs"]), blade
+        )
+
+        blade.patch_servers.assert_not_called()
+        module.fail_json.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    def test_directory_service_qualified_name_on_realm_server_is_unchanged(self):
+        """The full name of the directory service of a realm server matches"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_realm_server()])
+
+        module = _run_main(
+            _base_params(name="rzaudit::srv", directory_service=["rzaudit::srv_nfs"]),
+            blade,
+        )
+
+        blade.patch_servers.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    def test_directory_service_difference_fails_and_sends_nothing(self):
+        """Another name is refused: the array would accept and ignore it"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_server()])
+        blade.patch_servers.return_value = _response(200)
+
+        module = _run_main(_base_params(directory_service=["other_nfs"]), blade)
+
+        blade.patch_servers.assert_not_called()
+        module.exit_json.assert_not_called()
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert msg.startswith(
+            "The directory services of server myserver are myserver_nfs, not "
+            "other_nfs."
+        )
+        assert "cannot be changed with purefb_server" in msg
+
+    def test_directory_service_difference_fails_in_check_mode(self):
+        """Check mode predicts the refusal instead of a change"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_server()])
+
+        module = _run_main(
+            _base_params(directory_service=["other_nfs"]), blade, check_mode=True
+        )
+
+        blade.patch_servers.assert_not_called()
+        module.exit_json.assert_not_called()
+        module.fail_json.assert_called_once()
+        assert "not other_nfs." in module.fail_json.call_args[1]["msg"]
+
+    def test_directory_service_empty_list_fails(self):
+        """An empty list is not what the server has, and is never sent"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_server()])
+
+        module = _run_main(_base_params(directory_service=[]), blade)
+
+        blade.patch_servers.assert_not_called()
+        module.fail_json.assert_called_once()
+        assert "are myserver_nfs, not none." in module.fail_json.call_args[1]["msg"]
+
+    def test_directory_service_extra_name_fails(self):
+        """The whole list is compared, not only its first name"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_server()])
+
+        module = _run_main(
+            _base_params(directory_service=["myserver_nfs", "nfs"]), blade
+        )
+
+        blade.patch_servers.assert_not_called()
+        module.fail_json.assert_called_once()
+        assert "not myserver_nfs, nfs." in module.fail_json.call_args[1]["msg"]
+
+    def test_directory_service_of_another_realm_fails_on_realm_server(self):
+        """A name in another realm is not completed with the realm of the
+        server"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_realm_server()])
+
+        module = _run_main(
+            _base_params(name="rzaudit::srv", directory_service=["other::srv_nfs"]),
+            blade,
+        )
+
+        blade.patch_servers.assert_not_called()
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "are rzaudit::srv_nfs, not other::srv_nfs." in msg
+
+    def test_directory_service_realm_name_fails_on_array_server(self):
+        """An array-level server does not have the directory service of its
+        namesake in a realm"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(
+            200, [_server(directory_services=("srv_nfs",), name="srv")]
+        )
+
+        module = _run_main(
+            _base_params(name="srv", directory_service=["rzaudit::srv_nfs"]), blade
+        )
+
+        blade.patch_servers.assert_not_called()
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "are srv_nfs, not rzaudit::srv_nfs." in msg
+
+    def test_directory_service_difference_fails_before_the_dns_change(self):
+        """The refusal is decided before any other change is sent"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_server()])
+        blade.patch_servers.return_value = _response(200)
+
+        module = _run_main(
+            _base_params(dns=["mydns"], directory_service=["other_nfs"]), blade
+        )
+
+        blade.patch_servers.assert_not_called()
+        module.exit_json.assert_not_called()
+        module.fail_json.assert_called_once()
+
+    @patch("plugins.modules.purefb_server.Server")
+    def test_directory_service_is_not_sent_with_a_dns_change(self, mock_server):
+        """A matching directory_service next to a DNS change sends the DNS
+        only"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_server()])
+        blade.patch_servers.return_value = _response(200)
+
+        module = _run_main(
+            _base_params(dns=["mydns"], directory_service=["myserver_nfs"]), blade
+        )
+
+        blade.patch_servers.assert_called_once()
+        mock_server.assert_called_once()
+        assert list(mock_server.call_args[1]) == ["dns"]
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    @patch("plugins.modules.purefb_server.ServerPost")
+    def test_create_does_not_send_directory_services(self, mock_server_post):
+        """The array creates the directory service itself: the request
+        names it in create_ds only"""
+        blade = Mock()
+        blade.get_servers.return_value = _absent()
+        blade.post_servers.return_value = _response(200)
+
+        module = _run_main(
+            _base_params(dns=["mydns"], directory_service=["myserver_nfs"]), blade
+        )
+
+        blade.post_servers.assert_called_once()
+        assert list(mock_server_post.call_args[1]) == ["dns"]
+        assert blade.post_servers.call_args[1]["create_ds"] == "myserver_nfs"
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    @patch("plugins.modules.purefb_server.ServerPost")
+    def test_create_realm_server_accepts_bare_directory_service(self, mock_server_post):
+        """A new server in a realm is created with realm::server_nfs, which a
+        name without a realm stands for"""
+        blade = Mock()
+        blade.get_servers.return_value = _absent()
+        blade.post_servers.return_value = _response(200)
+
+        module = _run_main(
+            _base_params(
+                name="rzaudit::srv",
+                dns=["rzaudit::dns1"],
+                directory_service=["srv_nfs"],
+            ),
+            blade,
+        )
+
+        module.fail_json.assert_not_called()
+        assert list(mock_server_post.call_args[1]) == ["dns"]
+        assert blade.post_servers.call_args[1]["create_ds"] == "rzaudit::srv_nfs"
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_create_with_another_directory_service_is_refused(self):
+        """A server cannot be created with a directory service other than
+        its own, so nothing is created"""
+        blade = Mock()
+        blade.get_servers.return_value = _absent()
+        blade.post_servers.return_value = _response(200)
+
+        module = _run_main(_base_params(directory_service=["nfs"]), blade)
+
+        blade.post_servers.assert_not_called()
+        module.exit_json.assert_not_called()
+        module.fail_json.assert_called_once()
+        assert module.fail_json.call_args[1]["msg"].startswith(
+            "Server myserver is created with the directory service myserver_nfs, "
+            "not nfs."
+        )
+
+    def test_create_with_another_directory_service_is_refused_in_check_mode(self):
+        """Check mode predicts the refusal of the create"""
+        blade = Mock()
+        blade.get_servers.return_value = _absent()
+
+        module = _run_main(
+            _base_params(directory_service=["nfs"]), blade, check_mode=True
+        )
+
+        blade.post_servers.assert_not_called()
+        module.exit_json.assert_not_called()
+        module.fail_json.assert_called_once()
+
+    # ---------------- references of a server in a realm ----------------
+
+    def test_realm_server_dns_without_realm_gets_the_rule(self):
+        """The array says the DNS does not exist; the module adds what a
+        server in a realm can use"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_realm_server()])
+        blade.patch_servers.return_value = _response(400, message="DNS does not exist.")
+
+        module = _run_main(_base_params(name="rzaudit::srv", dns=["mydns"]), blade)
+
+        msg = module.fail_json.call_args[1]["msg"]
+        assert msg.startswith(
+            "Failed to update DNS config for server rzaudit::srv. Error: DNS "
+            "does not exist. A server in realm rzaudit can only use a DNS "
+            "configuration of that realm, named rzaudit::<name>"
+        )
+        assert "shared with the realm through purefb_resource_access." in msg
+        assert "local directory service" not in msg
+
+    def test_realm_server_dns_of_another_realm_gets_the_rule(self):
+        """A DNS configuration named in another realm gets the same rule"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_realm_server()])
+        blade.patch_servers.return_value = _response(
+            400, message="Cannot modify server. DNS is not accessible to the server."
+        )
+
+        module = _run_main(
+            _base_params(name="rzaudit::srv", dns=["other::dns1"]), blade
+        )
+
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "DNS is not accessible to the server. A server in realm rzaudit" in msg
+
+    def test_realm_server_dns_realm_in_another_case_gets_the_rule(self):
+        """The realm of a DNS configuration is given as the array reports it"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_realm_server()])
+        blade.patch_servers.return_value = _response(
+            400, message="Cannot modify server. DNS is not accessible to the server."
+        )
+
+        module = _run_main(
+            _base_params(name="rzaudit::srv", dns=["RZAUDIT::dns2"]), blade
+        )
+
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "with the realm in the case the array reports it" in msg
+
+    def test_realm_server_dns_in_its_realm_gets_no_rule(self):
+        """A reference that is named in the realm fails for another reason"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_realm_server()])
+        blade.patch_servers.return_value = _response(400, message="DNS does not exist.")
+
+        module = _run_main(
+            _base_params(name="rzaudit::srv", dns=["rzaudit::nodns"]), blade
+        )
+
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Failed to update DNS config for server rzaudit::srv. Error: DNS "
+            "does not exist."
+        )
+
+    def test_realm_of_the_rule_is_the_stored_one(self):
+        """The realm of the server is read from the name the array returned,
+        not from the spelling of the task"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_realm_server()])
+        blade.patch_servers.return_value = _response(400, message="DNS does not exist.")
+
+        module = _run_main(
+            _base_params(name="RZAUDIT::SRV", dns=["rzaudit::nodns"]), blade
+        )
+
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Failed to update DNS config for server RZAUDIT::SRV. Error: DNS "
+            "does not exist."
+        )
+
+    def test_array_server_dns_failure_gets_no_rule(self):
+        """Array-level servers keep the message of the array as it is"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_server()])
+        blade.patch_servers.return_value = _response(400, message="DNS does not exist.")
+
+        module = _run_main(_base_params(dns=["nodns"]), blade)
+
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Failed to update DNS config for server myserver. Error: DNS does "
+            "not exist."
+        )
+
+    def test_realm_server_local_ds_without_realm_gets_the_rule(self):
+        """The local directory service of a realm server is in its realm"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_realm_server()])
+        blade.patch_servers.return_value = _response(
+            400,
+            message="Cannot update server. Local directory service is not "
+            "accessible to the server.",
+        )
+
+        module = _run_main(
+            _base_params(name="rzaudit::srv", local_directory_service="lds1"), blade
+        )
+
+        msg = module.fail_json.call_args[1]["msg"]
+        assert msg.startswith(
+            "Failed to update local directory service for server rzaudit::srv. "
+            "Error: Cannot update server. Local directory service is not "
+            "accessible to the server. A server in realm rzaudit can only use "
+            "a local directory service of that realm, named rzaudit::lds1."
+        )
+        assert "DNS configuration" not in msg
+
+    def test_realm_server_local_ds_in_its_realm_gets_no_rule(self):
+        """A local directory service named in the realm fails as the array
+        says"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_realm_server()])
+        blade.patch_servers.return_value = _response(
+            400, message="Local directory service does not exist."
+        )
+
+        module = _run_main(
+            _base_params(name="rzaudit::srv", local_directory_service="rzaudit::nolds"),
+            blade,
+        )
+
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Failed to update local directory service for server rzaudit::srv. "
+            "Error: Local directory service does not exist."
+        )
+
+    def test_realm_server_failed_clear_gets_no_rule(self):
+        """Clearing the local directory service names no reference"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(
+            200, [_realm_server(lds="rzaudit::lds1")]
+        )
+        blade.patch_servers.return_value = _response(400, message="Not now.")
+
+        module = _run_main(
+            _base_params(name="rzaudit::srv", local_directory_service=""), blade
+        )
+
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Failed to update local directory service for server rzaudit::srv. "
+            "Error: Not now."
+        )
+
+    def test_create_realm_server_without_dns_gets_the_rule(self):
+        """A new server in a realm needs a DNS configuration: the module adds
+        which ones it can use"""
+        blade = Mock()
+        blade.get_servers.return_value = _absent()
+        blade.post_servers.return_value = _response(
+            400, message="DNS is required for servers inside a realm."
+        )
+
+        module = _run_main(_base_params(name="rzaudit::srv"), blade)
+
+        msg = module.fail_json.call_args[1]["msg"]
+        assert msg.startswith(
+            "Failed to add server rzaudit::srv. Error: DNS is required for "
+            "servers inside a realm. A server in realm rzaudit can only use a "
+            "DNS configuration of that realm"
+        )
+        assert "purefb_resource_access" in msg
+
+    def test_create_realm_server_with_bare_create_lds_gets_the_rule(self):
+        """create_local_directory_service of a realm server carries the realm"""
+        blade = Mock()
+        blade.get_servers.return_value = _absent()
+        blade.post_servers.return_value = _response(
+            400,
+            message="Cannot create server. Local directory service is not "
+            "accessible to the server.",
+        )
+
+        module = _run_main(
+            _base_params(
+                name="rzaudit::srv",
+                dns=["rzaudit::dns1"],
+                create_local_directory_service="lds2",
+            ),
+            blade,
+        )
+
+        msg = module.fail_json.call_args[1]["msg"]
+        assert msg.endswith(
+            "accessible to the server. A server in realm rzaudit can only use "
+            "a local directory service of that realm, named rzaudit::lds2."
+        )
+        assert "DNS configuration" not in msg
+
+    def test_shared_dns_gets_no_rule_when_the_local_ds_is_refused(self):
+        """An array-level DNS configuration shared with the realm is a valid
+        reference: a refusal of the local directory service says nothing
+        about it"""
+        blade = Mock()
+        blade.get_servers.return_value = _absent()
+        blade.post_servers.return_value = _response(
+            400,
+            message="Cannot create server. Local directory service is not "
+            "accessible to the server.",
+        )
+
+        module = _run_main(
+            _base_params(
+                name="rzaudit::srv",
+                dns=["shareddns"],
+                create_local_directory_service="lds2",
+            ),
+            blade,
+        )
+
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Failed to add server rzaudit::srv. Error: Cannot create server. "
+            "Local directory service is not accessible to the server. A server "
+            "in realm rzaudit can only use a local directory service of that "
+            "realm, named rzaudit::lds2."
+        )
+
+    def test_refused_dns_gets_no_local_ds_rule(self):
+        """A refusal of the DNS configuration gets the DNS rule only"""
+        blade = Mock()
+        blade.get_servers.return_value = _absent()
+        blade.post_servers.return_value = _response(400, message="DNS does not exist.")
+
+        module = _run_main(
+            _base_params(
+                name="rzaudit::srv", dns=["mydns"], local_directory_service="lds1"
+            ),
+            blade,
+        )
+
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "named rzaudit::<name>" in msg
+        assert msg.endswith("through purefb_resource_access.")
+        assert "local directory service" not in msg
+
+    def test_other_refusal_of_a_realm_server_gets_no_rule(self):
+        """A message about neither kind of reference stays as it is"""
+        blade = Mock()
+        blade.get_servers.return_value = _absent()
+        blade.post_servers.return_value = _response(
+            400, message="Realm does not exist."
+        )
+
+        module = _run_main(
+            _base_params(
+                name="norealm::srv", dns=["mydns"], local_directory_service="lds1"
+            ),
+            blade,
+        )
+
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Failed to add server norealm::srv. Error: Realm does not exist."
+        )
+
+    def test_create_array_server_failure_gets_no_rule(self):
+        """An array-level create fails with the message of the array alone"""
+        blade = Mock()
+        blade.get_servers.return_value = _absent()
+        blade.post_servers.return_value = _response(400, message="DNS does not exist.")
+
+        module = _run_main(
+            _base_params(dns=["nodns"], local_directory_service="lds1"), blade
+        )
+
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Failed to add server myserver. Error: DNS does not exist."
+        )
+
+    # ---------------- letter case ----------------
+
+    def test_update_dns_in_another_case_is_noop(self):
+        """The array stores the name of the DNS configuration in its own
+        case; another case in the task is not a change"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_server()])
+
+        module = _run_main(_base_params(dns=["MANAGEMENT"]), blade)
+
+        blade.patch_servers.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    def test_update_lds_in_another_case_is_noop(self):
+        """The attached local directory service is matched whatever the case"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(
+            200, [_realm_server(lds="rzaudit::lds1")]
+        )
+
+        module = _run_main(
+            _base_params(name="rzaudit::srv", local_directory_service="rzaudit::LDS1"),
+            blade,
+        )
+
+        blade.patch_servers.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    def test_update_create_lds_in_another_case_is_idempotent(self):
+        """create_local_directory_service on an existing server accepts the
+        attached local directory service whatever the case"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_server(lds="myserver_local")])
+
+        module = _run_main(
+            _base_params(create_local_directory_service="MyServer_Local"), blade
+        )
+
+        module.fail_json.assert_not_called()
+        blade.patch_servers.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    def test_update_clears_attached_lds(self):
+        """An empty string still clears the attached local directory service"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_server(lds="myserver_local")])
+        blade.patch_servers.return_value = _response(200)
+
+        module = _run_main(_base_params(local_directory_service=""), blade)
+
+        blade.patch_servers.assert_called_once()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_update_clear_of_unset_lds_is_noop(self):
+        """Clearing a local directory service that is not set sends nothing"""
+        blade = Mock()
+        blade.get_servers.return_value = _response(200, [_server()])
+
+        module = _run_main(_base_params(local_directory_service=""), blade)
+
+        blade.patch_servers.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False

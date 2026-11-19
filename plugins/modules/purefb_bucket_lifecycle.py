@@ -40,6 +40,11 @@ options:
   bucket:
     description:
     - Name of the bucket whose lifecycle policy holds the rule.
+    - For a bucket in a realm give the realm-qualified name, C(realm::bucket).
+      The rule name in I(name) is not qualified.
+    - A name without a realm prefix is never resolved inside a realm. It always
+      means the bucket of that name outside any realm, and the task fails if
+      there is no such bucket.
     type: str
     required: true
   name:
@@ -168,6 +173,14 @@ EXAMPLES = r"""
     name: tmp-cutoff
     prefix: tmp/
     keep_current_until: "2030-01-01"
+    fb_url: 10.10.10.2
+    api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+
+- name: Expire previous versions in bucket foo of realm realm1 after 30 days
+  everpure.flashblade.purefb_bucket_lifecycle:
+    bucket: realm1::foo
+    name: previous-30d
+    keep_previous_for: 30d
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
 

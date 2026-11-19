@@ -12,6 +12,8 @@ import multiprocessing
 import ctypes
 from unittest.mock import Mock, patch, MagicMock
 
+import pytest
+
 # Mock multiprocessing context for Windows
 if sys.platform == "win32":
     original_get_context = multiprocessing.get_context
@@ -77,6 +79,7 @@ from plugins.modules.purefb_bucket_lifecycle import (
     main,
     _context_kwargs,
     _current_state,
+    _get_bucket,
     _get_rule,
     _tags_param,
 )
@@ -811,3 +814,573 @@ class TestPurefbBucketLifecycle:
             keep_current_version_for=10 * DAY, filter={"tags": [("env", "dev")]}
         )
         module.fail_json.assert_not_called()
+
+
+# ---------------- buckets in a realm ----------------
+
+REALM_BUCKET = "realm1::bkt"
+OTHER_REALM_BUCKET = "realm2::bkt"
+BOTH_BUCKETS = ["bkt", REALM_BUCKET]
+# (the bucket a task names, another bucket with the same leaf name): outside and
+# inside a realm in both directions, and in two realms
+NAMESAKES = [
+    ("bkt", REALM_BUCKET),
+    (REALM_BUCKET, "bkt"),
+    (REALM_BUCKET, OTHER_REALM_BUCKET),
+]
+
+
+def _array(buckets):
+    """A blade that resolves bucket names the way the array does.
+
+    ``buckets`` maps the name of each bucket the array holds to its rules by
+    rule name. A bucket in a realm is named realm::bucket and answers to that
+    name only, so "bkt", "realm1::bkt" and "realm2::bkt" are three buckets.
+    A lookup of a name the array does not hold answers 400, whether the name
+    is unknown, in a realm that does not exist, or the bare name of a bucket
+    that lives in a realm. A rule name the bucket does not have answers 200
+    with no items. Without names, every bucket is listed. A rule call on a
+    bucket the array does not hold is refused here as the REST reference
+    describes; the module never sends one, it stops at the bucket lookup.
+    """
+    blade = Mock()
+    blade.get_versions.return_value.items = ["2.29", "2.30"]
+    blade.get_fleets.return_value = _response(200, [])
+
+    def get_buckets(names=None, **kwargs):
+        if names is None:
+            names = list(buckets)
+        if any(name not in buckets for name in names):
+            return _response(400)
+        items = []
+        for name in names:
+            bucket = Mock()
+            bucket.name = name
+            items.append(bucket)
+        return _response(200, items)
+
+    def get_rules(bucket_names, names, **kwargs):
+        if bucket_names[0] not in buckets:
+            return _response(400)
+        rules = buckets[bucket_names[0]]
+        return _response(200, [rules[name] for name in names if name in rules])
+
+    def write_rule(bucket_names, **kwargs):
+        return _response(200 if bucket_names[0] in buckets else 400)
+
+    blade.get_buckets = Mock(side_effect=get_buckets)
+    blade.get_buckets_lifecycle_policies_rules = Mock(side_effect=get_rules)
+    blade.post_buckets_lifecycle_policies_rules = Mock(side_effect=write_rule)
+    blade.patch_buckets_lifecycle_policies_rules = Mock(side_effect=write_rule)
+    blade.delete_buckets_lifecycle_policies_rules = Mock(side_effect=write_rule)
+    return blade
+
+
+def _bucket_names_sent(blade):
+    """Every bucket name the module sent to the array, whatever the call."""
+    sent = set()
+    for call in blade.get_buckets.call_args_list:
+        sent.update(call[1].get("names") or ["<every bucket>"])
+    for method in (
+        blade.get_buckets_lifecycle_policies_rules,
+        blade.post_buckets_lifecycle_policies_rules,
+        blade.patch_buckets_lifecycle_policies_rules,
+        blade.delete_buckets_lifecycle_policies_rules,
+    ):
+        for call in method.call_args_list:
+            sent.update(call[1]["bucket_names"])
+    return sent
+
+
+def _no_rule_written(blade):
+    return not (
+        blade.post_buckets_lifecycle_policies_rules.called
+        or blade.patch_buckets_lifecycle_policies_rules.called
+        or blade.delete_buckets_lifecycle_policies_rules.called
+    )
+
+
+class TestPurefbBucketLifecycleRealmBucket:
+    """A bucket in a realm is addressed by its full name, realm::bucket"""
+
+    # ---------------- lookups ----------------
+
+    @pytest.mark.parametrize("bucket", BOTH_BUCKETS)
+    def test_get_bucket_sends_the_name_as_given(self, bucket):
+        module = _module(_base_params(bucket=bucket))
+        blade = _array({"bkt": {}, REALM_BUCKET: {}})
+        assert _get_bucket(module, blade).name == bucket
+        blade.get_buckets.assert_called_once_with(names=[bucket])
+
+    @pytest.mark.parametrize("bucket", ["bkt", "zznorealm::bkt", "realm1::other"])
+    def test_get_bucket_never_falls_back_to_another_name(self, bucket):
+        module = _module(_base_params(bucket=bucket))
+        blade = _array({REALM_BUCKET: {}})
+        assert _get_bucket(module, blade) is None
+        blade.get_buckets.assert_called_once_with(names=[bucket])
+
+    def test_get_rule_addresses_the_realm_bucket(self):
+        module = _module(_base_params(bucket=REALM_BUCKET))
+        rule = _existing_rule()
+        blade = _array({"bkt": {}, REALM_BUCKET: {"rule1": rule}})
+        assert _get_rule(module, blade) is rule
+        blade.get_buckets_lifecycle_policies_rules.assert_called_once_with(
+            bucket_names=[REALM_BUCKET], names=["rule1"]
+        )
+
+    def test_get_rule_of_realm_bucket_passes_context(self):
+        module = _module(_base_params(bucket=REALM_BUCKET, context="peer1"))
+        blade = _array({REALM_BUCKET: {}})
+        assert _get_rule(module, blade) is None
+        blade.get_buckets_lifecycle_policies_rules.assert_called_once_with(
+            bucket_names=[REALM_BUCKET], names=["rule1"], context_names=["peer1"]
+        )
+
+    # ---------------- create ----------------
+
+    @pytest.mark.parametrize("bucket", BOTH_BUCKETS)
+    def test_create_sends_the_bucket_name_unchanged(self, bucket):
+        module = _module(
+            _base_params(
+                bucket=bucket,
+                prefix="logs/",
+                keep_previous_for="2d",
+                keep_previous_versions_count=3,
+            )
+        )
+        blade = _array({"bkt": {}, REALM_BUCKET: {}})
+        mock_post, dummy = _run(module, blade)
+
+        blade.get_buckets.assert_called_once_with(names=[bucket])
+        blade.get_buckets_lifecycle_policies_rules.assert_called_once_with(
+            bucket_names=[bucket], names=["rule1"]
+        )
+        mock_post.assert_called_once_with(
+            keep_previous_version_for=2 * DAY,
+            keep_previous_versions_count=3,
+            filter={"prefix": "logs/"},
+        )
+        blade.post_buckets_lifecycle_policies_rules.assert_called_once_with(
+            bucket_names=[bucket], names=["rule1"], rule=mock_post.return_value
+        )
+        blade.patch_buckets_lifecycle_policies_rules.assert_not_called()
+        module.fail_json.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_create_on_realm_bucket_with_date_confirms_date(self):
+        module = _module(
+            _base_params(bucket=REALM_BUCKET, keep_current_until="2030-01-01")
+        )
+        blade = _array({REALM_BUCKET: {}})
+        mock_post, dummy = _run(module, blade)
+
+        mock_post.assert_called_once_with(keep_current_version_until=1893456000000)
+        blade.post_buckets_lifecycle_policies_rules.assert_called_once_with(
+            bucket_names=[REALM_BUCKET],
+            names=["rule1"],
+            rule=mock_post.return_value,
+            confirm_date=True,
+        )
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_create_disabled_on_realm_bucket_posts_then_patches(self):
+        module = _module(
+            _base_params(bucket=REALM_BUCKET, keep_previous_for="2d", enabled=False)
+        )
+        blade = _array({"bkt": {}, REALM_BUCKET: {}})
+        mock_post, mock_patch = _run(module, blade)
+
+        mock_post.assert_called_once_with(keep_previous_version_for=2 * DAY)
+        blade.post_buckets_lifecycle_policies_rules.assert_called_once_with(
+            bucket_names=[REALM_BUCKET], names=["rule1"], rule=mock_post.return_value
+        )
+        mock_patch.assert_called_once_with(enabled=False)
+        blade.patch_buckets_lifecycle_policies_rules.assert_called_once_with(
+            bucket_names=[REALM_BUCKET], names=["rule1"], rule=mock_patch.return_value
+        )
+        assert _bucket_names_sent(blade) == {REALM_BUCKET}
+        module.fail_json.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_create_on_realm_bucket_check_mode_writes_nothing(self):
+        module = _module(
+            _base_params(bucket=REALM_BUCKET, keep_previous_for="2d"), check_mode=True
+        )
+        blade = _array({REALM_BUCKET: {}})
+        _run(module, blade)
+
+        assert _no_rule_written(blade)
+        assert _bucket_names_sent(blade) == {REALM_BUCKET}
+        module.fail_json.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_create_on_realm_bucket_with_context(self):
+        module = _module(
+            _base_params(bucket=REALM_BUCKET, keep_previous_for="2d", context="peer1")
+        )
+        blade = _array({REALM_BUCKET: {}})
+        mock_post, dummy = _run(module, blade)
+
+        blade.get_buckets.assert_called_once_with(
+            names=[REALM_BUCKET], context_names=["peer1"]
+        )
+        blade.get_buckets_lifecycle_policies_rules.assert_called_once_with(
+            bucket_names=[REALM_BUCKET], names=["rule1"], context_names=["peer1"]
+        )
+        blade.post_buckets_lifecycle_policies_rules.assert_called_once_with(
+            bucket_names=[REALM_BUCKET],
+            names=["rule1"],
+            rule=mock_post.return_value,
+            context_names=["peer1"],
+        )
+
+    # ---------------- update ----------------
+
+    @pytest.mark.parametrize("bucket", BOTH_BUCKETS)
+    def test_update_sends_the_bucket_name_unchanged(self, bucket):
+        module = _module(_base_params(bucket=bucket, keep_previous_for="3d"))
+        blade = _array(
+            {
+                "bkt": {"rule1": _existing_rule()},
+                REALM_BUCKET: {"rule1": _existing_rule()},
+            }
+        )
+        dummy, mock_patch = _run(module, blade)
+
+        mock_patch.assert_called_once_with(keep_previous_version_for=3 * DAY)
+        blade.patch_buckets_lifecycle_policies_rules.assert_called_once_with(
+            bucket_names=[bucket], names=["rule1"], rule=mock_patch.return_value
+        )
+        assert _bucket_names_sent(blade) == {bucket}
+        module.fail_json.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_update_realm_rule_is_idempotent(self):
+        module = _module(
+            _base_params(
+                bucket=REALM_BUCKET,
+                prefix="logs/",
+                keep_previous_for="2d",
+                keep_previous_versions_count=3,
+                tags=[{"key": "team", "value": "ops"}, {"key": "env", "value": "dev"}],
+            )
+        )
+        rule = _existing_rule(tags=[_tag("env", "dev"), _tag("team", "ops")])
+        blade = _array({REALM_BUCKET: {"rule1": rule}})
+        dummy, mock_patch = _run(module, blade)
+
+        mock_patch.assert_not_called()
+        assert _no_rule_written(blade)
+        assert _bucket_names_sent(blade) == {REALM_BUCKET}
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    def test_update_realm_rule_check_mode_writes_nothing(self):
+        module = _module(
+            _base_params(bucket=REALM_BUCKET, enabled=False), check_mode=True
+        )
+        blade = _array({REALM_BUCKET: {"rule1": _existing_rule()}})
+        _run(module, blade)
+
+        assert _no_rule_written(blade)
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_update_realm_rule_until_confirms_date(self):
+        module = _module(
+            _base_params(bucket=REALM_BUCKET, keep_current_until="2030-01-01")
+        )
+        blade = _array({REALM_BUCKET: {"rule1": _existing_rule()}})
+        dummy, mock_patch = _run(module, blade)
+
+        mock_patch.assert_called_once_with(keep_current_version_until=1893456000000)
+        blade.patch_buckets_lifecycle_policies_rules.assert_called_once_with(
+            bucket_names=[REALM_BUCKET],
+            names=["rule1"],
+            rule=mock_patch.return_value,
+            confirm_date=True,
+        )
+
+    # ---------------- delete ----------------
+
+    @pytest.mark.parametrize("bucket", BOTH_BUCKETS)
+    def test_delete_sends_the_bucket_name_unchanged(self, bucket):
+        module = _module(_base_params(bucket=bucket, state="absent"))
+        blade = _array(
+            {
+                "bkt": {"rule1": _existing_rule()},
+                REALM_BUCKET: {"rule1": _existing_rule()},
+            }
+        )
+        _run(module, blade)
+
+        blade.delete_buckets_lifecycle_policies_rules.assert_called_once_with(
+            bucket_names=[bucket], names=["rule1"]
+        )
+        assert _bucket_names_sent(blade) == {bucket}
+        module.fail_json.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_delete_realm_rule_check_mode_writes_nothing(self):
+        module = _module(
+            _base_params(bucket=REALM_BUCKET, state="absent"), check_mode=True
+        )
+        blade = _array({REALM_BUCKET: {"rule1": _existing_rule()}})
+        _run(module, blade)
+
+        assert _no_rule_written(blade)
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_delete_missing_realm_rule_is_noop(self):
+        module = _module(_base_params(bucket=REALM_BUCKET, state="absent"))
+        blade = _array({REALM_BUCKET: {}})
+        _run(module, blade)
+
+        assert _no_rule_written(blade)
+        assert _bucket_names_sent(blade) == {REALM_BUCKET}
+        module.fail_json.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    # ---------------- the same leaf name outside the realm, in it, and in two realms ----------------
+
+    @pytest.mark.parametrize("bucket, other", NAMESAKES)
+    def test_same_rule_name_on_both_buckets_is_two_rules(self, bucket, other):
+        # the request differs from the rule of this bucket and matches the other one
+        module = _module(_base_params(bucket=bucket, keep_previous_for="9d"))
+        blade = _array(
+            {
+                bucket: {"rule1": _existing_rule()},
+                other: {"rule1": _existing_rule(keep_previous_version_for=9 * DAY)},
+            }
+        )
+        dummy, mock_patch = _run(module, blade)
+
+        mock_patch.assert_called_once_with(keep_previous_version_for=9 * DAY)
+        blade.patch_buckets_lifecycle_policies_rules.assert_called_once_with(
+            bucket_names=[bucket], names=["rule1"], rule=mock_patch.return_value
+        )
+        assert _bucket_names_sent(blade) == {bucket}
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    @pytest.mark.parametrize("bucket, other", NAMESAKES)
+    def test_rule_that_differs_only_on_the_other_bucket_is_unchanged(
+        self, bucket, other
+    ):
+        # the request matches the rule of this bucket and differs from the other one
+        module = _module(_base_params(bucket=bucket, keep_previous_for="2d"))
+        blade = _array(
+            {
+                bucket: {"rule1": _existing_rule()},
+                other: {"rule1": _existing_rule(keep_previous_version_for=9 * DAY)},
+            }
+        )
+        _run(module, blade)
+
+        assert _no_rule_written(blade)
+        assert _bucket_names_sent(blade) == {bucket}
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    @pytest.mark.parametrize("bucket, other", NAMESAKES)
+    def test_delete_ignores_the_rule_of_the_other_bucket(self, bucket, other):
+        module = _module(_base_params(bucket=bucket, state="absent"))
+        blade = _array({bucket: {}, other: {"rule1": _existing_rule()}})
+        _run(module, blade)
+
+        assert _no_rule_written(blade)
+        assert _bucket_names_sent(blade) == {bucket}
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    @pytest.mark.parametrize("bucket, other", NAMESAKES)
+    def test_create_ignores_the_rule_of_the_other_bucket(self, bucket, other):
+        module = _module(_base_params(bucket=bucket, keep_previous_for="2d"))
+        blade = _array({bucket: {}, other: {"rule1": _existing_rule()}})
+        mock_post, dummy = _run(module, blade)
+
+        blade.post_buckets_lifecycle_policies_rules.assert_called_once_with(
+            bucket_names=[bucket], names=["rule1"], rule=mock_post.return_value
+        )
+        blade.patch_buckets_lifecycle_policies_rules.assert_not_called()
+        assert _bucket_names_sent(blade) == {bucket}
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    # ---------------- a fleet context ----------------
+
+    def test_update_realm_rule_with_context(self):
+        module = _module(
+            _base_params(bucket=REALM_BUCKET, keep_previous_for="3d", context="peer1")
+        )
+        blade = _array({"bkt": {}, REALM_BUCKET: {"rule1": _existing_rule()}})
+        dummy, mock_patch = _run(module, blade)
+
+        blade.get_buckets.assert_called_once_with(
+            names=[REALM_BUCKET], context_names=["peer1"]
+        )
+        blade.get_buckets_lifecycle_policies_rules.assert_called_once_with(
+            bucket_names=[REALM_BUCKET], names=["rule1"], context_names=["peer1"]
+        )
+        mock_patch.assert_called_once_with(keep_previous_version_for=3 * DAY)
+        blade.patch_buckets_lifecycle_policies_rules.assert_called_once_with(
+            bucket_names=[REALM_BUCKET],
+            names=["rule1"],
+            rule=mock_patch.return_value,
+            context_names=["peer1"],
+        )
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_delete_realm_rule_with_context(self):
+        module = _module(
+            _base_params(bucket=REALM_BUCKET, state="absent", context="peer1")
+        )
+        blade = _array({"bkt": {}, REALM_BUCKET: {"rule1": _existing_rule()}})
+        _run(module, blade)
+
+        blade.get_buckets.assert_called_once_with(
+            names=[REALM_BUCKET], context_names=["peer1"]
+        )
+        blade.delete_buckets_lifecycle_policies_rules.assert_called_once_with(
+            bucket_names=[REALM_BUCKET], names=["rule1"], context_names=["peer1"]
+        )
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_create_disabled_on_realm_bucket_with_context(self):
+        module = _module(
+            _base_params(
+                bucket=REALM_BUCKET,
+                keep_previous_for="2d",
+                enabled=False,
+                context="peer1",
+            )
+        )
+        blade = _array({"bkt": {}, REALM_BUCKET: {}})
+        mock_post, mock_patch = _run(module, blade)
+
+        blade.post_buckets_lifecycle_policies_rules.assert_called_once_with(
+            bucket_names=[REALM_BUCKET],
+            names=["rule1"],
+            rule=mock_post.return_value,
+            context_names=["peer1"],
+        )
+        mock_patch.assert_called_once_with(enabled=False)
+        blade.patch_buckets_lifecycle_policies_rules.assert_called_once_with(
+            bucket_names=[REALM_BUCKET],
+            names=["rule1"],
+            rule=mock_patch.return_value,
+            context_names=["peer1"],
+        )
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    @pytest.mark.parametrize("bucket", BOTH_BUCKETS)
+    @pytest.mark.parametrize(
+        "params, has_rule, method",
+        [
+            (
+                {"keep_previous_for": "2d"},
+                False,
+                "post_buckets_lifecycle_policies_rules",
+            ),
+            (
+                {"keep_previous_for": "3d"},
+                True,
+                "patch_buckets_lifecycle_policies_rules",
+            ),
+            ({"state": "absent"}, True, "delete_buckets_lifecycle_policies_rules"),
+        ],
+    )
+    def test_fleet_member_names_itself_as_context(
+        self, bucket, params, has_rule, method
+    ):
+        # no context in the task: a fleet member sends its own name, for a bucket
+        # in a realm exactly as for any other bucket
+        module = _module(_base_params(bucket=bucket, **params))
+        rules = {"rule1": _existing_rule()} if has_rule else {}
+        blade = _array({"bkt": dict(rules), REALM_BUCKET: dict(rules)})
+        blade.get_fleets.return_value = _response(200, [Mock()])
+        local_array = Mock()
+        local_array.name = "local-fb"
+        blade.get_arrays.return_value.items = [local_array]
+        _run(module, blade)
+
+        blade.get_buckets.assert_called_once_with(
+            names=[bucket], context_names=["local-fb"]
+        )
+        blade.get_buckets_lifecycle_policies_rules.assert_called_once_with(
+            bucket_names=[bucket], names=["rule1"], context_names=["local-fb"]
+        )
+        write = getattr(blade, method)
+        write.assert_called_once()
+        assert write.call_args[1]["bucket_names"] == [bucket]
+        assert write.call_args[1]["context_names"] == ["local-fb"]
+        assert _bucket_names_sent(blade) == {bucket}
+        module.fail_json.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    # ---------------- refusals ----------------
+
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_bare_name_of_a_bucket_in_a_realm_fails(self, state, check_mode):
+        module = _module(
+            _base_params(bucket="bkt", state=state, keep_previous_for="2d"),
+            check_mode=check_mode,
+        )
+        blade = _array({REALM_BUCKET: {"rule1": _existing_rule()}})
+        _run(module, blade)
+
+        module.fail_json.assert_called_once_with(
+            msg="Specified bucket bkt does not exist"
+        )
+        module.exit_json.assert_not_called()
+        blade.get_buckets.assert_called_once_with(names=["bkt"])
+        blade.get_buckets_lifecycle_policies_rules.assert_not_called()
+        assert _no_rule_written(blade)
+
+    @pytest.mark.parametrize("bucket", ["zznorealm::bkt", "realm1::other"])
+    def test_realm_qualified_name_the_array_does_not_hold_fails(self, bucket):
+        module = _module(_base_params(bucket=bucket, keep_previous_for="2d"))
+        blade = _array({"bkt": {}, REALM_BUCKET: {}})
+        _run(module, blade)
+
+        module.fail_json.assert_called_once_with(
+            msg="Specified bucket {0} does not exist".format(bucket)
+        )
+        blade.get_buckets.assert_called_once_with(names=[bucket])
+        blade.get_buckets_lifecycle_policies_rules.assert_not_called()
+        assert _no_rule_written(blade)
+
+    @pytest.mark.parametrize(
+        "method, params, has_rule, message",
+        [
+            (
+                "get_buckets_lifecycle_policies_rules",
+                {"keep_previous_for": "2d"},
+                False,
+                "Failed to read lifecycle rule rule1 for bucket realm1::bkt.",
+            ),
+            (
+                "post_buckets_lifecycle_policies_rules",
+                {"keep_previous_for": "2d"},
+                False,
+                "Failed to create lifecycle rule rule1 for bucket realm1::bkt.",
+            ),
+            (
+                "patch_buckets_lifecycle_policies_rules",
+                {"enabled": False},
+                True,
+                "Failed to update lifecycle rule rule1 for bucket realm1::bkt.",
+            ),
+            (
+                "delete_buckets_lifecycle_policies_rules",
+                {"state": "absent"},
+                True,
+                "Failed to delete lifecycle rule rule1 for bucket realm1::bkt.",
+            ),
+        ],
+    )
+    def test_api_errors_name_the_realm_bucket(self, method, params, has_rule, message):
+        module = _module(_base_params(bucket=REALM_BUCKET, **params))
+        rules = {"rule1": _existing_rule()} if has_rule else {}
+        blade = _array({REALM_BUCKET: rules})
+        setattr(blade, method, Mock(return_value=_response(400)))
+        _run(module, blade)
+
+        module.fail_json.assert_called_once()
+        assert module.fail_json.call_args[1]["msg"].startswith(message)
+        module.exit_json.assert_not_called()

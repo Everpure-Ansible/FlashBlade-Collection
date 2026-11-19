@@ -25,6 +25,9 @@ description:
   M(everpure.flashblade.purefb_syslog)).
 - The settings object is an array-wide singleton that always exists; the
   module only changes which certificate or certificate group it references.
+- The settings object belongs to the array. It cannot be created in or
+  scoped to a realm, and the array refuses a realm-scoped administrator
+  both reading and changing it.
 - Requires FlashBlade REST API version 2.0 or later (Purity//FB 3.2.0+).
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
@@ -35,6 +38,10 @@ options:
     - When omitted the module operates on the array's single settings object
       (named C(management) on current arrays) and fails if the array returns
       more than one.
+    - The array returns its settings object whatever name is requested, so
+      the module compares I(name) with the name of that object and fails, in
+      check mode too, when they differ. A realm-qualified name such as
+      C(realm1::management) therefore fails.
     type: str
   state:
     description:
@@ -48,6 +55,10 @@ options:
     description:
     - Name of an existing certificate on the array used to validate the
       syslog servers. Use M(everpure.flashblade.purefb_certs) to import one.
+    - The name is sent to the array as given. A bare name always refers to
+      the array-level certificate, never to a certificate of that name
+      inside a realm. The array also accepts the C(realm::name) form of a
+      certificate that lives in a realm; the settings remain array-wide.
     - An empty string clears a configured CA certificate.
     - The array references at most one of a CA certificate and a CA
       certificate group; when one is set the module clears the other in the
@@ -58,6 +69,8 @@ options:
     - Name of an existing certificate group on the array whose certificates
       validate the syslog servers. Use M(everpure.flashblade.purefb_certgrp)
       to create one.
+    - The name is treated like I(ca_certificate). A bare name is the
+      array-level group and C(realm::name) is a group inside a realm.
     - An empty string clears a configured CA certificate group.
     type: str
 extends_documentation_fragment:
@@ -156,6 +169,19 @@ def get_settings(module, blade):
     items = list(res.items)
     if not items:
         module.fail_json(msg="No syslog server settings object found.")
+    if module.params["name"]:
+        # The array ignores the names query on this endpoint and returns its
+        # settings object whatever name was asked for, so match it here.
+        matching = [item for item in items if item.name == module.params["name"]]
+        if not matching:
+            module.fail_json(
+                msg="Syslog server settings object {0} does not exist. Syslog "
+                "server settings are array-wide and cannot be scoped to a "
+                "realm; the settings object of this array is {1}.".format(
+                    module.params["name"], ", ".join(item.name for item in items)
+                )
+            )
+        items = matching
     if len(items) > 1:
         module.fail_json(
             msg="More than one syslog server settings object exists ({0}). "

@@ -48,8 +48,9 @@ options:
     - Accepts a number of seconds, or a duration with a unit suffix of
       C(s) (seconds), C(m) (minutes), C(h) (hours) or C(d) (days), for
       example C(90m) or C(6h).
-    - Range is 1 second to 48 hours (C(48h) or C(172800)). The default of
-      4 hours matches the array default.
+    - Range is 1 hour to 48 hours (C(1h) to C(48h), or C(3600) to
+      C(172800)); the array refuses a shorter or longer window. The default
+      of 4 hours matches the array default.
     - Ignored when I(state=absent).
     type: str
     default: 4h
@@ -150,6 +151,8 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.version import
 MIN_REQUIRED_API_VERSION = "2.16"
 # The array keeps exactly one maintenance window and requires this name.
 WINDOW_NAME = "array"
+# The array refuses a window shorter than one hour or longer than 48 hours.
+MIN_TIMEOUT_SECONDS = 3600
 MAX_TIMEOUT_SECONDS = 48 * 3600
 DURATION_UNITS = ("s", "m", "h", "d")
 
@@ -158,7 +161,7 @@ def parse_timeout(module):
     """Return the requested window duration in whole seconds.
 
     Accepts a bare number of seconds or a duration with an s/m/h/d suffix
-    and enforces the 1 second to 48 hour range the array supports.
+    and enforces the 1 hour to 48 hour range the array supports.
     """
     value = str(module.params["timeout"]).strip().lower()
     # isdecimal() matches exactly the characters int() accepts; isdigit()
@@ -174,12 +177,12 @@ def parse_timeout(module):
                 "such as 90m, 6h or 2d"
             ).format(module.params["timeout"])
         )
-    if not 1 <= seconds <= MAX_TIMEOUT_SECONDS:
+    if not MIN_TIMEOUT_SECONDS <= seconds <= MAX_TIMEOUT_SECONDS:
         module.fail_json(
             msg=(
-                "timeout must be between 1 second and 48 hours "
-                "(172800 seconds), got {0} seconds"
-            ).format(seconds)
+                "timeout must be between 1 hour and 48 hours "
+                "({0} to {1} seconds), got {2} seconds"
+            ).format(MIN_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS, seconds)
         )
     return seconds
 

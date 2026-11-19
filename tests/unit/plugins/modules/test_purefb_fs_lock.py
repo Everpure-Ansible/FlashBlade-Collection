@@ -79,6 +79,17 @@ from plugins.modules.purefb_fs_lock import (
 )
 
 MOD = "plugins.modules.purefb_fs_lock"
+REALM_FS = "realm1::fs1"
+# What the array says for a file system it does not have, and for a lock
+# request narrowed to a file system in a realm.
+NO_FILE_SYSTEM = "File system does not exist."
+REALM_REFUSAL = (
+    " File system realm1::fs1 does exist, in realm realm1: the array refused "
+    "a lock request narrowed to it."
+)
+# A refusal that does not say the name is missing. The array's text for an
+# identity it does not let read file systems was never recorded.
+NOT_PERMITTED = "Operation not permitted."
 
 
 def _params(**overrides):
@@ -108,13 +119,40 @@ def _response(items=None, status=200):
     return response
 
 
+def _refused(message, status=400):
+    """An array refusal carrying one error message."""
+    response = _response(status=status)
+    response.errors = [Mock(message=message)]
+    return response
+
+
+def _error_message(response, default="Unknown error"):
+    """The message module_utils.common.get_error_message takes from a response."""
+    errors = list(response.errors or [])
+    return errors[0].message if errors else default
+
+
 def _ref(name):
     ref = Mock()
     ref.name = name
     return ref
 
 
-def _lock(name, path="/build/output.db", client="10.0.0.1", inode=42):
+def _file_system(name, realm=None):
+    """A file system as the array returns it: realms is empty outside a realm."""
+    file_system = _ref(name)
+    file_system.destroyed = False
+    file_system.realms = []
+    if realm:
+        realm_ref = _ref(realm)
+        realm_ref.resource_type = "realms"
+        file_system.realms = [realm_ref]
+    return file_system
+
+
+def _lock(
+    name, path="/build/output.db", client="10.0.0.1", inode=42, file_system="fs1"
+):
     lock = _ref(name)
     lock.access_type = "exclusive"
     lock.client = _ref(client)
@@ -123,7 +161,7 @@ def _lock(name, path="/build/output.db", client="10.0.0.1", inode=42):
     lock.path = path
     lock.protocol = "NLM"
     lock.range = Mock(length=0, offset=0)
-    lock.source = _ref("fs1")
+    lock.source = _ref(file_system)
     return lock
 
 
@@ -140,7 +178,7 @@ def _session(name, client="10.0.0.1", user="alice", protocol="smb"):
     return session
 
 
-def _open_file(file_id, path="/build/output.db"):
+def _open_file(file_id, path="/build/output.db", file_system="fs1"):
     open_file = Mock()
     open_file.id = file_id
     open_file.client = _ref("10.0.0.1")
@@ -148,13 +186,25 @@ def _open_file(file_id, path="/build/output.db"):
     open_file.mode = "rw"
     open_file.path = path
     open_file.session = _ref("session-1")
-    open_file.source = _ref("fs1")
+    open_file.source = _ref(file_system)
     open_file.user = _ref("alice")
     return open_file
 
 
-def _blade(locks=(), clients=(), sessions=(), open_files=()):
+def _blade(locks=(), clients=(), sessions=(), open_files=(), file_systems=None):
+    """A mocked array that has the file system fs1 unless file_systems says otherwise."""
     blade = Mock()
+    if file_systems is None:
+        file_systems = [_file_system("fs1")]
+    known = dict((file_system.name, file_system) for file_system in file_systems)
+
+    def get_file_systems(names, **kwargs):
+        # The array refuses a name it does not have, realm-qualified or not.
+        if [name for name in names if name not in known]:
+            return _refused(NO_FILE_SYSTEM)
+        return _response([known[name] for name in names])
+
+    blade.get_file_systems = Mock(side_effect=get_file_systems)
     blade.get_file_systems_locks.return_value = _response(locks)
     blade.get_file_systems_locks_clients.return_value = _response(
         [_ref(client) for client in clients]
@@ -182,6 +232,8 @@ def _run(params, blade, api_version="2.30", check_mode=False):
         MOD + ".get_system", return_value=blade
     ), patch(MOD + ".get_rest_api_version", return_value=api_version), patch(
         MOD + ".LooseVersion", RealLooseVersion
+    ), patch(
+        MOD + ".get_error_message", _error_message
     ):
         try:
             main()
@@ -501,7 +553,15 @@ class TestPurefbFsLock:
     def test_clear_locks_is_a_noop_when_none_match(self):
         blade = _blade()
         result = _result(
-            _run(_params(state="absent", target="locks", file_system="fs1"), blade)
+            _run(
+                _params(
+                    state="absent",
+                    target="locks",
+                    file_system="fs1",
+                    path=["/build/output.db"],
+                ),
+                blade,
+            )
         )
         assert result["changed"] is False
         assert result["locks"] == {}
@@ -511,7 +571,12 @@ class TestPurefbFsLock:
         blade = _blade(locks=[_lock("lock1")])
         result = _result(
             _run(
-                _params(state="absent", target="locks", file_system="fs1"),
+                _params(
+                    state="absent",
+                    target="locks",
+                    file_system="fs1",
+                    path=["/build/output.db"],
+                ),
                 blade,
                 check_mode=True,
             )
@@ -576,7 +641,12 @@ class TestPurefbFsLock:
         blade = _blade(locks=[_lock("lock1")])
         msg = _failure(
             _run(
-                _params(state="absent", target="locks", file_system="fs1"),
+                _params(
+                    state="absent",
+                    target="locks",
+                    file_system="fs1",
+                    path=["/build/output.db"],
+                ),
                 blade,
                 api_version="2.8",
             )
@@ -603,7 +673,15 @@ class TestPurefbFsLock:
         blade = _blade(locks=[_lock("lock1")])
         blade.delete_file_systems_locks.return_value = _response(status=400)
         msg = _failure(
-            _run(_params(state="absent", target="locks", file_system="fs1"), blade)
+            _run(
+                _params(
+                    state="absent",
+                    target="locks",
+                    file_system="fs1",
+                    path=["/build/output.db"],
+                ),
+                blade,
+            )
         )
         assert "Failed to clear file locks" in msg
 
@@ -904,3 +982,402 @@ class TestPurefbFsLock:
         msg = _failure(_run(_params(context="fb2"), blade, api_version="2.21"))
         assert "context requires FlashBlade REST API version 2.22" in msg
         blade.get_file_systems_locks.assert_not_called()
+
+    # ---------------- locks on a file system in a realm ----------------
+
+    def test_list_locks_realm_file_system_refusal_names_the_realm(self):
+        blade = _blade(file_systems=[_file_system(REALM_FS, realm="realm1")])
+        blade.get_file_systems_locks.return_value = _refused(NO_FILE_SYSTEM)
+        msg = _failure(_run(_params(target="locks", file_system=REALM_FS), blade))
+        assert msg == (
+            "Failed to list file locks. Error: " + NO_FILE_SYSTEM + REALM_REFUSAL
+        )
+        blade.get_file_systems_locks.assert_called_once_with(
+            file_system_names=[REALM_FS]
+        )
+        blade.get_file_systems.assert_called_once_with(names=[REALM_FS])
+        blade.get_file_systems_locks_clients.assert_not_called()
+
+    def test_list_all_realm_file_system_refusal_names_the_realm(self):
+        blade = _blade(file_systems=[_file_system(REALM_FS, realm="realm1")])
+        blade.get_file_systems_locks.return_value = _refused(NO_FILE_SYSTEM)
+        msg = _failure(_run(_params(file_system=REALM_FS), blade))
+        assert msg.endswith(REALM_REFUSAL)
+        blade.get_file_systems_open_files.assert_not_called()
+
+    def test_list_locks_realm_refusal_looks_up_in_the_same_context(self):
+        blade = _blade(file_systems=[_file_system(REALM_FS, realm="realm1")])
+        blade.get_file_systems_locks.return_value = _refused(NO_FILE_SYSTEM)
+        msg = _failure(
+            _run(_params(target="locks", file_system=REALM_FS, context="fb2"), blade)
+        )
+        assert msg.endswith(REALM_REFUSAL)
+        blade.get_file_systems.assert_called_once_with(
+            names=[REALM_FS], context_names=["fb2"]
+        )
+
+    def test_clear_locks_realm_file_system_refusal_names_the_realm(self):
+        for check_mode in (False, True):
+            blade = _blade(file_systems=[_file_system(REALM_FS, realm="realm1")])
+            blade.get_file_systems_locks.return_value = _refused(NO_FILE_SYSTEM)
+            msg = _failure(
+                _run(
+                    _params(
+                        state="absent",
+                        target="locks",
+                        file_system=REALM_FS,
+                        path=["/"],
+                        recursive=True,
+                    ),
+                    blade,
+                    check_mode=check_mode,
+                )
+            )
+            assert msg == (
+                "Failed to list file locks. Error: " + NO_FILE_SYSTEM + REALM_REFUSAL
+            )
+            blade.delete_file_systems_locks.assert_not_called()
+
+    def test_clear_locks_realm_file_system_delete_refusal_names_the_realm(self):
+        blade = _blade(
+            locks=[_lock("lock1", file_system=REALM_FS)],
+            file_systems=[_file_system(REALM_FS, realm="realm1")],
+        )
+        blade.delete_file_systems_locks.return_value = _refused(NO_FILE_SYSTEM)
+        msg = _failure(
+            _run(
+                _params(
+                    state="absent",
+                    target="locks",
+                    file_system=REALM_FS,
+                    path=["/build/output.db"],
+                ),
+                blade,
+            )
+        )
+        assert msg == (
+            "Failed to clear file locks. Error: " + NO_FILE_SYSTEM + REALM_REFUSAL
+        )
+
+    def test_locks_realm_file_system_is_passed_through_when_the_array_serves_it(self):
+        blade = _blade(
+            locks=[_lock("lock1", file_system=REALM_FS)],
+            file_systems=[_file_system(REALM_FS, realm="realm1")],
+        )
+        params = _params(
+            target="locks", file_system=REALM_FS, path=["/build/output.db"]
+        )
+        result = _result(_run(params, blade))
+        assert result["locks"]["lock1"]["file_system"] == REALM_FS
+        blade.get_file_systems_locks.assert_called_once_with(
+            file_system_names=[REALM_FS], paths=["/build/output.db"]
+        )
+        result = _result(_run(dict(params, state="absent"), blade))
+        assert result["changed"] is True
+        blade.delete_file_systems_locks.assert_called_once_with(
+            file_system_names=[REALM_FS], paths=["/build/output.db"]
+        )
+        # A lock request the array serves is never preceded by a lookup.
+        blade.get_file_systems.assert_not_called()
+
+    def test_list_locks_missing_file_system_relays_the_array_error(self):
+        blade = _blade(file_systems=[])
+        blade.get_file_systems_locks.return_value = _refused(NO_FILE_SYSTEM)
+        msg = _failure(_run(_params(target="locks", file_system="nope"), blade))
+        assert msg == "Failed to list file locks. Error: " + NO_FILE_SYSTEM
+        blade.get_file_systems.assert_called_once_with(names=["nope"])
+
+    def test_list_locks_bare_name_does_not_match_a_realm_file_system(self):
+        blade = _blade(file_systems=[_file_system(REALM_FS, realm="realm1")])
+        blade.get_file_systems_locks.return_value = _refused(NO_FILE_SYSTEM)
+        msg = _failure(_run(_params(target="locks", file_system="fs1"), blade))
+        assert msg == "Failed to list file locks. Error: " + NO_FILE_SYSTEM
+
+    def test_list_locks_unknown_realm_relays_the_array_error(self):
+        blade = _blade(file_systems=[])
+        blade.get_file_systems_locks.return_value = _refused("Realm does not exist.")
+        msg = _failure(_run(_params(target="locks", file_system="norealm::fs1"), blade))
+        assert msg == "Failed to list file locks. Error: Realm does not exist."
+        blade.get_file_systems.assert_not_called()
+
+    def test_list_locks_other_failure_on_a_realm_file_system_is_relayed(self):
+        blade = _blade(file_systems=[_file_system(REALM_FS, realm="realm1")])
+        blade.get_file_systems_locks.return_value = _response(status=500)
+        msg = _failure(_run(_params(target="locks", file_system=REALM_FS), blade))
+        assert msg == "Failed to list file locks. Error: Unknown error"
+        blade.get_file_systems.assert_not_called()
+
+    def test_lock_refusal_of_a_file_system_outside_a_realm_says_it_exists(self):
+        # No array has been seen to answer this way for a file system outside
+        # a realm; if one does, the file system is still reported as existing
+        # and no realm is named.
+        blade = _blade()
+        blade.get_file_systems_locks.return_value = _refused(NO_FILE_SYSTEM)
+        msg = _failure(_run(_params(target="locks", file_system="fs1"), blade))
+        assert msg == (
+            "Failed to list file locks. Error: " + NO_FILE_SYSTEM + " File system "
+            "fs1 does exist: the array refused a lock request narrowed to it."
+        )
+        assert "realm" not in msg
+        blade.get_file_systems.assert_called_once_with(names=["fs1"])
+
+    def test_lock_refusal_is_relayed_when_the_lookup_is_refused_too(self):
+        blade = _blade(file_systems=[_file_system(REALM_FS, realm="realm1")])
+        blade.get_file_systems_locks.return_value = _refused(NO_FILE_SYSTEM)
+        blade.get_file_systems = Mock(return_value=_refused(NOT_PERMITTED))
+        module = _run(_params(target="locks", file_system=REALM_FS), blade)
+        assert _failure(module) == "Failed to list file locks. Error: " + NO_FILE_SYSTEM
+        module.warn.assert_not_called()
+
+    def test_lock_refusal_of_a_destroyed_realm_file_system_is_relayed(self):
+        # A destroyed file system is still returned by its name until it is
+        # eradicated; saying that it exists would mislead.
+        destroyed = _file_system(REALM_FS, realm="realm1")
+        destroyed.destroyed = True
+        blade = _blade(file_systems=[destroyed])
+        blade.get_file_systems_locks.return_value = _refused(NO_FILE_SYSTEM)
+        msg = _failure(_run(_params(target="locks", file_system=REALM_FS), blade))
+        assert msg == "Failed to list file locks. Error: " + NO_FILE_SYSTEM
+        blade.get_file_systems.assert_called_once_with(names=[REALM_FS])
+
+    def test_list_locks_array_level_file_system_needs_no_lookup(self):
+        blade = _blade(locks=[_lock("lock1")])
+        result = _result(_run(_params(target="locks", file_system="fs1"), blade))
+        assert list(result["locks"]) == ["lock1"]
+        blade.get_file_systems_locks.assert_called_once_with(file_system_names=["fs1"])
+        blade.get_file_systems.assert_not_called()
+
+    # ---------------- open files: the file system is checked first ----------------
+
+    def test_list_open_files_missing_file_system_fails(self):
+        blade = _blade(file_systems=[])
+        msg = _failure(_run(_params(target="open_files", file_system="nope"), blade))
+        assert msg == (
+            "Failed to list open files. File system nope was not found. "
+            "Error: File system does not exist."
+        )
+        blade.get_file_systems.assert_called_once_with(names=["nope"])
+        blade.get_file_systems_open_files.assert_not_called()
+
+    def test_list_open_files_unknown_realm_fails(self):
+        # The array answers the same way for a realm it does not have.
+        blade = _blade(file_systems=[_file_system(REALM_FS, realm="realm1")])
+        msg = _failure(
+            _run(_params(target="open_files", file_system="norealm::fs1"), blade)
+        )
+        assert "File system norealm::fs1 was not found" in msg
+        blade.get_file_systems_open_files.assert_not_called()
+
+    def test_list_open_files_bare_name_does_not_match_a_realm_file_system(self):
+        blade = _blade(file_systems=[_file_system(REALM_FS, realm="realm1")])
+        msg = _failure(_run(_params(target="open_files", file_system="fs1"), blade))
+        assert "File system fs1 was not found" in msg
+        blade.get_file_systems_open_files.assert_not_called()
+
+    def test_list_open_files_answer_without_the_file_system_fails(self):
+        blade = _blade()
+        blade.get_file_systems = Mock(return_value=_response())
+        msg = _failure(_run(_params(target="open_files", file_system="nope"), blade))
+        assert msg == "Failed to list open files. File system nope does not exist."
+        blade.get_file_systems_open_files.assert_not_called()
+
+    def test_close_open_files_missing_file_system_fails(self):
+        for check_mode in (False, True):
+            blade = _blade(open_files=[_open_file("of1")], file_systems=[])
+            msg = _failure(
+                _run(
+                    _params(state="absent", target="open_files", file_system="nope"),
+                    blade,
+                    check_mode=check_mode,
+                )
+            )
+            assert "File system nope was not found" in msg
+            blade.get_file_systems_open_files.assert_not_called()
+            blade.delete_file_systems_open_files.assert_not_called()
+
+    def test_list_all_missing_file_system_fails_at_the_open_files(self):
+        # user skips the locks and file_system skips the sessions, so only the
+        # open files are left to list, and their GET does not check the name.
+        blade = _blade(file_systems=[])
+        msg = _failure(_run(_params(file_system="nope", user=["alice"]), blade))
+        assert "File system nope was not found" in msg
+        blade.get_file_systems_locks.assert_not_called()
+        blade.get_file_systems_open_files.assert_not_called()
+
+    def test_open_files_realm_file_system_is_listed_and_closed(self):
+        blade = _blade(
+            open_files=[_open_file("of1", file_system=REALM_FS)],
+            file_systems=[_file_system(REALM_FS, realm="realm1")],
+        )
+        params = _params(target="open_files", file_system=REALM_FS)
+        result = _result(_run(params, blade))
+        assert result["changed"] is False
+        assert result["open_files"]["of1"]["file_system"] == REALM_FS
+        blade.get_file_systems.assert_called_once_with(names=[REALM_FS])
+        blade.get_file_systems_open_files.assert_called_once_with(
+            protocols=["smb"], file_system_names=[REALM_FS]
+        )
+        result = _result(_run(dict(params, state="absent"), blade))
+        assert result["changed"] is True
+        blade.delete_file_systems_open_files.assert_called_once_with(ids=["of1"])
+
+    def test_open_files_array_level_file_system_is_checked_then_listed(self):
+        blade = _blade(open_files=[_open_file("of1")])
+        module = _run(_params(target="open_files", file_system="fs1"), blade)
+        result = _result(module)
+        assert list(result["open_files"]) == ["of1"]
+        module.warn.assert_not_called()
+        blade.get_file_systems.assert_called_once_with(names=["fs1"])
+        blade.get_file_systems_open_files.assert_called_once_with(
+            protocols=["smb"], file_system_names=["fs1"]
+        )
+
+    def test_list_open_files_lookup_refused_for_another_reason_warns_and_lists(self):
+        # An identity may be allowed the open files but not the file systems.
+        # That does not show the name is wrong, so the request is not blocked.
+        blade = _blade(open_files=[_open_file("of1")])
+        blade.get_file_systems = Mock(return_value=_refused(NOT_PERMITTED))
+        module = _run(_params(target="open_files", file_system="fs1"), blade)
+        result = _result(module)
+        assert result["changed"] is False
+        assert list(result["open_files"]) == ["of1"]
+        module.warn.assert_called_once()
+        warning = module.warn.call_args[0][0]
+        assert "Could not check that file system fs1 exists" in warning
+        assert NOT_PERMITTED in warning
+        blade.get_file_systems_open_files.assert_called_once_with(
+            protocols=["smb"], file_system_names=["fs1"]
+        )
+
+    def test_list_open_files_lookup_error_without_a_message_warns_and_lists(self):
+        blade = _blade()
+        blade.get_file_systems = Mock(return_value=_response(status=503))
+        module = _run(_params(target="open_files", file_system="fs1"), blade)
+        assert _result(module)["open_files"] == {}
+        module.warn.assert_called_once()
+        assert "Error: Unknown error" in module.warn.call_args[0][0]
+
+    def test_close_open_files_lookup_refused_for_another_reason_warns_and_closes(self):
+        for check_mode in (False, True):
+            blade = _blade(open_files=[_open_file("of1")])
+            blade.get_file_systems = Mock(return_value=_refused(NOT_PERMITTED))
+            module = _run(
+                _params(state="absent", target="open_files", file_system="fs1"),
+                blade,
+                check_mode=check_mode,
+            )
+            assert _result(module)["changed"] is True
+            module.warn.assert_called_once()
+            if check_mode:
+                blade.delete_file_systems_open_files.assert_not_called()
+            else:
+                blade.delete_file_systems_open_files.assert_called_once_with(
+                    ids=["of1"]
+                )
+
+    def test_list_open_files_missing_file_system_fails_without_a_warning(self):
+        # Any wording of "does not exist" from the lookup is a missing name.
+        for message in (NO_FILE_SYSTEM, "Realm does not exist."):
+            blade = _blade()
+            blade.get_file_systems = Mock(return_value=_refused(message))
+            module = _run(_params(target="open_files", file_system="nope"), blade)
+            assert _failure(module) == (
+                "Failed to list open files. File system nope was not found. "
+                "Error: " + message
+            )
+            module.warn.assert_not_called()
+            blade.get_file_systems_open_files.assert_not_called()
+
+    def test_open_files_without_a_file_system_need_no_lookup(self):
+        blade = _blade(open_files=[_open_file("of1")])
+        _result(_run(_params(target="open_files", client=["10.0.0.1"]), blade))
+        _result(_run(_params(), blade))
+        blade.get_file_systems.assert_not_called()
+
+    # ---------------- clearing locks by file system alone ----------------
+
+    def test_clear_locks_by_file_system_alone_is_refused(self):
+        for check_mode in (False, True):
+            blade = _blade(locks=[_lock("lock1")])
+            msg = _failure(
+                _run(
+                    _params(state="absent", target="locks", file_system="fs1"),
+                    blade,
+                    check_mode=check_mode,
+                )
+            )
+            assert "also requires path or inode" in msg
+            blade.get_file_systems_locks.assert_not_called()
+            blade.delete_file_systems_locks.assert_not_called()
+
+    def test_clear_locks_by_file_system_and_client_is_refused(self):
+        blade = _blade(locks=[_lock("lock1", file_system=REALM_FS)])
+        msg = _failure(
+            _run(
+                _params(
+                    state="absent",
+                    target="locks",
+                    file_system=REALM_FS,
+                    client=["10.0.0.1"],
+                ),
+                blade,
+            )
+        )
+        assert "also requires path or inode" in msg
+        blade.get_file_systems_locks.assert_not_called()
+        blade.delete_file_systems_locks.assert_not_called()
+
+    def test_clear_locks_by_file_system_and_inode_sends_the_inodes(self):
+        blade = _blade(locks=[_lock("lock1")])
+        result = _result(
+            _run(
+                _params(
+                    state="absent",
+                    target="locks",
+                    file_system="fs1",
+                    inode=[42],
+                    client=["10.0.0.1"],
+                ),
+                blade,
+            )
+        )
+        assert result["changed"] is True
+        blade.delete_file_systems_locks.assert_called_once_with(
+            client_names=["10.0.0.1"], file_system_names=["fs1"], inodes=[42]
+        )
+
+    def test_clear_locks_whole_file_system_sends_root_and_recursive(self):
+        blade = _blade(locks=[_lock("lock1")])
+        result = _result(
+            _run(
+                _params(
+                    state="absent",
+                    target="locks",
+                    file_system="fs1",
+                    path=["/"],
+                    recursive=True,
+                    client=["10.0.0.1"],
+                ),
+                blade,
+            )
+        )
+        assert result["changed"] is True
+        blade.get_file_systems_locks.assert_called_once_with(
+            client_names=["10.0.0.1"], file_system_names=["fs1"]
+        )
+        blade.delete_file_systems_locks.assert_called_once_with(
+            client_names=["10.0.0.1"],
+            file_system_names=["fs1"],
+            paths=["/"],
+            recursive=True,
+        )
+
+    def test_list_locks_by_file_system_and_client_is_still_allowed(self):
+        blade = _blade()
+        result = _result(
+            _run(_params(target="locks", file_system="fs1", client=["10.0.0.1"]), blade)
+        )
+        assert result["locks"] == {}
+        blade.get_file_systems_locks.assert_called_once_with(
+            client_names=["10.0.0.1"], file_system_names=["fs1"]
+        )

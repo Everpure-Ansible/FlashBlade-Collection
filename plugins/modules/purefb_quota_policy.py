@@ -48,7 +48,8 @@ options:
   name:
     description:
     - Name of the quota policy.
-    - Accepts the realm-qualified form C(realm::name) for realm-scoped policies.
+    - A policy in a realm is named C(realm::name). The same name without the
+      realm is a different policy at the array level.
     type: str
     required: true
   state:
@@ -70,7 +71,15 @@ options:
     - New name for the quota policy. Applies to an existing policy only; a
       policy that does not exist yet is created as I(name).
     - Idempotent when a policy with the new name already exists and the
-      policy I(name) does not.
+      policy I(name) does not. The module fails without changing anything
+      when another policy already has the new name.
+    - A rename cannot move a policy into, out of or between realms. For a
+      policy in a realm the new name is given either without the realm, in
+      which case the policy keeps its realm, or as C(realm::name) with the
+      realm of the policy. Any other realm is refused.
+    - The array matches names without regard to case and does not rename a
+      policy to its own name, so a new name that differs from the name of
+      the policy only in case is refused.
     type: str
   import_from:
     description:
@@ -82,6 +91,7 @@ options:
       place; attach it afterwards with I(file_systems) and
       I(delete_existing_quotas=true) to replace them.
     - Only used when the policy is created. Mutually exclusive with I(rules).
+    - A file system in a realm is given by its full name C(realm::filesystem).
     type: str
   rules:
     description:
@@ -141,6 +151,14 @@ options:
       left untouched.
     - A file system can carry only one quota policy; the module fails when
       a listed file system is attached to another policy.
+    - New file systems are attached before the ones that are no longer
+      listed are detached, so a file system the array refuses leaves the
+      existing attachments in place.
+    - A file system in a realm is named C(realm::filesystem). A policy in a
+      realm can only be attached to file systems of the same realm and an
+      array-level policy only to file systems outside of any realm. The
+      module fails without changing anything when a listed file system is
+      not in the scope of the policy.
     type: list
     elements: str
   ignore_usage:
@@ -222,6 +240,15 @@ EXAMPLES = r"""
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
+- name: Attach a policy in realm tenant1 to a file system of that realm and rename it to tenant1::eng
+  everpure.flashblade.purefb_quota_policy:
+    name: tenant1::engineering
+    file_systems:
+      - tenant1::home
+    rename: eng
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
 - name: Delete a policy (detaching it from its file systems first)
   everpure.flashblade.purefb_quota_policy:
     name: engineering_old
@@ -239,7 +266,7 @@ policy:
   type: dict
   contains:
     name:
-      description: Name of the policy.
+      description: Name of the policy, C(realm::name) for a policy in a realm.
       type: str
     enabled:
       description: Whether the policy is enabled.
@@ -428,6 +455,97 @@ def _match_rule(desired, current_rules):
     return None
 
 
+def _realm_of(name):
+    """Return the realm of a realm::name name, empty for an array-level name."""
+    return name.rpartition("::")[0]
+
+
+def _resolve_rename(module):
+    """Return the full name the policy is renamed to, or None without rename.
+
+    The array keeps a realm policy in its realm when the new name is bare, so
+    a bare new name is resolved into the realm of the policy and that one name
+    is used for every lookup. A new name in another realm is refused here, as
+    the array does not move a policy with a rename.
+    """
+    rename = module.params["rename"]
+    if not rename:
+        return None
+    name = module.params["name"]
+    realm = _realm_of(name)
+    if "::" not in rename:
+        return "{0}::{1}".format(realm, rename) if realm else rename
+    # the array matches names without regard to case
+    if _realm_of(rename).lower() != realm.lower():
+        module.fail_json(
+            msg=(
+                "Cannot rename quota policy {0} to {1}: a rename cannot change "
+                "the realm of a policy. Give the new name without a realm{2}."
+            ).format(
+                name,
+                rename,
+                " or as {0}::<name>".format(realm) if realm else "",
+            )
+        )
+    if realm:
+        # one spelling of the realm; main() sends the one the array keeps
+        return "{0}::{1}".format(realm, rename.rpartition("::")[2])
+    return rename
+
+
+def _check_file_system_scope(module):
+    """Fail when file_systems names a file system the policy cannot have.
+
+    The array attaches a policy in a realm only to file systems of that realm
+    and an array-level policy only to file systems outside of any realm. It
+    refuses any other one only after the other options were applied, or a
+    new policy was created, and check mode cannot foresee that, so such a
+    name is refused before anything is written.
+    """
+    name = module.params["name"]
+    realm = _realm_of(name)
+    for file_system in module.params["file_systems"] or []:
+        # the array matches names without regard to case
+        if _realm_of(file_system).lower() == realm.lower():
+            continue
+        if realm:
+            reason = (
+                "a policy in realm {0} can only be attached to file systems "
+                "of that realm, named {0}::<filesystem>"
+            ).format(realm)
+        else:
+            reason = (
+                "an array-level policy can only be attached to file systems "
+                "outside of any realm"
+            )
+        module.fail_json(
+            msg="Cannot attach quota policy {0} to file system {1}: {2}.".format(
+                name, file_system, reason
+            )
+        )
+
+
+def _rule_hint(module, rule):
+    """Explain a refused rule write when the rule is listed without the realm.
+
+    After a rename that gave the new name of a realm policy without the realm
+    the array lists the rules of the policy without it, and refuses to change
+    or delete them until the policy is renamed with its full name.
+    """
+    rule_name = getattr(rule, "name", None)
+    if (
+        _realm_of(module.params["name"])
+        and isinstance(rule_name, str)
+        and "::" not in rule_name
+    ):
+        return (
+            " The array lists this rule without the realm of its policy and "
+            "does not change or delete it in that state. Renaming the policy "
+            "with this module, in a task of its own, restores the rule names."
+        )
+    return ""
+
+
 def _get_policy(module, blade, name):
     res = blade.get_user_group_quota_policies(names=[name], **_context_kwargs(module))
     if res.status_code == 200:
@@ -437,9 +555,11 @@ def _get_policy(module, blade, name):
     return None
 
 
-def _get_rules(module, blade):
+def _get_rules(module, blade, policy):
+    # by policy id: a realm policy and an array-level policy can share the
+    # name the array reports for their rules
     res = blade.get_user_group_quota_policies_rules(
-        filter="policy.name='{0}'".format(module.params["name"]),
+        filter="policy.id='{0}'".format(policy.id),
         **_context_kwargs(module),
     )
     if res.status_code != 200:
@@ -451,10 +571,15 @@ def _get_rules(module, blade):
     return list(res.items)
 
 
-def _get_members(module, blade):
-    """Return the sorted names of the file systems the policy is attached to."""
+def _get_members(module, blade, policy):
+    """Return the sorted names of the file systems the policy is attached to.
+
+    The attachments are read by policy id, as the array can list those of a
+    realm policy without the realm in either name. A realm policy is only ever
+    attached to file systems of its own realm, so such a name is qualified.
+    """
     res = blade.get_user_group_quota_policies_members(
-        policy_names=[module.params["name"]], **_context_kwargs(module)
+        policy_ids=[policy.id], **_context_kwargs(module)
     )
     if res.status_code != 200:
         module.fail_json(
@@ -462,10 +587,13 @@ def _get_members(module, blade):
                 module.params["name"], get_error_message(res)
             )
         )
+    realm = _realm_of(policy.name)
     members = set()
     for item in res.items:
         member_name = getattr(getattr(item, "member", None), "name", None)
         if member_name:
+            if realm and "::" not in member_name:
+                member_name = "{0}::{1}".format(realm, member_name)
             members.add(member_name)
     return sorted(members)
 
@@ -492,7 +620,7 @@ def _policy_facts(module, blade):
     if policy is None:
         return {}
     rules = []
-    for rule in _get_rules(module, blade):
+    for rule in _get_rules(module, blade, policy):
         subject = getattr(rule, "subject", None)
         notifications = getattr(rule, "notifications", None)
         rules.append(
@@ -515,7 +643,7 @@ def _policy_facts(module, blade):
         "name": policy.name,
         "enabled": getattr(policy, "enabled", None),
         "rules": rules,
-        "file_systems": _get_members(module, blade),
+        "file_systems": _get_members(module, blade, policy),
     }
 
 
@@ -588,8 +716,11 @@ def _delete_rule(module, blade, rule):
     )
     if res.status_code != 200:
         module.fail_json(
-            msg="Failed to delete rule {0} from quota policy {1}. Error: {2}".format(
-                rule.name, module.params["name"], get_error_message(res)
+            msg="Failed to delete rule {0} from quota policy {1}. Error: {2}{3}".format(
+                rule.name,
+                module.params["name"],
+                get_error_message(res),
+                _rule_hint(module, rule),
             )
         )
 
@@ -602,11 +733,11 @@ def _usage_hint(module, res):
     return ""
 
 
-def reconcile_rules(module, blade, desired_rules):
+def reconcile_rules(module, blade, policy, desired_rules):
     """Make the array rules match desired_rules; return True when changed."""
     if desired_rules is None:
         return False
-    current_rules = _get_rules(module, blade)
+    current_rules = _get_rules(module, blade, policy)
     to_add, to_patch, to_replace = [], [], []
     matched = set()
     for desired in desired_rules:
@@ -645,8 +776,11 @@ def reconcile_rules(module, blade, desired_rules):
         )
         if res.status_code != 200:
             module.fail_json(
-                msg="Failed to update rule {0} of quota policy {1}. Error: {2}".format(
-                    current.name, module.params["name"], get_error_message(res)
+                msg="Failed to update rule {0} of quota policy {1}. Error: {2}{3}".format(
+                    current.name,
+                    module.params["name"],
+                    get_error_message(res),
+                    _rule_hint(module, current),
                 )
             )
     for current in to_delete:
@@ -668,6 +802,20 @@ def reconcile_rules(module, blade, desired_rules):
     return True
 
 
+def _as_member(module, file_system):
+    """Return the name a file system is sent under beside the policy name.
+
+    The array matches names without regard to case, but it refuses a file
+    system whose realm is not written as the array keeps it. The policy is
+    addressed by the name the array keeps, see main(), so the realm of the
+    file system goes out as that name has it.
+    """
+    realm = _realm_of(module.params["name"])
+    if realm and "::" in file_system:
+        return "{0}::{1}".format(realm, file_system.rpartition("::")[2])
+    return file_system
+
+
 def _attach(module, blade, file_system, note=""):
     """Attach the policy to one file system; note is appended on refusal."""
     kwargs = _usage_kwargs(module)
@@ -675,7 +823,7 @@ def _attach(module, blade, file_system, note=""):
         kwargs["delete_existing_user_group_quota_settings"] = True
     res = blade.post_user_group_quota_policies_file_systems(
         policy_names=[module.params["name"]],
-        member_names=[file_system],
+        member_names=[_as_member(module, file_system)],
         **kwargs,
         **_context_kwargs(module),
     )
@@ -701,7 +849,7 @@ def _attach(module, blade, file_system, note=""):
 def _detach(module, blade, file_system):
     res = blade.delete_user_group_quota_policies_file_systems(
         policy_names=[module.params["name"]],
-        member_names=[file_system],
+        member_names=[_as_member(module, file_system)],
         **_context_kwargs(module),
     )
     if res.status_code != 200:
@@ -712,24 +860,28 @@ def _detach(module, blade, file_system):
         )
 
 
-def reconcile_members(module, blade, current=None, note=""):
+def reconcile_members(module, blade, current, note=""):
     """Attach and detach file systems to match the option; True when changed.
 
-    note is appended to every attach refusal, see create_policy.
+    current is the list of file systems the policy is attached to now. note
+    is appended to every attach refusal, see create_policy.
     """
     desired = module.params["file_systems"]
     if desired is None:
         return False
-    desired = sorted(set(desired))
-    if current is None:
-        current = _get_members(module, blade)
-    to_attach = [fs for fs in desired if fs not in current]
-    to_detach = [fs for fs in current if fs not in desired]
+    # the array matches names without regard to case: a file system written
+    # in another case than the array keeps is the one that is attached
+    attached = set(fs.lower() for fs in current)
+    wanted = {}
+    for file_system in sorted(set(desired)):
+        wanted.setdefault(file_system.lower(), file_system)
+    to_attach = [wanted[key] for key in sorted(wanted) if key not in attached]
+    to_detach = [fs for fs in current if fs.lower() not in wanted]
     if not (to_attach or to_detach):
         return False
     for file_system in to_attach:
         other = _attached_policy(module, blade, file_system)
-        if other and other != module.params["name"]:
+        if other and other.lower() != module.params["name"].lower():
             module.fail_json(
                 msg=(
                     "File system {0} is already attached to quota policy {1}; "
@@ -738,22 +890,26 @@ def reconcile_members(module, blade, current=None, note=""):
             )
     if module.check_mode:
         return True
-    for file_system in to_detach:
-        _detach(module, blade, file_system)
+    # attach first: a refused attachment then leaves the policy on the file
+    # systems it had, not on none
     for file_system in to_attach:
         _attach(module, blade, file_system, note)
+    for file_system in to_detach:
+        _detach(module, blade, file_system)
     return True
 
 
-def delete_policy(module, blade):
+def delete_policy(module, blade, policy):
     name = module.params["name"]
-    members = _get_members(module, blade)
+    members = _get_members(module, blade, policy)
     if not module.check_mode:
         # the array refuses to delete an attached policy
         for file_system in members:
             _detach(module, blade, file_system)
+        # by id: the array refuses the name of an unattached policy when the
+        # attachment of a namesake in a realm is listed without that realm
         res = blade.delete_user_group_quota_policies(
-            names=[name], **_context_kwargs(module)
+            ids=[policy.id], **_context_kwargs(module)
         )
         if res.status_code != 200:
             module.fail_json(
@@ -786,6 +942,10 @@ def create_policy(module, blade, desired_rules):
                 name, get_error_message(res)
             )
         )
+    created = [item.name for item in res.items if isinstance(item.name, str)]
+    if created:
+        # the array keeps the realm in its own spelling, see main()
+        module.params["name"] = created[0]
     # the policy now exists, so a refused rule or attachment must say so;
     # the next run takes the update path and only adds what is missing
     for desired in desired_rules or []:
@@ -795,19 +955,21 @@ def create_policy(module, blade, desired_rules):
             desired,
             note=" The policy was created; fix rules and re-run.",
         )
+    # a new policy is not attached to anything yet
     reconcile_members(
         module,
         blade,
+        [],
         note=" The policy was created; fix the attachment and re-run.",
     )
     module.exit_json(changed=True, policy=_policy_facts(module, blade))
 
 
-def update_policy(module, blade, policy, desired_rules):
+def update_policy(module, blade, policy, desired_rules, new_name):
     name = module.params["name"]
     changed = False
     enabled = module.params["enabled"]
-    members = _get_members(module, blade)
+    members = _get_members(module, blade, policy)
     if enabled is not None and bool(getattr(policy, "enabled", True)) != enabled:
         changed = True
         if not module.check_mode:
@@ -827,26 +989,27 @@ def update_policy(module, blade, policy, desired_rules):
                         get_error_message(res),
                     )
                 )
-    if reconcile_rules(module, blade, desired_rules):
+    if reconcile_rules(module, blade, policy, desired_rules):
         changed = True
     if reconcile_members(module, blade, members):
         changed = True
-    rename = module.params["rename"]
-    if rename and rename != name:
+    if new_name and new_name != name:
         changed = True
         if not module.check_mode:
+            # the full name is sent: a bare name on a realm policy leaves the
+            # array reporting its rules without the realm
             res = blade.patch_user_group_quota_policies(
                 names=[name],
-                policy=UserGroupQuotaPolicy(name=rename),
+                policy=UserGroupQuotaPolicy(name=new_name),
                 **_context_kwargs(module),
             )
             if res.status_code != 200:
                 module.fail_json(
                     msg="Failed to rename quota policy {0} to {1}. Error: {2}".format(
-                        name, rename, get_error_message(res)
+                        name, new_name, get_error_message(res)
                     )
                 )
-            module.params["name"] = rename
+            module.params["name"] = new_name
     module.exit_json(changed=changed, policy=_policy_facts(module, blade))
 
 
@@ -913,21 +1076,65 @@ def main():
 
     desired_rules = _normalise_rules(module)
     state = module.params["state"]
-    policy = _get_policy(module, blade, module.params["name"])
-    if policy is None and state == "present" and module.params["rename"]:
-        # rename already applied by an earlier run
-        policy = _get_policy(module, blade, module.params["rename"])
-        if policy is not None:
-            module.params["name"] = module.params["rename"]
+    name = module.params["name"]
+    new_name = _resolve_rename(module) if state == "present" else None
+    if state == "present":
+        _check_file_system_scope(module)
+    policy = _get_policy(module, blade, name)
+    rename_to = None
+    if new_name and new_name != name:
+        renamed = _get_policy(module, blade, new_name)
+        new_leaf = new_name.rpartition("::")[2]
+        kept_leaf = renamed.name.rpartition("::")[2] if renamed is not None else ""
+        if policy is None:
+            # rename already applied by an earlier run, when renamed exists
+            policy = renamed
+        elif renamed is None:
+            rename_to = new_name
+        elif renamed.id != policy.id:
+            # refused here, before enabled, rules and file_systems are applied
+            module.fail_json(
+                msg=(
+                    "Cannot rename quota policy {0} to {1}: a quota policy "
+                    "named {1} already exists."
+                ).format(name, new_name)
+            )
+        elif kept_leaf == new_leaf:
+            # the array matches names without regard to case: both names are
+            # this one policy, which already carries the new one
+            pass
+        elif kept_leaf.lower() == new_leaf.lower():
+            # the array answers this with "Policy already exists.", after
+            # enabled, rules and file_systems were applied
+            module.fail_json(
+                msg=(
+                    "Cannot rename quota policy {0} to {1}: the new name "
+                    "differs from the name of the policy only in case. The "
+                    "array matches names without regard to case and does not "
+                    "rename a policy to its own name."
+                ).format(name, new_name)
+            )
+        else:
+            rename_to = new_name
+    if policy is not None and isinstance(policy.name, str):
+        # The array matches names without regard to case, but it compares the
+        # realm of a second name in a request (the new name, a file system)
+        # as it is written. From here on the policy goes by the name the
+        # array keeps, and the names sent beside it take the realm from it.
+        module.params["name"] = policy.name
+        if rename_to and _realm_of(policy.name):
+            rename_to = "{0}::{1}".format(
+                _realm_of(policy.name), rename_to.rpartition("::")[2]
+            )
 
     if state == "absent" and policy is not None:
-        delete_policy(module, blade)
+        delete_policy(module, blade, policy)
     elif state == "absent":
         module.exit_json(changed=False)
     elif policy is None:
         create_policy(module, blade, desired_rules)
     else:
-        update_policy(module, blade, policy, desired_rules)
+        update_policy(module, blade, policy, desired_rules, rename_to)
 
 
 if __name__ == "__main__":

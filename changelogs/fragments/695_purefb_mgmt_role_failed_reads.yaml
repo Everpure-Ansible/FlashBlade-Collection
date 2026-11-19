@@ -1,0 +1,5 @@
+bugfixes:
+  - purefb_mgmt_role - a read of a role, an admin or a role mapping that the array refuses or cannot
+    answer now fails with the array's message instead of being taken for a missing object.
+  - purefb_mgmt_role - a role that a policy rule still grants is no longer deleted when the task
+    names it in another letter case or when the policy rules cannot be listed.

@@ -12,6 +12,8 @@ import multiprocessing
 import ctypes
 from unittest.mock import Mock, patch, MagicMock
 
+import pytest
+
 # Mock multiprocessing context for Windows
 if sys.platform == "win32":
     original_get_context = multiprocessing.get_context
@@ -256,6 +258,7 @@ class TestPurefbResourceAccess:
 
 MODULE = "plugins.modules.purefb_resource_access"
 OIDC = "sso/oidc/idps"
+SAML = "sso/saml2/idps"
 ACCESS_ID = "10314f42-020d-7080-8013-000000000001"
 ACCESS_ID_2 = "10314f42-020d-7080-8013-000000000002"
 IDP_ID = "10314f42-020d-7080-8013-0000000000a1"
@@ -349,11 +352,63 @@ def _version(value):
     return tuple(int(part) for part in value.split("."))
 
 
-def _blade(accesses=None, post=None, delete=None):
+# The read that finds a realm or a shareable resource by name, and what a
+# Purity//FB 4.8 array answers to it for a name it does not hold
+NAME_READS = {
+    "realms": ("get_realms", "Realm does not exist."),
+    "subnets": ("get_subnets", "Subnet does not exist."),
+    "dns": ("get_dns", "DNS does not exist."),
+    "targets": ("get_targets", "Target does not exist."),
+    OIDC: ("get_sso_oidc_idps", ERR_NO_IDP),
+    SAML: ("get_sso_saml2_idps", "SsoSaml2 configuration does not exist."),
+}
+
+
+def _named(name, destroyed=None):
+    """An object as a read by name returns it; a realm says if it is destroyed"""
+    if destroyed is None:
+        item = Mock(spec=["id", "name"])
+    else:
+        item = Mock(spec=["id", "name", "destroyed"])
+        item.destroyed = destroyed
+    item.id = IDP_ID
+    item.name = name
+    return item
+
+
+def _name_read(held, missing, exact=False):
+    """A read by name as the array serves it
+
+    A name is found whatever its case, a SAML2 identity provider only in its
+    own case, and a name the array does not hold is an error response, not
+    an empty list.
+    """
+
+    def read(names=None):
+        for item in held:
+            if item.name == names[0]:
+                return _listing([item])
+            if not exact and item.name.lower() == names[0].lower():
+                return _listing([item])
+        return _error(missing)
+
+    return Mock(side_effect=read)
+
+
+def _blade(accesses=None, post=None, delete=None, held=None):
+    """An array that holds realm1 and the OIDC provider okta, or what held says"""
     blade = Mock()
     blade.get_resource_accesses.return_value = _listing(accesses)
     blade.post_resource_accesses_batch.return_value = post or _valid()
     blade.delete_resource_accesses.return_value = delete or _valid()
+    if held is None:
+        held = {"realms": ["realm1"], OIDC: ["okta"]}
+    for resource_type, (method, missing) in NAME_READS.items():
+        items = [
+            _named(name, destroyed=False if resource_type == "realms" else None)
+            for name in held.get(resource_type, [])
+        ]
+        setattr(blade, method, _name_read(items, missing, resource_type == SAML))
     return blade
 
 
@@ -771,3 +826,382 @@ class TestResourceAccessFailedRead:
 
         module.fail_json.assert_not_called()
         module.exit_json.assert_called_once_with(changed=False)
+
+
+WOULD_FAIL = "Create resource access between {0} would fail. {1}"
+NOT_VERIFIED = (
+    "Check mode did not verify the resource access between {0}: {1} The array"
+    " decides when the request is sent."
+)
+# One resource of each type the array shares with a realm
+SHAREABLE = [
+    ("subnets", "Partner-2065"),
+    ("dns", "dns1"),
+    ("targets", "target1"),
+    (OIDC, "okta"),
+    (SAML, "PureSSO"),
+]
+
+
+def _check(params, held, **reads):
+    """Run a share in check mode on an array that holds what held says
+
+    A keyword names a read and the response it gives instead.
+    """
+    blade = _blade(held=held)
+    for method, response in reads.items():
+        setattr(blade, method, Mock(return_value=response))
+    return blade, _run(params, blade, check_mode=True)
+
+
+def _nothing_sent(blade):
+    blade.post_resource_accesses_batch.assert_not_called()
+    blade.delete_resource_accesses.assert_not_called()
+
+
+class TestResourceAccessCheckModeRefusals:
+    """Check mode fails for a share the array would refuse
+
+    Purity//FB 4.8 answers a create that names a realm or a resource it does
+    not hold with the error it gives to a read of that name, and it finds
+    both only under the names as it holds them.
+    """
+
+    @pytest.mark.parametrize("resource_type, resource_name", SHAREABLE)
+    def test_resource_the_array_does_not_hold(self, resource_type, resource_name):
+        params = _params(resource_type=resource_type, resource_name=resource_name)
+        blade, module = _check(params, {"realms": ["realm1"]})
+
+        method, missing = NAME_READS[resource_type]
+        getattr(blade, method).assert_called_once_with(names=[resource_name])
+        module.fail_json.assert_called_once_with(
+            msg=WOULD_FAIL.format(
+                "realms realm1 and {0} {1}".format(resource_type, resource_name),
+                "Error: " + missing,
+            )
+        )
+        module.exit_json.assert_not_called()
+        _nothing_sent(blade)
+
+    def test_realm_the_array_does_not_hold(self):
+        params = _params(resource_type="dns", resource_name="dns1", scope_name="r2")
+        blade, module = _check(params, {"realms": ["realm1"], "dns": ["dns1"]})
+
+        blade.get_realms.assert_called_once_with(names=["r2"])
+        module.fail_json.assert_called_once_with(
+            msg=WOULD_FAIL.format(
+                "realms r2 and dns dns1", "Error: Realm does not exist."
+            )
+        )
+        module.exit_json.assert_not_called()
+        _nothing_sent(blade)
+
+    def test_realm_qualified_resource_name_gets_the_hint(self):
+        params = _params(resource_name="realm1::okta")
+        blade, module = _check(params, {"realms": ["realm1"], OIDC: ["okta"]})
+
+        module.fail_json.assert_called_once_with(
+            msg=WOULD_FAIL.format(
+                "realms realm1 and sso/oidc/idps realm1::okta",
+                "Error: " + ERR_NO_IDP + " " + resource_access.REALM_PREFIX_HINT,
+            )
+        )
+        module.exit_json.assert_not_called()
+        _nothing_sent(blade)
+
+    def test_realm_named_in_another_case(self):
+        params = _params(scope_name="REALM1")
+        blade, module = _check(params, {"realms": ["realm1"], OIDC: ["okta"]})
+
+        module.fail_json.assert_called_once_with(
+            msg=WOULD_FAIL.format(
+                "realms REALM1 and sso/oidc/idps okta",
+                "The array holds realms REALM1 as realm1 and creates a resource"
+                " access only under the name as it holds it.",
+            )
+        )
+        module.exit_json.assert_not_called()
+        _nothing_sent(blade)
+
+    @pytest.mark.parametrize(
+        "resource_type, held_name",
+        [("dns", "dns1"), ("targets", "target1"), (OIDC, "okta")],
+    )
+    def test_resource_named_in_another_case(self, resource_type, held_name):
+        given = held_name.upper()
+        params = _params(resource_type=resource_type, resource_name=given)
+        blade, module = _check(
+            params, {"realms": ["realm1"], resource_type: [held_name]}
+        )
+
+        module.fail_json.assert_called_once_with(
+            msg=WOULD_FAIL.format(
+                "realms realm1 and {0} {1}".format(resource_type, given),
+                "The array holds {0} {1} as {2} and creates a resource access"
+                " only under the name as it holds it.".format(
+                    resource_type, given, held_name
+                ),
+            )
+        )
+        module.exit_json.assert_not_called()
+        _nothing_sent(blade)
+
+    def test_saml_provider_is_read_in_its_own_case(self):
+        params = _params(resource_type=SAML, resource_name="puresso")
+        blade, module = _check(params, {"realms": ["realm1"], SAML: ["PureSSO"]})
+
+        module.fail_json.assert_called_once_with(
+            msg=WOULD_FAIL.format(
+                "realms realm1 and sso/saml2/idps puresso",
+                "Error: SsoSaml2 configuration does not exist.",
+            )
+        )
+        module.exit_json.assert_not_called()
+
+    def test_missing_realm_fails_for_any_resource_type(self):
+        params = _params(
+            resource_type="telemetry-targets", resource_name="tt1", scope_name="r2"
+        )
+        blade, module = _check(params, {"realms": ["realm1"]})
+
+        module.fail_json.assert_called_once_with(
+            msg=WOULD_FAIL.format(
+                "realms r2 and telemetry-targets tt1", "Error: Realm does not exist."
+            )
+        )
+        module.warn.assert_not_called()
+        module.exit_json.assert_not_called()
+
+
+class TestResourceAccessCheckModePredictions:
+    """Check mode predicts the share when the array holds both ends
+
+    What the reads do not settle is left to the array and reported with a
+    warning; it never fails a share the array might accept.
+    """
+
+    @pytest.mark.parametrize("resource_type, resource_name", SHAREABLE)
+    def test_realm_and_resource_are_held(self, resource_type, resource_name):
+        params = _params(resource_type=resource_type, resource_name=resource_name)
+        blade, module = _check(
+            params, {"realms": ["realm1"], resource_type: [resource_name]}
+        )
+
+        blade.get_realms.assert_called_once_with(names=["realm1"])
+        getattr(blade, NAME_READS[resource_type][0]).assert_called_once_with(
+            names=[resource_name]
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+        module.fail_json.assert_not_called()
+        module.warn.assert_not_called()
+        _nothing_sent(blade)
+
+    def test_subnet_named_in_another_case_is_a_warning(self):
+        # not measured on an array: no failure is predicted for it
+        params = _params(resource_type="subnets", resource_name="partner-2065")
+        blade, module = _check(
+            params, {"realms": ["realm1"], "subnets": ["Partner-2065"]}
+        )
+
+        module.warn.assert_called_once_with(
+            NOT_VERIFIED.format(
+                "realms realm1 and subnets partner-2065",
+                "the array holds subnets partner-2065 as Partner-2065 and may"
+                " not find it under another case.",
+            )
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+        module.fail_json.assert_not_called()
+        _nothing_sent(blade)
+
+    def test_resource_type_the_module_does_not_know(self):
+        params = _params(resource_type="telemetry-targets", resource_name="tt1")
+        blade, module = _check(params, {"realms": ["realm1"]})
+
+        blade.get_realms.assert_called_once_with(names=["realm1"])
+        module.warn.assert_called_once_with(
+            NOT_VERIFIED.format(
+                "realms realm1 and telemetry-targets tt1",
+                "the module can only check a resource of type dns,"
+                " sso/oidc/idps, sso/saml2/idps, subnets, targets.",
+            )
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+        module.fail_json.assert_not_called()
+        _nothing_sent(blade)
+
+    def test_scope_type_the_module_does_not_know(self):
+        params = _params(scope_type="other-scope")
+        blade, module = _check(params, {})
+
+        blade.get_realms.assert_not_called()
+        blade.get_sso_oidc_idps.assert_not_called()
+        module.warn.assert_called_once_with(
+            NOT_VERIFIED.format(
+                "other-scope realm1 and sso/oidc/idps okta",
+                "the module can only check a scope of type realms.",
+            )
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+        module.fail_json.assert_not_called()
+
+    def test_destroyed_realm(self):
+        blade = _blade()
+        blade.get_realms = Mock(
+            return_value=_listing([_named("realm1", destroyed=True)])
+        )
+        module = _run(_params(), blade, check_mode=True)
+
+        module.warn.assert_called_once_with(
+            NOT_VERIFIED.format(
+                "realms realm1 and sso/oidc/idps okta", "realm realm1 is destroyed."
+            )
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+        module.fail_json.assert_not_called()
+        _nothing_sent(blade)
+
+    def test_resource_that_belongs_to_a_realm(self):
+        params = _params(resource_type="dns", resource_name="realm1::dns1")
+        blade, module = _check(params, {"realms": ["realm1"], "dns": ["realm1::dns1"]})
+
+        module.warn.assert_called_once_with(
+            NOT_VERIFIED.format(
+                "realms realm1 and dns realm1::dns1",
+                "dns realm1::dns1 belongs to a realm, and the array is only"
+                " known to share array-level resources.",
+            )
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+        module.fail_json.assert_not_called()
+
+    def test_realm_read_the_array_refuses(self):
+        blade, module = _check(
+            _params(),
+            {"realms": ["realm1"], OIDC: ["okta"]},
+            get_realms=_error(ERR_NOT_PERMITTED),
+        )
+
+        # the resource is still looked up
+        blade.get_sso_oidc_idps.assert_called_once_with(names=["okta"])
+        module.warn.assert_called_once_with(
+            NOT_VERIFIED.format(
+                "realms realm1 and sso/oidc/idps okta",
+                "the read of realms realm1 failed. Error: " + ERR_NOT_PERMITTED,
+            )
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+        module.fail_json.assert_not_called()
+        _nothing_sent(blade)
+
+    def test_resource_read_the_array_refuses(self):
+        blade, module = _check(
+            _params(),
+            {"realms": ["realm1"], OIDC: ["okta"]},
+            get_sso_oidc_idps=_error(ERR_RESTARTING, status_code=503),
+        )
+
+        module.warn.assert_called_once_with(
+            NOT_VERIFIED.format(
+                "realms realm1 and sso/oidc/idps okta",
+                "the read of sso/oidc/idps okta failed. Error: " + ERR_RESTARTING,
+            )
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+        module.fail_json.assert_not_called()
+
+    def test_read_that_returns_nothing(self):
+        blade, module = _check(
+            _params(resource_type="dns", resource_name="dns1"),
+            {"realms": ["realm1"]},
+            get_dns=_listing([]),
+        )
+
+        module.warn.assert_called_once_with(
+            NOT_VERIFIED.format(
+                "realms realm1 and dns dns1", "the array returned no dns dns1."
+            )
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+        module.fail_json.assert_not_called()
+
+    def test_error_without_a_full_stop_still_ends_the_sentence(self):
+        blade, module = _check(
+            _params(),
+            {"realms": ["realm1"], OIDC: ["okta"]},
+            get_realms=_error("Internal error"),
+        )
+
+        module.warn.assert_called_once_with(
+            NOT_VERIFIED.format(
+                "realms realm1 and sso/oidc/idps okta",
+                "the read of realms realm1 failed. Error: Internal error.",
+            )
+        )
+
+
+class TestResourceAccessCheckModeReads:
+    """The realm and the resource are read only to predict a new share"""
+
+    def test_existing_share_is_unchanged_without_the_reads(self):
+        blade = _blade(accesses=[_access(ACCESS_ID, "okta")], held={})
+        module = _run(_params(), blade, check_mode=True)
+
+        blade.get_realms.assert_not_called()
+        blade.get_sso_oidc_idps.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+        module.fail_json.assert_not_called()
+
+    def test_revoke_in_check_mode_makes_no_reads(self):
+        blade = _blade(accesses=[_access(ACCESS_ID, "okta")], held={})
+        module = _run(_params(state="absent"), blade, check_mode=True)
+
+        blade.get_realms.assert_not_called()
+        blade.get_sso_oidc_idps.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+        module.warn.assert_not_called()
+
+    def test_real_share_is_sent_without_the_reads(self):
+        # outside check mode the array is asked and its answer is reported
+        blade = _blade(held={}, post=_error(ERR_NO_IDP))
+        module = _run(_params(), blade)
+
+        blade.get_realms.assert_not_called()
+        blade.get_sso_oidc_idps.assert_not_called()
+        blade.post_resource_accesses_batch.assert_called_once()
+        module.fail_json.assert_called_once_with(
+            msg="Create resource access between realms realm1 and sso/oidc/idps"
+            " okta failed. Error: " + ERR_NO_IDP
+        )
+        module.warn.assert_not_called()
+
+    def test_with_realm_prefix_hint(self):
+        hint = resource_access._with_realm_prefix_hint
+        qualified = _module(_params(resource_name="realm1::okta"))
+        assert (
+            hint(qualified, "It failed")
+            == "It failed. " + resource_access.REALM_PREFIX_HINT
+        )
+        assert (
+            hint(qualified, "It failed.")
+            == "It failed. " + resource_access.REALM_PREFIX_HINT
+        )
+        assert hint(_module(_params()), "It failed") == "It failed"
+
+
+class TestResourceAccessDocumentation:
+    """What the module says about the resources that are shared with a realm"""
+
+    @pytest.mark.parametrize("resource_type", ["subnets", "dns", "targets", OIDC, SAML])
+    def test_shareable_resource_type_is_documented(self, resource_type):
+        assert "C({0})".format(resource_type) in resource_access.DOCUMENTATION
+        assert "resource_type: " + resource_type in resource_access.EXAMPLES
+        assert resource_type in resource_access.REALM_SHAREABLE
+
+    def test_no_example_shares_the_management_dns_configuration(self):
+        assert "resource_name: management" not in resource_access.EXAMPLES
+
+    def test_a_shared_dns_configuration_can_be_changed_from_the_realm(self):
+        text = " ".join(resource_access.DOCUMENTATION.split())
+        assert "A shared DNS configuration can also be changed from the realm" in text
+        assert "shared with several realms can be changed" in text

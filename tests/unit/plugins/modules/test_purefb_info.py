@@ -7821,3 +7821,125 @@ class TestPurefbInfoRealmReadBack:
         assert "realm_connection_keys" not in info
         assert "realm_connections" not in info
         assert not [call for call in older.calls if "connection_key" in call[0]]
+
+
+# Read-back for an identity whose custom role grants one resource type. For
+# a role with "file-systems: get" on the array Purity//FB 4.8.8 serves GET
+# /file-systems and refuses GET /arrays, /hardware, /admins and /audits with
+# HTTP 400 "Operation not permitted. Authorization for 'get' on
+# 'purestorage.com/api/v2/<endpoint>' is required.". The other reads were not
+# probed for such an identity; they are modelled as refused in the same way.
+
+
+def _refused_for_role(read):
+    return _SdkError(
+        400,
+        "Operation not permitted. Authorization for 'get' on "
+        "'purestorage.com/api/v2/{0}' is required.".format(read[4:].replace("_", "-")),
+    )
+
+
+def _file_system_row(name):
+    return _Row(
+        name=name,
+        id="44444444-4444-4444-8444-444444444444",
+        fast_remove_directory_enabled=False,
+        snapshot_directory_enabled=False,
+        provisioned=1073741824,
+        destroyed=False,
+        http=_Row(enabled=False),
+        hard_limit_enabled=False,
+        promotion_status="promoted",
+        requested_promotion_state="promoted",
+        writable=True,
+        default_group_quota=0,
+        default_user_quota=0,
+    )
+
+
+def _custom_role_client(**overrides):
+    """The array as an identity that may only read file systems reads it"""
+    reads = {name: _refused_for_role(name) for name in _module_reads()}
+    reads["get_hardware"] = _refused_for_role("get_hardware")
+    reads["get_file_systems"] = _listing([_file_system_row("fs1")])
+    reads.update(overrides)
+    return _fake_client(reads)
+
+
+class TestPurefbInfoRefusedReads:
+    """No refused read ends in a traceback, the array record included"""
+
+    @pytest.mark.parametrize("subset", SUBSETS_FOR_A_REALM_ADMIN + ("clients",))
+    def test_each_subset_is_gathered_with_a_custom_role(self, subset):
+        module, info = _run_main(_custom_role_client(), subset)
+        assert isinstance(info, dict)
+        # every read is refused, none fails: nothing to warn about
+        module.warn.assert_not_called()
+
+    @pytest.mark.parametrize("subset", SUBSETS_FOR_A_REALM_ADMIN + ("clients",))
+    def test_each_subset_is_gathered_when_every_read_is_refused(self, subset):
+        client = _custom_role_client(
+            get_file_systems=_refused_for_role("get_file_systems")
+        )
+        info = _run_main(client, subset)[1]
+        assert isinstance(info, dict)
+
+    def test_minimum_subset_without_the_array_record(self):
+        """GET /arrays is refused: the entries read from the array record
+        are null and the read the role grants is still counted."""
+        default = _run_main(_custom_role_client(), "minimum")[1]["default"]
+        assert default["filesystems"] == 1
+        for key in (
+            "flashblade_name",
+            "purity_version",
+            "banner",
+            "idle_timeout",
+            "timezone",
+            "smb_mode",
+            "security_update",
+            "blades",
+            "policies",
+            "kerberos_keytabs",
+            "total_capacity",
+        ):
+            assert default[key] is None, key
+        assert default["product_type"] == "Unknown"
+        assert default["network_access_policy"] == "None"
+        assert default["api_versions"] == "2.30"
+        assert default["remote_assist"] == {}
+        assert default["maintenance_window"] == []
+
+    def test_file_systems_are_reported_with_a_custom_role(self):
+        """The per-file-system reads the role does not grant leave their
+        entries empty."""
+        info = _run_main(_custom_role_client(), "filesystems")[1]
+        assert list(info["filesystems"]) == ["fs1"]
+        fsys = info["filesystems"]["fs1"]
+        assert fsys["provisioned"] == 1073741824
+        assert fsys["user_quotas"] == {}
+        assert fsys["group_quotas"] == {}
+        assert fsys["quota_policy"] is None
+        assert fsys["policy_quotas"] == {"users": [], "groups": []}
+        assert fsys["worm_policy"] is None
+        assert info["file_system_exports"] == []
+        assert info["junctions"] == {}
+
+    def test_config_and_drives_without_the_array_record(self):
+        client = _custom_role_client()
+        config = _run_main(client, "config")[1]["config"]
+        assert config["ntp"] is None
+        assert config["dns"] == {}
+        assert config["ssl_certs"] == {}
+        assert _run_main(client, "drives")[1]["drives"] == {}
+
+    def test_refusal_is_recognised_with_and_without_its_detail(self):
+        refused = purefb_info_module._read_refused
+        assert refused(_refused())
+        assert refused(_refused_for_role("get_arrays"))
+        assert not refused(_SdkError(400, "File system does not exist."))
+        assert not refused(_SdkError(500, "Unexpected error."))
+        assert not refused(_listing())
+        # one error of a response that is not a refusal keeps it a failure
+        mixed = _refused()
+        mixed.errors.append(_Row(message="Unexpected error.", context=None))
+        assert not refused(mixed)

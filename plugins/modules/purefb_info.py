@@ -153,11 +153,15 @@ options:
         C(storage_class_members) lists the local array itself when it is
         not in a fleet; C(realm_connections) and C(remote_realms) are
         empty when no realm is connected.
-      - With credentials whose access is limited to a realm the array
-        refuses the array-wide reads (hardware, array space and
-        performance, support, software and so on). The entries built from
-        a refused read are returned empty or null instead of failing the
-        module.
+      - The array refuses the reads the credentials in use are not allowed
+        to make. An administrator whose access is limited to a realm is
+        refused the array-wide reads (hardware, array space and
+        performance, support, software and so on), and a custom role is
+        refused every read it does not grant. The entries built from a
+        refused read are returned empty or null instead of failing the
+        module. Keytabs, which the array fails to list for an
+        administrator limited to a realm, are reported empty with a
+        warning.
     required: false
     type: list
     elements: str
@@ -634,9 +638,11 @@ def generate_default_dict(blade):
     # get_rest_api_version()/LooseVersion migration makes these gates evaluate
     # correctly, so the gated sections can now appear where they never did.
     api_version = get_rest_api_version(blade)
-    defaults = list(blade.get_arrays().items)[0]
-    default_info["flashblade_name"] = defaults.name
-    default_info["purity_version"] = defaults.version
+    # The array record is refused to an identity whose role does not grant
+    # it; the entries read from it are then null.
+    defaults = _first_item(blade.get_arrays())
+    default_info["flashblade_name"] = getattr(defaults, "name", None)
+    default_info["purity_version"] = getattr(defaults, "version", None)
     # the login (MOTD) banner, so purefb_banner changes can be read back
     default_info["banner"] = getattr(defaults, "banner", None)
     default_info["filesystems"] = blade.get_file_systems().total_item_count
@@ -693,7 +699,10 @@ def generate_default_dict(blade):
         blade.get_object_store_virtual_hosts()
     )
     default_info["api_clients"] = _listed(blade.get_api_clients())
-    default_info["idle_timeout"] = int(defaults.idle_timeout / 60000)
+    idle_timeout = getattr(defaults, "idle_timeout", None)
+    default_info["idle_timeout"] = (
+        int(idle_timeout / 60000) if idle_timeout is not None else None
+    )
     # The EULA, the admin settings and the support settings are array-wide:
     # an identity the array refuses them to gets null or empty entries.
     eula = _first_item(blade.get_arrays_eula())
@@ -715,7 +724,7 @@ def generate_default_dict(blade):
             str(admin_settings.lockout_duration / 1000) + " seconds"
         )
     default_info["smb_mode"] = getattr(defaults, "smb_mode", None)
-    default_info["timezone"] = defaults.time_zone
+    default_info["timezone"] = getattr(defaults, "time_zone", None)
     default_info["product_type"] = getattr(defaults, "product_type", "Unknown")
     if LooseVersion(SECURITY_API_VERSION) <= LooseVersion(api_version):
         # read defensively: the array does not report its encryption

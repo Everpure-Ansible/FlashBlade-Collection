@@ -35,7 +35,7 @@ options:
     - The name of the realm.
     - This has to be unique among the realms of the array, including
       destroyed realms that are pending eradication.
-    - A realm name cannot contain C(::).
+    - A realm name cannot contain C(::) or a comma.
     type: str
     required: true
   without_default_access_list:
@@ -262,6 +262,7 @@ MINIMUM_API_VERSION = "2.19"
 REALM_DEFAULTS_API_VERSION = "2.20"
 REALM_QOS_API_VERSION = "2.20"
 TLS_OPTION = "default_inbound_tls_policy"
+NAME_OPTIONS = ("name", "rename", "qos_policy", "default_object_server", TLS_OPTION)
 
 
 def _same(first, second):
@@ -845,6 +846,15 @@ def main():
         module.fail_json(msg="py-pure-client sdk is required for this module")
 
     state = module.params["state"]
+    for option in NAME_OPTIONS:
+        if "," in (module.params[option] or ""):
+            # the array reads a comma as the separator of a list of names
+            module.fail_json(
+                msg="{0} {1} is not a name: the array reads a comma as the "
+                "separator of a list of names. Give one name.".format(
+                    option, module.params[option]
+                )
+            )
     for option in ("name", "rename"):
         if "::" in (module.params[option] or ""):
             module.fail_json(

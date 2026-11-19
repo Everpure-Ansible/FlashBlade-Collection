@@ -762,6 +762,32 @@ class TestPurefbRealmNames:
         assert "rename tenant1::inner is not a realm name" in _failure(module)
         module.get_system.assert_not_called()
 
+    def test_comma_in_name_fails_before_login(self):
+        array = _Array(realms=("tenant1", "tenant2"))
+        for state in ("present", "absent"):
+            module = _run(array, name="tenant1,tenant2", state=state)
+            assert "name tenant1,tenant2 is not a name" in _failure(module)
+            module.get_system.assert_not_called()
+        assert array.writes == []
+
+    def test_comma_in_rename_fails_before_login(self):
+        array = _Array()
+        module = _run(array, rename="tenant2,tenant3", check_mode=True)
+        assert "rename tenant2,tenant3 is not a name" in _failure(module)
+        module.get_system.assert_not_called()
+
+    def test_comma_in_a_reference_fails_before_login(self):
+        for option in (
+            "qos_policy",
+            "default_object_server",
+            "default_inbound_tls_policy",
+        ):
+            array = _Array()
+            module = _run(array, **{option: "one,two"})
+            assert "{0} one,two is not a name".format(option) in _failure(module)
+            module.get_system.assert_not_called()
+            assert array.writes == []
+
     def test_rename_equal_to_name_is_noop(self):
         array = _Array()
         for check_mode in (True, False):

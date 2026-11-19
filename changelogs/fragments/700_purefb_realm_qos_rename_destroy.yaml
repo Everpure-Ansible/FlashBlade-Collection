@@ -14,6 +14,8 @@ bugfixes:
   - purefb_realm - a realm that has a default inbound TLS policy is renamed by clearing the policy,
     renaming the realm and setting the policy again, as the array accepts no change to the policy
     after a plain rename.
+  - purefb_realm - a name that holds a comma is refused before any request, as the array reads a
+    comma as the separator of a list of names.
   - purefb_realm - ``state=absent`` fails naming the resource accesses and management access policy
     rules that still refer to the realm, also in check mode.
   - purefb_realm - a read the array refuses is reported with its message instead of being read as

@@ -408,11 +408,24 @@ class TestResourceAccessFailureMessages:
         blade.post_resource_accesses_batch.assert_called_once()
         module.fail_json.assert_called_once_with(
             msg="Create resource access between realms realm1 and sso/oidc/idps"
-            " realm1::okta failed. A resource that is shared with a realm is an"
-            " array-level object and is named without a realm prefix. Error: "
-            + ERR_NO_IDP
+            " realm1::okta failed. Error: " + ERR_NO_IDP + " An array-level"
+            " resource is shared under its own name, without a realm prefix."
         )
         module.exit_json.assert_not_called()
+
+    def test_hint_follows_an_error_without_a_full_stop(self):
+        blade = _blade(post=_error(ERR_BAD_TYPE))
+        module = _run(
+            _params(resource_type="telemetry-targets", resource_name="realm1::tt1"),
+            blade,
+        )
+
+        module.fail_json.assert_called_once_with(
+            msg="Create resource access between realms realm1 and"
+            " telemetry-targets realm1::tt1 failed. Error: " + ERR_BAD_TYPE + "."
+            " An array-level resource is shared under its own name, without a"
+            " realm prefix."
+        )
 
     def test_delete_failure_names_both_ends(self):
         blade = _blade(accesses=[_access(ACCESS_ID, "okta")], delete=_error(ERR_IN_USE))
@@ -434,8 +447,9 @@ class TestResourceAccessFailureMessages:
 
     def test_hint_only_for_a_realm_prefix_in_a_realm_scope(self):
         hint = resource_access._realm_prefix_hint
-        assert hint(_module(_params(resource_name="realm1::okta"))) == (
-            " " + resource_access.REALM_PREFIX_HINT
+        assert (
+            hint(_module(_params(resource_name="realm1::okta")))
+            == resource_access.REALM_PREFIX_HINT
         )
         assert hint(_module(_params())) == ""
         # the scope types are defined by the array; any other one gets no hint
@@ -592,3 +606,104 @@ class TestResourceAccessArrayLevelRegression:
         module.fail_json.assert_not_called()
         blade.post_resource_accesses_batch.assert_called_once()
         module.exit_json.assert_called_once_with(changed=True)
+
+
+# What the array answers when it does not serve the read of the resource accesses
+ERR_NOT_PERMITTED = "Operation not permitted."
+ERR_RESTARTING = (
+    "Services are restarting and most operations are not available. This may"
+    " take some time. Try again later."
+)
+GET_FAILED = "Get resource access between realms realm1 and sso/oidc/idps okta failed."
+
+
+def _blade_refusing_the_read(lookup, post=None):
+    """The GET answers an error response, which has no items and no count"""
+    blade = _blade(post=post)
+    blade.get_resource_accesses.return_value = lookup
+    return blade
+
+
+class TestResourceAccessFailedRead:
+    """A read the array refuses does not mean that nothing is shared
+
+    Purity//FB 4.8 answers 400 "Operation not permitted." to an administrator
+    whose management access is limited to a realm.
+    """
+
+    def test_revoke_fails_instead_of_reporting_no_change(self):
+        blade = _blade_refusing_the_read(_error(ERR_NOT_PERMITTED))
+        module = _run(_params(state="absent"), blade)
+
+        module.fail_json.assert_called_once_with(
+            msg=GET_FAILED + " Error: " + ERR_NOT_PERMITTED
+        )
+        module.exit_json.assert_not_called()
+        blade.delete_resource_accesses.assert_not_called()
+        blade.post_resource_accesses_batch.assert_not_called()
+
+    def test_revoke_check_mode_fails_too(self):
+        blade = _blade_refusing_the_read(_error(ERR_NOT_PERMITTED))
+        module = _run(_params(state="absent"), blade, check_mode=True)
+
+        module.fail_json.assert_called_once_with(
+            msg=GET_FAILED + " Error: " + ERR_NOT_PERMITTED
+        )
+        module.exit_json.assert_not_called()
+        blade.delete_resource_accesses.assert_not_called()
+
+    def test_revoke_fails_while_the_services_restart(self):
+        blade = _blade_refusing_the_read(_error(ERR_RESTARTING, status_code=503))
+        module = _run(_params(state="absent"), blade)
+
+        module.fail_json.assert_called_once_with(
+            msg=GET_FAILED + " Error: " + ERR_RESTARTING
+        )
+        module.exit_json.assert_not_called()
+        blade.delete_resource_accesses.assert_not_called()
+
+    def test_share_check_mode_fails_instead_of_predicting_a_change(self):
+        blade = _blade_refusing_the_read(_error(ERR_NOT_PERMITTED))
+        module = _run(_params(), blade, check_mode=True)
+
+        module.fail_json.assert_called_once_with(
+            msg=GET_FAILED + " Error: " + ERR_NOT_PERMITTED
+        )
+        module.exit_json.assert_not_called()
+        blade.post_resource_accesses_batch.assert_not_called()
+
+    def test_share_is_still_sent_and_the_array_decides(self):
+        blade = _blade_refusing_the_read(
+            _error(ERR_NOT_PERMITTED), post=_error(ERR_NOT_PERMITTED)
+        )
+        module = _run(_params(), blade)
+
+        blade.post_resource_accesses_batch.assert_called_once_with(
+            items=[
+                {
+                    "resource": {"name": "okta", "resource_type": OIDC},
+                    "scope": {"name": "realm1", "resource_type": "realms"},
+                }
+            ]
+        )
+        module.fail_json.assert_called_once_with(
+            msg="Create resource access between realms realm1 and sso/oidc/idps"
+            " okta failed. Error: " + ERR_NOT_PERMITTED
+        )
+        module.exit_json.assert_not_called()
+
+    def test_share_the_array_accepts_is_reported_as_changed(self):
+        blade = _blade_refusing_the_read(_error(ERR_RESTARTING, status_code=503))
+        module = _run(_params(), blade)
+
+        blade.post_resource_accesses_batch.assert_called_once()
+        module.exit_json.assert_called_once_with(changed=True)
+        module.fail_json.assert_not_called()
+
+    def test_read_that_matches_nothing_is_not_a_failure(self):
+        # a filter that matches nothing answers 200 with an empty list
+        blade = _blade()
+        module = _run(_params(state="absent"), blade, check_mode=True)
+
+        module.fail_json.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)

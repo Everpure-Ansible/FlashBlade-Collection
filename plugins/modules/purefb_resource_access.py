@@ -48,9 +48,9 @@ options:
   resource_name:
     description:
       - The name of the resource you want to target.
-      - A resource that is shared with a realm is an array-level object, so
-        give its name without a realm prefix. The array does not find an
-        OIDC identity provider that is named C(realm::provider).
+      - An array-level resource is shared under its own name, without a
+        realm prefix. Purity//FB 4.8 does not find an OIDC identity provider
+        under the name C(realm::provider).
     type: str
     required: true
   state:
@@ -74,6 +74,15 @@ options:
       - Resource access are immutable. You have to delete it and then create a new one.
     type: str
     required: true
+notes:
+- Check mode reports the request the module would send. Whether the array
+  accepts the resource type, the resource name or a revoke is only known
+  when the request is sent.
+- The module reads the resource accesses to find out whether one exists.
+  Purity//FB 4.8 refuses that read with C(Operation not permitted) for an
+  administrator whose management access is limited to a realm. With
+  I(state=absent) and in check mode the module then fails with the error of
+  the array; with I(state=present) it still sends the create request.
 extends_documentation_fragment:
 - everpure.flashblade.everpure.fb
 """
@@ -142,8 +151,7 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
 MINIMUM_API_VERSION = "2.19"
 
 REALM_PREFIX_HINT = (
-    "A resource that is shared with a realm is an array-level object and is"
-    " named without a realm prefix."
+    "An array-level resource is shared under its own name, without a realm prefix."
 )
 
 
@@ -163,7 +171,7 @@ def _realm_prefix_hint(module):
         module.params["scope_type"] == "realms"
         and "::" in module.params["resource_name"]
     ):
-        return " " + REALM_PREFIX_HINT
+        return REALM_PREFIX_HINT
     return ""
 
 
@@ -179,7 +187,17 @@ def get_resource_access(module, blade):
         + "'"
     )
     res = blade.get_resource_accesses(filter=filter_string)
-    if res.status_code == 200 and res.total_item_count:
+    if res.status_code != 200:
+        if module.params["state"] == "present" and not module.check_mode:
+            # Whether the access exists is not known, but the create request
+            # can still be sent and the array accepts or refuses it.
+            return False, False
+        module.fail_json(
+            msg="Get resource access between {0} failed. Error: {1}".format(
+                _access_text(module), get_error_message(res)
+            )
+        )
+    if res.total_item_count:
         items = list(res.items)
         for item in items:
             if item.resource.name == module.params["resource_name"]:
@@ -203,13 +221,15 @@ def create_resource_access(module, blade):
         )
         res = blade.post_resource_accesses_batch(items=[resource])
         if res.status_code != 200:
-            module.fail_json(
-                msg="Create resource access between {0} failed.{1} Error: {2}".format(
-                    _access_text(module),
-                    _realm_prefix_hint(module),
-                    get_error_message(res),
-                )
+            msg = "Create resource access between {0} failed. Error: {1}".format(
+                _access_text(module), get_error_message(res)
             )
+            hint = _realm_prefix_hint(module)
+            if hint:
+                if not msg.endswith("."):
+                    msg += "."
+                msg = "{0} {1}".format(msg, hint)
+            module.fail_json(msg=msg)
     module.exit_json(changed=changed)
 
 

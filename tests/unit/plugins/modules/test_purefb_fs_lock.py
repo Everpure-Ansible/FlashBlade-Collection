@@ -1112,6 +1112,17 @@ class TestPurefbFsLock:
         msg = _failure(_run(_params(target="locks", file_system="fs1"), blade))
         assert msg == "Failed to list file locks. Error: " + NO_FILE_SYSTEM
 
+    def test_lock_refusal_of_a_destroyed_realm_file_system_is_relayed(self):
+        # A destroyed file system is still returned by its name until it is
+        # eradicated; saying that it exists would mislead.
+        destroyed = _file_system(REALM_FS, realm="realm1")
+        destroyed.destroyed = True
+        blade = _blade(file_systems=[destroyed])
+        blade.get_file_systems_locks.return_value = _refused(NO_FILE_SYSTEM)
+        msg = _failure(_run(_params(target="locks", file_system=REALM_FS), blade))
+        assert msg == "Failed to list file locks. Error: " + NO_FILE_SYSTEM
+        blade.get_file_systems.assert_called_once_with(names=[REALM_FS])
+
     def test_list_locks_array_level_file_system_needs_no_lookup(self):
         blade = _blade(locks=[_lock("lock1")])
         result = _result(_run(_params(target="locks", file_system="fs1"), blade))

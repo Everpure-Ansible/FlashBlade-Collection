@@ -448,15 +448,16 @@ def fail_locks(module, blade, action, res):
 
     The array answers a lock request narrowed to a file system in a realm as
     if the file system were missing. When it says the file system does not
-    exist the name is looked up, and a file system that is there, in a realm,
-    is reported as such.
+    exist the name is looked up, and a file system that is there, in a realm
+    and not destroyed, is reported as such.
     """
     error = get_error_message(res)
     msg = "Failed to {0} file locks. Error: {1}".format(action, error)
     file_system = module.params["file_system"]
     if file_system and "file system does not exist" in str(error).lower():
-        realm = _realm_name(_find_file_system(module, blade)[0])
-        if realm:
+        found = _find_file_system(module, blade)[0]
+        realm = _realm_name(found)
+        if realm and not getattr(found, "destroyed", False):
             msg += (
                 " File system {0} does exist, in realm {1}: the array refused "
                 "a lock request narrowed to a file system in a realm.".format(

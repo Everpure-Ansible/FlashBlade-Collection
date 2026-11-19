@@ -8,3 +8,5 @@ bugfixes:
   - purefb_s3_export_policy - a rename to a name that is taken or differs only in case is refused
     before the rules are changed, and a failed read of the policy or its rules is reported instead
     of being taken for a missing policy or an empty rule list.
+  - purefb_s3_export_policy - a ``name`` or ``rename`` that holds a comma is refused. The array
+    reads it as a list of names, and a task manages one policy.

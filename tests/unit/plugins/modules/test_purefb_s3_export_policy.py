@@ -141,12 +141,25 @@ def _array(policies):
 
     Names are matched without regard to case and returned as stored; a name
     the array does not hold is a 400, in a realm and outside of one alike.
+    A comma separates names: the answer holds every policy named, once, or
+    is the same 400 when one of them is missing. A blank name is a 400 of
+    its own.
     """
     by_name = {policy.name.lower(): policy for policy in policies}
 
     def get(names=None, **kwargs):
-        policy = by_name.get(names[0].lower())
-        return _found(policy) if policy else _refused()
+        if not names[0].strip():
+            return _refused("Missing or invalid parameter.")
+        found = []
+        for name in names[0].split(","):
+            if not name:
+                continue
+            policy = by_name.get(name.lower())
+            if policy is None:
+                return _refused()
+            if policy not in found:
+                found.append(policy)
+        return _found(*found) if found else _refused()
 
     return get
 
@@ -1704,6 +1717,61 @@ class TestPurefbS3ExportPolicyRealms:
                 assert "only in case" in _failure(module)
                 assert _writes(blade) == []
                 blade.get_s3_export_policies_rules.assert_not_called()
+
+    # ---------------- names holding a comma ----------------
+
+    def test_main_name_holding_a_comma_refused(self):
+        """The array reads a comma as a separator of names and answers with
+        every policy named: such a name is refused before any lookup"""
+        policies = [_policy("pol"), _policy("other"), _policy("realm1::pol")]
+        for name in ("pol,other", "other,pol", "pol,", "pol,gone", "realm1::pol,pol"):
+            for state in ("present", "absent"):
+                for check_mode in (True, False):
+                    module, blade = _run(
+                        {"name": name, "state": state, "enabled": False},
+                        policies=policies,
+                        check_mode=check_mode,
+                    )
+
+                    msg = _failure(module)
+                    assert "name {0} holds a comma".format(name) in msg
+                    assert _lookups(blade) == []
+                    assert _writes(blade) == []
+
+    def test_main_rename_holding_a_comma_refused(self):
+        """A new name holding a comma is refused whether or not name exists:
+        with name gone, the lookup of it answers with the policies it names
+        and the first of them would be taken for the renamed policy"""
+        policies = [_policy("pol"), _policy("other")]
+        for name, rename in (
+            ("gone", "pol,other"),
+            ("gone", "other,"),
+            ("pol", "new,other"),
+            ("pol", "new,"),
+        ):
+            for check_mode in (True, False):
+                module, blade = _run(
+                    {"name": name, "rename": rename, "enabled": False},
+                    policies=policies,
+                    check_mode=check_mode,
+                )
+
+                msg = _failure(module)
+                assert "rename {0} holds a comma".format(rename) in msg
+                assert _lookups(blade) == []
+                assert _writes(blade) == []
+
+    def test_main_absent_does_not_read_rename_holding_a_comma(self):
+        """rename is ignored with state=absent, whatever it holds"""
+        module, blade = _run(
+            {"name": "pol", "rename": "new,other", "state": "absent"},
+            policies=[_policy("pol"), _policy("other")],
+        )
+
+        assert _changed(module) is True
+        assert _lookups(blade) == ["pol"]
+        assert _writes(blade) == ["delete_s3_export_policies"]
+        assert blade.delete_s3_export_policies.call_args[1]["names"] == ["pol"]
 
     def test_main_rename_of_missing_policy_fails(self):
         """Neither name nor the new name exists: nothing to rename"""

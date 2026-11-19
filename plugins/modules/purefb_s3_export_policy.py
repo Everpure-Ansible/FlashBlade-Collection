@@ -225,6 +225,23 @@ def _leaf(name):
     return name or ""
 
 
+def _check_one_name(module, option):
+    """Fail when the value of option holds a comma.
+
+    The array reads a comma as a separator of names and answers a lookup of
+    such a value with every policy it names, the first of which would be
+    taken for the policy of the task. No policy name holds a comma.
+    """
+    value = module.params[option]
+    if value and "," in value:
+        module.fail_json(
+            msg=(
+                "{0} {1} holds a comma, which the array reads as a separator "
+                "of names. Give the name of one S3 export policy."
+            ).format(option, value)
+        )
+
+
 def _resolve_rename(module):
     """Return the new name in the scope of the policy, or None without rename.
 
@@ -530,9 +547,13 @@ def main():
 
     state = module.params["state"]
     name = module.params["name"]
+    _check_one_name(module, "name")
     # rename belongs to state=present only: with state=absent it is ignored,
     # so a task that removes a policy never acts on the policy called rename
-    new_name = _resolve_rename(module) if state == "present" else None
+    new_name = None
+    if state == "present":
+        _check_one_name(module, "rename")
+        new_name = _resolve_rename(module)
     policy = _get_policy(module, blade)
     rename_to = None
 

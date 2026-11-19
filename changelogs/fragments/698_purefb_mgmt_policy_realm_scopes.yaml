@@ -1,0 +1,8 @@
+bugfixes:
+  - purefb_mgmt_policy - a read that the array refuses is now reported with the message of the
+    array instead of being taken for a policy that does not exist or has no members. An
+    administrator confined to a realm no longer gets a create predicted or attempted for an
+    existing policy, or ``state=absent`` reported as unchanged.
+  - purefb_mgmt_policy - a rule to add that names a realm which does not exist now fails before
+    any write, in check mode too, instead of being reported as a change. A realm scope written in
+    another letter case is sent in the spelling the array holds, which the array requires.

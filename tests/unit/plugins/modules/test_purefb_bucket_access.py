@@ -1612,3 +1612,131 @@ class TestStoredBucketName:
         _run(mock_ansible_module, mock_get_system, module, blade, "exit_json")
 
         blade.get_buckets.assert_called_once_with(names=[BUCKET], destroyed=False)
+
+
+# Every SDK call that reads or writes a bucket policy or one of its rules.
+_POLICY_CALLS = [
+    kind[call]
+    for kind in (_ACCESS_RULES, _CORS_RULES)
+    for call in (
+        "get_policies",
+        "post_policies",
+        "delete_policies",
+        "get_rules",
+        "post_rules",
+        "delete_rules",
+    )
+]
+
+
+def _assert_no_policy_call(blade):
+    for call in _POLICY_CALLS:
+        getattr(blade, call).assert_not_called()
+
+
+@patch("plugins.modules.purefb_bucket_access.LooseVersion", RealLooseVersion)
+@patch("plugins.modules.purefb_bucket_access.HAS_PYPURECLIENT", True)
+@patch("plugins.modules.purefb_bucket_access.get_rest_api_version", return_value="2.30")
+@patch("plugins.modules.purefb_bucket_access.purefb_argument_spec", return_value={})
+@patch("plugins.modules.purefb_bucket_access.get_system")
+@patch("plugins.modules.purefb_bucket_access.AnsibleModule")
+class TestOneNamedBucket:
+    """Only the bucket that has the name asked for is taken.
+
+    GET /buckets reads a name as a pattern (bk* finds bkt) and a comma as
+    the separator of a list of names, and answers with every bucket that
+    matches. The policy endpoints take the name of one bucket, so the task
+    fails before a policy is read or written rather than act on a bucket it
+    did not name.
+    """
+
+    @pytest.mark.parametrize(
+        "task",
+        [
+            {},
+            {"state": "absent"},
+            {"state": "absent", "rule": None},
+            {"policy_type": "cors"},
+            {"policy_type": "cors", "state": "absent", "rule": None},
+        ],
+    )
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_pattern_that_finds_another_bucket_is_refused(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_spec,
+        mock_version,
+        check_mode,
+        task,
+    ):
+        module = _module(name="bk*", **task)
+        module.check_mode = check_mode
+        blade = _blade(rule_exists=True)
+        _wire_policy(blade, _CORS_RULES, rules=[_stored_cors_rule()])
+
+        _run(mock_ansible_module, mock_get_system, module, blade, "fail_json")
+
+        assert module.fail_json.call_args[1]["msg"] == (
+            "bk* is not the name of one bucket: the array matches it to bucket "
+            "bkt. A pattern or a list of names is not accepted, a task manages "
+            "the policy of one bucket."
+        )
+        _assert_no_policy_call(blade)
+
+    @pytest.mark.parametrize(
+        "name, found",
+        [
+            ("*", ["bkt", "bkt2"]),
+            ("bkt,bkt2", ["bkt", "bkt2"]),
+            ("bkt2,bkt", ["bkt", "bkt2"]),
+            ("realm1::*", ["realm1::bkt", "realm1::other"]),
+            ("*::bkt", ["realm1::bkt", "realm2::bkt"]),
+        ],
+    )
+    def test_name_that_finds_several_buckets_is_refused(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version, name, found
+    ):
+        module = _module(name=name, state="absent", rule=None)
+        blade = _blade(rule_exists=True)
+        blade.get_buckets.return_value = _response(
+            200, [_bucket(bucket) for bucket in found]
+        )
+
+        _run(mock_ansible_module, mock_get_system, module, blade, "fail_json")
+
+        assert module.fail_json.call_args[1]["msg"].startswith(
+            "{0} is not the name of one bucket: the array matches it to 2 "
+            "buckets.".format(name)
+        )
+        _assert_no_policy_call(blade)
+
+    @pytest.mark.parametrize(
+        "name, stored",
+        [
+            (" bkt ", "bkt"),
+            ("bkt,", "bkt"),
+            (",bkt", "bkt"),
+            (" REALM1::Bkt ", REALM_BUCKET),
+        ],
+    )
+    def test_spellings_the_array_reads_as_the_bucket_are_accepted(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_spec,
+        mock_version,
+        name,
+        stored,
+    ):
+        module = _module(name=name)
+        blade = _blade(bucket=stored, rule_exists=True)
+
+        _run(mock_ansible_module, mock_get_system, module, blade, "exit_json")
+
+        blade.get_buckets.assert_called_once_with(names=[name], destroyed=False)
+        blade.get_buckets_bucket_access_policies_rules.assert_called_once_with(
+            bucket_names=[stored]
+        )
+        assert _write_sequence(blade, _ACCESS_RULES) == []
+        module.exit_json.assert_called_once_with(changed=False)

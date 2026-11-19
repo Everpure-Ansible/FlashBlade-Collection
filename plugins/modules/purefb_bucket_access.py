@@ -41,6 +41,8 @@ options:
   name:
     description:
     - Name of Object Store bucket the policy applies to.
+    - The name of one bucket is needed. A pattern or a list of names is
+      refused.
     - For a bucket in a realm use C(realm::bucket). A realm-scoped
       administrator must use the realm-qualified name; a bare name is not
       placed in, or resolved to, the administrator's realm.
@@ -327,12 +329,34 @@ def _leaf(name):
     return name.rpartition("::")[2]
 
 
+def _named_bucket(name, items):
+    """Return the bucket called name from the answer to a look-up, or None.
+
+    The array reads a name as a pattern (*) and a comma as the separator of
+    a list of names, and answers with every bucket that matches. Only a
+    bucket that has the name asked for is taken, never one the array
+    returned because it matches that name in some other way. Letter case,
+    blanks around the name and an empty entry of a list are ignored, as
+    the array ignores them.
+    """
+    wanted = [part.strip().lower() for part in name.split(",") if part.strip()]
+    if len(wanted) != 1:
+        return None
+    for item in items:
+        if str(getattr(item, "name", "")).lower() == wanted[0]:
+            return item
+    return None
+
+
 def _stored_bucket_name(module, blade, api_version):
     """Return the name of the bucket as the array stores it.
 
     The array finds a bucket whatever the letter case of the name it is
     asked for, but accepts a rule resource only with the stored spelling
-    of the bucket name, so the stored name is used from here on.
+    of the bucket name, so the stored name is used from here on. A name
+    the array matches to other buckets fails the task: the policy
+    endpoints take the name of one bucket, and a task never acts on a
+    bucket it did not name.
     """
     bucket = module.params["name"]
     res = blade.get_buckets(
@@ -351,7 +375,18 @@ def _stored_bucket_name(module, blade, api_version):
         module.fail_json(
             msg="Bucket {0} does not exist, or is destroyed.".format(bucket)
         )
-    return items[0].name
+    found = _named_bucket(bucket, items)
+    if found is None:
+        if len(items) == 1:
+            matched = "bucket {0}".format(items[0].name)
+        else:
+            matched = "{0} buckets".format(len(items))
+        module.fail_json(
+            msg="{0} is not the name of one bucket: the array matches it to {1}. "
+            "A pattern or a list of names is not accepted, a task manages the "
+            "policy of one bucket.".format(bucket, matched)
+        )
+    return found.name
 
 
 def _access_rule_matches(module, rule):

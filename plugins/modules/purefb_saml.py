@@ -21,17 +21,34 @@ version_added: '1.19.0'
 short_description: Manage FlashBlade SAML2 service and identity providers
 description:
 - Enable or disable FlashBlade SAML2 providers
+- Identity providers are array-level objects. A provider cannot be created in
+  a realm, so the module refuses a realm-qualified I(name) (C(realm::name)).
+- To make a provider available to a realm, share it with the realm using
+  M(everpure.flashblade.purefb_resource_access) with
+  I(resource_type=sso/saml2/idps) and I(scope_type=realms). A shared provider
+  keeps its unqualified name.
+- The certificates and the certificate group a provider refers to must be
+  array-level objects as well. The array refuses one that belongs to a realm,
+  so the module refuses a realm-qualified reference.
+- An administrator whose access is limited to a realm can read the providers
+  shared with that realm. The array refuses that administrator
+  I(state=test) and every change, and answers for any other provider that it
+  does not exist.
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
   name:
     description:
     - Name of the SAML2 identity provider (IdP)
+    - Providers are array-level objects, so the name cannot be
+      realm-qualified (C(realm::name)).
     type: str
     required: true
   state:
     description:
-    - Define whether the API client should exist or not, or test.
+    - Define whether the identity provider should exist or not, or test its
+      configuration.
+    - C(test) fails when the identity provider does not exist.
     default: present
     choices: [ absent, present, test ]
     type: str
@@ -75,6 +92,9 @@ options:
     - Name of the certificate, managed by M(everpure.flashblade.purefb_certs), that the
       service provider uses to verify the SAML response signature from the identity provider.
     - The array stores a reference to the certificate, not the certificate itself.
+    - This and the other certificates and the certificate group the provider
+      refers to must be array-level objects. A name that belongs to a realm
+      (C(realm::name)) is refused.
     type: str
   decryption_credential:
     description:
@@ -189,6 +209,22 @@ EXAMPLES = r"""
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
 
+- name: Share the object service identity provider with a realm
+  everpure.flashblade.purefb_resource_access:
+    resource_type: sso/saml2/idps
+    resource_name: myObjectIDP
+    scope_type: realms
+    scope_name: realm1
+    fb_url: 10.10.10.2
+    api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+
+- name: Test the SAML2 SSO configuration
+  everpure.flashblade.purefb_saml:
+    name: myIDP
+    state: test
+    fb_url: 10.10.10.2
+    api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+
 - name: Enable SAML2 SSO
   everpure.flashblade.purefb_saml:
     name: myIDP
@@ -263,6 +299,26 @@ GATED_OPTIONS = (
     ("sp_entity_id", FLEET_API_VERSION),
     ("trust_other_saml_sps_in_fleet", FLEET_API_VERSION),
 )
+# options that name a certificate or a certificate group
+REFERENCE_OPTIONS = (
+    "x509_cert",
+    "signing_credential",
+    "decryption_credential",
+    "metadata_url_ca_certificate",
+    "metadata_url_ca_certificate_group",
+)
+REALM_NAME_MSG = (
+    "Invalid name '{0}': SAML2 identity providers are array-level objects and "
+    "their names cannot be realm-qualified (realm::name). Use the unqualified "
+    "provider name. To make a provider available to a realm, share it with "
+    "the realm using the purefb_resource_access module (resource_type "
+    "sso/saml2/idps, scope_type realms)."
+)
+REALM_REFERENCE_MSG = (
+    "Invalid {0} '{1}': a SAML2 identity provider is an array-level object "
+    "and can only refer to array-level certificates and certificate groups, "
+    "not to one that belongs to a realm (realm::name)."
+)
 
 
 def _check_option_versions(module, api_version):
@@ -277,9 +333,53 @@ def _check_option_versions(module, api_version):
             )
 
 
+def _refuse_realm_names(module):
+    """Refuse realm-qualified names the array never accepts, before any request
+
+    Providers are array-level objects. The array's name rule rejects the realm
+    separator on create with a message that does not mention realms, answers a
+    lookup of such a name like any missing provider, and refuses a provider
+    every certificate or certificate group that belongs to a realm. Left to
+    the array, state=absent would report an unchanged no-op and check mode a
+    change that cannot happen. The references are only read for state=present.
+    """
+    name = module.params["name"]
+    if "::" in name:
+        module.fail_json(msg=REALM_NAME_MSG.format(name))
+    if module.params["state"] != "present":
+        return
+    for option in REFERENCE_OPTIONS:
+        value = module.params[option]
+        if value and "::" in value:
+            module.fail_json(msg=REALM_REFERENCE_MSG.format(option, value))
+
+
+def _get_idp(module, blade, name):
+    """Return the provider called name, or None when it does not exist
+
+    The array answers "... does not exist." for a provider that is not
+    configured and, to an administrator limited to a realm, for one that is
+    not shared with that realm. Any other failed read is reported with the
+    array's message rather than taken for a missing provider.
+    """
+    res = blade.get_sso_saml2_idps(names=[name])
+    if res.status_code == 200:
+        items = list(res.items)
+        return items[0] if items else None
+    error = get_error_message(res)
+    if "does not exist" in str(error).lower():
+        return None
+    module.fail_json(msg="Failed to read SAML2 IdP {0}. Error: {1}".format(name, error))
+
+
 def _ref_name(obj, attr):
     """Name held by a reference sub-object, or None when unset"""
     return getattr(getattr(obj, attr, None), "name", None)
+
+
+def _same_name(first, second):
+    """True when two names are set and differ at most in letter case"""
+    return bool(first and second) and first.lower() == second.lower()
 
 
 def _ref(name):
@@ -316,22 +416,25 @@ def _facts_from(idp):
     }
 
 
-def _idp_facts(blade, name):
-    """Read the provider back and return its facts, or {} if it cannot be read"""
-    res = blade.get_sso_saml2_idps(names=[name])
-    if res.status_code != 200:
+def _idp_facts(module, blade, name):
+    """Read the provider back after a write and return its facts"""
+    idp = _get_idp(module, blade, name)
+    if idp is None:
         return {}
-    items = list(res.items)
-    if not items:
-        return {}
-    return _facts_from(items[0])
+    return _facts_from(idp)
 
 
 def test_saml(module, blade):
     """Test SAML2 IdP configuration"""
     test_response = []
-    response = list(blade.get_sso_saml2_idps_test(names=[module.params["name"]]).items)
-    for component in response:
+    res = blade.get_sso_saml2_idps_test(names=[module.params["name"]])
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to test SAML2 IdP {0}. Error: {1}".format(
+                module.params["name"], get_error_message(res)
+            )
+        )
+    for component in list(res.items):
         if component.enabled:
             enabled = "true"
         else:
@@ -413,6 +516,13 @@ def update_saml(module, blade, current_idp):
     ):
         if params[option]:
             new_idp[key] = params[option]
+    # for the verification certificate and the two service provider
+    # credentials the array accepts a certificate named in another letter case
+    # and stores the certificate's own spelling, so that is not a change (the
+    # CA certificate and the CA certificate group are matched exactly)
+    for key in ("sp_sign_cred", "sp_decrypt_cred", "id_cert"):
+        if _same_name(new_idp[key], old_idp[key]):
+            new_idp[key] = old_idp[key]
     # the array holds either a CA certificate or a CA certificate group and
     # refuses a PATCH naming both, so setting one clears the other
     if params["metadata_url_ca_certificate"]:
@@ -485,7 +595,7 @@ def update_saml(module, blade, current_idp):
                         params["name"], get_error_message(res)
                     )
                 )
-            facts = _idp_facts(blade, params["name"])
+            facts = _idp_facts(module, blade, params["name"])
         else:
             facts = _facts_from(current_idp)
     else:
@@ -553,7 +663,7 @@ def create_saml(module, blade):
                         params["name"], get_error_message(res)
                     )
                 )
-        facts = _idp_facts(blade, params["name"])
+        facts = _idp_facts(module, blade, params["name"])
 
     module.exit_json(changed=changed, **facts)
 
@@ -605,6 +715,9 @@ def main():
     if not HAS_PYPURECLIENT:
         module.fail_json(msg="py-pure-client sdk is required for this module")
 
+    # refused before the array is contacted, in check mode too
+    _refuse_realm_names(module)
+
     blade = get_system(module)
     api_version = get_rest_api_version(blade)
 
@@ -623,12 +736,7 @@ def main():
     if module.params["services"] is not None and not module.params["services"]:
         module.fail_json(msg="services must contain at least one of management, object")
 
-    res = blade.get_sso_saml2_idps(names=[module.params["name"]])
-    current_idp = None
-    if res.status_code == 200:
-        items = list(res.items)
-        if items:
-            current_idp = items[0]
+    current_idp = _get_idp(module, blade, module.params["name"])
     exists = current_idp is not None
 
     if (
@@ -647,7 +755,11 @@ def main():
         update_saml(module, blade, current_idp)
     elif exists and state == "absent":
         delete_saml(module, blade)
-    elif exists and state == "test":
+    elif state == "test":
+        if not exists:
+            module.fail_json(
+                msg="SAML2 IdP {0} does not exist".format(module.params["name"])
+            )
         test_saml(module, blade)
 
     module.exit_json(changed=False)

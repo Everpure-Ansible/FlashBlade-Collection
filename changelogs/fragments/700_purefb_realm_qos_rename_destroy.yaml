@@ -1,0 +1,20 @@
+minor_changes:
+  - purefb_realm - new option ``default_inbound_tls_policy`` to set or clear the default inbound TLS
+    policy of a realm.
+bugfixes:
+  - purefb_realm - an empty ``qos_policy`` detaches the QoS policy, and ``state=absent`` detaches it
+    before the destroy, as the array does not destroy a realm that has one.
+  - purefb_realm - options given with ``rename``, or on the run that recovers a destroyed realm, are
+    applied in the same run instead of being dropped.
+  - purefb_realm - names are compared without regard to letter case, as the array matches them, so
+    another spelling no longer reports changed on every run.
+  - purefb_realm - ``rename`` is refused before any write, also in check mode, when the new name
+    contains ``::``, is taken or differs only in letter case. A new name equal to ``name`` is no
+    rename, and a realm that does not exist is created with the new name.
+  - purefb_realm - a realm that has a default inbound TLS policy is renamed by clearing the policy,
+    renaming the realm and setting the policy again, as the array accepts no change to the policy
+    after a plain rename.
+  - purefb_realm - ``state=absent`` fails naming the resource accesses and management access policy
+    rules that still refer to the realm, also in check mode.
+  - purefb_realm - a read the array refuses is reported with its message instead of being read as
+    absent, and ``qos_policy`` on an array below REST 2.20 fails naming the version.

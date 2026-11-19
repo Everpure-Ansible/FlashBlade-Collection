@@ -621,6 +621,55 @@ def _guard_reads(module, blade):
             setattr(blade, name, guarded(name, method))
 
 
+# What the array answers to a listing of object store users, roles or
+# policy members that would cover more than one query may name: "Querying
+# is only supported for a maximum of ten users or ten policies per query."
+QUERY_TOO_WIDE_MESSAGE = "per query"
+# Members or policies one such query may name
+MEMBERSHIP_QUERY_SIZE = 10
+
+
+def _query_too_wide(response):
+    """True when the array refused a listing for covering too much"""
+    if not _read_failed(response):
+        return False
+    messages = _error_messages(response)
+    return bool(messages) and all(
+        QUERY_TOO_WIDE_MESSAGE in message.lower() for message in messages
+    )
+
+
+def _named_object_gone(response):
+    """True when a read failed because what it names no longer exists"""
+    messages = _error_messages(response)
+    return bool(messages) and all(
+        "does not exist" in message.lower() for message in messages
+    )
+
+
+def _listing_in_tens(read, key, values, strict=True):
+    """Rows of a membership listing, read for ten values of ``key`` at a time
+
+    For a listing the array refuses to give in one query. One value that no
+    longer exists fails the query of its ten, which are then read one by
+    one; a policy or member removed since it was listed is skipped. Any
+    other failed read is passed on, or skipped when ``strict`` is false.
+    """
+    rows = []
+    for start in range(0, len(values), MEMBERSHIP_QUERY_SIZE):
+        chunk = values[start : start + MEMBERSHIP_QUERY_SIZE]
+        res = read(**{key: chunk})
+        if not _read_failed(res):
+            rows.extend(res.items)
+            continue
+        for value in chunk:
+            res = read(**{key: [value]})
+            if _read_failed(res) and (_named_object_gone(res) or not strict):
+                continue
+            rows.extend(res.items)
+    return rows
+
+
 def _first_item(response):
     """First item of a listing, or None when it holds none"""
     items = list(response.items)
@@ -2087,8 +2136,29 @@ def generate_policies_dict(blade):
     return policies_info
 
 
+def _policy_member_rows(blade, policies):
+    """Every row of GET policies-all/members
+
+    One query returns the members of every policy, unless the array holds
+    more object store users or roles than one query may cover; the members
+    are then read for ten policies at a time.
+    """
+    res = blade.get_policies_all_members()
+    if not _query_too_wide(res):
+        return list(res.items)
+    return _listing_in_tens(
+        blade.get_policies_all_members,
+        "policy_ids",
+        [
+            policy.id
+            for policy in policies
+            if isinstance(getattr(policy, "id", None), str)
+        ],
+    )
+
+
 def _policy_members_by_name(blade, policies):
-    """Map policy name -> members from one GET policies-all/members call.
+    """Map policy name -> members from GET policies-all/members.
 
     The endpoint covers every policy type (snapshot, access, telemetry,
     network, TLS ...) in a single response. Rows are attributed by policy
@@ -2098,7 +2168,7 @@ def _policy_members_by_name(blade, policies):
     """
     names_by_id = {policy.id: policy.name for policy in policies}
     members = {}
-    for row in blade.get_policies_all_members().items:
+    for row in _policy_member_rows(blade, policies):
         policy_ref = getattr(row, "policy", None)
         policy_name = names_by_id.get(
             getattr(policy_ref, "id", None), getattr(policy_ref, "name", None)
@@ -3017,11 +3087,21 @@ def generate_object_store_roles_dict(blade):
             "access_policies": [],
         }
     links = blade.get_object_store_roles_object_store_access_policies()
+    rows = []
     if links.status_code == 200:
-        for link in list(links.items):
-            role_name = getattr(getattr(link, "member", None), "name", None)
-            if role_name in roles_info:
-                roles_info[role_name]["access_policies"].append(link.policy.name)
+        rows = list(links.items)
+    elif _query_too_wide(links):
+        # the array lists the policies of at most ten roles in one query
+        rows = _listing_in_tens(
+            blade.get_object_store_roles_object_store_access_policies,
+            "member_names",
+            list(roles_info),
+            strict=False,
+        )
+    for link in rows:
+        role_name = getattr(getattr(link, "member", None), "name", None)
+        if role_name in roles_info:
+            roles_info[role_name]["access_policies"].append(link.policy.name)
     return roles_info
 
 

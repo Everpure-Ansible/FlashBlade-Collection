@@ -6,3 +6,10 @@ bugfixes:
   - purefb_snap - a read the array refuses is reported with the array's message instead of being
     taken to mean that the filesystem or snapshot does not exist, and the array connections are
     read only when ``target`` is given.
+  - purefb_snap - ``state=restore`` without ``suffix`` was refused by the array when ``name`` was
+    written in another letter case than the filesystem has. The name the array has for the
+    filesystem is now used.
+  - purefb_snap - a ``name`` or ``suffix`` that holds ``*`` or a comma is refused. The array reads
+    them as a pattern and a list of names in a look-up but not in a change, so such a task
+    reported on a filesystem or snapshot the array would not act on. Blanks around ``name`` are
+    ignored, as the array ignores them.

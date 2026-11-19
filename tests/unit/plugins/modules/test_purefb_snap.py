@@ -78,6 +78,7 @@ from plugins.modules.purefb_snap import (
     get_fssnapshot,
     get_target_filesystem,
     _check_copy_scope,
+    _check_names,
     _first_item,
     _get_filesystem,
     _is_copy_of,
@@ -520,6 +521,20 @@ class TestCheckCopyScope:
         _check_copy_scope(module)
         module.fail_json.assert_not_called()
 
+    @pytest.mark.parametrize("name", ["fs", "realm1::fs"])
+    def test_target_in_the_spelling_of_the_source_is_left_alone(self, name):
+        module = _module(name=name, target_fs=name + "-Copy")
+        _check_copy_scope(module)
+        assert module.params["target_fs"] == name + "-Copy"
+
+    @pytest.mark.parametrize("target_fs", ["REALM1::FS-Copy", "Realm1::FS-Copy"])
+    def test_target_takes_the_realm_as_the_source_has_it(self, target_fs):
+        """The array reads the realm of a new filesystem as it is written"""
+        module = _module(name="realm1::fs", target_fs=target_fs)
+        _check_copy_scope(module)
+        module.fail_json.assert_not_called()
+        assert module.params["target_fs"] == "realm1::FS-Copy"
+
     @pytest.mark.parametrize(
         "name, target_fs, hint",
         [
@@ -714,12 +729,44 @@ class TestPurefbSnapCopy:
             "filesystem {1}.".format(target_fs, name)
         )
 
-    def test_copy_inside_a_realm_whose_name_differs_in_case(self):
-        """One realm written in two ways is not another scope"""
-        module = _module(name="REALM1::fs", target_fs="realm1::fs-copy")
+    @pytest.mark.parametrize("check_mode", [True, False])
+    @pytest.mark.parametrize(
+        "name, target_fs",
+        [
+            ("REALM1::fs", "realm1::fs-copy"),
+            ("realm1::fs", "REALM1::fs-copy"),
+            ("Realm1::FS", "REALM1::fs-copy"),
+        ],
+    )
+    def test_copy_inside_a_realm_whose_name_differs_in_case(
+        self, name, target_fs, check_mode
+    ):
+        """One realm written in two ways is not another scope.
+
+        The array refuses a new filesystem whose realm is not written as the
+        realm of the source is stored, so the stored names are sent.
+        """
+        module = _module(name=name, target_fs=target_fs)
+        module.check_mode = check_mode
         blade = _blade(snapshots=[_snapshot(name="realm1::fs.snap")])
-        _run_main(module, blade, _filesystem(name="realm1::fs"))
-        blade.post_file_systems.assert_called_once()
+        run = _run_main(module, blade, _filesystem(name="realm1::fs"))
+        blade.get_file_system_snapshots.assert_called_once_with(
+            names_or_owner_names=["realm1::fs.snap"]
+        )
+        blade.get_file_systems.assert_called_once_with(names=["realm1::fs-copy"])
+        if check_mode:
+            blade.post_file_systems.assert_not_called()
+            module.exit_json.assert_called_once_with(
+                changed=True, promotion_status=None
+            )
+            return
+        run["reference"].assert_called_once_with(name="realm1::fs.snap")
+        blade.post_file_systems.assert_called_once_with(
+            names=["realm1::fs-copy"],
+            include_snapshot=True,
+            file_system=run["fs_post"].return_value,
+            default_exports=["''"],
+        )
         module.exit_json.assert_called_once_with(
             changed=True, promotion_status="promoting"
         )
@@ -998,3 +1045,160 @@ class TestPurefbSnapCreate:
             "Error: " + REFUSED
         )
         blade.post_file_system_snapshots.assert_not_called()
+
+
+class TestCheckNames:
+    """_check_names takes each name as the name of one object"""
+
+    @pytest.mark.parametrize(
+        "option, value",
+        [
+            ("name", "f*"),
+            ("name", "*::fs"),
+            ("name", "fs,realm1::fs"),
+            ("suffix", "*"),
+            ("suffix", "snap,realm1::fs.snap"),
+            ("target_fs", "fs-c*"),
+            ("target_fs", "fs-copy,fs-copy2"),
+        ],
+    )
+    def test_pattern_or_list_is_refused(self, option, value):
+        module = _module(**{option: value})
+        with pytest.raises(FailJson):
+            _check_names(module)
+        assert _fail_msg(module).startswith(
+            "{0} {1} is not the name of one filesystem or snapshot".format(
+                option, value
+            )
+        )
+
+    def test_blanks_around_a_name_are_removed(self):
+        """The array ignores them; the suffix is left as it was given"""
+        module = _module(name=" realm1::fs ", suffix=" snap ", target_fs=" fs-copy ")
+        _check_names(module)
+        module.fail_json.assert_not_called()
+        assert module.params["name"] == "realm1::fs"
+        assert module.params["target_fs"] == "fs-copy"
+        assert module.params["suffix"] == " snap "
+
+    def test_names_that_were_not_given_are_left_alone(self):
+        module = _module(suffix=None, target_fs=None)
+        _check_names(module)
+        module.fail_json.assert_not_called()
+        assert module.params["suffix"] is None
+        assert module.params["target_fs"] is None
+
+
+class TestPurefbSnapNames:
+    """main() acts on the one filesystem and snapshot that have the names"""
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    @pytest.mark.parametrize(
+        "state, option, value",
+        [
+            ("present", "name", "f*"),
+            ("present", "name", "fs,fs2"),
+            ("absent", "name", "*::fs"),
+            ("absent", "suffix", "*"),
+            ("absent", "suffix", "snap,realm1::fs.snap"),
+            ("restore", "name", "f*"),
+            ("copy", "name", "f*"),
+            ("copy", "target_fs", "fs-c*"),
+        ],
+    )
+    def test_pattern_or_list_is_refused_before_anything_is_read(
+        self, state, option, value, check_mode
+    ):
+        """The array answers such a look-up with objects of other names"""
+        module = _module(state=state, eradicate=True, **{option: value})
+        module.check_mode = check_mode
+        blade = _blade(snapshots=[_snapshot()], target=_copy())
+        _run_main(module, blade, _filesystem(), expect=FailJson, real_read=True)
+        assert blade.mock_calls == []
+        module.exit_json.assert_not_called()
+        assert _fail_msg(module).startswith(
+            "{0} {1} is not the name of one filesystem or snapshot".format(
+                option, value
+            )
+        )
+
+    def test_absent_with_blanks_around_the_name_finds_the_snapshot(self):
+        """Blanks inside the name of the snapshot would hide it"""
+        module = _module(name=" fs ", state="absent", target_fs=None)
+        blade = _blade(snapshots=[_snapshot()])
+        blade.patch_file_system_snapshots.return_value = _response([])
+        _run_main(module, blade, None)
+        blade.get_file_system_snapshots.assert_called_once_with(
+            names_or_owner_names=["fs.snap"]
+        )
+        blade.patch_file_system_snapshots.assert_called_once()
+        assert blade.patch_file_system_snapshots.call_args.kwargs["names"] == [
+            "fs.snap"
+        ]
+        module.exit_json.assert_called_once_with(changed=True)
+
+    @pytest.mark.parametrize(
+        "name, stored", [("FS", "fs"), ("REALM1::fs", "realm1::fs"), (" fs ", "fs")]
+    )
+    def test_create_uses_the_name_the_array_has(self, name, stored):
+        module = _module(name=name, state="present", target_fs=None)
+        blade = _blade()
+        run = _run_main(module, blade, _filesystem(name=stored))
+        blade.get_file_system_snapshots.assert_called_once_with(
+            names_or_owner_names=[stored + ".snap"]
+        )
+        blade.post_file_system_snapshots.assert_called_once_with(
+            source_names=[stored], file_system_snapshot=run["snap_post"].return_value
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    @pytest.mark.parametrize(
+        "name, stored", [("FS", "fs"), ("REALM1::fs", "realm1::fs")]
+    )
+    def test_restore_from_the_latest_snapshot_uses_the_name_the_array_has(
+        self, name, stored
+    ):
+        """The array refuses a restore whose target is not written as the
+        filesystem of the source snapshot is"""
+        module = _module(name=name, state="restore", suffix=None, target_fs=None)
+        older = _snapshot(name=stored + ".older", created=1)
+        newer = _snapshot(name=stored + ".newer", created=2)
+
+        def snapshots(**kwargs):
+            if "." in kwargs["names_or_owner_names"][0]:
+                return _response([], 400, SNAP_MISSING)
+            assert kwargs["names_or_owner_names"] == [stored]
+            return _response([older, newer])
+
+        blade = _blade()
+        blade.get_file_system_snapshots.side_effect = snapshots
+        run = _run_main(module, blade, _filesystem(name=stored))
+        run["reference"].assert_called_once_with(name=stored + ".newer")
+        blade.post_file_systems.assert_called_once_with(
+            names=[stored],
+            overwrite=True,
+            discard_non_snapshotted_data=True,
+            file_system=run["fs_post"].return_value,
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_restore_from_a_suffix_uses_the_name_the_array_has(self):
+        module = _module(name="REALM1::FS", state="restore", target_fs=None)
+        blade = _blade(snapshots=[_snapshot(name="realm1::fs.snap")])
+        run = _run_main(module, blade, _filesystem(name="realm1::fs"))
+        run["reference"].assert_called_once_with(name="realm1::fs.snap")
+        blade.post_file_systems.assert_called_once_with(
+            names=["realm1::fs"],
+            overwrite=True,
+            discard_non_snapshotted_data=True,
+            file_system=run["fs_post"].return_value,
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_missing_filesystem_is_reported_by_the_name_given(self):
+        module = _module(name="REALM1::FS", state="restore", target_fs=None)
+        blade = _blade()
+        _run_main(module, blade, None, expect=FailJson)
+        assert _fail_msg(module) == (
+            "Filesystem REALM1::FS does not exist, cannot restore it."
+        )

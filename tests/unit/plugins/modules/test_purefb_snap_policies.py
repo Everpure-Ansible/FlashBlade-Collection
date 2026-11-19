@@ -99,6 +99,7 @@ def _module(**overrides):
         "suffix": "snap",
         "now": False,
         "target": None,
+        "target_fs": None,
         "eradicate": False,
         "state": "present",
         "latest_replica": False,

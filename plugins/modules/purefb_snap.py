@@ -38,6 +38,9 @@ options:
       filesystem at the array level.
     - A realm-scoped administrator must use the realm-qualified name; a bare
       name is not placed in, or resolved to, the administrator's realm.
+    - This is the name of one filesystem. A I(name), I(suffix) or
+      I(target_fs) that holds a C(*) or a comma, which the array reads as
+      a pattern or as a list of names, is refused.
     required: true
     type: str
   suffix:
@@ -302,6 +305,29 @@ def _realm_of(name):
     return name.rpartition("::")[0]
 
 
+def _check_names(module):
+    """Take name, suffix and target_fs as the name of one object each.
+
+    In a look-up the array reads * in a name as a pattern and a comma as a
+    separator of names, and answers with every object that matches. It does
+    not do so in a change, so a task with such a name could only report on
+    an object that the array then does not act on, and is refused before
+    anything is read. The array ignores blanks around a name; they are
+    removed here because the name of a snapshot is built from name.
+    """
+    for option in ("name", "target_fs"):
+        if module.params[option]:
+            module.params[option] = module.params[option].strip()
+    for option in ("name", "suffix", "target_fs"):
+        value = module.params[option]
+        if value and ("*" in value or "," in value):
+            module.fail_json(
+                msg="{0} {1} is not the name of one filesystem or snapshot: the "
+                "array reads * as a pattern and a comma as a separator of "
+                "names.".format(option, value)
+            )
+
+
 def _context_kwargs(module, blade):
     """Return context_names kwargs when a fleet context applies."""
     if (
@@ -343,11 +369,19 @@ def _check_copy_scope(module):
     The array creates the copy of a filesystem only in the realm of that
     filesystem, and outside of any realm for an array-level filesystem. The
     names decide it, so the request is refused in check mode as well.
+
+    The array finds a realm whatever the letter case of its name, but it
+    compares the realm of a new filesystem with the realm of the source as
+    the name is written. name holds the name the array has for the source,
+    so a target in the same realm is given the realm as it is written there.
     """
     name = module.params["name"]
     target_name = module.params["target_fs"]
     realm = _realm_of(name)
-    if _realm_of(target_name).lower() == realm.lower():
+    target_realm, _sep, target_leaf = target_name.rpartition("::")
+    if target_realm.lower() == realm.lower():
+        if target_realm != realm:
+            module.params["target_fs"] = "{0}::{1}".format(realm, target_leaf)
         return
     if realm:
         where = "in realm {0}, named {0}::<name>".format(realm)
@@ -880,6 +914,7 @@ def main():
     if not HAS_PYPURECLIENT:
         module.fail_json(msg="py-pure-client sdk is required for this module")
 
+    _check_names(module)
     # Remember whether the caller named a suffix before a default is
     # generated; state=restore uses the named snapshot only in that case.
     module.params["suffix_given"] = module.params["suffix"] is not None
@@ -917,6 +952,11 @@ def main():
     filesystem = None
     if state != "absent":
         filesystem = _get_filesystem(module, blade)
+        if filesystem:
+            # The array finds a filesystem whatever the letter case of its
+            # name, but it reads the names of a restore and of a copy as
+            # they are written, so the name it has for the filesystem is used
+            module.params["name"] = filesystem.name
     snap = get_fssnapshot(module, blade)
     if (
         module.params["detach_policies"] is not None

@@ -10,7 +10,7 @@ __metaclass__ = type
 import importlib.util
 import json
 import sys
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock, call, patch, MagicMock
 
 import pytest
 
@@ -105,6 +105,17 @@ def refused(message):
     response.status_code = 400
     error = Mock()
     error.message = message
+    response.errors = [error]
+    return response
+
+
+def unaccepted(status, message=None):
+    """The answer of the array to an access token it does not accept."""
+    response = Mock()
+    response.status_code = status
+    error = Mock()
+    error.message = message
+    error.context = None
     response.errors = [error]
     return response
 
@@ -457,7 +468,7 @@ class TestGetSystemLogin:
     def test_array_admin_is_logged_in(
         self, mock_client_class, mock_environ, credentials
     ):
-        """An array administrator gets the client, with no request sent."""
+        """An array administrator gets the client."""
         mock_environ.get.return_value = None
         mock_module = login_module(credentials)
         mock_client = Mock()
@@ -471,17 +482,97 @@ class TestGetSystemLogin:
         mock_client_class.assert_called_once()
         mock_module.fail_json.assert_not_called()
 
-    @AUTH_MODES
-    def test_login_sends_no_request(self, mock_client_class, mock_environ, credentials):
-        """Creating the client is the login, nothing is read to verify it."""
+    def test_api_token_login_sends_no_request(self, mock_client_class, mock_environ):
+        """The array checks an API token at the login, nothing is read."""
+        mock_environ.get.return_value = None
+        mock_module = login_module(API_TOKEN)
+        mock_client = Mock()
+        mock_client.get_arrays.return_value = unaccepted(403)
+        mock_client_class.return_value = mock_client
+
+        result = get_system(mock_module)
+
+        assert result == mock_client
+        assert mock_client.mock_calls == []
+        mock_module.fail_json.assert_not_called()
+
+    @API_CLIENT_MODES
+    def test_api_client_login_sends_one_request(
+        self, mock_client_class, mock_environ, credentials
+    ):
+        """The token exchange does not say whether the array knows the user."""
         mock_environ.get.return_value = None
         mock_module = login_module(credentials)
         mock_client = Mock()
+        mock_client.get_arrays.return_value = answered()
         mock_client_class.return_value = mock_client
 
-        get_system(mock_module)
+        result = get_system(mock_module)
 
-        assert mock_client.mock_calls == []
+        assert result == mock_client
+        assert mock_client.mock_calls == [call.get_arrays()]
+        mock_module.fail_json.assert_not_called()
+
+    @API_CLIENT_MODES
+    @pytest.mark.parametrize("status", [401, 403])
+    def test_access_token_the_array_does_not_accept(
+        self, mock_client_class, mock_environ, credentials, status
+    ):
+        """An access token for a user the array does not know is refused."""
+        mock_environ.get.return_value = None
+        mock_module = login_module(credentials)
+        mock_client = Mock()
+        mock_client.get_arrays.return_value = unaccepted(status)
+        mock_client_class.return_value = mock_client
+
+        with pytest.raises(SystemExit):
+            get_system(mock_module)
+
+        mock_module.fail_json.assert_called_once()
+        assert mock_module.fail_json.call_args[1]["msg"] == (
+            "Failed to log in to FlashBlade flashblade.example.com. Error: the "
+            "array issued an access token but refuses the requests made with it "
+            "(HTTP {0}). Check that the user the identity token names exists on "
+            "the array.".format(status)
+        )
+
+    @API_CLIENT_MODES
+    def test_unaccepted_access_token_with_a_message(
+        self, mock_client_class, mock_environ, credentials
+    ):
+        """The message of the array is reported when the SDK passes one on."""
+        mock_environ.get.return_value = None
+        mock_module = login_module(credentials)
+        mock_client = Mock()
+        mock_client.get_arrays.return_value = unaccepted(403, "Access Denied")
+        mock_client_class.return_value = mock_client
+
+        with pytest.raises(SystemExit):
+            get_system(mock_module)
+
+        msg = mock_module.fail_json.call_args[1]["msg"]
+        assert msg.startswith("Failed to log in to FlashBlade flashblade.example.com. ")
+        assert "(HTTP 403: Access Denied)" in msg
+
+    @API_CLIENT_MODES
+    def test_session_check_that_cannot_be_sent_fails_cleanly(
+        self, mock_client_class, mock_environ, credentials
+    ):
+        """An error of the request after the login is not a traceback."""
+        mock_environ.get.return_value = None
+        mock_module = login_module(credentials)
+        mock_client = Mock()
+        mock_client.get_arrays.side_effect = FakeHTTPError("Read timed out.")
+        mock_client_class.return_value = mock_client
+
+        with pytest.raises(SystemExit):
+            get_system(mock_module)
+
+        mock_module.fail_json.assert_called_once()
+        assert mock_module.fail_json.call_args[1]["msg"] == (
+            "Failed to connect to FlashBlade flashblade.example.com. "
+            "Error: Read timed out."
+        )
 
     @AUTH_MODES
     def test_realm_scoped_identity_is_logged_in(
@@ -498,7 +589,10 @@ class TestGetSystemLogin:
         result = get_system(mock_module)
 
         assert result == mock_client
-        assert mock_client.mock_calls == []
+        mock_client.get_hardware.assert_not_called()
+        assert mock_client.get_arrays.call_count == (
+            0 if "api_token" in credentials and credentials["api_token"] else 1
+        )
         mock_module.fail_json.assert_not_called()
 
     @AUTH_MODES
@@ -522,7 +616,10 @@ class TestGetSystemLogin:
         result = get_system(mock_module)
 
         assert result == mock_client
-        assert mock_client.mock_calls == []
+        mock_client.get_hardware.assert_not_called()
+        assert mock_client.get_arrays.call_count == (
+            0 if "api_token" in credentials and credentials["api_token"] else 1
+        )
         mock_module.fail_json.assert_not_called()
 
     @REFUSED_LOGINS

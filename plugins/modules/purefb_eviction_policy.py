@@ -69,6 +69,8 @@ options:
       I(name), or as a bare name, which is taken as a name in that realm.
       A new name in another realm, or a realm on the new name of a policy
       that is not in one, is refused.
+    - If I(name) exists and another policy already has the new name, the
+      rename is refused.
     - Only takes effect when the policy already exists. If I(name) no
       longer exists but a policy with the new name exists in the same
       realm, the rename is treated as already applied and that policy is
@@ -233,6 +235,13 @@ def _realm(name):
     return ""
 
 
+def _leaf(name):
+    """Return a name without its realm prefix."""
+    if name and "::" in name:
+        return name.split("::", 1)[1]
+    return name or ""
+
+
 def _check_realms(module):
     """Keep the request inside the realm of the policy it names.
 
@@ -244,23 +253,25 @@ def _check_realms(module):
     are settled here, before any read or write, so check mode agrees with
     a real run and the rename-already-applied lookup cannot resolve to a
     policy with the same name in another scope. A bare new name for a
-    policy in a realm is taken as a name in that realm. Purity//FB documents
-    names as case-insensitive on input, so the realms are compared without
-    regard to case and a realm spelled in another case is left to the array.
+    policy in a realm is taken as a name in that realm. The array matches
+    names without regard to case, so the realms are compared that way. It
+    does refuse a new name whose realm is not spelled exactly as in the name
+    the policy is addressed by, so the new name is given the realm as the
+    name option spells it.
     """
     name = module.params["name"]
     realm = _realm(name)
     rename = module.params["rename"]
     if rename:
-        if realm and "::" not in rename:
-            module.params["rename"] = "{0}::{1}".format(realm, rename)
-        elif _realm(rename).lower() != realm.lower():
+        if "::" in rename and _realm(rename).lower() != realm.lower():
             module.fail_json(
                 msg=(
                     "Cannot rename data eviction policy {0} to {1}: a rename "
                     "cannot move a policy into or out of a realm."
                 ).format(name, rename)
             )
+        if realm:
+            module.params["rename"] = "{0}::{1}".format(realm, _leaf(rename))
     for fs_name in module.params["file_systems"] or []:
         if _realm(fs_name).lower() == realm.lower():
             continue
@@ -425,8 +436,12 @@ def _reconcile_members(module, blade):
     """
     desired = sorted(set(module.params["file_systems"]))
     current = _get_members(module, blade)
-    to_attach = [name for name in desired if name not in current]
-    to_detach = [name for name in current if name not in desired]
+    # The array matches names without regard to case, so a file system
+    # listed in another case than the array reports is the attached one.
+    current_keys = set(name.lower() for name in current)
+    desired_keys = set(name.lower() for name in desired)
+    to_attach = [name for name in desired if name.lower() not in current_keys]
+    to_detach = [name for name in current if name.lower() not in desired_keys]
     if not (to_attach or to_detach):
         return False
     if not module.check_mode:
@@ -510,10 +525,26 @@ def update_policy(module, blade, policy):
     if keep_size is not None and keep_size != getattr(policy, "keep_size", None):
         patch_kwargs["keep_size"] = keep_size
 
-    if module.params["rename"] and module.params["rename"] != getattr(
-        policy, "name", None
-    ):
-        patch_kwargs["name"] = module.params["rename"]
+    rename = module.params["rename"]
+    if rename and _leaf(rename) != _leaf(getattr(policy, "name", None)):
+        # _check_realms keeps the new name in the scope of the policy, so
+        # only the part after the realm can differ. The array does not
+        # refuse every new name that another policy already has: inside a
+        # realm it can end up with two policies under one name. Such a
+        # rename is refused here, before any write and in check mode too.
+        # A lookup that returns this policy itself is a rename that only
+        # changes the case of the name.
+        taken = _get_policy(module, blade, rename)
+        if taken is not None and getattr(taken, "id", None) != getattr(
+            policy, "id", None
+        ):
+            module.fail_json(
+                msg=(
+                    "Cannot rename data eviction policy {0} to {1}: a data "
+                    "eviction policy named {1} already exists."
+                ).format(module.params["name"], rename)
+            )
+        patch_kwargs["name"] = rename
 
     if module.params["file_systems"] is not None:
         # Reconcile under the current name; a rename is applied afterwards

@@ -32,6 +32,12 @@ description:
 - Rule fields that are not set in a task keep their current value when an
   existing rule is updated; the documented defaults are only applied when a
   new rule is created.
+- Snapshot, NFS, SMB client, SMB share and WORM policies can be managed in a
+  realm by naming them C(realm::name). An object store access policy is in
+  the realm of its I(account). Network access policies are not realm objects.
+- An administrator whose access is limited to a realm must use the
+  realm-qualified name; a name without a realm is not placed in, or resolved
+  to, the realm of the administrator.
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
@@ -50,6 +56,9 @@ options:
     description:
     - Name of policy to copy rule to, or name of the new policy to create
       when copying a whole policy.
+    - The target can be in another realm than I(name), or outside of any
+      realm, for an administrator with access to both. Give it as
+      C(realm::name), or as C(realm::account/policy) for an access policy.
     type: str
     version_added: "1.9.0"
   target_rule:
@@ -69,6 +78,8 @@ options:
     description:
     - Name of Object Store account policy applies to.
     - B(Special Case) I(pure policy) is used for the system-wide S3 policies
+    - For an account in a realm use C(realm::account). The policy is then in
+      that realm; the realm never goes on I(name).
     type: str
     version_added: "1.9.0"
   rule:
@@ -160,6 +171,10 @@ options:
   name:
     description:
     - Name of the policy
+    - To manage a snapshot, NFS, SMB or WORM policy in a realm use
+      C(realm::name).
+    - The name of an object store access policy never carries a realm, see
+      I(account).
     type: str
   enabled:
     description:
@@ -190,12 +205,19 @@ options:
     description:
     - List of filesystems to add to a policy on creation
     - To amend policy members use the I(everpure.flashblade.purefb_fs) module
+    - The file systems of a policy in a realm are named C(realm::filesystem)
+      and must be in the realm of the policy. A policy that is not in a realm
+      only takes file systems outside of any realm. Any other file system is
+      refused before the policy is created or changed.
     type: list
     elements: str
   replica_link:
     description:
     - List of filesystem replica links to add to a policy on creation
     - To amend policy members use the I(everpure.flashblade.purefb_fs_replica) module
+    - A replica link is named after its local file system, which must be in
+      the same realm as the policy, or outside of any realm when the policy
+      is (C(realm::filesystem) for a policy in a realm).
     type: list
     elements: str
   access:
@@ -234,6 +256,8 @@ options:
     - Specifies the clients that will be permitted to access the export.
     - Accepted notation is a single IP address, subnet in CIDR notation, netgroup, or
       anonymous (*).
+    - Required to create an SMB client policy, which is created with its
+      first rule.
     type: str
     version_added: "1.9.0"
   fileid_32bit:
@@ -284,6 +308,14 @@ options:
     - Snapshot policies cannot be renamed on any Purity//FB release (4.6.4 ignores
       the new name, 4.8.8 rejects the request); the module fails rather than
       report a rename the array did not perform.
+    - A policy cannot be moved into, out of or between realms. For a policy
+      in a realm give the new name without a realm, in which case the policy
+      keeps its realm, or as C(realm::name) with the realm of I(name). Any
+      other realm is refused.
+    - If I(name) no longer exists and a policy with the new name does, the
+      rename is taken as already applied. The task fails when neither policy
+      exists, or when I(name) exists and another policy already has the new
+      name.
     type: str
     version_added: "1.10.0"
   destroy_snapshots:
@@ -295,6 +327,8 @@ options:
   principal:
     description:
      - The user or group who is the subject of this rule, and their domain
+     - Required to create an SMB share policy, which is created with its
+       first rule.
     type: str
     version_added: '1.12.0'
   change:
@@ -511,12 +545,6 @@ EXAMPLES = r"""
     object_resources: "*"
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
-- name: Create an empty SMB client policy
-  everpure.flashblade.purefb_policy:
-    name: test_smb_client
-    policy_type: smb_client
-    fb_url: 10.10.10.2
-    api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
 - name: Create an SMB client policy with a client rule
   everpure.flashblade.purefb_policy:
     name: test_smb_client
@@ -656,6 +684,41 @@ EXAMPLES = r"""
     commit_mode: autocommit
     autocommit_delay_on: creation
     autocommit_delay_period: 2h
+    fb_url: 10.10.10.2
+    api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+- name: Create an NFS export policy with a client rule in realm realm1
+  everpure.flashblade.purefb_policy:
+    name: realm1::exports
+    policy_type: nfs
+    client: "10.0.1.0/24"
+    permission: rw
+    fb_url: 10.10.10.2
+    api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+- name: Rename the NFS export policy, which stays in realm realm1
+  everpure.flashblade.purefb_policy:
+    name: realm1::exports
+    policy_type: nfs
+    rename: exports_old
+    fb_url: 10.10.10.2
+    api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+- name: Create a snapshot policy in realm realm1 for a file system of that realm
+  everpure.flashblade.purefb_policy:
+    name: realm1::daily
+    policy_type: snapshot
+    every: 86400
+    keep_for: 604800
+    filesystem:
+      - realm1::fs1
+    fb_url: 10.10.10.2
+    api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+- name: Create an object store access policy for an account in realm realm1
+  everpure.flashblade.purefb_policy:
+    name: read_only
+    account: realm1::acct
+    policy_type: access
+    rule: rule1
+    actions: "s3:GetObject"
+    object_resources: "*"
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
 """
@@ -864,6 +927,206 @@ def _context_kwargs(module, versions):
     ):
         return {"context_names": [module.params["context"]]}
     return {}
+
+
+def _realm_of(name):
+    """Return the realm of a realm::name name, empty for an array-level name."""
+    return (name or "").rpartition("::")[0]
+
+
+def _leaf(name):
+    """Return a name without its realm."""
+    return (name or "").rpartition("::")[2]
+
+
+def _lookup(module, res, what, name):
+    """Return the first item of a read by name, or None when it does not exist.
+
+    Only the array's "does not exist" answer means absent. Any other
+    failure, such as a read the array refuses to the administrator, fails
+    the task with the array's message instead of passing for a missing
+    object, which would let state=absent report ok or state=present attempt
+    a create.
+    """
+    if res.status_code == 200:
+        items = list(res.items)
+        return items[0] if items else None
+    error = get_error_message(res)
+    if "does not exist" in str(error).lower():
+        return None
+    module.fail_json(msg="Failed to read {0} {1}. Error: {2}".format(what, name, error))
+
+
+def _resolve_rename(module, what):
+    """Return the new name of a rename, in the realm of the policy.
+
+    A rename cannot move a policy into, out of or between realms, and the
+    array compares the realm of the new name with the realm of the name the
+    policy is addressed by as both are written. A new name without a realm
+    is therefore taken as a name in the realm of the policy, a new name with
+    that realm is sent with the realm as I(name) spells it, and any other
+    realm is refused here, before any read or write and in check mode too.
+    """
+    name = module.params["name"]
+    rename = module.params["rename"]
+    realm = _realm_of(name)
+    # the array matches names without regard to case
+    if "::" in rename and _realm_of(rename).lower() != realm.lower():
+        module.fail_json(
+            msg="Cannot rename {0} {1} to {2}: a rename cannot move a policy "
+            "into, out of or between realms.".format(what, name, rename)
+        )
+    if realm:
+        return "{0}::{1}".format(realm, _leaf(rename))
+    return rename
+
+
+def _find_policies(module, getter, what, ctx, renaming):
+    """Return the policy called I(name) and, for a rename, the policy that
+    already has the new name. Each is None when it does not exist.
+
+    The new name is put in the realm of the policy first, so the second
+    lookup never finds a policy of the same name in another scope.
+    """
+    name = module.params["name"]
+    if renaming:
+        module.params["rename"] = _resolve_rename(module, what)
+    policy = _lookup(module, getter(names=[name], **ctx), what, name)
+    new_policy = None
+    if renaming:
+        new_policy = _lookup(
+            module,
+            getter(names=[module.params["rename"]], **ctx),
+            what,
+            module.params["rename"],
+        )
+    return policy, new_policy
+
+
+def _rename_needed(module, what, policy, new_policy):
+    """Return True when I(policy) has to be renamed, False when it already
+    has the new name.
+
+    Settled before the check-mode branch, so check mode and a real run
+    agree. A missing policy whose new name exists was renamed by an earlier
+    run. A rename of a policy that does not exist, or onto the name of
+    another policy, fails instead of reporting ok with nothing renamed.
+    """
+    name = module.params["name"]
+    rename = module.params["rename"]
+    if policy is None:
+        if new_policy is None:
+            module.fail_json(
+                msg="Cannot rename {0} {1} to {2}: {1} does not exist.".format(
+                    what, name, rename
+                )
+            )
+        return False
+    if new_policy is None:
+        return True
+    policy_id = getattr(policy, "id", None)
+    if policy_id is None or getattr(new_policy, "id", None) != policy_id:
+        module.fail_json(
+            msg="Cannot rename {0} {1} to {2}: {2} already exists.".format(
+                what, name, rename
+            )
+        )
+    # Both names are this one policy: the array matches names without regard
+    # to case, and it does not rename a policy to its own name.
+    if _leaf(getattr(policy, "name", None)) != _leaf(rename):
+        module.fail_json(
+            msg="Cannot rename {0} {1} to {2}: the new name differs from the "
+            "name of the policy only in case, and the array matches names "
+            "without regard to case.".format(what, name, rename)
+        )
+    return False
+
+
+def _check_member_realms(module):
+    """Fail when a snapshot policy and one of its members are in different scopes.
+
+    The array attaches a policy in a realm only to members of that realm and
+    an array-level policy only to members outside of any realm. It refuses
+    any other member after a new policy was created, and check mode cannot
+    foresee that, so such a member is refused before anything is read or
+    written.
+    """
+    name = module.params["name"]
+    realm = _realm_of(name)
+    for option, kind in (
+        ("filesystem", "File system"),
+        ("replica_link", "Replica link"),
+    ):
+        for member in module.params[option] or []:
+            # the array matches names without regard to case
+            if _realm_of(member).lower() == realm.lower():
+                continue
+            if realm:
+                reason = (
+                    "a policy in realm {0} only takes members of that realm, "
+                    "named {0}::<filesystem>"
+                ).format(realm)
+            else:
+                reason = (
+                    "a policy that is not in a realm only takes members "
+                    "outside of any realm"
+                )
+            module.fail_json(
+                msg="{0} {1} and snapshot policy {2} must be in the same realm, "
+                "or both outside a realm: {3}.".format(kind, member, name, reason)
+            )
+
+
+def _require_file_system(module, blade, filesystem, ctx):
+    """Fail unless I(filesystem) exists and is not destroyed."""
+    res = blade.get_file_systems(names=[filesystem], destroyed=False, **ctx)
+    if _lookup(module, res, "file system", filesystem) is None:
+        module.fail_json(
+            msg="Filesystem {0} to assign to {1} does not "
+            "exist, or is deleted.".format(filesystem, module.params["name"])
+        )
+
+
+def _replica_link(module, blade, link, ctx):
+    """Return the replica link of local file system I(link), failing when
+    the file system has none."""
+    res = blade.get_file_system_replica_links(local_file_system_names=[link], **ctx)
+    found = _lookup(module, res, "replica link", link)
+    if found is None:
+        module.fail_json(
+            msg="Replica link {0} to assign to {1} does not exist: the file "
+            "system does not exist or has no replica link.".format(
+                link, module.params["name"]
+            )
+        )
+    return found
+
+
+def _policy_members(module, res, what):
+    """Return the members of a snapshot policy from a member read, failing
+    with the array's message when the read is refused."""
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to read the {0} of snapshot policy {1}. Error: {2}".format(
+                what, module.params["name"], get_error_message(res)
+            )
+        )
+    return list(res.items)
+
+
+def _member_link(member):
+    """Return the local file system name and the remote name of a replica
+    link the policy is attached to.
+
+    A replica link is identified by its local file system and its remote;
+    the member reference names the local file system when no link is given.
+    """
+    link = getattr(member, "link", None)
+    local = getattr(getattr(link, "local_file_system", None), "name", None)
+    remote = getattr(getattr(link, "remote", None), "name", None)
+    if not local:
+        local = getattr(getattr(member, "member", None), "name", None)
+    return local or "", remote
 
 
 def _worm_autocommit_config(delay_on, delay_period):
@@ -1165,10 +1428,11 @@ def delete_smb_share_policy(module, blade):
             changed = True
             if not module.check_mode:
                 # Share rule names are the principal, unique only within the
-                # policy, so the policy must be named as well.
+                # policy. The rule is addressed by its id: by name the array
+                # does not find the rule of a policy in a realm for an
+                # administrator whose access is limited to that realm.
                 res = blade.delete_smb_share_policies_rules(
-                    policy_names=[module.params["name"]],
-                    names=[rule.name],
+                    ids=[rule.id],
                     **_context_kwargs(module, versions),
                 )
                 if res.status_code != 200:
@@ -1237,6 +1501,10 @@ def create_smb_share_policy(module, blade):
     """Create SMB Share Policy"""
     changed = True
     versions = get_rest_api_version(blade)
+    # Checked before the policy is created, and in check mode: a new policy
+    # is created with its first rule, and must not be left behind without one.
+    if not module.params["principal"]:
+        module.fail_json(msg="principal is required to create a new rule")
     if not module.check_mode:
         if (
             LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
@@ -1283,38 +1551,35 @@ def create_smb_share_policy(module, blade):
                         module.params["name"], get_error_message(res)
                     )
                 )
-        if not module.params["principal"]:
-            module.fail_json(msg="principal is required to create a new rule")
-        else:
-            # Send the permissions as the array stores them (see
-            # _share_rule_perms); the raw task values can mix allow and deny,
-            # which POST rejects.
-            perms = _share_rule_desired(module, {})
-            rule = SmbSharePolicyRule(
-                principal=module.params["principal"],
-                **{level: value for level, value in perms.items() if value},
+        # Send the permissions as the array stores them (see
+        # _share_rule_perms); the raw task values can mix allow and deny,
+        # which POST rejects.
+        perms = _share_rule_desired(module, {})
+        rule = SmbSharePolicyRule(
+            principal=module.params["principal"],
+            **{level: value for level, value in perms.items() if value},
+        )
+        if (
+            LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
+            and module.params["context"]
+        ):
+            res = blade.post_smb_share_policies_rules(
+                policy_names=[module.params["name"]],
+                rule=rule,
+                context_names=[module.params["context"]],
             )
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                and module.params["context"]
-            ):
-                res = blade.post_smb_share_policies_rules(
-                    policy_names=[module.params["name"]],
-                    rule=rule,
-                    context_names=[module.params["context"]],
+        else:
+            res = blade.post_smb_share_policies_rules(
+                policy_names=[module.params["name"]],
+                rule=rule,
+            )
+        if res.status_code != 200:
+            module.fail_json(
+                msg="Failed to create rule for policy {0}. Error: {1}".format(
+                    module.params["name"],
+                    get_error_message(res),
                 )
-            else:
-                res = blade.post_smb_share_policies_rules(
-                    policy_names=[module.params["name"]],
-                    rule=rule,
-                )
-            if res.status_code != 200:
-                module.fail_json(
-                    msg="Failed to create rule for policy {0}. Error: {1}".format(
-                        module.params["name"],
-                        get_error_message(res),
-                    )
-                )
+            )
     module.exit_json(changed=changed)
 
 
@@ -1397,10 +1662,12 @@ def update_smb_share_policy(module, blade):
                     )
                     # Share rules are unordered and carry no index: the rule
                     # is named after its principal, which is only unique
-                    # within the policy, so address it by name and policy.
+                    # within the policy, so address it by its id. By name
+                    # the array does not find the rule of a policy in a realm
+                    # for an administrator whose access is limited to that
+                    # realm.
                     res = blade.patch_smb_share_policies_rules(
-                        policy_names=[module.params["name"]],
-                        names=[old_policy_rule.name],
+                        ids=[old_policy_rule.id],
                         rule=rule,
                         **_context_kwargs(module, versions),
                     )
@@ -1591,6 +1858,10 @@ def create_smb_client_policy(module, blade):
     """Create SMB Client Policy"""
     changed = True
     versions = get_rest_api_version(blade)
+    # Checked before the policy is created, and in check mode: a new policy
+    # is created with its first rule, and must not be left behind without one.
+    if not module.params["client"]:
+        module.fail_json(msg="client is required to create a new rule")
     if not module.check_mode:
         if (
             LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
@@ -1637,31 +1908,28 @@ def create_smb_client_policy(module, blade):
                         module.params["name"], get_error_message(res)
                     )
                 )
-        if not module.params["client"]:
-            module.fail_json(msg="client is required to create a new rule")
+        rule = _smb_client_rule_from_params(module, versions)
+        if (
+            LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
+            and module.params["context"]
+        ):
+            res = blade.post_smb_client_policies_rules(
+                policy_names=[module.params["name"]],
+                rule=rule,
+                context_names=[module.params["context"]],
+            )
         else:
-            rule = _smb_client_rule_from_params(module, versions)
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                and module.params["context"]
-            ):
-                res = blade.post_smb_client_policies_rules(
-                    policy_names=[module.params["name"]],
-                    rule=rule,
-                    context_names=[module.params["context"]],
+            res = blade.post_smb_client_policies_rules(
+                policy_names=[module.params["name"]],
+                rule=rule,
+            )
+        if res.status_code != 200:
+            module.fail_json(
+                msg="Failed to rule for policy {0}. Error: {1}".format(
+                    module.params["name"],
+                    get_error_message(res),
                 )
-            else:
-                res = blade.post_smb_client_policies_rules(
-                    policy_names=[module.params["name"]],
-                    rule=rule,
-                )
-            if res.status_code != 200:
-                module.fail_json(
-                    msg="Failed to rule for policy {0}. Error: {1}".format(
-                        module.params["name"],
-                        get_error_message(res),
-                    )
-                )
+            )
     module.exit_json(changed=changed)
 
 
@@ -3029,7 +3297,9 @@ def create_os_policy(module, blade):
             )
         if res.status_code != 200:
             module.fail_json(
-                msg="Failed to create access policy {0}.".format(policy_name)
+                msg="Failed to create access policy {0}. Error: {1}".format(
+                    policy_name, get_error_message(res)
+                )
             )
         if module.params["rule"]:
             if not module.params["actions"] or not module.params["object_resources"]:
@@ -3308,7 +3578,7 @@ def copy_os_policy_rule(module, blade):
     if res.status_code == 200:
         module.fail_json(
             msg="Target rule {0} already exists in policy {1}".format(
-                module.params["target_rule"], policy_name
+                module.params["target_rule"], module.params["target"]
             )
         )
     if (
@@ -3500,6 +3770,15 @@ def create_snap_policy(module, blade):
     if module.params["at"] and not module.params["every"]:
         module.fail_json(msg="`at` requires `every` to be provided.")
 
+    # Members are looked up before the policy is created, and in check mode:
+    # a member the array cannot attach must not leave an empty policy behind.
+    ctx = _context_kwargs(module, versions)
+    for filesystem in module.params["filesystem"] or []:
+        _require_file_system(module, blade, filesystem, ctx)
+    remotes = {}
+    for link in module.params["replica_link"] or []:
+        remotes[link] = _replica_link(module, blade, link, ctx).remote.name
+
     if not module.check_mode:
         if module.params["at"] and module.params["every"]:
             if not module.params["every"] % 86400 == 0:
@@ -3579,89 +3858,33 @@ def create_snap_policy(module, blade):
                     module.params["name"], get_error_message(res)
                 )
             )
-        if module.params["filesystem"]:
-            for filesystem in module.params["filesystem"]:
-                if (
-                    LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                    and module.params["context"]
-                ):
-                    res = blade.get_file_systems(
-                        names=[filesystem],
-                        destroyed=False,
-                        context_names=[module.params["context"]],
+        for filesystem in module.params["filesystem"] or []:
+            res = blade.post_policies_file_systems(
+                policy_names=[module.params["name"]],
+                member_names=[filesystem],
+                **ctx,
+            )
+            if res.status_code != 200:
+                module.fail_json(
+                    msg="Failed to add filesystem {0} to "
+                    "policy {1}. Error: {2}".format(
+                        filesystem, module.params["name"], get_error_message(res)
                     )
-                else:
-                    res = blade.get_file_systems(names=[filesystem], destroyed=False)
-                if res.status_code != 200:
-                    module.fail_json(
-                        msg="Filesystems to assign to {0} does not "
-                        "exist, or is deleted.".format(module.params["name"])
+                )
+        for link in module.params["replica_link"] or []:
+            res = blade.post_policies_file_system_replica_links(
+                policy_names=[module.params["name"]],
+                local_file_system_names=[link],
+                remote_names=[remotes[link]],
+                **ctx,
+            )
+            if res.status_code != 200:
+                module.fail_json(
+                    msg="Failed to connect filesystem replica link {0} to policy {1}. "
+                    "Error: {2}".format(
+                        link, module.params["name"], get_error_message(res)
                     )
-                if (
-                    LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                    and module.params["context"]
-                ):
-                    res = blade.post_policies_file_systems(
-                        policy_names=[module.params["name"]],
-                        member_names=[filesystem],
-                        context_names=[module.params["context"]],
-                    )
-                else:
-                    res = blade.post_policies_file_systems(
-                        policy_names=[module.params["name"]],
-                        member_names=[filesystem],
-                    )
-                if res.status_code != 200:
-                    module.fail_json(
-                        msg="Failed to add filesystem {0} to "
-                        "policy {1}. Error: {2}.".format(
-                            filesystem, module.params["name"], get_error_message(res)
-                        )
-                    )
-        if module.params["replica_link"]:
-            repl_link = []
-            for link in module.params["replica_link"]:
-                if (
-                    LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                    and module.params["context"]
-                ):
-                    res = blade.get_file_system_replica_links(
-                        local_file_system_names=[link],
-                        context_names=[module.params["context"]],
-                    )
-                else:
-                    res = blade.get_file_system_replica_links(
-                        local_file_system_names=[link]
-                    )
-                if res.status_code != 200:
-                    module.fail_json(
-                        msg="Replica Link {0} does not exist.".format(link)
-                    )
-                else:
-                    repl_link = list(res.items)[0]
-                if (
-                    LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                    and module.params["context"]
-                ):
-                    res = blade.post_policies_file_system_replica_links(
-                        policy_names=[module.params["name"]],
-                        local_file_system_names=[link],
-                        remote_names=[repl_link.remote.name],
-                        context_names=[module.params["context"]],
-                    )
-                else:
-                    res = blade.post_policies_file_system_replica_links(
-                        policy_names=[module.params["name"]],
-                        local_file_system_names=[link],
-                        remote_names=[repl_link.remote.name],
-                    )
-                if res.status_code != 200:
-                    module.fail_json(
-                        msg="Failed to connect filesystem replicsa link {0} to policy {1}. "
-                        "Error: {2}".format(
-                            link, module.params["name"], get_error_message(res)
-                        )
-                    )
+                )
     module.exit_json(changed=changed)
 
 
@@ -3803,180 +4026,111 @@ def update_snap_policy(module, blade):
                     )
 
     if module.params["filesystem"]:
-        current_filesystems = []
-        if (
-            LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-            and module.params["context"]
-        ):
-            policy_fs_details = list(
+        # The array matches names without regard to case and returns the
+        # stored spelling, so members are compared lower-cased.
+        current_filesystems = [
+            str(member.member.name).lower()
+            for member in _policy_members(
+                module,
                 blade.get_policies_file_systems(
-                    policy_names=[module.params["name"]],
-                    context_names=[module.params["context"]],
-                ).items
+                    policy_names=[module.params["name"]], **ctx
+                ),
+                "file systems",
             )
-        else:
-            policy_fs_details = list(
-                blade.get_policies_file_systems(
-                    policy_names=[module.params["name"]]
-                ).items
-            )
-        for member in policy_fs_details:
-            current_filesystems.append(member.member.name)
+        ]
         if module.params["state"] == "present":
-            difference_set = [
-                item
-                for item in module.params["filesystem"]
-                if item not in current_filesystems
-            ]
-            for new_fs in difference_set:
+            for new_fs in module.params["filesystem"]:
+                if new_fs.lower() in current_filesystems:
+                    continue
+                current_filesystems.append(new_fs.lower())
                 changed = True
-                if (
-                    LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                    and module.params["context"]
-                ):
-                    res = blade.get_file_systems(
-                        names=[new_fs],
-                        destroyed=False,
-                        context_names=[module.params["context"]],
-                    )
-                else:
-                    res = blade.get_file_systems(names=[new_fs], destroyed=False)
-                if res.status_code != 200:
-                    module.fail_json(
-                        msg="Filesystem {0} to assign to {1} does not "
-                        "exist, or is deleted.".format(new_fs, module.params["name"])
-                    )
-                if (
-                    LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                    and module.params["context"]
-                ):
+                _require_file_system(module, blade, new_fs, ctx)
+                if not module.check_mode:
                     res = blade.post_policies_file_systems(
                         policy_names=[module.params["name"]],
                         member_names=[new_fs],
-                        context_names=[module.params["context"]],
+                        **ctx,
                     )
-                else:
-                    res = blade.post_policies_file_systems(
-                        policy_names=[module.params["name"]],
-                        member_names=[new_fs],
-                    )
-                if res.status_code != 200:
-                    module.fail_json(
-                        msg="Failed to add filesystem {0} to "
-                        "policy {1}. Error: {2}.".format(
-                            new_fs, module.params["name"], get_error_message(res)
+                    if res.status_code != 200:
+                        module.fail_json(
+                            msg="Failed to add filesystem {0} to "
+                            "policy {1}. Error: {2}".format(
+                                new_fs, module.params["name"], get_error_message(res)
+                            )
                         )
-                    )
         else:
             for old_fs in module.params["filesystem"]:
-                if old_fs in current_filesystems:
-                    changed = True
-                    if (
-                        LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                        and module.params["context"]
-                    ):
-                        res = blade.delete_policies_file_systems(
-                            policy_names=[module.params["name"]],
-                            member_names=[old_fs],
-                            context_names=[module.params["context"]],
-                        )
-                    else:
-                        res = blade.delete_policies_file_systems(
-                            policy_names=[module.params["name"]],
-                            member_names=[old_fs],
-                        )
+                if old_fs.lower() not in current_filesystems:
+                    continue
+                current_filesystems.remove(old_fs.lower())
+                changed = True
+                if not module.check_mode:
+                    res = blade.delete_policies_file_systems(
+                        policy_names=[module.params["name"]],
+                        member_names=[old_fs],
+                        **ctx,
+                    )
                     if res.status_code != 200:
                         module.fail_json(
                             msg="Failed to remove filesystem {0} from "
-                            "policy {1}. Error: {2}.".format(
+                            "policy {1}. Error: {2}".format(
                                 old_fs, module.params["name"], get_error_message(res)
                             )
                         )
     if module.params["replica_link"]:
-        current_rls = []
-        if (
-            LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-            and module.params["context"]
+        # A replica link is named after its local file system and is
+        # addressed by that name and its remote. Keep the remote of every
+        # link the policy is attached to, keyed by the lower-cased name.
+        current_links = {}
+        for member in _policy_members(
+            module,
+            blade.get_policies_file_system_replica_links(
+                policy_names=[module.params["name"]], **ctx
+            ),
+            "replica links",
         ):
-            policy_rl_details = list(
-                blade.get_policies_file_system_replica_links(
-                    policy_names=[module.params["name"]],
-                    context_names=[module.params["context"]],
-                ).items
-            )
-        else:
-            policy_rl_details = list(
-                blade.get_policies_file_system_replica_links(
-                    policy_names=[module.params["name"]]
-                ).items
-            )
-        for member in policy_rl_details:
-            current_rls.append(member.member.name)
+            local, remote = _member_link(member)
+            current_links[str(local).lower()] = remote
         if module.params["state"] == "present":
-            difference_set = [
-                item
-                for item in module.params["replica_link"]
-                if item not in current_rls
-            ]
-            for new_rl in difference_set:
+            for new_rl in module.params["replica_link"]:
+                if new_rl.lower() in current_links:
+                    continue
                 changed = True
-                if (
-                    LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                    and module.params["context"]
-                ):
-                    res = blade.get_file_systems_replica_links(
-                        names=[new_rl], context_names=[module.params["context"]]
-                    )
-                else:
-                    res = blade.get_file_systems_replica_links(names=[new_rl])
-                if res.status_code != 200:
-                    module.fail_json(
-                        msg="Replica link {0} to assign to {1} does not "
-                        "exist, or is deleted.".format(new_rl, module.params["name"])
-                    )
-                if (
-                    LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                    and module.params["context"]
-                ):
+                remote = _replica_link(module, blade, new_rl, ctx).remote.name
+                current_links[new_rl.lower()] = remote
+                if not module.check_mode:
                     res = blade.post_policies_file_system_replica_links(
                         policy_names=[module.params["name"]],
-                        member_names=[new_rl],
-                        context_names=[module.params["context"]],
+                        local_file_system_names=[new_rl],
+                        remote_names=[remote],
+                        **ctx,
                     )
-                else:
-                    res = blade.post_policies_file_system_replica_links(
-                        policy_names=[module.params["name"]],
-                        member_names=[new_rl],
-                    )
-                if res.status_code != 200:
-                    module.fail_json(
-                        msg="Failed to add replica link {0} to "
-                        "policy {1}. Error: {2}.".format(
-                            new_rl, module.params["name"], get_error_message(res)
+                    if res.status_code != 200:
+                        module.fail_json(
+                            msg="Failed to add replica link {0} to "
+                            "policy {1}. Error: {2}".format(
+                                new_rl, module.params["name"], get_error_message(res)
+                            )
                         )
-                    )
         else:
             for old_rl in module.params["replica_link"]:
-                if old_rl in current_rls:
-                    changed = True
-                    if (
-                        LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                        and module.params["context"]
-                    ):
-                        res = blade.delete_policies_file_system_replica_links(
-                            policy_names=[module.params["name"]],
-                            member_names=[old_rl],
-                            context_names=[module.params["context"]],
-                        )
-                    else:
-                        res = blade.delete_policies_file_system_replica_links(
-                            policy_names=[module.params["name"]],
-                            member_names=[old_rl],
-                        )
+                if old_rl.lower() not in current_links:
+                    continue
+                changed = True
+                remote = current_links.pop(old_rl.lower())
+                if not remote:
+                    remote = _replica_link(module, blade, old_rl, ctx).remote.name
+                if not module.check_mode:
+                    res = blade.delete_policies_file_system_replica_links(
+                        policy_names=[module.params["name"]],
+                        local_file_system_names=[old_rl],
+                        remote_names=[remote],
+                        **ctx,
+                    )
                     if res.status_code != 200:
                         module.fail_json(
                             msg="Failed to remove replica link {0} from "
-                            "policy {1}. Error: {2}.".format(
+                            "policy {1}. Error: {2}".format(
                                 old_rl, module.params["name"], get_error_message(res)
                             )
                         )
@@ -3989,6 +4143,15 @@ def rename_snap_policy(module, blade):
 
     changed = True
     versions = get_rest_api_version(blade)
+    if module.check_mode:
+        # No Purity//FB release renames a snapshot policy (see below), so
+        # check mode must not predict a change the real run cannot make.
+        module.fail_json(
+            msg="Failed to rename snapshot policy {0} to {1}: Purity//FB does "
+            "not support renaming snapshot policies (REST {2}).".format(
+                module.params["name"], module.params["rename"], versions
+            )
+        )
     if not module.check_mode:
         # Policy keeps `name` in the request body (SnapshotPolicyPatch strips
         # it as read-only), so this is the only way to ask for a rename.
@@ -4166,13 +4329,16 @@ def copy_policy(module, blade, source):
             commit_mode = getattr(source, "commit_mode", None)
             if commit_mode is not None:
                 policy_kwargs["commit_mode"] = commit_mode
-            source_autocommit = getattr(source, "autocommit_config", None)
-            autocommit_config = _worm_autocommit_config(
-                getattr(source_autocommit, "delay_on", None),
-                getattr(source_autocommit, "delay_period", None),
-            )
-            if autocommit_config is not None:
-                policy_kwargs["autocommit_config"] = autocommit_config
+            # The array reports an autocommit configuration for every policy
+            # but accepts one only for a policy that commits automatically.
+            if commit_mode in ("autocommit", "hybrid"):
+                source_autocommit = getattr(source, "autocommit_config", None)
+                autocommit_config = _worm_autocommit_config(
+                    getattr(source_autocommit, "delay_on", None),
+                    getattr(source_autocommit, "delay_period", None),
+                )
+                if autocommit_config is not None:
+                    policy_kwargs["autocommit_config"] = autocommit_config
             res = blade.post_worm_data_policies(
                 names=[target], policy=WormDataPolicy(**policy_kwargs), **ctx
             )
@@ -4314,28 +4480,30 @@ def main():
         fleet_res = blade.get_fleets()
         if fleet_res.status_code == 200 and list(fleet_res.items):
             module.params["context"] = list(blade.get_arrays().items)[0].name
+    ctx = _context_kwargs(module, versions)
+    name = module.params["name"]
+    # A new name is only acted on with state=present.
+    renaming = state == "present" and bool(module.params["rename"])
     if module.params["policy_type"] == "access":
         if not HAS_PYPURECLIENT:
             module.fail_json(msg="py-pure-client sdk is required for this module")
-        try:
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                and module.params["context"]
-            ):
-                policy = list(
-                    blade.get_object_store_access_policies(
-                        names=[module.params["account"] + "/" + module.params["name"]],
-                        context_names=[module.params["context"]],
-                    ).items
-                )[0]
-            else:
-                policy = list(
-                    blade.get_object_store_access_policies(
-                        names=[module.params["account"] + "/" + module.params["name"]]
-                    ).items
-                )[0]
-        except AttributeError:
-            policy = None
+        if "::" in name:
+            # An access policy is in the realm of its account and never
+            # carries a realm of its own; the array refuses such a name
+            # without a reason, so say what to write instead.
+            module.fail_json(
+                msg="Access policy name {0} cannot carry a realm. An access "
+                "policy is in the realm of its account: for a policy in a "
+                "realm put the realm on account (realm::account) and give "
+                "name without it.".format(name)
+            )
+        policy_name = module.params["account"] + "/" + name
+        policy = _lookup(
+            module,
+            blade.get_object_store_access_policies(names=[policy_name], **ctx),
+            "access policy",
+            policy_name,
+        )
         if module.params["user"]:
             member_name = module.params["account"] + "/" + module.params["user"]
             if (
@@ -4398,7 +4566,6 @@ def main():
                 )
             copy_os_policy_rule(module, blade)
     elif module.params["policy_type"] == "nfs":
-        new_policy = None
         if LooseVersion(NFS_POLICY_API_VERSION) > LooseVersion(versions):
             module.fail_json(
                 msg=(
@@ -4409,44 +4576,13 @@ def main():
             )
         if not HAS_PYPURECLIENT:
             module.fail_json(msg="py-pure-client sdk is required for this module")
-        try:
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                and module.params["context"]
-            ):
-                policy = list(
-                    blade.get_nfs_export_policies(
-                        names=[module.params["name"]],
-                        context_names=[module.params["context"]],
-                    ).items
-                )[0]
-            else:
-                policy = list(
-                    blade.get_nfs_export_policies(names=[module.params["name"]]).items
-                )[0]
-        except AttributeError:
-            policy = None
-        if module.params["rename"]:
-            try:
-                if (
-                    LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                    and module.params["context"]
-                ):
-                    new_policy = list(
-                        blade.get_nfs_export_policies(
-                            names=[module.params["rename"]],
-                            context_names=[module.params["context"]],
-                        ).items
-                    )[0]
-                else:
-                    new_policy = list(
-                        blade.get_nfs_export_policies(
-                            names=[module.params["rename"]]
-                        ).items
-                    )[0]
-            except AttributeError:
-                new_policy = None
-        if policy and state == "present" and not module.params["rename"]:
+        policy, new_policy = _find_policies(
+            module, blade.get_nfs_export_policies, "NFS export policy", ctx, renaming
+        )
+        if renaming:
+            if _rename_needed(module, "NFS export policy", policy, new_policy):
+                rename_nfs_policy(module, blade)
+        elif policy and state == "present":
             if module.params["before_rule"]:
                 if (
                     LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
@@ -4477,11 +4613,7 @@ def main():
                         )
                     )
             update_nfs_policy(module, blade)
-        elif (
-            state == "present" and module.params["rename"] and policy and not new_policy
-        ):
-            rename_nfs_policy(module, blade)
-        elif state == "present" and not policy and not module.params["rename"]:
+        elif state == "present":
             create_nfs_policy(module, blade)
         elif state == "absent" and policy:
             delete_nfs_policy(module, blade)
@@ -4498,44 +4630,13 @@ def main():
             )
         if not HAS_PYPURECLIENT:
             module.fail_json(msg="py-pure-client sdk is required for this module")
-        try:
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                and module.params["context"]
-            ):
-                policy = list(
-                    blade.get_smb_client_policies(
-                        names=[module.params["name"]],
-                        context_names=[module.params["context"]],
-                    ).items
-                )[0]
-            else:
-                policy = list(
-                    blade.get_smb_client_policies(names=[module.params["name"]]).items
-                )[0]
-        except AttributeError:
-            policy = None
-        if module.params["rename"]:
-            try:
-                if (
-                    LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                    and module.params["context"]
-                ):
-                    new_policy = list(
-                        blade.get_smb_client_policies(
-                            names=[module.params["rename"]],
-                            context_names=[module.params["context"]],
-                        ).items
-                    )[0]
-                else:
-                    new_policy = list(
-                        blade.get_smb_client_policies(
-                            names=[module.params["rename"]]
-                        ).items
-                    )[0]
-            except AttributeError:
-                new_policy = None
-        if policy and state == "present" and not module.params["rename"]:
+        policy, new_policy = _find_policies(
+            module, blade.get_smb_client_policies, "SMB client policy", ctx, renaming
+        )
+        if renaming:
+            if _rename_needed(module, "SMB client policy", policy, new_policy):
+                rename_smb_client_policy(module, blade)
+        elif policy and state == "present":
             if module.params["before_rule"]:
                 if (
                     LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
@@ -4566,11 +4667,7 @@ def main():
                         )
                     )
             update_smb_client_policy(module, blade)
-        elif (
-            state == "present" and module.params["rename"] and policy and not new_policy
-        ):
-            rename_smb_client_policy(module, blade)
-        elif state == "present" and not policy and not module.params["rename"]:
+        elif state == "present":
             create_smb_client_policy(module, blade)
         elif state == "absent" and policy:
             delete_smb_client_policy(module, blade)
@@ -4587,44 +4684,13 @@ def main():
             )
         if not HAS_PYPURECLIENT:
             module.fail_json(msg="py-pure-client sdk is required for this module")
-        try:
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                and module.params["context"]
-            ):
-                policy = list(
-                    blade.get_smb_share_policies(
-                        names=[module.params["name"]],
-                        context_names=[module.params["context"]],
-                    ).items
-                )[0]
-            else:
-                policy = list(
-                    blade.get_smb_share_policies(names=[module.params["name"]]).items
-                )[0]
-        except AttributeError:
-            policy = None
-        if module.params["rename"]:
-            try:
-                if (
-                    LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                    and module.params["context"]
-                ):
-                    new_policy = list(
-                        blade.get_smb_share_policies(
-                            names=[module.params["rename"]],
-                            context_names=[module.params["context"]],
-                        ).items
-                    )[0]
-                else:
-                    new_policy = list(
-                        blade.get_smb_share_policies(
-                            names=[module.params["rename"]]
-                        ).items
-                    )[0]
-            except AttributeError:
-                new_policy = None
-        if policy and state == "present" and not module.params["rename"]:
+        policy, new_policy = _find_policies(
+            module, blade.get_smb_share_policies, "SMB share policy", ctx, renaming
+        )
+        if renaming:
+            if _rename_needed(module, "SMB share policy", policy, new_policy):
+                rename_smb_share_policy(module, blade)
+        elif policy and state == "present":
             if module.params["before_rule"]:
                 # Share rules are keyed by principal and have no index or
                 # evaluation order, so there is nothing to move them before.
@@ -4632,11 +4698,7 @@ def main():
                     msg="`before_rule` is not supported for SMB share policies"
                 )
             update_smb_share_policy(module, blade)
-        elif (
-            state == "present" and module.params["rename"] and policy and not new_policy
-        ):
-            rename_smb_share_policy(module, blade)
-        elif state == "present" and not policy and not module.params["rename"]:
+        elif state == "present":
             create_smb_share_policy(module, blade)
         elif state == "absent" and policy:
             delete_smb_share_policy(module, blade)
@@ -4656,21 +4718,22 @@ def main():
         # The network-access-policies endpoints take no fleet context in any
         # REST version (the SDK methods have no context_names argument), so
         # the context defaulted for fleet members above must not be sent.
-        try:
-            policy = list(
-                blade.get_network_access_policies(names=[module.params["name"]]).items
-            )[0]
-        except AttributeError:
-            policy = None
+        # A read the array refuses is reported as such: the policy cannot be
+        # created, so "does not exist" would send the user the wrong way.
+        policy = _lookup(
+            module,
+            blade.get_network_access_policies(names=[name]),
+            "network access policy",
+            name,
+        )
+        new_policy = None
         if module.params["rename"]:
-            try:
-                new_policy = list(
-                    blade.get_network_access_policies(
-                        names=[module.params["rename"]]
-                    ).items
-                )[0]
-            except AttributeError:
-                new_policy = None
+            new_policy = _lookup(
+                module,
+                blade.get_network_access_policies(names=[module.params["rename"]]),
+                "network access policy",
+                module.params["rename"],
+            )
         if policy and state == "present" and not module.params["rename"]:
             if module.params["before_rule"]:
                 res = blade.get_network_access_policies_rules(
@@ -4708,50 +4771,15 @@ def main():
         _check_worm_autocommit_version(module, versions)
         if not HAS_PYPURECLIENT:
             module.fail_json(msg="py-pure-client sdk is required for this module")
-        try:
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                and module.params["context"]
-            ):
-                policy = list(
-                    blade.get_worm_data_policies(
-                        names=[module.params["name"]],
-                        context_names=[module.params["context"]],
-                    ).items
-                )[0]
-            else:
-                policy = list(
-                    blade.get_worm_data_policies(names=[module.params["name"]]).items
-                )[0]
-        except AttributeError:
-            policy = None
-        if module.params["rename"]:
-            try:
-                if (
-                    LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                    and module.params["context"]
-                ):
-                    new_policy = list(
-                        blade.get_worm_data_policies(
-                            names=[module.params["rename"]],
-                            context_names=[module.params["context"]],
-                        ).items
-                    )[0]
-                else:
-                    new_policy = list(
-                        blade.get_worm_data_policies(
-                            names=[module.params["rename"]]
-                        ).items
-                    )[0]
-            except AttributeError:
-                new_policy = None
-        if policy and state == "present" and not module.params["rename"]:
+        policy, new_policy = _find_policies(
+            module, blade.get_worm_data_policies, "WORM data policy", ctx, renaming
+        )
+        if renaming:
+            if _rename_needed(module, "WORM data policy", policy, new_policy):
+                rename_worm_data_policy(module)
+        elif policy and state == "present":
             update_worm_data_policy(module, blade)
-        elif (
-            state == "present" and module.params["rename"] and policy and not new_policy
-        ):
-            rename_worm_data_policy(module)
-        elif state == "present" and not policy and not module.params["rename"]:
+        elif state == "present":
             create_worm_data_policy(module, blade)
         elif state == "absent" and policy:
             delete_worm_data_policy(module, blade)
@@ -4760,38 +4788,17 @@ def main():
     else:
         if not HAS_PYPURECLIENT:
             module.fail_json(msg="py-pure-client sdk is required for this module")
-        try:
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(versions)
-                and module.params["context"]
-            ):
-                policy = list(
-                    blade.get_policies(
-                        names=[module.params["name"]],
-                        context_names=[module.params["context"]],
-                    ).items
-                )[0]
-            else:
-                policy = list(blade.get_policies(names=[module.params["name"]]).items)[
-                    0
-                ]
-        except AttributeError:
-            policy = None
-        if module.params["rename"]:
-            try:
-                new_policy = list(
-                    blade.get_policies(
-                        names=[module.params["rename"]],
-                        **_context_kwargs(module, versions),
-                    ).items
-                )[0]
-            except AttributeError:
-                new_policy = None
-        if state == "present" and module.params["rename"] and policy and not new_policy:
-            rename_snap_policy(module, blade)
-        elif not policy and state == "present" and not module.params["rename"]:
+        if state != "copy":
+            _check_member_realms(module)
+        policy, new_policy = _find_policies(
+            module, blade.get_policies, "snapshot policy", ctx, renaming
+        )
+        if renaming:
+            if _rename_needed(module, "snapshot policy", policy, new_policy):
+                rename_snap_policy(module, blade)
+        elif not policy and state == "present":
             create_snap_policy(module, blade)
-        elif policy and state == "present" and not module.params["rename"]:
+        elif policy and state == "present":
             update_snap_policy(module, blade)
         elif policy and state == "absent":
             if module.params["filesystem"] or module.params["replica_link"]:

@@ -57,9 +57,14 @@ from plugins.modules.purefb_policy import (
     _worm_autocommit_config,
     _worm_autocommit_params,
     _valid_os_actions,
+    copy_os_policy_rule,
     copy_policy,
     main,
     create_network_access_policy,
+    create_os_policy,
+    create_smb_client_policy,
+    create_smb_share_policy,
+    create_snap_policy,
     create_worm_data_policy,
     delete_network_access_policy,
     delete_smb_share_policy,
@@ -81,6 +86,30 @@ from plugins.module_utils.time_utils import (
     time_to_milliseconds as _real_ttm,
 )
 from plugins.module_utils.version import LooseVersion as _RealLooseVersion
+
+
+def _array_message(res):
+    """What get_error_message returns for an SDK error response."""
+    return res.errors[0].message
+
+
+def _error_response(message, status=400):
+    """An SDK ErrorResponse: a status and the errors, no items."""
+    res = Mock(spec=["status_code", "errors"])
+    res.status_code = status
+    error = Mock()
+    error.message = message
+    res.errors = [error]
+    return res
+
+
+def _found(*items):
+    """An SDK ValidResponse holding the given items."""
+    res = Mock()
+    res.status_code = 200
+    res.items = list(items)
+    res.total_item_count = len(items)
+    return res
 
 
 def _existing_rule(access="root-squash"):
@@ -421,6 +450,7 @@ def _fleet_member_blade():
                 "keyword argument 'context_names'"
             )
         resp = Mock()
+        resp.status_code = 200
         resp.items = [Mock()]
         return resp
 
@@ -691,7 +721,7 @@ class TestUpdateSnapPolicy:
         module.params["state"] = "absent"
         module.params["filesystem"] = ["fs1"]
         blade = _snap_blade(_snap_rule(every=3600000, keep_for=86400000), enabled=False)
-        blade.get_policies_file_systems.return_value.items = []
+        blade.get_policies_file_systems.return_value = _found()
 
         update_snap_policy(module, blade)
 
@@ -789,18 +819,22 @@ class TestRenameSnapPolicy:
         module.exit_json.assert_not_called()
 
     @patch("plugins.modules.purefb_policy.LooseVersion")
-    def test_rename_check_mode_does_not_touch_array(self, mock_loose_version):
+    def test_rename_check_mode_fails_without_touching_array(self, mock_loose_version):
+        """Check mode must not predict a rename no release performs."""
         mock_loose_version.return_value.__le__ = Mock(return_value=False)
         module = _snap_module()
         module.check_mode = True
         module.params["rename"] = "weekly_snap_policy"
         blade = _snap_blade(_snap_rule())
 
-        rename_snap_policy(module, blade)
+        with pytest.raises(SystemExit):
+            rename_snap_policy(module, blade)
 
         blade.patch_policies.assert_not_called()
         blade.get_policies.assert_not_called()
-        module.exit_json.assert_called_once_with(changed=True)
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "does not support renaming snapshot policies" in msg
+        module.exit_json.assert_not_called()
 
 
 def _ctx_module(context):
@@ -868,6 +902,7 @@ def _share_rule(read="allow", change="allow", full_control=None):
     """
     rule = Mock()
     # The array names a share rule after its principal; there is no index.
+    rule.id = "10314f42-020d-7080-8013-000000000001"
     rule.name = "Everyone"
     rule.principal = "Everyone"
     rule.read = read
@@ -989,11 +1024,14 @@ class TestUpdateSmbSharePolicy:
         update_smb_share_policy(module, blade)
 
         blade.patch_smb_share_policies_rules.assert_called_once()
-        # Addressed by rule name (the principal) within the policy, never by
-        # a "<policy>.<index>" name: share rules have no index.
+        # Addressed by the id of the rule, never by a "<policy>.<index>"
+        # name (share rules have no index) and not by principal and policy
+        # name either: that form does not find the rule of a policy in a
+        # realm for an administrator limited to that realm.
         call_kwargs = blade.patch_smb_share_policies_rules.call_args[1]
-        assert call_kwargs["names"] == ["Everyone"]
-        assert call_kwargs["policy_names"] == ["share_pol"]
+        assert call_kwargs["ids"] == ["10314f42-020d-7080-8013-000000000001"]
+        assert "names" not in call_kwargs
+        assert "policy_names" not in call_kwargs
         assert "context_names" not in call_kwargs
         # PATCH smb-share-policies/rules rejects `principal` ("Invalid body
         # parameter: principal") and derives implied permissions itself, so
@@ -1206,7 +1244,7 @@ class TestShareRuleLadder:
         delete_smb_share_policy(module, blade)
 
         blade.delete_smb_share_policies_rules.assert_called_once_with(
-            policy_names=["share_pol"], names=["Everyone"]
+            ids=["10314f42-020d-7080-8013-000000000001"]
         )
         blade.delete_smb_share_policies.assert_not_called()
         module.exit_json.assert_called_once_with(changed=True)
@@ -1760,9 +1798,9 @@ def _worm_blade(policy=None):
     ok = Mock()
     ok.status_code = 200
     if policy is None:
-        missing = Mock(spec=["status_code"])
-        missing.status_code = 400
-        blade.get_worm_data_policies.return_value = missing
+        blade.get_worm_data_policies.return_value = _error_response(
+            "Worm data policy does not exist."
+        )
     else:
         found = Mock()
         found.status_code = 200
@@ -2108,7 +2146,11 @@ class TestWormMainDispatch:
                                 "plugins.modules.purefb_policy.LooseVersion",
                                 new=_RealLooseVersion,
                             ):
-                                pol.main()
+                                with patch(
+                                    "plugins.modules.purefb_policy.get_error_message",
+                                    new=_array_message,
+                                ):
+                                    pol.main()
 
     @patch("plugins.modules.purefb_policy.create_worm_data_policy")
     def test_autocommit_option_is_rejected_below_2_29(self, mock_create):
@@ -2313,6 +2355,7 @@ class TestOsPolicyActions:
         assert action in _OS_ACCESS_ACTIONS_FALLBACK
 
 
+@patch("plugins.modules.purefb_policy.get_error_message", new=_array_message)
 @patch("plugins.modules.purefb_policy.LooseVersion", RealLooseVersion)
 @patch("plugins.modules.purefb_policy.HAS_PYTZ", True)
 @patch("plugins.modules.purefb_policy.HAS_PYPURECLIENT", True)
@@ -2328,12 +2371,12 @@ class TestOsPolicyMainActions:
         blade = _actions_blade(_CATALOGUE)
         blade.get_fleets.return_value.status_code = 400
         if policy_exists:
-            blade.get_object_store_access_policies.return_value.items = [Mock()]
+            blade.get_object_store_access_policies.return_value = _found(Mock())
         else:
             # A missing policy is an ErrorResponse: no ``items`` at all.
-            missing = Mock(spec=["status_code"])
-            missing.status_code = 400
-            blade.get_object_store_access_policies.return_value = missing
+            blade.get_object_store_access_policies.return_value = _error_response(
+                "Policy does not exist."
+            )
         return blade
 
     def test_argspec_has_no_static_action_choices(
@@ -2381,6 +2424,7 @@ class TestOsPolicyMainActions:
         with pytest.raises(SystemExit, match="fail_json"):
             main()
 
+        assert "s3:Bogus" in module.fail_json.call_args[1]["msg"]
         blade.post_object_store_access_policies.assert_not_called()
         blade.post_object_store_access_policies_rules.assert_not_called()
 
@@ -2404,3 +2448,1155 @@ class TestOsPolicyMainActions:
 
         blade.get_object_store_access_policy_actions.assert_not_called()
         blade.delete_object_store_access_policies.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Realm names, checked reads, rename decisions and check mode.
+#
+# A policy is in a realm when it is named realm::policy; an access policy is
+# in the realm of its account (realm::account). The array matches names
+# without regard to case and answers 400 "... does not exist." for a missing
+# object, which is the only answer that means absent.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_context():
+    """Run a module function as on an array that takes no fleet context,
+    with the array's own text as the error message."""
+    with patch("plugins.modules.purefb_policy.LooseVersion") as loose_version:
+        loose_version.return_value.__le__ = Mock(return_value=False)
+        with patch(
+            "plugins.modules.purefb_policy.get_error_message", new=_array_message
+        ):
+            yield
+
+
+def _sdk_policy(name, policy_id):
+    """A policy as the SDK returns it: the stored name and an id."""
+    policy = Mock()
+    policy.name = name
+    policy.id = policy_id
+    policy.enabled = True
+    return policy
+
+
+def _by_name(policies, missing="Policy does not exist."):
+    """A lookup that answers like the array: 200 for a name it has (matched
+    without regard to case), 400 "does not exist" for any other name."""
+
+    def lookup(names=None, **kwargs):
+        policy = policies.get(names[0].lower())
+        if policy is None:
+            return _error_response(missing)
+        return _found(policy)
+
+    return lookup
+
+
+def _main_module(check_mode=False, **params):
+    """A mock AnsibleModule for main(): every option unset unless given."""
+    module = Mock()
+    module.check_mode = check_mode
+    module.params = defaultdict(
+        lambda: None, {"state": "present", "enabled": True, "context": ""}
+    )
+    module.params.update(params)
+    module.fail_json = Mock(side_effect=SystemExit("fail_json called"))
+    module.exit_json = Mock()
+    return module
+
+
+def _main_blade():
+    """A blade that is not a fleet member."""
+    blade = Mock()
+    blade.get_fleets.return_value = _error_response("Fleet does not exist.")
+    return blade
+
+
+def _run_main(module, blade, **replaced):
+    """Run main() against the mocks. Keyword arguments replace module
+    functions (the create, update, rename and delete entry points)."""
+    import plugins.modules.purefb_policy as pol
+
+    targets = {
+        "AnsibleModule": Mock(return_value=module),
+        "get_system": Mock(return_value=blade),
+        "purefb_argument_spec": Mock(return_value={}),
+        "get_rest_api_version": Mock(return_value="2.30"),
+        "HAS_PYTZ": True,
+        "HAS_PYPURECLIENT": True,
+        "LooseVersion": _RealLooseVersion,
+        "get_error_message": _array_message,
+    }
+    targets.update(replaced)
+    patches = [patch.object(pol, name, new) for name, new in targets.items()]
+    for item in patches:
+        item.start()
+    try:
+        pol.main()
+    finally:
+        for item in reversed(patches):
+            item.stop()
+
+
+class TestRealmNameHelpers:
+    @pytest.mark.parametrize(
+        "name,realm,leaf",
+        [
+            ("pol", "", "pol"),
+            ("rzaudit::pol", "rzaudit", "pol"),
+            ("RZAUDIT::Pol", "RZAUDIT", "Pol"),
+            (None, "", ""),
+        ],
+    )
+    def test_realm_and_leaf(self, name, realm, leaf):
+        import plugins.modules.purefb_policy as pol
+
+        assert pol._realm_of(name) == realm
+        assert pol._leaf(name) == leaf
+
+
+@patch("plugins.modules.purefb_policy.get_error_message", new=_array_message)
+class TestLookup:
+    """Only "does not exist" means absent."""
+
+    def test_found_item_is_returned(self):
+        import plugins.modules.purefb_policy as pol
+
+        policy = _sdk_policy("rzaudit::pol", "id-1")
+        module = _main_module()
+        assert (
+            pol._lookup(module, _found(policy), "NFS export policy", "rzaudit::pol")
+            is policy
+        )
+
+    def test_empty_answer_is_absent(self):
+        import plugins.modules.purefb_policy as pol
+
+        assert pol._lookup(_main_module(), _found(), "file system", "fs1") is None
+
+    def test_does_not_exist_is_absent(self):
+        import plugins.modules.purefb_policy as pol
+
+        res = _error_response("NFS export policy does not exist.")
+        module = _main_module()
+        assert pol._lookup(module, res, "NFS export policy", "pol") is None
+        module.fail_json.assert_not_called()
+
+    def test_refused_read_fails_with_the_array_message(self):
+        import plugins.modules.purefb_policy as pol
+
+        res = _error_response("Operation not permitted.", status=403)
+        module = _main_module()
+        with pytest.raises(SystemExit):
+            pol._lookup(module, res, "NFS export policy", "pol")
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Operation not permitted." in msg
+        assert "NFS export policy pol" in msg
+
+
+# policy_type, lookup, creator, the array's text for a missing policy
+POLICY_TYPES = [
+    ("snapshot", "get_policies", "create_snap_policy", "Policy does not exist."),
+    (
+        "nfs",
+        "get_nfs_export_policies",
+        "create_nfs_policy",
+        "NFS export policy does not exist.",
+    ),
+    (
+        "smb_client",
+        "get_smb_client_policies",
+        "create_smb_client_policy",
+        "SMB client policy does not exist.",
+    ),
+    (
+        "smb_share",
+        "get_smb_share_policies",
+        "create_smb_share_policy",
+        "SMB share policy does not exist.",
+    ),
+    (
+        "worm",
+        "get_worm_data_policies",
+        "create_worm_data_policy",
+        "Worm data policy does not exist.",
+    ),
+    (
+        "network",
+        "get_network_access_policies",
+        "create_network_access_policy",
+        "Network access policy does not exist.",
+    ),
+    (
+        "access",
+        "get_object_store_access_policies",
+        "create_os_policy",
+        "Policy does not exist.",
+    ),
+]
+
+
+@pytest.mark.parametrize("policy_type,getter,creator,missing", POLICY_TYPES)
+class TestMainLookups:
+    """main() takes a policy for absent only when the array says so."""
+
+    @staticmethod
+    def _module(policy_type, name="rzaudit::pol"):
+        params = {"policy_type": policy_type, "name": name}
+        if policy_type == "access":
+            params.update(name="pol", account="rzaudit::acc")
+        if policy_type == "network":
+            params.update(
+                name="default-network-access-policy", interfaces=["management-ssh"]
+            )
+        return _main_module(**params)
+
+    def test_refused_read_is_not_taken_for_absent(
+        self, policy_type, getter, creator, missing
+    ):
+        module = self._module(policy_type)
+        blade = _main_blade()
+        getattr(blade, getter).return_value = _error_response(
+            "Operation not permitted.", status=403
+        )
+        create = Mock()
+
+        with pytest.raises(SystemExit):
+            _run_main(module, blade, **{creator: create})
+
+        create.assert_not_called()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Operation not permitted." in msg
+        assert "cannot be created" not in msg
+
+    def test_missing_policy_is_created(self, policy_type, getter, creator, missing):
+        module = self._module(policy_type)
+        blade = _main_blade()
+        getattr(blade, getter).return_value = _error_response(missing)
+        create = Mock()
+
+        _run_main(module, blade, **{creator: create})
+
+        create.assert_called_once_with(module, blade)
+        module.fail_json.assert_not_called()
+
+    def test_absent_of_a_missing_policy_is_unchanged(
+        self, policy_type, getter, creator, missing
+    ):
+        module = self._module(policy_type)
+        module.params["state"] = "absent"
+        blade = _main_blade()
+        getattr(blade, getter).return_value = _error_response(missing)
+
+        _run_main(module, blade)
+
+        module.fail_json.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+
+RENAME_TYPES = [
+    ("nfs", "get_nfs_export_policies", "rename_nfs_policy"),
+    ("smb_client", "get_smb_client_policies", "rename_smb_client_policy"),
+    ("smb_share", "get_smb_share_policies", "rename_smb_share_policy"),
+    ("snapshot", "get_policies", "rename_snap_policy"),
+]
+
+
+@pytest.mark.parametrize("policy_type,getter,renamer", RENAME_TYPES)
+class TestRenameInMain:
+    """A rename is settled in main(), before the check-mode branch: it never
+    crosses a realm boundary, and it reports ok only when nothing is left
+    to rename."""
+
+    @staticmethod
+    def _run(policy_type, getter, renamer, policies, check_mode=False, **params):
+        module = _main_module(check_mode=check_mode, policy_type=policy_type, **params)
+        blade = _main_blade()
+        lookup = getattr(blade, getter)
+        lookup.side_effect = _by_name(policies)
+        rename = Mock()
+        try:
+            _run_main(module, blade, **{renamer: rename})
+            failed = False
+        except SystemExit:
+            failed = True
+        return module, lookup, rename, failed
+
+    def test_bare_new_name_stays_in_the_realm(self, policy_type, getter, renamer):
+        policies = {"rzaudit::pol": _sdk_policy("rzaudit::pol", "id-1")}
+
+        module, lookup, rename, failed = self._run(
+            policy_type, getter, renamer, policies, name="rzaudit::pol", rename="pol2"
+        )
+
+        assert not failed
+        assert module.params["rename"] == "rzaudit::pol2"
+        assert [call[1]["names"] for call in lookup.call_args_list] == [
+            ["rzaudit::pol"],
+            ["rzaudit::pol2"],
+        ]
+        rename.assert_called_once()
+
+    def test_new_name_takes_the_realm_as_name_spells_it(
+        self, policy_type, getter, renamer
+    ):
+        """The array compares the realm of the two names as written."""
+        policies = {"rzaudit::pol": _sdk_policy("rzaudit::pol", "id-1")}
+
+        module, lookup, rename, failed = self._run(
+            policy_type,
+            getter,
+            renamer,
+            policies,
+            name="RZAUDIT::pol",
+            rename="rzaudit::pol2",
+        )
+
+        assert not failed
+        assert module.params["rename"] == "RZAUDIT::pol2"
+        rename.assert_called_once()
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize(
+        "name,new_name",
+        [
+            ("rzaudit::pol", "other::pol2"),
+            ("pol", "rzaudit::pol2"),
+        ],
+    )
+    def test_rename_across_a_realm_boundary_is_refused(
+        self, policy_type, getter, renamer, name, new_name, check_mode
+    ):
+        policies = {name.lower(): _sdk_policy(name, "id-1")}
+
+        module, lookup, rename, failed = self._run(
+            policy_type,
+            getter,
+            renamer,
+            policies,
+            check_mode=check_mode,
+            name=name,
+            rename=new_name,
+        )
+
+        assert failed
+        assert "into, out of or between realms" in module.fail_json.call_args[1]["msg"]
+        # decided from the names alone: nothing read, nothing written
+        lookup.assert_not_called()
+        rename.assert_not_called()
+
+    def test_array_level_namesake_is_not_the_new_name(
+        self, policy_type, getter, renamer
+    ):
+        """A policy outside the realm that has the bare new name is another
+        policy: the realm policy is still to be renamed."""
+        policies = {
+            "rzaudit::pol": _sdk_policy("rzaudit::pol", "id-1"),
+            "pol2": _sdk_policy("pol2", "id-2"),
+        }
+
+        module, lookup, rename, failed = self._run(
+            policy_type, getter, renamer, policies, name="rzaudit::pol", rename="pol2"
+        )
+
+        assert not failed
+        rename.assert_called_once()
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_neither_name_exists_fails(self, policy_type, getter, renamer, check_mode):
+        module, lookup, rename, failed = self._run(
+            policy_type,
+            getter,
+            renamer,
+            {},
+            check_mode=check_mode,
+            name="rzaudit::pol",
+            rename="pol2",
+        )
+
+        assert failed
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "rzaudit::pol does not exist" in msg
+        rename.assert_not_called()
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_new_name_of_another_policy_fails(
+        self, policy_type, getter, renamer, check_mode
+    ):
+        policies = {
+            "rzaudit::pol": _sdk_policy("rzaudit::pol", "id-1"),
+            "rzaudit::pol2": _sdk_policy("rzaudit::pol2", "id-2"),
+        }
+
+        module, lookup, rename, failed = self._run(
+            policy_type,
+            getter,
+            renamer,
+            policies,
+            check_mode=check_mode,
+            name="rzaudit::pol",
+            rename="pol2",
+        )
+
+        assert failed
+        assert "rzaudit::pol2 already exists" in module.fail_json.call_args[1]["msg"]
+        rename.assert_not_called()
+
+    def test_new_name_that_differs_only_in_case_fails(
+        self, policy_type, getter, renamer
+    ):
+        """The array finds the policy itself under the new name and does not
+        rename a policy to its own name."""
+        policies = {"pol": _sdk_policy("pol", "id-1")}
+
+        module, lookup, rename, failed = self._run(
+            policy_type, getter, renamer, policies, name="pol", rename="POL"
+        )
+
+        assert failed
+        assert "only in case" in module.fail_json.call_args[1]["msg"]
+        rename.assert_not_called()
+
+    def test_already_renamed_is_unchanged(self, policy_type, getter, renamer):
+        policies = {"rzaudit::pol2": _sdk_policy("rzaudit::pol2", "id-1")}
+
+        module, lookup, rename, failed = self._run(
+            policy_type, getter, renamer, policies, name="rzaudit::pol", rename="pol2"
+        )
+
+        assert not failed
+        rename.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+    def test_own_name_is_unchanged(self, policy_type, getter, renamer):
+        policies = {"rzaudit::pol": _sdk_policy("rzaudit::pol", "id-1")}
+
+        module, lookup, rename, failed = self._run(
+            policy_type, getter, renamer, policies, name="rzaudit::pol", rename="pol"
+        )
+
+        assert not failed
+        rename.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+    def test_array_level_rename_is_sent(self, policy_type, getter, renamer):
+        policies = {"pol": _sdk_policy("pol", "id-1")}
+
+        module, lookup, rename, failed = self._run(
+            policy_type, getter, renamer, policies, name="pol", rename="pol2"
+        )
+
+        assert not failed
+        assert module.params["rename"] == "pol2"
+        rename.assert_called_once()
+
+
+class TestWormRenameInMain:
+    def test_rename_of_a_missing_policy_fails(self):
+        module = _main_module(policy_type="worm", name="rzaudit::worm", rename="w2")
+        blade = _main_blade()
+        blade.get_worm_data_policies.side_effect = _by_name({})
+        rename = Mock()
+
+        with pytest.raises(SystemExit):
+            _run_main(module, blade, rename_worm_data_policy=rename)
+
+        assert "does not exist" in module.fail_json.call_args[1]["msg"]
+        rename.assert_not_called()
+
+    def test_rename_of_an_existing_policy_still_warns(self):
+        module = _main_module(policy_type="worm", name="rzaudit::worm", rename="w2")
+        blade = _main_blade()
+        blade.get_worm_data_policies.side_effect = _by_name(
+            {"rzaudit::worm": _sdk_policy("rzaudit::worm", "id-1")}
+        )
+        rename = Mock()
+
+        _run_main(module, blade, rename_worm_data_policy=rename)
+
+        rename.assert_called_once_with(module)
+        module.fail_json.assert_not_called()
+
+
+class TestSnapMemberRealmsInMain:
+    """A snapshot policy and its members share a scope. A member of another
+    scope is refused before anything is read, so no empty policy is left
+    behind and check mode agrees with the real run."""
+
+    @staticmethod
+    def _run(check_mode=False, **params):
+        module = _main_module(check_mode=check_mode, policy_type="snapshot", **params)
+        blade = _main_blade()
+        blade.get_policies.side_effect = _by_name({})
+        create = Mock()
+        try:
+            _run_main(module, blade, create_snap_policy=create)
+            failed = False
+        except SystemExit:
+            failed = True
+        return module, blade, create, failed
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("option", ["filesystem", "replica_link"])
+    @pytest.mark.parametrize(
+        "name,member",
+        [
+            ("rzaudit::snap", "fs1"),
+            ("rzaudit::snap", "other::fs1"),
+            ("snap", "rzaudit::fs1"),
+        ],
+    )
+    def test_member_of_another_scope_is_refused(self, name, member, option, check_mode):
+        module, blade, create, failed = self._run(
+            check_mode=check_mode, name=name, **{option: [member]}
+        )
+
+        assert failed
+        msg = module.fail_json.call_args[1]["msg"]
+        assert member in msg and name in msg
+        assert "same realm" in msg
+        blade.get_policies.assert_not_called()
+        create.assert_not_called()
+
+    def test_detach_of_a_member_of_another_scope_is_refused(self):
+        module, blade, create, failed = self._run(
+            name="rzaudit::snap", state="absent", filesystem=["fs1"]
+        )
+
+        assert failed
+        assert "same realm" in module.fail_json.call_args[1]["msg"]
+
+    @pytest.mark.parametrize(
+        "name,member",
+        [
+            ("snap", "fs1"),
+            ("rzaudit::snap", "rzaudit::fs1"),
+            ("rzaudit::snap", "RZAUDIT::fs1"),
+        ],
+    )
+    def test_member_of_the_same_scope_is_accepted(self, name, member):
+        module, blade, create, failed = self._run(name=name, filesystem=[member])
+
+        assert not failed
+        create.assert_called_once_with(module, blade)
+
+
+def _snap_create_module(check_mode=False, **overrides):
+    module = _snap_module()
+    module.check_mode = check_mode
+    module.params.update(overrides)
+    return module
+
+
+def _replica_link_obj(local, remote):
+    """A FileSystemReplicaLink as GET /file-system-replica-links returns it."""
+    link = Mock(spec=["id", "local_file_system", "remote", "remote_file_system"])
+    link.local_file_system.name = local
+    link.remote.name = remote
+    return link
+
+
+def _fs_member(name, policy="daily_snap_policy"):
+    """A member as GET /policies/file-systems returns it."""
+    member = Mock(spec=["member", "policy"])
+    member.member.name = name
+    member.policy.name = policy
+    return member
+
+
+def _link_member(local, remote, policy="daily_snap_policy"):
+    """A member as GET /policies/file-system-replica-links returns it."""
+    member = Mock(spec=["context", "member", "policy", "link"])
+    member.member.name = local
+    member.policy.name = policy
+    member.link = Mock(spec=["local_file_system", "remote", "remote_file_system"])
+    member.link.local_file_system.name = local
+    member.link.remote.name = remote
+    return member
+
+
+@pytest.mark.usefixtures("no_context")
+class TestCreateSnapPolicyMembers:
+    """Members are looked up before the policy is created."""
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_missing_file_system_fails_before_the_policy_is_created(self, check_mode):
+        module = _snap_create_module(
+            check_mode=check_mode,
+            name="rzaudit::snap",
+            filesystem=["rzaudit::nofs"],
+        )
+        blade = Mock()
+        blade.get_file_systems.return_value = _error_response(
+            "File system does not exist."
+        )
+
+        with pytest.raises(SystemExit):
+            create_snap_policy(module, blade)
+
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "rzaudit::nofs" in msg and "does not exist" in msg
+        blade.post_policies.assert_not_called()
+        blade.post_policies_file_systems.assert_not_called()
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_file_system_without_a_replica_link_fails_before_the_policy_is_created(
+        self, check_mode
+    ):
+        """A file system without a replica link is a 200 with no items."""
+        module = _snap_create_module(
+            check_mode=check_mode, name="snap", replica_link=["fs1"]
+        )
+        blade = Mock()
+        blade.get_file_system_replica_links.return_value = _found()
+
+        with pytest.raises(SystemExit):
+            create_snap_policy(module, blade)
+
+        assert "has no replica link" in module.fail_json.call_args[1]["msg"]
+        blade.post_policies.assert_not_called()
+
+    def test_refused_file_system_read_fails_with_the_array_message(self):
+        module = _snap_create_module(name="rzaudit::snap", filesystem=["rzaudit::fs1"])
+        blade = Mock()
+        blade.get_file_systems.return_value = _error_response(
+            "Operation not permitted.", status=403
+        )
+
+        with pytest.raises(SystemExit):
+            create_snap_policy(module, blade)
+
+        assert "Operation not permitted." in module.fail_json.call_args[1]["msg"]
+        blade.post_policies.assert_not_called()
+
+    def test_members_are_attached_after_the_policy_is_created(self):
+        module = _snap_create_module(
+            name="rzaudit::snap",
+            filesystem=["rzaudit::fs1"],
+            replica_link=["rzaudit::fs2"],
+        )
+        blade = Mock()
+        blade.get_file_systems.return_value = _found(Mock())
+        blade.get_file_system_replica_links.return_value = _found(
+            _replica_link_obj("rzaudit::fs2", "remote-array")
+        )
+        for call in (
+            blade.post_policies,
+            blade.post_policies_file_systems,
+            blade.post_policies_file_system_replica_links,
+        ):
+            call.return_value.status_code = 200
+
+        create_snap_policy(module, blade)
+
+        blade.get_file_system_replica_links.assert_called_once_with(
+            local_file_system_names=["rzaudit::fs2"]
+        )
+        blade.post_policies_file_systems.assert_called_once_with(
+            policy_names=["rzaudit::snap"], member_names=["rzaudit::fs1"]
+        )
+        blade.post_policies_file_system_replica_links.assert_called_once_with(
+            policy_names=["rzaudit::snap"],
+            local_file_system_names=["rzaudit::fs2"],
+            remote_names=["remote-array"],
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_check_mode_reads_the_members_and_writes_nothing(self):
+        module = _snap_create_module(
+            check_mode=True, name="snap", filesystem=["fs1"], replica_link=["fs2"]
+        )
+        blade = Mock()
+        blade.get_file_systems.return_value = _found(Mock())
+        blade.get_file_system_replica_links.return_value = _found(
+            _replica_link_obj("fs2", "remote-array")
+        )
+
+        create_snap_policy(module, blade)
+
+        blade.get_file_systems.assert_called_once()
+        blade.get_file_system_replica_links.assert_called_once()
+        blade.post_policies.assert_not_called()
+        blade.post_policies_file_systems.assert_not_called()
+        blade.post_policies_file_system_replica_links.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+
+
+def _member_blade(file_systems=(), links=()):
+    """A blade for update_snap_policy whose policy has the given members.
+    Like the SDK client, it has no get_file_systems_replica_links."""
+    blade = _snap_blade(_snap_rule())
+    del blade.get_file_systems_replica_links
+    blade.get_policies_file_systems.return_value = _found(*file_systems)
+    blade.get_policies_file_system_replica_links.return_value = _found(*links)
+    blade.get_file_systems.return_value = _found(Mock())
+    for call in (
+        blade.post_policies_file_systems,
+        blade.delete_policies_file_systems,
+        blade.post_policies_file_system_replica_links,
+        blade.delete_policies_file_system_replica_links,
+    ):
+        call.return_value.status_code = 200
+    return blade
+
+
+def _member_module(check_mode=False, **overrides):
+    """An update_snap_policy task that only names members."""
+    module = _snap_module()
+    module.check_mode = check_mode
+    module.params.update(overrides)
+    return module
+
+
+@pytest.mark.usefixtures("no_context")
+class TestSnapPolicyFileSystemMembers:
+    def test_check_mode_attach_writes_nothing(self):
+        module = _member_module(
+            check_mode=True, name="rzaudit::snap", filesystem=["rzaudit::fs1"]
+        )
+        blade = _member_blade()
+
+        update_snap_policy(module, blade)
+
+        blade.get_file_systems.assert_called_once()
+        blade.post_policies_file_systems.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_check_mode_detach_writes_nothing(self):
+        module = _member_module(
+            check_mode=True,
+            name="rzaudit::snap",
+            state="absent",
+            filesystem=["rzaudit::fs1"],
+        )
+        blade = _member_blade(file_systems=[_fs_member("rzaudit::fs1")])
+
+        update_snap_policy(module, blade)
+
+        blade.delete_policies_file_systems.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_attach(self):
+        module = _member_module(name="rzaudit::snap", filesystem=["rzaudit::fs1"])
+        blade = _member_blade()
+
+        update_snap_policy(module, blade)
+
+        blade.post_policies_file_systems.assert_called_once_with(
+            policy_names=["rzaudit::snap"], member_names=["rzaudit::fs1"]
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_detach(self):
+        module = _member_module(
+            name="rzaudit::snap", state="absent", filesystem=["rzaudit::fs1"]
+        )
+        blade = _member_blade(file_systems=[_fs_member("rzaudit::fs1")])
+
+        update_snap_policy(module, blade)
+
+        blade.delete_policies_file_systems.assert_called_once_with(
+            policy_names=["rzaudit::snap"], member_names=["rzaudit::fs1"]
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_member_in_another_case_is_already_attached(self):
+        """The array returns the stored spelling of a member."""
+        module = _member_module(name="rzaudit::snap", filesystem=["RZAUDIT::FS1"])
+        blade = _member_blade(file_systems=[_fs_member("rzaudit::fs1")])
+
+        update_snap_policy(module, blade)
+
+        blade.post_policies_file_systems.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+    def test_member_in_another_case_is_detached(self):
+        module = _member_module(
+            name="rzaudit::snap", state="absent", filesystem=["RZAUDIT::FS1"]
+        )
+        blade = _member_blade(file_systems=[_fs_member("rzaudit::fs1")])
+
+        update_snap_policy(module, blade)
+
+        blade.delete_policies_file_systems.assert_called_once()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_same_member_twice_is_attached_once(self):
+        module = _member_module(name="snap", filesystem=["fs1", "FS1"])
+        blade = _member_blade()
+
+        update_snap_policy(module, blade)
+
+        blade.post_policies_file_systems.assert_called_once()
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_missing_file_system_fails(self, check_mode):
+        module = _member_module(check_mode=check_mode, name="snap", filesystem=["fs1"])
+        blade = _member_blade()
+        blade.get_file_systems.return_value = _error_response(
+            "File system does not exist."
+        )
+
+        with pytest.raises(SystemExit):
+            update_snap_policy(module, blade)
+
+        assert "fs1" in module.fail_json.call_args[1]["msg"]
+        blade.post_policies_file_systems.assert_not_called()
+
+    def test_refused_member_read_fails_with_the_array_message(self):
+        module = _member_module(name="snap", filesystem=["fs1"])
+        blade = _member_blade()
+        blade.get_policies_file_systems.return_value = _error_response(
+            "Operation not permitted.", status=403
+        )
+
+        with pytest.raises(SystemExit):
+            update_snap_policy(module, blade)
+
+        assert "Operation not permitted." in module.fail_json.call_args[1]["msg"]
+
+
+@pytest.mark.usefixtures("no_context")
+class TestSnapPolicyReplicaLinkMembers:
+    """A replica link is addressed by its local file system and its remote."""
+
+    def test_attach_looks_the_link_up_and_names_its_remote(self):
+        module = _member_module(name="snap", replica_link=["fs1"])
+        blade = _member_blade()
+        blade.get_file_system_replica_links.return_value = _found(
+            _replica_link_obj("fs1", "remote-array")
+        )
+
+        update_snap_policy(module, blade)
+
+        blade.get_file_system_replica_links.assert_called_once_with(
+            local_file_system_names=["fs1"]
+        )
+        blade.post_policies_file_system_replica_links.assert_called_once_with(
+            policy_names=["snap"],
+            local_file_system_names=["fs1"],
+            remote_names=["remote-array"],
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_check_mode_attach_writes_nothing(self):
+        module = _member_module(check_mode=True, name="snap", replica_link=["fs1"])
+        blade = _member_blade()
+        blade.get_file_system_replica_links.return_value = _found(
+            _replica_link_obj("fs1", "remote-array")
+        )
+
+        update_snap_policy(module, blade)
+
+        blade.post_policies_file_system_replica_links.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_attached_link_is_unchanged(self):
+        module = _member_module(name="rzaudit::snap", replica_link=["RZAUDIT::fs1"])
+        blade = _member_blade(links=[_link_member("rzaudit::fs1", "remote-array")])
+
+        update_snap_policy(module, blade)
+
+        blade.get_file_system_replica_links.assert_not_called()
+        blade.post_policies_file_system_replica_links.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+    def test_detach_names_the_remote_of_the_link(self):
+        module = _member_module(name="snap", state="absent", replica_link=["fs1"])
+        blade = _member_blade(links=[_link_member("fs1", "remote-array")])
+
+        update_snap_policy(module, blade)
+
+        blade.delete_policies_file_system_replica_links.assert_called_once_with(
+            policy_names=["snap"],
+            local_file_system_names=["fs1"],
+            remote_names=["remote-array"],
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_check_mode_detach_writes_nothing(self):
+        module = _member_module(
+            check_mode=True, name="snap", state="absent", replica_link=["fs1"]
+        )
+        blade = _member_blade(links=[_link_member("fs1", "remote-array")])
+
+        update_snap_policy(module, blade)
+
+        blade.delete_policies_file_system_replica_links.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_detach_of_a_link_that_is_not_attached_is_unchanged(self):
+        module = _member_module(name="snap", state="absent", replica_link=["fs1"])
+        blade = _member_blade()
+
+        update_snap_policy(module, blade)
+
+        blade.delete_policies_file_system_replica_links.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_file_system_without_a_replica_link_fails(self, check_mode):
+        module = _member_module(
+            check_mode=check_mode, name="snap", replica_link=["fs1"]
+        )
+        blade = _member_blade()
+        blade.get_file_system_replica_links.return_value = _found()
+
+        with pytest.raises(SystemExit):
+            update_snap_policy(module, blade)
+
+        assert "has no replica link" in module.fail_json.call_args[1]["msg"]
+        blade.post_policies_file_system_replica_links.assert_not_called()
+
+    def test_missing_file_system_fails(self):
+        module = _member_module(name="snap", replica_link=["fs1"])
+        blade = _member_blade()
+        blade.get_file_system_replica_links.return_value = _error_response(
+            "File system does not exist."
+        )
+
+        with pytest.raises(SystemExit):
+            update_snap_policy(module, blade)
+
+        assert "fs1" in module.fail_json.call_args[1]["msg"]
+
+    def test_member_without_link_details_is_matched_by_its_reference(self):
+        """The remote is then read from the replica link itself."""
+        import plugins.modules.purefb_policy as pol
+
+        member = Mock(spec=["member", "policy"])
+        member.member.name = "fs1"
+        assert pol._member_link(member) == ("fs1", None)
+
+        module = _member_module(name="snap", state="absent", replica_link=["fs1"])
+        blade = _member_blade(links=[member])
+        blade.get_file_system_replica_links.return_value = _found(
+            _replica_link_obj("fs1", "remote-array")
+        )
+
+        update_snap_policy(module, blade)
+
+        blade.delete_policies_file_system_replica_links.assert_called_once_with(
+            policy_names=["snap"],
+            local_file_system_names=["fs1"],
+            remote_names=["remote-array"],
+        )
+
+
+@pytest.mark.usefixtures("no_context")
+class TestSmbShareRuleInRealm:
+    """A share rule is addressed by its id for every administrator."""
+
+    def test_rule_of_a_realm_policy_is_patched_by_id(self):
+        module = _share_module(
+            name="rzaudit::share_pol",
+            read="allow",
+            change="allow",
+            full_control="allow",
+        )
+        blade = _share_blade([_share_rule()])
+
+        update_smb_share_policy(module, blade)
+
+        blade.get_smb_share_policies_rules.assert_called_once_with(
+            policy_names=["rzaudit::share_pol"], filter="principal='Everyone'"
+        )
+        call_kwargs = blade.patch_smb_share_policies_rules.call_args[1]
+        assert call_kwargs["ids"] == ["10314f42-020d-7080-8013-000000000001"]
+        assert "names" not in call_kwargs and "policy_names" not in call_kwargs
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_rule_of_a_realm_policy_is_deleted_by_id(self):
+        module = _share_module(name="rzaudit::share_pol")
+        blade = _share_blade([_share_rule()])
+
+        delete_smb_share_policy(module, blade)
+
+        blade.delete_smb_share_policies_rules.assert_called_once_with(
+            ids=["10314f42-020d-7080-8013-000000000001"]
+        )
+        blade.delete_smb_share_policies.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_check_mode_sends_no_rule_write(self):
+        module = _share_module(name="rzaudit::share_pol", full_control="allow")
+        module.check_mode = True
+        blade = _share_blade([_share_rule()])
+
+        update_smb_share_policy(module, blade)
+
+        blade.patch_smb_share_policies_rules.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+
+
+@pytest.mark.usefixtures("no_context")
+class TestSmbPolicyCreateNeedsItsRule:
+    """A new SMB policy is created with its first rule: without the rule
+    field nothing is created, in check mode too."""
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_share_policy_without_principal_creates_nothing(self, check_mode):
+        module = _share_module(name="rzaudit::share_pol", principal=None)
+        module.check_mode = check_mode
+        blade = Mock()
+
+        with pytest.raises(SystemExit):
+            create_smb_share_policy(module, blade)
+
+        assert "principal is required" in module.fail_json.call_args[1]["msg"]
+        blade.post_smb_share_policies.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_client_policy_without_client_creates_nothing(self, check_mode):
+        module = _share_module(name="rzaudit::client_pol", client=None)
+        module.check_mode = check_mode
+        blade = Mock()
+
+        with pytest.raises(SystemExit):
+            create_smb_client_policy(module, blade)
+
+        assert "client is required" in module.fail_json.call_args[1]["msg"]
+        blade.post_smb_client_policies.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    def test_share_policy_with_principal_is_created_with_its_rule(self):
+        module = _share_module(name="rzaudit::share_pol", read="allow")
+        blade = Mock()
+        blade.post_smb_share_policies.return_value.status_code = 200
+        blade.post_smb_share_policies_rules.return_value.status_code = 200
+
+        create_smb_share_policy(module, blade)
+
+        blade.post_smb_share_policies.assert_called_once_with(
+            names=["rzaudit::share_pol"]
+        )
+        blade.post_smb_share_policies_rules.assert_called_once()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_share_policy_check_mode_with_principal_is_changed(self):
+        module = _share_module(name="rzaudit::share_pol", read="allow")
+        module.check_mode = True
+        blade = Mock()
+
+        create_smb_share_policy(module, blade)
+
+        blade.post_smb_share_policies.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+
+
+@pytest.mark.usefixtures("no_context")
+class TestAccessPolicyInRealm:
+    """An access policy is in the realm of its account."""
+
+    def test_create_failure_carries_the_array_message(self):
+        module = _os_module(
+            account="zznorealm::acc", name="pol", rule=None, desc="", user=None
+        )
+        blade = Mock()
+        blade.post_object_store_access_policies.return_value = _error_response(
+            "Realm does not exist."
+        )
+
+        with pytest.raises(SystemExit):
+            create_os_policy(module, blade)
+
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "zznorealm::acc/pol" in msg
+        assert "Realm does not exist." in msg
+
+    @pytest.mark.parametrize("state", ["present", "absent", "copy"])
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_realm_on_the_policy_name_is_refused(self, state, check_mode):
+        module = _main_module(
+            check_mode=check_mode,
+            policy_type="access",
+            state=state,
+            account="acc",
+            name="rzaudit::pol",
+        )
+        blade = _main_blade()
+        create = Mock()
+
+        with pytest.raises(SystemExit):
+            _run_main(module, blade, create_os_policy=create)
+
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "realm::account" in msg
+        blade.get_object_store_access_policies.assert_not_called()
+        create.assert_not_called()
+
+    def test_realm_on_the_account_is_looked_up_and_created(self):
+        module = _main_module(policy_type="access", account="rzaudit::acc", name="pol")
+        blade = _main_blade()
+        blade.get_object_store_access_policies.return_value = _error_response(
+            "Policy does not exist."
+        )
+        create = Mock()
+
+        _run_main(module, blade, create_os_policy=create)
+
+        blade.get_object_store_access_policies.assert_called_once_with(
+            names=["rzaudit::acc/pol"]
+        )
+        create.assert_called_once_with(module, blade)
+
+    def test_existing_target_rule_message_names_the_target_policy(self):
+        module = _os_module(
+            account="rzaudit::acc",
+            name="pol",
+            rule="r1",
+            target="other::acc/pol",
+            target_rule=None,
+        )
+        blade = Mock()
+        blade.get_object_store_access_policies_rules.return_value = _found(_os_rule())
+
+        with pytest.raises(SystemExit):
+            copy_os_policy_rule(module, blade)
+
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Target rule r1 already exists in policy other::acc/pol" in msg
+        assert "rzaudit::acc/pol" not in msg
+        blade.post_object_store_access_policies_rules.assert_not_called()
+
+
+class TestCopyWormPolicyCommitMode:
+    """The array reports an autocommit configuration for every WORM policy
+    and accepts one only with commit_mode autocommit or hybrid."""
+
+    @worm_env()
+    def test_copy_of_a_manual_policy_sends_no_autocommit_config(self):
+        module = _copy_module(policy_type="worm", target="rzaudit::worm_copy")
+        blade = _worm_blade()
+
+        copy_policy(module, blade, _worm_policy(commit_mode="manual"))
+
+        call = blade.post_worm_data_policies.call_args[1]
+        assert call["names"] == ["rzaudit::worm_copy"]
+        assert call["policy"] == dict(
+            LEGACY_BODY,
+            mode="compliance",
+            retention_lock="unlocked",
+            commit_mode="manual",
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    @worm_env()
+    def test_copy_of_a_hybrid_policy_keeps_the_autocommit_config(self):
+        module = _copy_module(policy_type="worm")
+        blade = _worm_blade()
+        source = _worm_policy(
+            commit_mode="hybrid", delay_on="creation", delay_period=7200000
+        )
+
+        copy_policy(module, blade, source)
+
+        policy = blade.post_worm_data_policies.call_args[1]["policy"]
+        assert policy["commit_mode"] == "hybrid"
+        assert policy["autocommit_config"] == {
+            "delay_on": "creation",
+            "delay_period": 7200000,
+        }

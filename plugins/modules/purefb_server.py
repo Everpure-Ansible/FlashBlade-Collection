@@ -32,8 +32,9 @@ description:
   the only one attached to a virtual host, attach another server to that
   virtual host or delete the virtual host first. Then detach the server from
   every virtual host with M(everpure.flashblade.purefb_virtualhost) and
-  delete it. Applies from Purity//FB 4.6.3 (REST 2.20), where virtual hosts
-  have attached servers.
+  delete it. The delete is also refused when the virtual hosts, or the
+  servers attached to them, cannot be read. Applies from Purity//FB 4.6.3
+  (REST 2.20), where virtual hosts have attached servers.
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
@@ -153,22 +154,35 @@ VHOST_SERVERS_API_VERSION = "2.20"
 WILDCARD_SERVER = "*"
 
 
+_UNSET = object()
+
+
+def _field(obj, key, default=None):
+    """Return a field of an SDK object or of a plain dict"""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
 def _reference_keys(ref):
-    """Return the name and ID of a server reference"""
-    if isinstance(ref, dict):
-        return ref.get("name"), ref.get("id")
-    return getattr(ref, "name", None), getattr(ref, "id", None)
+    """Return the name and ID of a server or of a server reference"""
+    return _field(ref, "name"), _field(ref, "id")
 
 
-def _virtual_hosts_of_server(module, blade, server_id):
+def _virtual_hosts_of_server(module, blade, servers):
     """Return the names of the object store virtual hosts attached to the
-    server: those with no other server attached, and those that are attached
-    to other servers as well.
+    servers the delete addresses: those with no other server attached, and
+    those that are attached to other servers as well.
 
     The delete is only sent once it is known that no virtual host is
-    attached to the server, so a failed read stops the module and an
-    attached server that cannot be identified counts as this server. The
-    wildcard * is not a server and never counts as another one.
+    attached, so the module stops when the virtual hosts or their attached
+    servers cannot be read, and an attached server that cannot be identified
+    counts as one of the servers to delete. The wildcard * is not a server
+    and never counts as another one.
+
+    ``servers`` is every server the lookup of the name returned. Server
+    names are not case sensitive and a name holding a comma matches more
+    than one server, so each of them is compared, by ID and by name.
     """
     name = module.params["name"]
     res = blade.get_object_store_virtual_hosts()
@@ -178,21 +192,47 @@ def _virtual_hosts_of_server(module, blade, server_id):
             "virtual hosts to check that none is attached to it. "
             "Error: {1}".format(name, get_error_message(res))
         )
+    names = set([name.lower()])
+    ids = set()
+    for server in servers:
+        server_name, server_id = _reference_keys(server)
+        if server_name:
+            names.add(str(server_name).lower())
+        if server_id:
+            ids.add(server_id)
     sole = []
     shared = []
+    unknown = []
     for vhost in list(res.items):
+        refs = _field(vhost, "attached_servers", _UNSET)
+        if refs is _UNSET:
+            # The client speaks a REST version without attached servers
+            unknown.append(str(_field(vhost, "name")))
+            continue
         attached = False
         others = False
-        for ref in getattr(vhost, "attached_servers", None) or []:
+        for ref in refs or []:
             ref_name, ref_id = _reference_keys(ref)
-            if ref_name is None and ref_id is None:
+            if ref_id is not None and ref_id in ids:
                 attached = True
-            elif ref_name == name or (server_id and ref_id == server_id):
+            elif ref_name is not None and str(ref_name).lower() in names:
+                attached = True
+            elif ref_name is None and (ref_id is None or not ids):
                 attached = True
             elif ref_name != WILDCARD_SERVER:
                 others = True
         if attached:
-            (shared if others else sole).append(str(vhost.name))
+            (shared if others else sole).append(str(_field(vhost, "name")))
+    if unknown:
+        module.fail_json(
+            msg="Server {0} was not deleted: the servers attached to the "
+            "object store virtual hosts {1} are not reported to this client, "
+            "so it cannot be checked that none of them is attached to the "
+            "server. Use a py-pure-client release that supports REST {2} or "
+            "higher.".format(
+                name, ", ".join(sorted(unknown)), VHOST_SERVERS_API_VERSION
+            )
+        )
     return sorted(sole), sorted(shared)
 
 
@@ -203,8 +243,7 @@ def delete_server(module, blade, api_version, servers):
         # Neither the delete nor any change to a virtual host is sent while
         # a virtual host is attached to the server, whatever the array would
         # do with the attachment.
-        server_id = getattr(servers[0], "id", None) if servers else None
-        sole, shared = _virtual_hosts_of_server(module, blade, server_id)
+        sole, shared = _virtual_hosts_of_server(module, blade, servers)
         if sole or shared:
             msg = (
                 "Server {0} was not deleted because it is attached to object "

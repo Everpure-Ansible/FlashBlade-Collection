@@ -120,6 +120,8 @@ def _ref(name):
 SERVER_ID = "0a0a0a0a-1111-2222-3333-444444444444"
 OTHER_ID = "0b0b0b0b-1111-2222-3333-444444444444"
 WILDCARD_ID = "0c0c0c0c-1111-2222-3333-444444444444"
+THIRD_ID = "0d0d0d0d-1111-2222-3333-444444444444"
+FOURTH_ID = "0e0e0e0e-1111-2222-3333-444444444444"
 
 
 def _server(
@@ -805,6 +807,200 @@ class TestPurefbServer:
             if call[0].startswith(("post_", "patch_", "delete_", "put_"))
         ]
         assert written == []
+
+    # ---------------- delete: every server the name resolves to ----------------
+
+    def test_delete_checks_every_server_the_name_matches(self):
+        """A name holding a comma matches several servers and each one is checked"""
+        vhosts = [_vhost("acme-s3", _attached("myserver", SERVER_ID))]
+        params = _base_params(name="aserver,myserver", state="absent")
+        for found in (
+            [_server(name="aserver", server_id=OTHER_ID), _server()],
+            [_server(), _server(name="zserver", server_id=OTHER_ID)],
+        ):
+            for check_mode in (False, True):
+                blade = _delete_blade(vhosts)
+                blade.get_servers.return_value = _response(200, found)
+
+                module = _run_main(params, blade, check_mode=check_mode)
+
+                blade.get_servers.assert_called_once_with(names=["aserver,myserver"])
+                blade.delete_servers.assert_not_called()
+                module.exit_json.assert_not_called()
+                module.fail_json.assert_called_once()
+                msg = module.fail_json.call_args[1]["msg"]
+                assert "Server aserver,myserver was not deleted" in msg
+                assert "only server attached to acme-s3:" in msg
+
+    def test_delete_of_all_servers_of_a_virtual_host_leaves_it_none(self):
+        """Servers deleted together are not each other's remaining server"""
+        blade = _delete_blade(
+            [
+                _vhost(
+                    "acme-s3",
+                    _attached("aserver", OTHER_ID),
+                    _attached("myserver", SERVER_ID),
+                )
+            ]
+        )
+        blade.get_servers.return_value = _response(
+            200, [_server(name="aserver", server_id=OTHER_ID), _server()]
+        )
+
+        module = _run_main(_base_params(name="aserver,myserver", state="absent"), blade)
+
+        blade.delete_servers.assert_not_called()
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "only server attached to acme-s3:" in msg
+        assert "along with other servers" not in msg
+
+    def test_delete_matches_server_name_whatever_the_case(self):
+        """Server names are not case sensitive, so the reported name counts too"""
+        blade = _delete_blade([_vhost("acme-s3", _attached("myserver"))])
+        blade.get_servers.return_value = _response(200, [_server(server_id=None)])
+
+        module = _run_main(_base_params(name="MYSERVER", state="absent"), blade)
+
+        blade.get_servers.assert_called_once_with(names=["MYSERVER"])
+        blade.delete_servers.assert_not_called()
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Server MYSERVER was not deleted" in msg
+        assert "only server attached to acme-s3:" in msg
+
+        blade = _delete_blade([_vhost("acme-s3", _attached("MyServer"))])
+        blade.get_servers.return_value = _response(200, [_server(server_id=None)])
+
+        module = _run_main(_base_params(state="absent"), blade)
+
+        blade.delete_servers.assert_not_called()
+        module.fail_json.assert_called_once()
+        assert "acme-s3" in module.fail_json.call_args[1]["msg"]
+
+    def test_delete_allowed_under_other_spelling_without_attachment(self):
+        """The wider match leaves a server no virtual host is attached to alone"""
+        blade = _delete_blade(
+            [
+                _builtin_vhost(),
+                _vhost("acme-s3", _attached("otherserver", OTHER_ID)),
+                _vhost("realm1::acme", _attached("realm1::myserver", THIRD_ID)),
+                _vhost("acme-2", _attached("myserver2", FOURTH_ID)),
+            ]
+        )
+
+        module = _run_main(_base_params(name="MYSERVER", state="absent"), blade)
+
+        blade.get_object_store_virtual_hosts.assert_called_once_with()
+        blade.delete_servers.assert_called_once_with(
+            names=["MYSERVER"], cascade_delete="directory-services"
+        )
+        module.fail_json.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_delete_id_only_reference_needs_a_server_id(self):
+        """A reference with only an ID blocks when the server has no ID to compare"""
+        vhosts = [_vhost("acme-s3", _attached(None, OTHER_ID))]
+        blade = _delete_blade(vhosts)
+        blade.get_servers.return_value = _response(200, [_server(server_id=None)])
+
+        module = _run_main(_base_params(state="absent"), blade)
+
+        blade.delete_servers.assert_not_called()
+        module.fail_json.assert_called_once()
+        assert "acme-s3" in module.fail_json.call_args[1]["msg"]
+
+        blade = _delete_blade(vhosts)
+
+        module = _run_main(_base_params(state="absent"), blade)
+
+        blade.delete_servers.assert_called_once_with(
+            names=["myserver"], cascade_delete="directory-services"
+        )
+        module.fail_json.assert_not_called()
+
+    # ---------------- delete: attachments that cannot be read ----------------
+
+    def test_delete_refused_when_attached_servers_are_not_reported(self):
+        """A client speaking REST before 2.20 to a newer array sees no attachments"""
+        for check_mode in (False, True):
+            old_shape = Mock(spec=["id", "name"])
+            old_shape.name = "acme-s3"
+            builtin = Mock(spec=["id", "name"])
+            builtin.name = "s3.amazonaws.com"
+            blade = _delete_blade([builtin, old_shape])
+
+            module = _run_main(
+                _base_params(state="absent"), blade, check_mode=check_mode
+            )
+
+            blade.delete_servers.assert_not_called()
+            module.exit_json.assert_not_called()
+            module.fail_json.assert_called_once()
+            msg = module.fail_json.call_args[1]["msg"]
+            assert "Server myserver was not deleted" in msg
+            assert "acme-s3, s3.amazonaws.com are not reported" in msg
+            assert "py-pure-client release that supports REST 2.20" in msg
+
+    def test_delete_reads_dict_virtual_hosts(self):
+        """Virtual hosts given as plain dicts are read the same way"""
+        blade = _delete_blade(
+            [
+                {
+                    "name": "acme-s3",
+                    "attached_servers": [{"id": SERVER_ID, "name": "myserver"}],
+                }
+            ]
+        )
+
+        module = _run_main(_base_params(state="absent"), blade)
+
+        blade.delete_servers.assert_not_called()
+        module.fail_json.assert_called_once()
+        assert (
+            "only server attached to acme-s3:" in module.fail_json.call_args[1]["msg"]
+        )
+
+        blade = _delete_blade([{"name": "acme-s3"}])
+
+        module = _run_main(_base_params(state="absent"), blade)
+
+        blade.delete_servers.assert_not_called()
+        module.fail_json.assert_called_once()
+        assert "acme-s3 are not reported" in module.fail_json.call_args[1]["msg"]
+
+    def test_delete_not_sent_when_virtual_host_read_raises(self):
+        """An exception while reading the virtual hosts leaves the server alone"""
+        blade = _delete_blade()
+        blade.get_object_store_virtual_hosts.side_effect = RuntimeError("lost")
+        raised = False
+
+        try:
+            _run_main(_base_params(state="absent"), blade)
+        except RuntimeError:
+            raised = True
+
+        assert raised
+        blade.delete_servers.assert_not_called()
+
+    def test_delete_not_sent_when_a_later_page_cannot_be_read(self):
+        """A page of virtual hosts that fails to load stops the module first"""
+
+        def _pages():
+            yield _builtin_vhost()
+            raise RuntimeError("next page failed")
+
+        blade = _delete_blade()
+        blade.get_object_store_virtual_hosts.return_value = _response(200, _pages())
+        raised = False
+
+        try:
+            _run_main(_base_params(state="absent"), blade)
+        except RuntimeError:
+            raised = True
+
+        assert raised
+        blade.delete_servers.assert_not_called()
 
     # ---------------- gates ----------------
 

@@ -139,6 +139,23 @@ def _full_record(name="9228"):
     )
 
 
+# The array keeps only the ID of a realm once the realm is eradicated
+ERADICATED_REALM_ID = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
+
+
+def _realm_record(name="14075", realm="realm1"):
+    """A record of a command run on an object inside a realm"""
+    return _record(
+        name=name,
+        user="svc-ansible",
+        user_interface="REST",
+        command="purefs",
+        subcommand="create",
+        arguments="--size '1G' {0}::fs1".format(realm),
+        scopes=[_Audit(id="id-" + realm, name=realm, resource_type="realms")],
+    )
+
+
 def _base_params(**overrides):
     params = {
         "start": None,
@@ -148,6 +165,7 @@ def _base_params(**overrides):
         "command": None,
         "user_interface": None,
         "correlation_id": None,
+        "scopes": None,
         "include_system_events": False,
         "newest_first": False,
         "limit": None,
@@ -264,13 +282,53 @@ class TestPurefbAudits:
             command="purefs",
             user_interface="REST",
             correlation_id="6f1c",
+            scopes=["realm1"],
         )
         expected = (
             "time>={0} and time<={1} and user='pureuser' and command='purefs' "
             "and user_interface='REST' and correlation_id='6f1c*' "
-            "and system_event='false'"
+            "and scopes.name='realm1' and system_event='false'"
         ).format(WINDOW_START_MS, WINDOW_END_MS)
         assert _build_filter(module, "2.30", "UTC") == expected
+
+    @patch(MODULE + ".LooseVersion", LooseVersion)
+    def test_build_filter_one_scope(self):
+        """One realm name becomes a scopes.name filter, with no parentheses"""
+        assert (
+            _build_filter(_module(scopes=["realm1"]), "2.30", "UTC")
+            == "scopes.name='realm1' and system_event='false'"
+        )
+        # Scopes arrived in 2.20, before the system_event field
+        assert (
+            _build_filter(_module(scopes=["realm1"]), "2.20", "UTC")
+            == "scopes.name='realm1'"
+        )
+
+    @patch(MODULE + ".LooseVersion", LooseVersion)
+    def test_build_filter_several_scopes_match_any(self):
+        """Several names are OR-ed inside parentheses and AND-ed with the rest"""
+        module = _module(command="purefs", scopes=["realm1", "array1"])
+        assert _build_filter(module, "2.30", "UTC") == (
+            "command='purefs' and (scopes.name='realm1' or scopes.name='array1') "
+            "and system_event='false'"
+        )
+
+    @patch(MODULE + ".LooseVersion", LooseVersion)
+    def test_build_filter_ignores_empty_and_repeated_scopes(self):
+        """Empty entries and repeats are dropped; nothing left means no filter"""
+        module = _module(scopes=["realm1", "", "realm1"])
+        assert _build_filter(module, "2.20", "UTC") == "scopes.name='realm1'"
+        assert _build_filter(_module(scopes=[""]), "2.20", "UTC") is None
+        assert _build_filter(_module(scopes=[]), "2.20", "UTC") is None
+        assert _build_filter(_module(scopes=None), "2.20", "UTC") is None
+
+    @patch(MODULE + ".LooseVersion", LooseVersion)
+    def test_build_filter_passes_wildcard_and_qualified_scope_unchanged(self):
+        """A wildcard or a realm::object value is sent as given, never split"""
+        module = _module(scopes=["tenant*", "realm1::fs1"])
+        assert _build_filter(module, "2.20", "UTC") == (
+            "(scopes.name='tenant*' or scopes.name='realm1::fs1')"
+        )
 
     @patch(MODULE + ".LooseVersion", LooseVersion)
     def test_build_filter_rejects_end_before_start(self):
@@ -301,6 +359,17 @@ class TestPurefbAudits:
         module = _module(user="svc-ansible", command="purefs", user_interface="REST")
         _validate_filter_values(module)
         module.fail_json.assert_not_called()
+
+    def test_validate_filter_values_rejects_single_quote_in_a_scope(self):
+        """A scope name containing a single quote is refused"""
+        module = _module(scopes=["realm1", "o'realm"])
+        try:
+            _validate_filter_values(module)
+        except SystemExit:
+            pass
+        module.fail_json.assert_called_once_with(
+            msg="scopes value o'realm must not contain a single quote"
+        )
 
     # ---------------- _resolve_timezone ----------------
 
@@ -395,6 +464,36 @@ class TestPurefbAudits:
         assert result["system_event"] is False
         assert result["correlation_id"] is None
         assert result["origin"] == "array1"
+
+    def test_format_audit_eradicated_realm_scope_is_reported_by_id(self):
+        """A scope the array returns without a name is reported by its ID"""
+        nameless = _Audit(id=ERADICATED_REALM_ID, resource_type="realms")
+        null_name = _Audit(id=ERADICATED_REALM_ID, name=None, resource_type="realms")
+        for scope in (nameless, null_name):
+            audit = _record(
+                command="purerealm",
+                subcommand="create",
+                arguments="--without-default-access-list realm1",
+                scopes=[_ref("array1"), scope],
+            )
+            result = _format_audit(audit, "UTC")
+            assert result["scopes"] == ["array1", ERADICATED_REALM_ID]
+
+    def test_format_audit_only_scope_of_eradicated_realm(self):
+        """A record scoped only to an eradicated realm keeps the realm::name arguments"""
+        audit = _realm_record()
+        audit.scopes = [_Audit(id=ERADICATED_REALM_ID, resource_type="realms")]
+        result = _format_audit(audit, "UTC")
+        assert result["scopes"] == [ERADICATED_REALM_ID]
+        assert result["arguments"] == "--size '1G' realm1::fs1"
+
+    def test_format_audit_never_returns_a_null_scope(self):
+        """A scope with neither a name nor an ID, or a null entry, is left out"""
+        audit = _record(
+            scopes=[_ref("array1"), _Audit(resource_type="realms"), None],
+        )
+        assert _format_audit(audit, "UTC")["scopes"] == ["array1"]
+        assert _format_audit(_record(scopes=[None]), "UTC")["scopes"] == []
 
     def test_format_audit_without_time_or_origin(self):
         """A record with no time or origin does not crash the module"""
@@ -505,6 +604,130 @@ class TestPurefbAudits:
         assert "correlation_id option requires FlashBlade REST version 2.28" in msg
         blade.get_audits.assert_not_called()
 
+    def test_main_reads_newest_records_of_one_realm(self):
+        """scopes, newest_first and limit read the newest records of a realm"""
+        module = _module(scopes=["realm1"], newest_first=True, limit=3)
+        blade = _blade(audits=[_realm_record("14075"), _realm_record("14071")])
+        _run_main(module, blade)
+
+        blade.get_audits.assert_called_once_with(
+            filter="scopes.name='realm1' and system_event='false'",
+            limit=3,
+            sort=["time-"],
+        )
+        result = module.exit_json.call_args[1]
+        assert result["changed"] is False
+        assert [a["scopes"] for a in result["purefb_audits"]] == [["realm1"]] * 2
+        assert result["purefb_audits"][0]["arguments"] == "--size '1G' realm1::fs1"
+
+    def test_main_scopes_idempotent_rerun_and_check_mode(self):
+        """A scoped read is repeated unchanged, in check mode as well"""
+        blade = _blade(audits=[_realm_record()])
+        results = []
+        for check_mode in (False, False, True):
+            module = _module(check_mode=check_mode, scopes=["realm1", "array1"])
+            _run_main(module, blade)
+            results.append(module.exit_json.call_args[1])
+
+        assert blade.get_audits.call_count == 3
+        for call in blade.get_audits.call_args_list:
+            assert call[1] == {
+                "filter": "(scopes.name='realm1' or scopes.name='array1') "
+                "and system_event='false'"
+            }
+        assert results[0] == results[1] == results[2]
+        assert results[0]["changed"] is False
+
+    def test_main_array_scope_selects_array_level_records(self):
+        """The array name selects the records of array-level objects"""
+        audit = _full_record("14071")
+        audit.scopes = [_ref("array1")]
+        module = _module(scopes=["array1"], command="purefs")
+        blade = _blade(audits=[audit])
+        _run_main(module, blade)
+
+        blade.get_audits.assert_called_once_with(
+            filter="command='purefs' and scopes.name='array1' "
+            "and system_event='false'"
+        )
+        result = module.exit_json.call_args[1]
+        assert result["changed"] is False
+        assert result["purefb_audits"][0]["scopes"] == ["array1"]
+        assert "::" not in result["purefb_audits"][0]["arguments"]
+
+    def test_main_without_scopes_sends_the_request_unchanged(self):
+        """No scopes, or an empty list, leaves the request as it always was"""
+        for scopes in (None, []):
+            module = _module(scopes=scopes, user="pureuser")
+            blade = _blade(audits=[_record("1"), _full_record("2")])
+            _run_main(module, blade)
+
+            module.fail_json.assert_not_called()
+            blade.get_audits.assert_called_once_with(
+                filter="user='pureuser' and system_event='false'"
+            )
+            result = module.exit_json.call_args[1]
+            assert result["changed"] is False
+            assert [a["scopes"] for a in result["purefb_audits"]] == [
+                [],
+                ["array1", "realm1"],
+            ]
+
+    def test_main_scopes_requires_2_20(self):
+        """The scopes option is refused before REST 2.20, before any read"""
+        module = _module(scopes=["realm1"])
+        blade = _blade()
+        _run_main(module, blade, api_version="2.19")
+
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "scopes option requires FlashBlade REST version 2.20" in msg
+        blade.get_arrays.assert_not_called()
+        blade.get_audits.assert_not_called()
+
+    def test_main_scopes_allowed_from_2_20(self):
+        """From REST 2.20 the scope filter is sent; empty scopes need no gate"""
+        module = _module(scopes=["realm1"])
+        blade = _blade(audits=[_realm_record()])
+        _run_main(module, blade, api_version="2.20")
+
+        module.fail_json.assert_not_called()
+        blade.get_audits.assert_called_once_with(filter="scopes.name='realm1'")
+
+        module = _module(scopes=[""])
+        blade = _blade(audits=[_record("1")])
+        _run_main(module, blade, api_version="2.19")
+
+        module.fail_json.assert_not_called()
+        blade.get_audits.assert_called_once_with()
+
+    def test_main_rejects_quoted_scope_before_contacting_the_array(self):
+        """A scope name with a single quote fails before any array request"""
+        module = _module(scopes=["o'realm"])
+        blade = _blade()
+        _run_main(module, blade)
+
+        module.fail_json.assert_called_once_with(
+            msg="scopes value o'realm must not contain a single quote"
+        )
+        blade.get_arrays.assert_not_called()
+        blade.get_audits.assert_not_called()
+
+    def test_main_returns_eradicated_realm_scope_by_id(self):
+        """Records of an eradicated realm are listed without a null scope"""
+        audit = _realm_record()
+        audit.scopes = [_Audit(id=ERADICATED_REALM_ID, resource_type="realms")]
+        module = _module()
+        blade = _blade(audits=[audit, _full_record("2")])
+        _run_main(module, blade)
+
+        result = module.exit_json.call_args[1]
+        assert result["changed"] is False
+        assert [a["scopes"] for a in result["purefb_audits"]] == [
+            [ERADICATED_REALM_ID],
+            ["array1", "realm1"],
+        ]
+
     def test_main_rejects_limit_below_one(self):
         """limit must be at least 1"""
         module = _module(limit=0)
@@ -539,3 +762,7 @@ class TestPurefbAudits:
     def test_audit_context_version_constant(self):
         """The 2.28 gate is the version that introduced the fleet context"""
         assert AUDIT_CONTEXT_VERSION == "2.28"
+
+    def test_audit_scopes_version_constant(self):
+        """The 2.20 gate is the version that introduced the scopes field"""
+        assert audits_module.AUDIT_SCOPES_VERSION == "2.20"

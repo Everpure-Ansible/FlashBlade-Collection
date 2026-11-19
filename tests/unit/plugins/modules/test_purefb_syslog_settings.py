@@ -216,6 +216,64 @@ class TestGetSettings:
         assert "More than one" in msg
         assert "management, data-audit" in msg
 
+    def test_fails_when_name_is_realm_qualified(self):
+        """The array returns its object whatever name is asked for."""
+        module = _module(name="realm1::management")
+        blade = _blade(_settings())
+        try:
+            get_settings(module, blade)
+        except SystemExit:
+            pass
+        blade.get_syslog_servers_settings.assert_called_once_with(
+            names=["realm1::management"]
+        )
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "realm1::management does not exist" in msg
+        assert "array-wide" in msg
+        assert "cannot be scoped to a realm" in msg
+        assert msg.endswith("the settings object of this array is management.")
+
+    def test_fails_when_name_is_unknown(self):
+        module = _module(name="nosuch")
+        blade = _blade(_settings())
+        try:
+            get_settings(module, blade)
+        except SystemExit:
+            pass
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Syslog server settings object nosuch does not exist" in msg
+        assert msg.endswith("the settings object of this array is management.")
+
+    def test_name_selects_one_of_several_objects(self):
+        module = _module(name="data-audit")
+        other = _settings()
+        other.name = "data-audit"
+        blade = _blade()
+        blade.get_syslog_servers_settings.return_value = _response(
+            items=[_settings(), other]
+        )
+        assert get_settings(module, blade) is other
+        module.fail_json.assert_not_called()
+
+    def test_name_mismatch_lists_every_object(self):
+        module = _module(name="realm1::data-audit")
+        other = _settings()
+        other.name = "data-audit"
+        blade = _blade()
+        blade.get_syslog_servers_settings.return_value = _response(
+            items=[_settings(), other]
+        )
+        try:
+            get_settings(module, blade)
+        except SystemExit:
+            pass
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "realm1::data-audit does not exist" in msg
+        assert msg.endswith("management, data-audit.")
+
 
 class TestUpdateSettings:
     """update_settings must PATCH only what differs and report it."""
@@ -437,6 +495,71 @@ class TestUpdateSettings:
         assert "boom" in msg
         module.exit_json.assert_not_called()
 
+    def test_no_change_when_realm_certificate_matches(self):
+        module = _module(ca_certificate="realm1::ca1")
+        blade = _blade()
+        try:
+            update_settings(module, blade, _settings(ca_certificate="realm1::ca1"))
+        except SystemExit:
+            pass
+        blade.get_certificates.assert_not_called()
+        blade.patch_syslog_servers_settings.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+    @patch(MODULE_PATH + ".SyslogServerSettings")
+    def test_realm_certificate_is_looked_up_and_sent_qualified(self, mock_model):
+        """A bare name and its realm namesake are different certificates."""
+        module = _module(ca_certificate="realm1::ca1")
+        blade = _blade()
+        try:
+            update_settings(module, blade, _settings(ca_certificate="ca1"))
+        except SystemExit:
+            pass
+        blade.get_certificates.assert_called_once_with(names=["realm1::ca1"])
+        mock_model.assert_called_once_with(ca_certificate={"name": "realm1::ca1"})
+        module.exit_json.assert_called_once_with(changed=True)
+
+    @patch(MODULE_PATH + ".SyslogServerSettings")
+    def test_bare_group_replaces_its_realm_namesake(self, mock_model):
+        module = _module(ca_certificate_group="grp1")
+        blade = _blade()
+        try:
+            update_settings(
+                module, blade, _settings(ca_certificate_group="realm1::grp1")
+            )
+        except SystemExit:
+            pass
+        blade.get_certificate_groups.assert_called_once_with(names=["grp1"])
+        mock_model.assert_called_once_with(ca_certificate_group={"name": "grp1"})
+        module.exit_json.assert_called_once_with(changed=True)
+
+    @patch(MODULE_PATH + ".SyslogServerSettings")
+    def test_switches_from_realm_certificate_to_realm_group(self, mock_model):
+        module = _module(ca_certificate_group="realm1::grp1")
+        blade = _blade()
+        try:
+            update_settings(module, blade, _settings(ca_certificate="realm1::ca1"))
+        except SystemExit:
+            pass
+        blade.get_certificate_groups.assert_called_once_with(names=["realm1::grp1"])
+        mock_model.assert_called_once_with(
+            ca_certificate_group={"name": "realm1::grp1"}, ca_certificate={"name": ""}
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    @patch(MODULE_PATH + ".SyslogServerSettings")
+    def test_absent_clears_realm_group(self, mock_model):
+        module = _module(state="absent")
+        blade = _blade()
+        try:
+            update_settings(
+                module, blade, _settings(ca_certificate_group="realm1::grp1")
+            )
+        except SystemExit:
+            pass
+        mock_model.assert_called_once_with(ca_certificate_group={"name": ""})
+        module.exit_json.assert_called_once_with(changed=True)
+
 
 class TestMain:
     """main() wiring: SDK guard, version gate, argument spec."""
@@ -515,3 +638,104 @@ class TestMain:
             msg="py-pure-client sdk is required for this module"
         )
         mock_get_system.assert_not_called()
+
+    @patch(MODULE_PATH + ".SyslogServerSettings")
+    @patch(MODULE_PATH + ".LooseVersion")
+    @patch(MODULE_PATH + ".get_rest_api_version", return_value="2.30")
+    @patch(MODULE_PATH + ".get_system")
+    @patch(MODULE_PATH + ".AnsibleModule")
+    @patch(MODULE_PATH + ".HAS_PYPURECLIENT", True)
+    def test_realm_qualified_name_fails_in_check_mode(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_version,
+        mock_loose_version,
+        mock_model,
+    ):
+        """Check mode must not report a change for a name the array ignores."""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        module = _module(name="realm1::management", ca_certificate_group="realm1::grp1")
+        module.check_mode = True
+        mock_ansible_module.return_value = module
+        blade = _blade(_settings(ca_certificate="ca1"))
+        mock_get_system.return_value = blade
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "realm1::management does not exist" in msg
+        assert "array-wide" in msg
+        blade.get_certificate_groups.assert_not_called()
+        blade.patch_syslog_servers_settings.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    @patch(MODULE_PATH + ".SyslogServerSettings")
+    @patch(MODULE_PATH + ".LooseVersion")
+    @patch(MODULE_PATH + ".get_rest_api_version", return_value="2.30")
+    @patch(MODULE_PATH + ".get_system")
+    @patch(MODULE_PATH + ".AnsibleModule")
+    @patch(MODULE_PATH + ".HAS_PYPURECLIENT", True)
+    def test_wrong_name_with_state_absent_clears_nothing(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_version,
+        mock_loose_version,
+        mock_model,
+    ):
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        module = _module(name="realm1::management", state="absent")
+        mock_ansible_module.return_value = module
+        blade = _blade(_settings(ca_certificate="ca1"))
+        mock_get_system.return_value = blade
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        module.fail_json.assert_called_once()
+        assert "array-wide" in module.fail_json.call_args[1]["msg"]
+        mock_model.assert_not_called()
+        blade.patch_syslog_servers_settings.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    @patch(MODULE_PATH + ".SyslogServerSettings")
+    @patch(MODULE_PATH + ".LooseVersion")
+    @patch(MODULE_PATH + ".get_rest_api_version", return_value="2.30")
+    @patch(MODULE_PATH + ".get_system")
+    @patch(MODULE_PATH + ".AnsibleModule")
+    @patch(MODULE_PATH + ".HAS_PYPURECLIENT", True)
+    def test_matching_name_sets_realm_group_end_to_end(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_version,
+        mock_loose_version,
+        mock_model,
+    ):
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        module = _module(name="management", ca_certificate_group="realm1::grp1")
+        mock_ansible_module.return_value = module
+        blade = _blade(_settings(ca_certificate="ca1"))
+        mock_get_system.return_value = blade
+
+        try:
+            main()
+        except SystemExit:
+            pass
+
+        module.fail_json.assert_not_called()
+        blade.get_certificate_groups.assert_called_once_with(names=["realm1::grp1"])
+        mock_model.assert_called_once_with(
+            ca_certificate_group={"name": "realm1::grp1"}, ca_certificate={"name": ""}
+        )
+        blade.patch_syslog_servers_settings.assert_called_once_with(
+            names=["management"], syslog_server_settings=mock_model.return_value
+        )
+        module.exit_json.assert_called_once_with(changed=True)

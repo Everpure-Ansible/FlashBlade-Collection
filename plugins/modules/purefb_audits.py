@@ -103,6 +103,7 @@ options:
       them. Empty entries are ignored.
     - The array treats C(*) in an entry as a wildcard, so C(tenant*) selects
       the records of every realm whose name starts with C(tenant).
+    - The array matches the names without regard to case.
     - The C(scopes) of each returned record then lists only the scopes that
       matched, not every scope the record affected.
     - A realm that has been eradicated cannot be selected, because the array

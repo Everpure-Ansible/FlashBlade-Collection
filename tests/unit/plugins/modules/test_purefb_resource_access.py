@@ -537,6 +537,70 @@ class TestResourceAccessOidcShare:
         module.exit_json.assert_called_once_with(changed=False)
 
 
+class TestResourceAccessNameCase:
+    """An existing resource access is found whatever the case of the name
+
+    Purity//FB 4.8 refuses to create OKTA beside okta ("... with the given
+    name already exists."), answers a GET of OKTA with the provider okta and
+    lists a resource access under the name the resource was created with.
+    """
+
+    def test_share_under_another_case_is_unchanged(self):
+        blade = _blade(accesses=[_access(ACCESS_ID, "okta")])
+        module = _run(_params(resource_name="OKTA"), blade)
+
+        blade.post_resource_accesses_batch.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+        module.fail_json.assert_not_called()
+
+    def test_share_under_another_case_check_mode_is_unchanged(self):
+        blade = _blade(accesses=[_access(ACCESS_ID, "Okta")])
+        module = _run(_params(resource_name="okta"), blade, check_mode=True)
+
+        blade.post_resource_accesses_batch.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+    def test_revoke_under_another_case_deletes_the_access(self):
+        blade = _blade(
+            accesses=[_access(ACCESS_ID, "Partner-2065", resource_type="subnets")]
+        )
+        module = _run(
+            _params(
+                resource_type="subnets", resource_name="partner-2065", state="absent"
+            ),
+            blade,
+        )
+
+        blade.delete_resource_accesses.assert_called_once_with(ids=[ACCESS_ID])
+        module.exit_json.assert_called_once_with(changed=True)
+        module.fail_json.assert_not_called()
+
+    def test_revoke_under_another_case_check_mode_predicts_the_change(self):
+        blade = _blade(accesses=[_access(ACCESS_ID, "okta")])
+        module = _run(
+            _params(resource_name="OKTA", state="absent"), blade, check_mode=True
+        )
+
+        blade.delete_resource_accesses.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_the_exact_spelling_wins(self):
+        blade = _blade(
+            accesses=[_access(ACCESS_ID, "OKTA"), _access(ACCESS_ID_2, "okta")]
+        )
+
+        found = get_resource_access(_module(_params(resource_name="okta")), blade)
+        assert found == (True, ACCESS_ID_2)
+        found = get_resource_access(_module(_params(resource_name="Okta")), blade)
+        assert found == (True, ACCESS_ID)
+
+    def test_another_name_is_still_another_resource(self):
+        blade = _blade(accesses=[_access(ACCESS_ID, "okta-prod")])
+
+        missing = get_resource_access(_module(_params(resource_name="OKTA")), blade)
+        assert missing == (False, False)
+
+
 class TestResourceAccessArrayLevelRegression:
     """Subnets and DNS configurations are shared as before"""
 

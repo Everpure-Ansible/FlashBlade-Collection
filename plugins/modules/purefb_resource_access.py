@@ -51,6 +51,11 @@ options:
       - An array-level resource is shared under its own name, without a
         realm prefix. Purity//FB 4.8 does not find an OIDC identity provider
         under the name C(realm::provider).
+      - Names are unique on the array whatever their case, and an existing
+        resource access is found whatever the case of I(resource_name) and
+        I(scope_name). To create one, give the name as the array holds it.
+        Purity//FB 4.8 does not find an OIDC identity provider under a name
+        in another case when a resource access is created.
     type: str
     required: true
   state:
@@ -199,8 +204,14 @@ def get_resource_access(module, blade):
         )
     if res.total_item_count:
         items = list(res.items)
+        wanted = module.params["resource_name"]
         for item in items:
-            if item.resource.name == module.params["resource_name"]:
+            if item.resource.name == wanted:
+                return True, item.id
+        # Names are unique on the array whatever their case, and a resource
+        # access is listed under the name the resource was created with.
+        for item in items:
+            if item.resource.name.lower() == wanted.lower():
                 return True, item.id
     return False, False
 

@@ -244,7 +244,9 @@ def _check_realms(module):
     are settled here, before any read or write, so check mode agrees with
     a real run and the rename-already-applied lookup cannot resolve to a
     policy with the same name in another scope. A bare new name for a
-    policy in a realm is taken as a name in that realm.
+    policy in a realm is taken as a name in that realm. Purity//FB documents
+    names as case-insensitive on input, so the realms are compared without
+    regard to case and a realm spelled in another case is left to the array.
     """
     name = module.params["name"]
     realm = _realm(name)
@@ -252,7 +254,7 @@ def _check_realms(module):
     if rename:
         if realm and "::" not in rename:
             module.params["rename"] = "{0}::{1}".format(realm, rename)
-        elif _realm(rename) != realm:
+        elif _realm(rename).lower() != realm.lower():
             module.fail_json(
                 msg=(
                     "Cannot rename data eviction policy {0} to {1}: a rename "
@@ -260,7 +262,7 @@ def _check_realms(module):
                 ).format(name, rename)
             )
     for fs_name in module.params["file_systems"] or []:
-        if _realm(fs_name) == realm:
+        if _realm(fs_name).lower() == realm.lower():
             continue
         if realm:
             module.fail_json(
@@ -581,8 +583,8 @@ def main():
         if policy is None:
             module.fail_json(
                 msg=(
-                    "Cannot rename data eviction policy {0} to {1}: neither "
-                    "policy exists."
+                    "Cannot rename data eviction policy {0}: policy does not "
+                    "exist, and neither does a policy named {1}."
                 ).format(module.params["name"], module.params["rename"])
             )
         module.params["name"] = module.params["rename"]

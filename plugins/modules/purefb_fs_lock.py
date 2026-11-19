@@ -31,8 +31,13 @@ description:
   is granted the lock, so only clear locks whose client has gone away, and
   only with the agreement of the owner of the data.
 - A I(file_system) that does not exist fails the task. A I(path) or
-  I(inode) is not checked by the module, so one that does not exist is
-  rejected or matches nothing as the array decides.
+  I(inode) is not checked by the module. The array rejects a lock request
+  for one that does not exist. For open files, and for locks with
+  I(recursive=true), a I(path) that does not exist matches nothing.
+- The array serves these requests to an administrator whose access covers
+  the array. Purity//FB 4.8.8 refuses them to an administrator whose
+  access is limited to a realm, also for the file systems of that realm,
+  and the task fails with the array's message.
 - Requires FlashBlade REST API version 2.8 or later for locks and NLM
   reclamation, 2.10 or later for sessions and for clearing locks by file
   system, path or inode, 2.17 or later for open files and 2.22 or later for
@@ -67,10 +72,9 @@ options:
     - Name of the file system whose locks or open files to list or clear.
     - A file system in a realm is named C(realm::name). The bare name matches
       only a file system outside every realm.
-    - The array can answer a lock request narrowed to a file system it has,
-      for example one in a realm, as if the file system did not exist. The
-      task then fails with a message that says the file system exists and
-      names the realm it is in.
+    - The array can answer a lock request narrowed to a file system in a
+      realm as if the file system did not exist. The task then fails with a
+      message that says the file system exists and names the realm it is in.
     - Clearing locks by I(file_system) also needs I(path) or I(inode),
       because the array does not clear locks by file system alone.
       I(path=/) with I(recursive=true) covers the whole file system, within
@@ -480,8 +484,11 @@ def check_file_system(module, blade):
 
     The open-files GET does not check the name: it answers with no items for
     a file system the array does not have, which would read as no open files.
-    A lookup the array refuses for any other reason does not show the name is
-    wrong, so the task warns and the open files are listed without the check.
+    The lookup is refused for a name the array does not have, and answered
+    with no items for a file system the identity cannot see, as one outside
+    the realm of an administrator limited to that realm. A lookup the array
+    refuses for any other reason does not show the name is wrong, so the task
+    warns and the open files are listed without the check.
     """
     name = module.params["file_system"]
     file_system, error = _find_file_system(module, blade)
@@ -489,9 +496,7 @@ def check_file_system(module, blade):
         return
     if error is None:
         module.fail_json(
-            msg="Failed to list open files. File system {0} does not exist.".format(
-                name
-            )
+            msg="Failed to list open files. File system {0} was not found.".format(name)
         )
     if "does not exist" in str(error).lower():
         module.fail_json(
@@ -501,7 +506,7 @@ def check_file_system(module, blade):
     module.warn(
         "Could not check that file system {0} exists. Error: {1}. The array "
         "lists no open files for a file system it does not have, so an empty "
-        "result does not confirm the name.".format(name, error)
+        "result does not confirm the name.".format(name, str(error).rstrip("."))
     )
 
 

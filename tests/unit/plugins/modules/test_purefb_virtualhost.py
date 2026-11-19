@@ -167,7 +167,9 @@ def _blade(existing=None, total=1, servers=KNOWN_SERVERS, realm_defaults=None):
 
     blade.quirks makes the array misbehave for the defence-in-depth tests:
     post_without_servers, hidden (names a GET cannot read), ignore_attach,
-    detach_drops_all, fail_patch (callable on the PATCH body).
+    detach_drops_all, fail_patch (callable on the PATCH body), post_fails
+    (the POST answers 400 and leaves "nothing", a host "left_empty" or a
+    host "left_attached" behind).
     """
     hosts = dict(existing or {})
     realm_defaults = realm_defaults or {}
@@ -189,10 +191,13 @@ def _blade(existing=None, total=1, servers=KNOWN_SERVERS, realm_defaults=None):
         name = kwargs["names"][0]
         body = kwargs.get("object_store_virtual_host") or {}
         attached = [ref["name"] for ref in body.get("attached_servers", [])]
-        if blade.quirks.get("post_without_servers"):
+        failure = blade.quirks.get("post_fails")
+        if failure == "nothing":
+            return _response(400)
+        if blade.quirks.get("post_without_servers") or failure == "left_empty":
             attached = []
         hosts[name] = _vhost(name, hostname=body.get("hostname"), servers=attached)
-        return _response(200)
+        return _response(400 if failure else 200)
 
     def _patch(**kwargs):
         name = kwargs["names"][0]
@@ -849,6 +854,27 @@ class TestAttachedServerGuardCreate:
         assert DEFAULT_SERVER in msg and "Pass servers" in msg
         _no_writes(blade)
 
+    def test_array_default_server_lookup_error_is_reported(self):
+        """The look-up was refused: the array error is part of the message"""
+        module = _module()
+        blade = _blade(servers=())
+        _run(module, blade)
+        msg = _failure(module)
+        assert DEFAULT_SERVER in msg and "Pass servers" in msg
+        assert msg.endswith("Error: array error")
+        _no_writes(blade)
+
+    def test_array_default_server_not_listed_refused(self):
+        """A 200 that lists no server is not trusted either"""
+        module = _module()
+        blade = _blade()
+        blade.get_servers.side_effect = None
+        blade.get_servers.return_value = _response(200, items=[])
+        _run(module, blade)
+        msg = _failure(module)
+        assert DEFAULT_SERVER in msg and msg.endswith("at least one server.")
+        _no_writes(blade)
+
     def test_array_default_server_missing_refused_in_check_mode(self):
         module = _module(check_mode=True)
         blade = _blade(servers=())
@@ -972,6 +998,20 @@ class TestAttachedServerGuardCreate:
         )
         blade.get_servers.assert_called_once_with(names=["tenant_a", "tenant_b"])
 
+    def test_servers_that_differ_only_in_case_are_sent_once(self):
+        """Server names are not case sensitive on the array"""
+        module = _module(servers=["tenant_a", "Tenant_A", "tenant_b"])
+        blade = _blade()
+        _run(module, blade)
+        blade.get_servers.assert_called_once_with(names=["tenant_a", "tenant_b"])
+        blade.post_object_store_virtual_hosts.assert_called_once_with(
+            names=["acme-s3"],
+            object_store_virtual_host={
+                "attached_servers": [_ref("tenant_a"), _ref("tenant_b")]
+            },
+        )
+        assert _changed(module) is True
+
     def test_wildcard_is_left_to_the_array(self):
         module = _module(servers=["*"])
         blade = _blade()
@@ -1044,6 +1084,106 @@ class TestAttachedServerGuardCreate:
         msg = _failure(module)
         assert "deleting it again failed" in msg and "array error" in msg
         assert "Attach a server to it or delete it" in msg
+
+    # ---------------- a create request that fails ----------------
+
+    def test_failed_create_looks_for_a_leftover_host(self):
+        """Nothing was created: only the array error is reported"""
+        module = _module(servers=["tenant_a"])
+        blade = _blade()
+        blade.quirks["post_fails"] = "nothing"
+        _run(module, blade)
+        assert _failure(module) == (
+            "Failed to add Object Store Virtual Host acme-s3. Error: array error"
+        )
+        calls = [
+            call[1].get("names")
+            for call in blade.get_object_store_virtual_hosts.call_args_list
+        ]
+        # lookup, host count, look-up after the failed POST
+        assert calls == [["acme-s3"], None, ["acme-s3"]]
+        blade.patch_object_store_virtual_hosts.assert_not_called()
+        blade.delete_object_store_virtual_hosts.assert_not_called()
+
+    def test_failed_create_that_left_an_attached_host_only_reports(self):
+        module = _module(servers=["tenant_a"])
+        blade = _blade()
+        blade.quirks["post_fails"] = "left_attached"
+        _run(module, blade)
+        assert _failure(module) == (
+            "Failed to add Object Store Virtual Host acme-s3. Error: array error"
+        )
+        blade.patch_object_store_virtual_hosts.assert_not_called()
+        blade.delete_object_store_virtual_hosts.assert_not_called()
+        assert _attached(blade, "acme-s3") == ["tenant_a"]
+
+    def test_failed_create_that_left_a_serverless_host_attaches_its_servers(self):
+        """Should be impossible: the POST fails but leaves a host with no server"""
+        module = _module(servers=["tenant_a", "tenant_b"], context="peer1")
+        blade = _blade()
+        blade.quirks["post_fails"] = "left_empty"
+        _run(module, blade)
+        msg = _failure(module)
+        assert "was found without an attached server" in msg
+        assert "tenant_a, tenant_b was attached to it" in msg
+        assert "at least one object store server" in msg
+        assert msg.endswith("Error: array error")
+        blade.patch_object_store_virtual_hosts.assert_called_once_with(
+            names=["acme-s3"],
+            object_store_virtual_host={
+                "add_attached_servers": [_ref("tenant_a"), _ref("tenant_b")]
+            },
+            context_names=["peer1"],
+        )
+        # a failed request does not prove the host is this task's: never deleted
+        blade.delete_object_store_virtual_hosts.assert_not_called()
+        assert _attached(blade, "acme-s3") == ["tenant_a", "tenant_b"]
+
+    def test_failed_create_without_servers_attaches_the_default_server(self):
+        module = _module(name="tenant1::acme-s3", hostname="s3.acme.com")
+        blade = _blade(realm_defaults={"tenant1": "tenant1::s3srv"})
+        blade.quirks["post_fails"] = "left_empty"
+        _run(module, blade)
+        assert "tenant1::s3srv was attached to it" in _failure(module)
+        assert _bodies(blade) == [{"add_attached_servers": [_ref("tenant1::s3srv")]}]
+        assert _attached(blade, "tenant1::acme-s3") == ["tenant1::s3srv"]
+
+    def test_failed_create_whose_repair_fails_is_reported(self):
+        module = _module(servers=["tenant_a"])
+        blade = _blade()
+        blade.quirks["post_fails"] = "left_empty"
+        blade.quirks["fail_patch"] = lambda body: True
+        _run(module, blade)
+        msg = _failure(module)
+        assert "attaching one failed" in msg
+        assert "Attach a server to it or delete it" in msg
+        assert msg.endswith("Error: array error")
+        blade.delete_object_store_virtual_hosts.assert_not_called()
+        assert "acme-s3" in blade.hosts
+
+    def test_failed_create_whose_repair_took_no_effect_is_reported(self):
+        module = _module(servers=["tenant_a"])
+        blade = _blade()
+        blade.quirks["post_fails"] = "left_empty"
+        blade.quirks["ignore_attach"] = True
+        _run(module, blade)
+        msg = _failure(module)
+        assert "attaching one failed" in msg
+        assert "Attach a server to it or delete it" in msg
+        assert len(_bodies(blade)) == 1
+
+    def test_failed_create_on_old_api_is_unchanged(self):
+        """Before REST 2.20 a failed create is reported and nothing is read"""
+        module = _module()
+        blade = _blade()
+        blade.quirks["post_fails"] = "nothing"
+        _run(module, blade, api_version="2.19")
+        assert _failure(module) == (
+            "Failed to add Object Store Virtual Host acme-s3. Error: array error"
+        )
+        # lookup and host count only
+        assert blade.get_object_store_virtual_hosts.call_count == 2
+        blade.patch_object_store_virtual_hosts.assert_not_called()
 
 
 class TestAttachedServerGuardUpdate:
@@ -1157,6 +1297,52 @@ class TestAttachedServerGuardUpdate:
         assert blade.get_object_store_virtual_hosts.call_count == 3
         assert _changed(module) is True
         assert _attached(blade, "acme-s3") == ["tenant_a"]
+
+    def test_same_server_in_another_case_is_not_a_change(self):
+        """Not attached as a new server and then detached as the old one"""
+        module = _module(servers=["TENANT_A"])
+        blade = _blade({"acme-s3": _vhost("acme-s3", servers=["tenant_a"])})
+        _run(module, blade)
+        _no_writes(blade)
+        assert _changed(module) is False
+
+    def test_same_server_in_another_case_is_not_a_change_in_check_mode(self):
+        module = _module(check_mode=True, servers=["Tenant_A", "tenant_B"])
+        blade = _blade({"acme-s3": _vhost("acme-s3", servers=["tenant_a", "tenant_b"])})
+        _run(module, blade)
+        _no_writes(blade)
+        assert _changed(module) is False
+
+    def test_delta_ignores_case(self):
+        module = _module(servers=["Tenant_A", "tenant_c", "TENANT_C"])
+        blade = _blade({"acme-s3": _vhost("acme-s3", servers=["tenant_a", "tenant_b"])})
+        _run(module, blade)
+        assert _bodies(blade) == [
+            {"add_attached_servers": [_ref("tenant_c")]},
+            {"remove_attached_servers": [_ref("tenant_b")]},
+        ]
+        assert _changed(module) is True
+        assert _attached(blade, "acme-s3") == ["tenant_a", "tenant_c"]
+
+    def test_detach_check_ignores_case(self):
+        """The only server left is the one to detach, reported in another case"""
+        module = _module(servers=["tenant_a"])
+        blade = _blade({"acme-s3": _vhost("acme-s3", servers=["tenant_a", "tenant_b"])})
+        inner = blade.get_object_store_virtual_hosts.side_effect
+        reads = []
+
+        def _get_then_lose_tenant_a(**kwargs):
+            res = inner(**kwargs)
+            reads.append(kwargs)
+            if len(reads) == 1:
+                blade.hosts["acme-s3"] = _vhost("acme-s3", servers=["Tenant_B"])
+            return res
+
+        blade.get_object_store_virtual_hosts.side_effect = _get_then_lose_tenant_a
+        _run(module, blade)
+        msg = _failure(module)
+        assert "would leave" in msg and "nothing was detached" in msg
+        blade.patch_object_store_virtual_hosts.assert_not_called()
 
     def test_detach_not_sent_when_attach_took_no_effect(self):
         """The array answers 200 to the attach but attaches nothing"""
@@ -1341,6 +1527,26 @@ class TestAttachedServerGuardUpdate:
         msg = _failure(module)
         assert "tenant_a was attached again" in msg
         assert _attached(blade, "acme-s3") == ["tenant_a"]
+        blade.delete_object_store_virtual_hosts.assert_not_called()
+
+    def test_repair_attaches_one_server_when_the_lists_cannot_be_attached(self):
+        """tenant_a no longer exists: tenant_b is attached again on its own"""
+        module = _module(servers=["tenant_a"])
+        blade = _blade({"acme-s3": _vhost("acme-s3", servers=["tenant_a", "tenant_b"])})
+        blade.quirks["detach_drops_all"] = True
+        blade.quirks["fail_patch"] = lambda body: _ref("tenant_a") in body.get(
+            "add_attached_servers", []
+        )
+        _run(module, blade)
+        msg = _failure(module)
+        assert "tenant_b was attached again" in msg
+        assert _bodies(blade) == [
+            {"remove_attached_servers": [_ref("tenant_b")]},
+            {"add_attached_servers": [_ref("tenant_a"), _ref("tenant_b")]},
+            {"add_attached_servers": [_ref("tenant_a")]},
+            {"add_attached_servers": [_ref("tenant_b")]},
+        ]
+        assert _attached(blade, "acme-s3") == ["tenant_b"]
         blade.delete_object_store_virtual_hosts.assert_not_called()
 
     def test_failed_repair_is_reported_and_host_is_kept(self):

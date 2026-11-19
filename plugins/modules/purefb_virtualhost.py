@@ -59,6 +59,7 @@ options:
     - Exact list of object store servers allowed to use this virtual host.
     - Servers are attached and detached so that the attached set matches
       this list. New servers are attached before any other is detached.
+    - Server names are not case sensitive.
     - A virtual host must stay attached to at least one object store
       server, so an empty list is refused. List the servers that should
       stay attached, or use I(state=absent) to remove the virtual host.
@@ -244,6 +245,21 @@ def _references(servers):
     return [Reference(name=srv) for srv in servers]
 
 
+def _unique(servers):
+    """Return the server names once each, in the order given.
+
+    Server names are not case sensitive on the array, so names that differ
+    only in case are the same server.
+    """
+    seen = set()
+    unique = []
+    for srv in servers:
+        if srv.lower() not in seen:
+            seen.add(srv.lower())
+            unique.append(srv)
+    return unique
+
+
 def _validate_servers(module):
     """Refuse a servers list that names no server."""
     servers = module.params["servers"]
@@ -331,11 +347,14 @@ def _default_server(module, blade, ctx):
         server = ARRAY_DEFAULT_SERVER
     res = blade.get_servers(names=[server], **ctx)
     if res.status_code != 200 or not list(res.items):
+        error = ""
+        if res.status_code != 200:
+            error = " Error: {0}".format(get_error_message(res))
         module.fail_json(
             msg="Object Store Virtual Host {0} was not created: the default "
             "object store server {1} was not found, so the virtual host would "
             "have no attached server. {2}. Pass servers with at least one "
-            "server.".format(name, server, ATTACH_RULE)
+            "server.{3}".format(name, server, ATTACH_RULE, error)
         )
     return server
 
@@ -370,6 +389,50 @@ def _verify_created(module, blade, ctx):
     )
 
 
+def _fail_create(module, blade, ctx, servers, res):
+    """Fail after a create request that the array answered with an error.
+
+    Such a request normally creates nothing, and only the error is
+    reported. The virtual host is looked up once more all the same. If it
+    now exists without an attached server, the servers named in the request
+    are attached to it. It is not deleted: after a failed request there is
+    no proof that this task created it, and attaching a server is the
+    repair that is right for a virtual host of any origin.
+    """
+    name = module.params["name"]
+    error = get_error_message(res)
+    vhost = _get_host(blade, name, ctx)
+    if vhost is None or _server_names(vhost):
+        module.fail_json(
+            msg="Failed to add Object Store Virtual Host {0}. Error: {1}".format(
+                name, error
+            )
+        )
+    res = blade.patch_object_store_virtual_hosts(
+        names=[name],
+        object_store_virtual_host=ObjectStoreVirtualHostPatch(
+            add_attached_servers=_references(servers)
+        ),
+        **ctx
+    )
+    if res.status_code == 200:
+        check = _get_host(blade, name, ctx)
+        if check is not None and _server_names(check):
+            module.fail_json(
+                msg="Failed to add Object Store Virtual Host {0}. A virtual host "
+                "of that name was found without an attached server, so {1} was "
+                "attached to it. {2}. Check the virtual host and run the task "
+                "again. Error: {3}".format(name, ", ".join(servers), ATTACH_RULE, error)
+            )
+    module.fail_json(
+        msg="Failed to add Object Store Virtual Host {0}. A virtual host of that "
+        "name was found without an attached server and attaching one failed. "
+        "Attach a server to it or delete it. {1}. Error: {2}".format(
+            name, ATTACH_RULE, error
+        )
+    )
+
+
 def _verify_attached(module, blade, ctx, previous, wanted):
     """Confirm a virtual host still has an attached server after a change.
 
@@ -377,10 +440,13 @@ def _verify_attached(module, blade, ctx, previous, wanted):
     this should never find anything wrong. If the virtual host nevertheless
     reports no attached server, the servers it had before the task are
     attached again, because they are known to be attachable to it, and
-    failing that the requested servers. An existing virtual host is never
-    deleted by this repair: it was not created by this task, so removing it
-    stays the operator's decision. The task fails in every case so that the
-    result is noticed.
+    failing that the requested servers. When neither list can be attached
+    as a whole, for instance because one of its servers no longer exists,
+    the servers are tried one at a time: one attached server is enough to
+    satisfy the rule. An existing virtual host is never deleted by this
+    repair: it was not created by this task, so removing it stays the
+    operator's decision. The task fails in every case so that the result is
+    noticed.
     """
     name = module.params["name"]
     vhost = _get_host(blade, name, ctx)
@@ -392,8 +458,10 @@ def _verify_attached(module, blade, ctx, previous, wanted):
         )
     if _server_names(vhost):
         return
+    candidates = [sorted(previous), sorted(wanted)]
+    candidates += [[srv] for srv in sorted(set(previous) | set(wanted))]
     tried = []
-    for candidate in (sorted(previous), sorted(wanted)):
+    for candidate in candidates:
         if not candidate or candidate in tried:
             continue
         tried.append(candidate)
@@ -449,7 +517,8 @@ def _change_servers(module, blade, ctx, current, add, remove):
                 "before detaching {1}, so nothing was detached. Run the task "
                 "again.".format(name, ", ".join(remove))
             )
-        if not _server_names(vhost) - set(remove):
+        remove_keys = set(srv.lower() for srv in remove)
+        if not [srv for srv in _server_names(vhost) if srv.lower() not in remove_keys]:
             module.fail_json(
                 msg="Detaching {0} would leave Object Store Virtual Host {1} "
                 "without an attached server, so nothing was detached. "
@@ -515,7 +584,7 @@ def add_host(module, blade, api_version, ctx):
     if servers is None:
         servers = [_default_server(module, blade, ctx)]
     else:
-        servers = [srv for pos, srv in enumerate(servers) if srv not in servers[:pos]]
+        servers = _unique(servers)
         _require_servers(module, blade, servers, ctx)
     if not servers:
         # Not reachable: the last check before the request is built.
@@ -534,11 +603,7 @@ def add_host(module, blade, api_version, ctx):
             **ctx
         )
         if res.status_code != 200:
-            module.fail_json(
-                msg="Failed to add Object Store Virtual Host {0}. Error: {1}".format(
-                    name, get_error_message(res)
-                )
-            )
+            _fail_create(module, blade, ctx, servers, res)
         _verify_created(module, blade, ctx)
     module.exit_json(changed=changed)
 
@@ -582,13 +647,20 @@ def update_host(module, blade, vhost, api_version, ctx):
                 )
         else:
             if servers is not None:
-                wanted = set(servers)
                 # Attaching an already attached server, or detaching one
                 # that is not attached, is rejected by the array, so only
                 # the exact delta is sent. attached_servers (full replace)
-                # must never be combined with the add/remove lists.
-                add = sorted(wanted - current_servers)
-                remove = sorted(current_servers - wanted)
+                # must never be combined with the add/remove lists. Server
+                # names are not case sensitive on the array: a name that
+                # differs only in case is the attached server, not a new
+                # one, and must not be attached and then detached.
+                wanted = _unique(servers)
+                current_keys = set(srv.lower() for srv in current_servers)
+                wanted_keys = set(srv.lower() for srv in wanted)
+                add = sorted(srv for srv in wanted if srv.lower() not in current_keys)
+                remove = sorted(
+                    srv for srv in current_servers if srv.lower() not in wanted_keys
+                )
             # Every refusal happens here, before any request and in check
             # mode as well.
             if not current_servers and not add:

@@ -683,14 +683,133 @@ class TestPurefbBucketLifecycle:
             keep_previous_version_for=2 * DAY, filter={"tags": [("env", "dev")]}
         )
 
-    def test_clear_tags_with_abort_in_one_task(self):
-        module = _module(_base_params(tags=[], abort_uploads_after="1d"))
+    # ---------------- tags and an upload abort on an existing rule ----------------
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("tags", [None, []])
+    def test_abort_on_a_tagged_rule_fails_before_any_write(self, tags, check_mode):
+        """The array judges the abort by the tags the rule has, also when the
+        same request removes them; check mode must not report a change"""
+        module = _module(
+            _base_params(tags=tags, abort_uploads_after="1d"), check_mode=check_mode
+        )
         blade = _blade(rule=_existing_rule(tags=[_tag("env", "dev")]))
         dummy, mock_patch = _run(module, blade)
+
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert msg.startswith(
+            "abort_uploads_after cannot be set on lifecycle rule rule1 for "
+            "bucket bkt while the rule has tags"
+        )
+        assert "separate task" in msg
+        module.exit_json.assert_not_called()
+        mock_patch.assert_not_called()
+        blade.patch_buckets_lifecycle_policies_rules.assert_not_called()
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_tags_on_a_rule_with_an_abort_fail_before_any_write(self, check_mode):
+        module = _module(
+            _base_params(tags=[{"key": "env", "value": "dev"}]), check_mode=check_mode
+        )
+        blade = _blade(
+            rule=_existing_rule(abort_incomplete_multipart_uploads_after=DAY)
+        )
+        dummy, mock_patch = _run(module, blade)
+
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert msg.startswith(
+            "tags cannot be set on lifecycle rule rule1 for bucket bkt while "
+            "the rule has abort_uploads_after set"
+        )
+        assert "abort_uploads_after to 0d in the same task" in msg
+        module.exit_json.assert_not_called()
+        mock_patch.assert_not_called()
+        blade.patch_buckets_lifecycle_policies_rules.assert_not_called()
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_tags_replace_the_abort_in_one_task(self, check_mode):
+        """Removing the abort and adding tags in one request is accepted"""
+        module = _module(
+            _base_params(
+                tags=[{"key": "env", "value": "dev"}], abort_uploads_after="0d"
+            ),
+            check_mode=check_mode,
+        )
+        blade = _blade(
+            rule=_existing_rule(abort_incomplete_multipart_uploads_after=DAY)
+        )
+        dummy, mock_patch = _run(module, blade)
+
+        module.fail_json.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is True
+        if check_mode:
+            blade.patch_buckets_lifecycle_policies_rules.assert_not_called()
+        else:
+            mock_patch.assert_called_once_with(
+                abort_incomplete_multipart_uploads_after=0,
+                filter={"prefix": "logs/", "tags": [("env", "dev")]},
+            )
+
+    @pytest.mark.parametrize(
+        "rule_tags, rule_abort, params",
+        [
+            # a tagged rule: nothing to remove, the tags it has, both
+            ([("env", "dev")], None, {"abort_uploads_after": "0d"}),
+            ([("env", "dev")], None, {"tags": [{"key": "env", "value": "dev"}]}),
+            (
+                [("env", "dev")],
+                None,
+                {"tags": [{"key": "env", "value": "dev"}], "abort_uploads_after": "0d"},
+            ),
+            # a rule with an abort: the abort it has, no tags, both
+            ([], DAY, {"abort_uploads_after": "1d"}),
+            ([], DAY, {"tags": []}),
+            ([], DAY, {"tags": [], "abort_uploads_after": "1d"}),
+            # a rule holding both, however it came to be: its own values
+            ([("env", "dev")], DAY, {"abort_uploads_after": "1d"}),
+            ([("env", "dev")], DAY, {"tags": [{"key": "env", "value": "dev"}]}),
+        ],
+    )
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_rule_as_it_stands_is_never_refused(
+        self, rule_tags, rule_abort, params, check_mode
+    ):
+        module = _module(_base_params(**params), check_mode=check_mode)
+        rule = _existing_rule(
+            tags=[_tag(key, value) for key, value in rule_tags],
+            abort_incomplete_multipart_uploads_after=rule_abort,
+        )
+        blade = _blade(rule=rule)
+        dummy, mock_patch = _run(module, blade)
+
+        module.fail_json.assert_not_called()
+        mock_patch.assert_not_called()
+        blade.patch_buckets_lifecycle_policies_rules.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    def test_abort_changed_on_a_rule_without_tags(self):
+        module = _module(_base_params(abort_uploads_after="2d"))
+        blade = _blade(
+            rule=_existing_rule(abort_incomplete_multipart_uploads_after=DAY)
+        )
+        dummy, mock_patch = _run(module, blade)
+
         module.fail_json.assert_not_called()
         mock_patch.assert_called_once_with(
-            abort_incomplete_multipart_uploads_after=DAY,
-            filter={"prefix": "logs/", "tags": []},
+            abort_incomplete_multipart_uploads_after=2 * DAY
+        )
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_other_settings_of_a_tagged_rule_can_change(self):
+        module = _module(_base_params(keep_previous_for="3d", enabled=False))
+        blade = _blade(rule=_existing_rule(tags=[_tag("env", "dev")]))
+        dummy, mock_patch = _run(module, blade)
+
+        module.fail_json.assert_not_called()
+        mock_patch.assert_called_once_with(
+            keep_previous_version_for=3 * DAY, enabled=False
         )
         assert module.exit_json.call_args[1]["changed"] is True
 
@@ -1331,6 +1450,51 @@ class TestPurefbBucketLifecycleRealmBucket:
         blade.get_buckets.assert_called_once_with(names=["bkt"])
         blade.get_buckets_lifecycle_policies_rules.assert_not_called()
         assert _no_rule_written(blade)
+
+    @pytest.mark.parametrize("bucket", BOTH_BUCKETS)
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_abort_on_a_tagged_rule_fails_and_names_the_bucket(
+        self, bucket, check_mode
+    ):
+        module = _module(
+            _base_params(bucket=bucket, abort_uploads_after="1d"),
+            check_mode=check_mode,
+        )
+        blade = _array(
+            {
+                "bkt": {"rule1": _existing_rule(tags=[_tag("env", "dev")])},
+                REALM_BUCKET: {"rule1": _existing_rule(tags=[_tag("env", "dev")])},
+            }
+        )
+        _run(module, blade)
+
+        module.fail_json.assert_called_once()
+        assert (
+            "lifecycle rule rule1 for bucket {0} while the rule has tags".format(bucket)
+            in module.fail_json.call_args[1]["msg"]
+        )
+        module.exit_json.assert_not_called()
+        assert _no_rule_written(blade)
+        assert _bucket_names_sent(blade) == {bucket}
+
+    @pytest.mark.parametrize("bucket, other", NAMESAKES)
+    def test_abort_is_judged_by_the_rule_of_the_named_bucket_alone(self, bucket, other):
+        module = _module(_base_params(bucket=bucket, abort_uploads_after="1d"))
+        blade = _array(
+            {
+                bucket: {"rule1": _existing_rule()},
+                other: {"rule1": _existing_rule(tags=[_tag("env", "dev")])},
+            }
+        )
+        dummy, mock_patch = _run(module, blade)
+
+        module.fail_json.assert_not_called()
+        mock_patch.assert_called_once_with(abort_incomplete_multipart_uploads_after=DAY)
+        blade.patch_buckets_lifecycle_policies_rules.assert_called_once_with(
+            bucket_names=[bucket], names=["rule1"], rule=mock_patch.return_value
+        )
+        assert _bucket_names_sent(blade) == {bucket}
+        assert module.exit_json.call_args[1]["changed"] is True
 
     @pytest.mark.parametrize("bucket", ["zznorealm::bkt", "realm1::other"])
     def test_realm_qualified_name_the_array_does_not_hold_fails(self, bucket):

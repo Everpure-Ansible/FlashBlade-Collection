@@ -41,7 +41,8 @@ options:
     description:
     - Name of the bucket whose lifecycle policy holds the rule.
     - For a bucket in a realm give the realm-qualified name, C(realm::bucket).
-      The rule name in I(name) is not qualified.
+      The rule name in I(name) is not qualified; a realm prefix given there
+      becomes part of the rule name.
     - A name without a realm prefix is never resolved inside a realm. It always
       means the bucket of that name outside any realm, and the task fails if
       there is no such bucket.
@@ -78,6 +79,9 @@ options:
     - Cannot be combined with a non-zero I(abort_uploads_after); the array
       rejects a multipart-upload abort on a tag-filtered rule, including a
       request that removes the tags and adds the abort at the same time.
+      Such a task fails before anything is changed.
+    - To add tags to a rule that has an I(abort_uploads_after), set
+      I(abort_uploads_after) to C(0d) in the same task.
     - An empty list removes the tags from an existing rule.
     type: list
     elements: dict
@@ -485,9 +489,46 @@ def create_rule(module, blade, until_ms):
     module.exit_json(changed=changed)
 
 
+def _check_abort_and_tags(module, current):
+    """Fail an update the array rejects for mixing tags and an upload abort.
+
+    The array judges a multipart-upload abort by the tags the rule has before
+    the request, so it rejects the abort even when the same request removes
+    the tags. Tags on a rule that has an abort are accepted only when the same
+    request removes the abort. Failing here, before any write, keeps check
+    mode in step with the real run. A task that changes neither setting is
+    never refused.
+    """
+    current_abort = current["abort_incomplete_multipart_uploads_after"]
+    abort = module.params["abort_uploads_after"]
+    abort_ms = current_abort if abort is None else time_to_milliseconds(abort)
+    if abort_ms and abort_ms != current_abort and current["tags"]:
+        module.fail_json(
+            msg=(
+                "abort_uploads_after cannot be set on lifecycle rule {0} for "
+                "bucket {1} while the rule has tags; the array rejects a "
+                "multipart-upload abort on a tag-filtered rule, also when the "
+                "same task removes the tags. Remove the tags in a separate "
+                "task first"
+            ).format(module.params["name"], module.params["bucket"])
+        )
+    tags = _tags_param(module)
+    if tags and tags != current["tags"] and abort_ms:
+        module.fail_json(
+            msg=(
+                "tags cannot be set on lifecycle rule {0} for bucket {1} while "
+                "the rule has abort_uploads_after set; the array rejects tags "
+                "on a rule that aborts multipart uploads. Set "
+                "abort_uploads_after to 0d in the same task"
+            ).format(module.params["name"], module.params["bucket"])
+        )
+
+
 def update_rule(module, blade, rule, until_ms):
     """Update a lifecycle policy rule, sending only the changed fields"""
-    changes = _rule_changes(module, _current_state(rule), until_ms)
+    current = _current_state(rule)
+    _check_abort_and_tags(module, current)
+    changes = _rule_changes(module, current, until_ms)
     if not changes:
         module.exit_json(changed=False)
     changed = True
@@ -548,8 +589,8 @@ def _validate_params(module):
                         MAX_TAG_VALUE_LENGTH
                     )
                 )
-        # only a task that itself sets tags is refused here; the array rejects
-        # the abort on a rule that still has tags, with its own message
+        # a task that itself sets both is refused here; update_rule refuses
+        # the combinations that depend on what the rule already has
         abort = module.params["abort_uploads_after"]
         if abort and time_to_milliseconds(abort):
             module.fail_json(

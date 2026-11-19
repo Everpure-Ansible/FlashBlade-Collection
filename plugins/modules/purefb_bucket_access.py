@@ -41,6 +41,9 @@ options:
   name:
     description:
     - Name of Object Store bucket the policy applies to.
+    - For a bucket in a realm use C(realm::bucket). A realm-scoped
+      administrator must use the realm-qualified name; a bare name is not
+      placed in, or resolved to, the administrator's realm.
     type: str
     required: true
   rule:
@@ -117,6 +120,9 @@ options:
     - The list of resources which this rule applies to.
     - The only currently supported resource is all objects in a bucket to
       which the parent policy belongs.
+    - A resource is given without the bucket name, which the module adds.
+      The array reports the resources of a rule with the bucket name
+      without its realm, for example C(bar/*) for bucket C(tenant1::bar).
     elements: str
     type: list
     default: ["*"]
@@ -148,6 +154,13 @@ EXAMPLES = r"""
   everpure.flashblade.purefb_bucket_access:
     rule: foo
     name: bar
+    policy_type: access
+    fb_url: 10.10.10.2
+    api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+- name: Create a bucket access policy rule for bucket bar in realm tenant1
+  everpure.flashblade.purefb_bucket_access:
+    rule: foo
+    name: tenant1::bar
     policy_type: access
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
@@ -304,17 +317,56 @@ def _check_actions(module, blade, api_version):
         )
 
 
+# What the array answers when it is asked for a bucket that is missing or
+# destroyed; any other failed read of the bucket is reported as it is.
+_NO_BUCKET_ERRORS = ("does not exist", "has been destroyed")
+
+
+def _leaf(name):
+    """Return a name without its realm prefix"""
+    return name.rpartition("::")[2]
+
+
+def _stored_bucket_name(module, blade, api_version):
+    """Return the name of the bucket as the array stores it.
+
+    The array finds a bucket whatever the letter case of the name it is
+    asked for, but accepts a rule resource only with the stored spelling
+    of the bucket name, so the stored name is used from here on.
+    """
+    bucket = module.params["name"]
+    res = blade.get_buckets(
+        names=[bucket], destroyed=False, **_context_kwargs(module, api_version)
+    )
+    items = []
+    if res.status_code == 200:
+        items = list(res.items)
+    else:
+        error = get_error_message(res)
+        if not any(text in str(error).lower() for text in _NO_BUCKET_ERRORS):
+            module.fail_json(
+                msg="Failed to read bucket {0}. Error: {1}".format(bucket, error)
+            )
+    if not items:
+        module.fail_json(
+            msg="Bucket {0} does not exist, or is destroyed.".format(bucket)
+        )
+    return items[0].name
+
+
 def _access_rule_matches(module, rule):
     """Compare a live bucket access policy rule with the requested rule.
 
     effect is not compared: the REST API only supports allow, and deny is
-    rejected before this point.
+    rejected before this point. The array stores the resources of a rule
+    with the bucket name without its realm, whereas a request has to carry
+    the realm, so the stored rule is compared with the bare bucket name.
     """
+    bucket = _leaf(module.params["name"])
     desired = {
         "actions": sorted(module.params["actions"]),
         "resources": sorted(
-            module.params["name"] + "/" + resource
-            for resource in module.params["resources"]
+            bucket + "/" + resource for resource in module.params["resources"]
         ),
         "all_principals": bool(module.params["principals"]),
     }
@@ -668,6 +720,8 @@ def delete_access_policy(module, blade):
 
 def create_access_policy(module, blade):
     """Create or update a bucket access policy rule (and the policy if needed)"""
+    # The array refuses a resource whose bucket name lacks the realm (and
+    # stores it without), so the request carries the full bucket name.
     bucket = module.params["name"]
     body = BucketAccessPolicyRulePost(
         effect=module.params["effect"],
@@ -774,23 +828,8 @@ def main():
                 "Minimum FlashBlade REST version required: {0}".format(MIN_API_VERSION)
             )
         )
-    if (
-        LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-        and module.params["context"]
-    ):
-        res = blade.get_buckets(
-            names=[module.params["name"]],
-            destroyed=False,
-            context_names=[module.params["context"]],
-        )
-    else:
-        res = blade.get_buckets(names=[module.params["name"]], destroyed=False)
-    if res.status_code != 200:
-        module.fail_json(
-            msg="Bucket {0} does not exist, or is destroyed.".format(
-                module.params["name"]
-            )
-        )
+    # Every later lookup, request and message uses the name the array stores.
+    module.params["name"] = _stored_bucket_name(module, blade, api_version)
     if state == "present" and module.params["policy_type"] == "access":
         # Ask the array which actions it knows before anything is written.
         _check_actions(module, blade, api_version)

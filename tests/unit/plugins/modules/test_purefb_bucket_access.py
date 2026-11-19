@@ -187,6 +187,13 @@ def _stored_cors_rule(methods=None, origins=None, headers=None, name=RULE):
     )
 
 
+def _bucket(name=BUCKET):
+    """A bucket as GET /buckets returns it; name is the array's own spelling."""
+    bucket = Mock()
+    bucket.name = name
+    return bucket
+
+
 def _wire_policy(
     blade,
     kind,
@@ -270,6 +277,7 @@ def _blade(
     stored=None,
     existing=None,
     extra_rules=(),
+    bucket=BUCKET,
     **knobs
 ):
     """Build a mock blade for main() with a bucket access policy fake.
@@ -277,12 +285,13 @@ def _blade(
     rule_exists: the rule is already on the array (existing, or a matching
     s3:GetObject rule) when main() first looks for it. stored: what the array
     keeps for a POSTed rule (defaults to a rule that matches the default
-    request). extra_rules: other rules already in the policy. knobs: the
-    failure switches of _wire_policy.
+    request). extra_rules: other rules already in the policy. bucket: the
+    name the array returns for the bucket. knobs: the failure switches of
+    _wire_policy.
     """
     blade = Mock()
     blade.get_fleets.return_value = _response(400)
-    blade.get_buckets.return_value = _response(200, [Mock()])
+    blade.get_buckets.return_value = _response(200, [_bucket(bucket)])
     blade.get_object_store_access_policy_actions.return_value = _catalogue_response(
         _CATALOGUE if catalogue is None else catalogue
     )
@@ -301,12 +310,17 @@ def _blade(
 
 
 def _cors_blade(
-    rule_exists=False, policy_exists=True, stored=None, existing=None, **knobs
+    rule_exists=False,
+    policy_exists=True,
+    stored=None,
+    existing=None,
+    bucket=BUCKET,
+    **knobs
 ):
     """Build a mock blade for main() with a CORS policy fake."""
     blade = Mock()
     blade.get_fleets.return_value = _response(400)
-    blade.get_buckets.return_value = _response(200, [Mock()])
+    blade.get_buckets.return_value = _response(200, [_bucket(bucket)])
     rules = []
     if rule_exists:
         rules.append(existing if existing is not None else _stored_cors_rule())
@@ -701,10 +715,16 @@ class TestMainActions:
         blade.get_buckets.return_value = _response(400)
         mock_get_system.return_value = blade
 
-        with pytest.raises(SystemExit, match="fail_json"):
-            main()
+        with patch(
+            "plugins.modules.purefb_bucket_access.get_error_message",
+            return_value="Bucket does not exist.",
+        ):
+            with pytest.raises(SystemExit, match="fail_json"):
+                main()
 
-        assert "does not exist" in module.fail_json.call_args[1]["msg"]
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Bucket bkt does not exist, or is destroyed."
+        )
         blade.get_object_store_access_policy_actions.assert_not_called()
 
     def test_fleet_context_reaches_the_lookup(
@@ -1292,3 +1312,303 @@ class TestCors:
             "Failed to read the CORS policy of bucket bkt."
         )
         blade.delete_buckets_cross_origin_resource_sharing_policies_rules.assert_not_called()
+
+
+REALM_BUCKET = "realm1::bkt"
+
+
+class TestAccessRuleResources:
+    """Stored rule resources carry the bucket name without its realm."""
+
+    @pytest.mark.parametrize(
+        "bucket, stored, requested, expected",
+        [
+            ("bkt", ["bkt/*"], ["*"], True),
+            (REALM_BUCKET, ["bkt/*"], ["*"], True),
+            (REALM_BUCKET, ["bkt/b/*", "bkt/a/*"], ["a/*", "b/*"], True),
+            (REALM_BUCKET, ["other/*"], ["*"], False),
+            (REALM_BUCKET, ["bkt/logs/*"], ["*"], False),
+            ("bkt", ["bkt/logs/*"], ["*"], False),
+        ],
+    )
+    def test_stored_resources_are_compared_with_the_bare_bucket_name(
+        self, bucket, stored, requested, expected
+    ):
+        module = _module(name=bucket, resources=requested)
+        rule = _stored_rule(resources=stored)
+
+        assert _ACCESS_RULES["matches"](module, rule) is expected
+
+
+@patch("plugins.modules.purefb_bucket_access.LooseVersion", RealLooseVersion)
+@patch("plugins.modules.purefb_bucket_access.HAS_PYPURECLIENT", True)
+@patch("plugins.modules.purefb_bucket_access.get_rest_api_version", return_value="2.30")
+@patch("plugins.modules.purefb_bucket_access.purefb_argument_spec", return_value={})
+@patch("plugins.modules.purefb_bucket_access.get_system")
+@patch("plugins.modules.purefb_bucket_access.AnsibleModule")
+class TestRealmBucket:
+    """A bucket in a realm is named realm::bucket.
+
+    The array accepts a rule resource only with the full bucket name and
+    stores it with the bucket name without the realm: the rules of
+    realm1::bkt read back with resources ["bkt/*"], exactly as those of an
+    array-level bucket bkt do.
+    """
+
+    def test_matching_rule_is_idempotent(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version
+    ):
+        module = _module(name=REALM_BUCKET)
+        blade = _blade(bucket=REALM_BUCKET, rule_exists=True)
+
+        _run(mock_ansible_module, mock_get_system, module, blade, "exit_json")
+
+        assert _write_sequence(blade, _ACCESS_RULES) == []
+        blade.get_buckets_bucket_access_policies_rules.assert_called_once_with(
+            bucket_names=[REALM_BUCKET]
+        )
+        module.exit_json.assert_called_once_with(changed=False)
+
+    def test_matching_rule_in_check_mode_is_unchanged(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version
+    ):
+        module = _module(name=REALM_BUCKET)
+        module.check_mode = True
+        blade = _blade(bucket=REALM_BUCKET, rule_exists=True)
+
+        _run(mock_ansible_module, mock_get_system, module, blade, "exit_json")
+
+        assert _write_sequence(blade, _ACCESS_RULES) == []
+        module.exit_json.assert_called_once_with(changed=False)
+
+    def test_create_sends_the_realm_and_accepts_the_stored_rule(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version
+    ):
+        module = _module(name=REALM_BUCKET)
+        blade = _blade(bucket=REALM_BUCKET, policy_exists=False)
+
+        with patch(
+            "plugins.modules.purefb_bucket_access.BucketAccessPolicyRulePost"
+        ) as mock_body:
+            _run(mock_ansible_module, mock_get_system, module, blade, "exit_json")
+
+        # The array refuses "bkt/*" in the request for a bucket in a realm.
+        assert mock_body.call_args[1]["resources"] == ["realm1::bkt/*"]
+        blade.post_buckets_bucket_access_policies.assert_called_once_with(
+            bucket_names=[REALM_BUCKET]
+        )
+        posted = blade.post_buckets_bucket_access_policies_rules.call_args[1]
+        assert posted["bucket_names"] == [REALM_BUCKET]
+        assert posted["names"] == [RULE]
+        assert posted["rule"] is mock_body.return_value
+        module.fail_json.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_create_in_check_mode_writes_nothing(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version
+    ):
+        module = _module(name=REALM_BUCKET)
+        module.check_mode = True
+        blade = _blade(bucket=REALM_BUCKET)
+
+        _run(mock_ansible_module, mock_get_system, module, blade, "exit_json")
+
+        assert _write_sequence(blade, _ACCESS_RULES) == []
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_differing_rule_is_replaced(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version
+    ):
+        module = _module(name=REALM_BUCKET)
+        blade = _blade(
+            bucket=REALM_BUCKET,
+            rule_exists=True,
+            existing=_stored_rule(all_principals=False),
+        )
+
+        _run(mock_ansible_module, mock_get_system, module, blade, "exit_json")
+
+        assert _write_sequence(blade, _ACCESS_RULES) == [
+            ("post", TEMP),
+            ("delete", RULE),
+            ("post", RULE),
+            ("delete", TEMP),
+        ]
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_coerced_rule_is_still_reported(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version
+    ):
+        module = _module(
+            name=REALM_BUCKET, actions=["s3:GetObject", "s3:PutObjectTagging"]
+        )
+        blade = _blade(
+            bucket=REALM_BUCKET, stored=_stored_rule(actions=["s3:GetObject"])
+        )
+
+        _run(mock_ansible_module, mock_get_system, module, blade, "fail_json")
+
+        kwargs = module.fail_json.call_args[1]
+        assert kwargs["changed"] is True
+        assert kwargs["msg"].startswith(
+            "Access policy rule rule1 in policy realm1::bkt was not stored as "
+            "requested: the array kept actions=['s3:GetObject'], "
+            "resources=['bkt/*'], all_principals=True."
+        )
+
+    def test_delete_rule(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version
+    ):
+        module = _module(name=REALM_BUCKET, state="absent")
+        blade = _blade(bucket=REALM_BUCKET, rule_exists=True)
+
+        _run(mock_ansible_module, mock_get_system, module, blade, "exit_json")
+
+        blade.delete_buckets_bucket_access_policies_rules.assert_called_once_with(
+            bucket_names=[REALM_BUCKET], names=[RULE]
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_delete_policy(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version
+    ):
+        module = _module(name=REALM_BUCKET, state="absent", rule=None)
+        blade = _blade(bucket=REALM_BUCKET, rule_exists=True)
+
+        _run(mock_ansible_module, mock_get_system, module, blade, "exit_json")
+
+        blade.delete_buckets_bucket_access_policies.assert_called_once_with(
+            bucket_names=[REALM_BUCKET]
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_cors_rule_is_created_and_then_unchanged(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version
+    ):
+        blade = _cors_blade(bucket=REALM_BUCKET, policy_exists=False)
+        for expected in (True, False):
+            module = _module(name=REALM_BUCKET, policy_type="cors")
+
+            _run(mock_ansible_module, mock_get_system, module, blade, "exit_json")
+
+            module.exit_json.assert_called_once_with(changed=expected)
+        policies = blade.post_buckets_cross_origin_resource_sharing_policies
+        policies.assert_called_once_with(bucket_names=[REALM_BUCKET])
+        assert _write_sequence(blade, _CORS_RULES) == [("post", RULE)]
+
+
+@patch("plugins.modules.purefb_bucket_access.LooseVersion", RealLooseVersion)
+@patch("plugins.modules.purefb_bucket_access.HAS_PYPURECLIENT", True)
+@patch("plugins.modules.purefb_bucket_access.get_rest_api_version", return_value="2.30")
+@patch("plugins.modules.purefb_bucket_access.purefb_argument_spec", return_value={})
+@patch("plugins.modules.purefb_bucket_access.get_system")
+@patch("plugins.modules.purefb_bucket_access.AnsibleModule")
+class TestStoredBucketName:
+    """The bucket is read once and its stored name is used from then on.
+
+    The array finds a bucket whatever the letter case of the name and
+    returns the stored spelling; a rule resource with any other spelling of
+    the bucket name is refused.
+    """
+
+    def test_other_letter_case_matches_the_stored_rule(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version
+    ):
+        module = _module(name="BKT")
+        blade = _blade(rule_exists=True)
+
+        _run(mock_ansible_module, mock_get_system, module, blade, "exit_json")
+
+        blade.get_buckets.assert_called_once_with(names=["BKT"], destroyed=False)
+        assert _write_sequence(blade, _ACCESS_RULES) == []
+        module.exit_json.assert_called_once_with(changed=False)
+
+    def test_other_letter_case_posts_the_stored_spelling(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version
+    ):
+        module = _module(name="REALM1::Bkt")
+        blade = _blade(bucket=REALM_BUCKET)
+
+        with patch(
+            "plugins.modules.purefb_bucket_access.BucketAccessPolicyRulePost"
+        ) as mock_body:
+            _run(mock_ansible_module, mock_get_system, module, blade, "exit_json")
+
+        assert mock_body.call_args[1]["resources"] == ["realm1::bkt/*"]
+        module.exit_json.assert_called_once_with(changed=True)
+
+    @pytest.mark.parametrize(
+        "error", ["Bucket does not exist.", "Bucket has been destroyed."]
+    )
+    def test_missing_or_destroyed_bucket_is_reported_as_absent(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version, error
+    ):
+        module = _module(name=REALM_BUCKET)
+        blade = _blade()
+        blade.get_buckets.return_value = _response(400)
+
+        with patch(
+            "plugins.modules.purefb_bucket_access.get_error_message",
+            return_value=error,
+        ):
+            _run(mock_ansible_module, mock_get_system, module, blade, "fail_json")
+
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Bucket realm1::bkt does not exist, or is destroyed."
+        )
+        blade.get_buckets_bucket_access_policies.assert_not_called()
+
+    def test_refused_bucket_read_reports_the_array_message(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version
+    ):
+        module = _module()
+        blade = _blade()
+        blade.get_buckets.return_value = _response(403)
+
+        with patch(
+            "plugins.modules.purefb_bucket_access.get_error_message",
+            return_value="Operation not permitted.",
+        ):
+            _run(mock_ansible_module, mock_get_system, module, blade, "fail_json")
+
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Failed to read bucket bkt. Error: Operation not permitted."
+        )
+        blade.get_buckets_bucket_access_policies.assert_not_called()
+
+    def test_empty_bucket_read_is_reported_as_absent(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version
+    ):
+        module = _module()
+        blade = _blade()
+        blade.get_buckets.return_value = _response(200, [])
+
+        _run(mock_ansible_module, mock_get_system, module, blade, "fail_json")
+
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Bucket bkt does not exist, or is destroyed."
+        )
+        blade.get_buckets_bucket_access_policies.assert_not_called()
+
+    def test_fleet_context_reaches_the_bucket_read(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version
+    ):
+        module = _module(context="array-b", state="absent")
+        blade = _blade()
+
+        _run(mock_ansible_module, mock_get_system, module, blade, "exit_json")
+
+        blade.get_buckets.assert_called_once_with(
+            names=[BUCKET], destroyed=False, context_names=["array-b"]
+        )
+
+    def test_context_is_not_sent_below_rest_2_17(
+        self, mock_ansible_module, mock_get_system, mock_spec, mock_version
+    ):
+        mock_version.return_value = "2.16"
+        module = _module(context="array-b", state="absent")
+        blade = _blade()
+
+        _run(mock_ansible_module, mock_get_system, module, blade, "exit_json")
+
+        blade.get_buckets.assert_called_once_with(names=[BUCKET], destroyed=False)

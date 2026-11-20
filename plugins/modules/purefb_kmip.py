@@ -143,17 +143,45 @@ def _reference_name(obj, field):
     return getattr(getattr(obj, field, None), "name", None)
 
 
+def _does_not_exist(res):
+    """True when a failed read says that the named object does not exist.
+
+    The array answers a read of an unknown name with an error rather than
+    an empty list. Any other failed read (a refusal, an array that is busy
+    or failing) says nothing about the object and must not be taken for a
+    missing one.
+    """
+    return "does not exist" in str(get_error_message(res)).lower()
+
+
 def get_kmip(module, blade):
-    """Return the named KMIP object, or None if it does not exist."""
-    res = blade.get_kmip(names=[module.params["name"]])
-    if res.status_code != 200:
-        return None
-    items = list(res.items)
-    return items[0] if items else None
+    """Return the named KMIP object, or None when it does not exist.
+
+    Only the array's "does not exist" answer reads as None. Any other
+    failed read fails the task with the array's message, so that
+    state=absent does not report ok, and state=present does not plan a
+    create, for an object the module could not read.
+    """
+    name = module.params["name"]
+    res = blade.get_kmip(names=[name])
+    if res.status_code == 200:
+        items = list(res.items)
+        return items[0] if items else None
+    if not _does_not_exist(res):
+        module.fail_json(
+            msg="Failed to read KMIP object {0}. Error: {1}".format(
+                name, get_error_message(res)
+            )
+        )
+    return None
 
 
 def _check_certificate(module, blade, param):
-    """Fail unless the named certificate or certificate group exists."""
+    """Fail unless the named certificate or certificate group exists.
+
+    A read that fails for any other reason is reported with the array's
+    message instead of being taken for a missing object.
+    """
     name = module.params[param]
     if not name:
         return
@@ -163,15 +191,28 @@ def _check_certificate(module, blade, param):
     else:
         res = blade.get_certificates(names=[name])
         kind = "Certificate"
-    if res.status_code != 200:
-        module.fail_json(msg="{0} {1} does not exist.".format(kind, name))
+    if res.status_code == 200:
+        return
+    if _does_not_exist(res):
+        msg = "{0} {1} does not exist.".format(kind, name)
+    else:
+        msg = "Failed to read {0} {1}. Error: {2}".format(
+            kind.lower(), name, get_error_message(res)
+        )
+    module.fail_json(msg=msg)
 
 
 def report_kmip_test(module, blade):
     """Report the array's KMIP connectivity tests. Makes no changes."""
     test_response = []
-    response = list(blade.get_kmip_test(names=[module.params["name"]]).items)
-    for component in response:
+    res = blade.get_kmip_test(names=[module.params["name"]])
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to test KMIP object {0}. Error: {1}".format(
+                module.params["name"], get_error_message(res)
+            )
+        )
+    for component in list(res.items):
         test_response.append(
             {
                 "component_address": component.component_address,

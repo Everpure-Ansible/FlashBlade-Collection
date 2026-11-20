@@ -10,6 +10,7 @@ __metaclass__ = type
 import sys
 import multiprocessing
 import ctypes
+from contextlib import ExitStack
 from unittest.mock import Mock, patch, MagicMock
 
 # Mock multiprocessing context for Windows
@@ -70,1830 +71,1519 @@ sys.modules["ansible_collections.everpure.flashblade.plugins.module_utils.versio
     MagicMock()
 )
 
-from plugins.modules.purefb_realm import (
-    main,
-    get_realm,
-    get_pending_realm,
-    get_policy,
-    make_realm,
-    update_realm,
+from plugins.module_utils.version import LooseVersion as RealLooseVersion
+from plugins.modules.purefb_realm import main
+
+MOD = "plugins.modules.purefb_realm"
+
+# Answers of Purity//FB 4.8.8
+NO_REALM = "Realm does not exist."
+EXISTS = "A realm already exists with the given name."
+CONTAINS = (
+    "This realm contains entities. Please destroy and eradicate all entities "
+    "before destroying the realm."
 )
+DENIED = "Operation not permitted."
+STALE = "Object changed during processing. Please try again."
+NEEDS_FLAG = "without_default_access_list query parameter is required."
+# The stand-in's own answer where the answer of the array is not known
+REFUSED = "Refused by the stand-in."
 
 
-class TestPurefbRealm:
-    """Test cases for purefb_realm module"""
+class _Item:
+    """A plain object with the given attributes: a model or a response."""
 
-    @patch("plugins.modules.purefb_realm.get_pending_realm")
-    @patch("plugins.modules.purefb_realm.get_realm")
-    @patch("plugins.modules.purefb_realm.LooseVersion")
-    @patch("plugins.modules.purefb_realm.get_system")
-    @patch("plugins.modules.purefb_realm.AnsibleModule")
-    @patch("plugins.modules.purefb_realm.HAS_PURESTORAGE", True)
-    def test_main_create_realm(
+    def __init__(self, **attrs):
+        self.__dict__.update(attrs)
+
+
+def _ok(items=None):
+    return _Item(status_code=200, items=list(items or []), errors=[])
+
+
+def _err(message):
+    return _Item(status_code=400, items=[], errors=[_Item(message=message)])
+
+
+def _error_message(res, default="Unknown error"):
+    errors = list(getattr(res, "errors", None) or [])
+    return errors[0].message if errors else default
+
+
+def _body(**kwargs):
+    """Stand-in for the pypureclient models, so request bodies compare."""
+    return kwargs
+
+
+def _find(names, wanted):
+    """The array matches names without regard to case and returns the name
+    it keeps."""
+    for name in names:
+        if name.lower() == wanted.lower():
+            return name
+    return None
+
+
+def _prefix(name):
+    return name.rpartition("::")[0]
+
+
+class _Array:
+    """A small stateful stand-in for the array.
+
+    realms and destroyed name the live and the destroyed realms. qos maps a
+    realm to its QoS policy, defaults a realm to its default object store
+    server and tls a realm to its default inbound TLS policy (full names).
+    accesses are (resource type, resource name, realm) and rules (management
+    access policy, realm). entities names realms that hold objects of other
+    kinds. realm_admin makes it answer a realm-scoped administrator. fail
+    maps a method, or patch_realms.name / .destroyed / .tls, to the message
+    that request is refused with; a list holds one answer for each call and
+    None lets a call through. writes records every write that was sent.
+    """
+
+    METHODS = (
+        "get_realms",
+        "post_realms",
+        "patch_realms",
+        "delete_realms",
+        "get_qos_policies",
+        "get_qos_policies_members",
+        "post_qos_policies_members",
+        "delete_qos_policies_members",
+        "get_servers",
+        "get_tls_policies",
+        "get_realms_defaults",
+        "patch_realms_defaults",
+        "get_resource_accesses",
+        "get_management_access_policies",
+    )
+    REST_2_20 = (
+        "post_qos_policies_members",
+        "delete_qos_policies_members",
+        "get_realms_defaults",
+        "patch_realms_defaults",
+    )
+
+    def __init__(
         self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
+        realms=("tenant1",),
+        destroyed=(),
+        qos_policies=("gold", "silver"),
+        qos=None,
+        servers=(),
+        defaults=None,
+        tls_policies=(),
+        tls=None,
+        accesses=(),
+        rules=(),
+        entities=(),
     ):
-        """Test creating a new realm"""
-        # Setup mock module
-        mock_module = Mock()
-        mock_module.exit_json = Mock(side_effect=SystemExit)
-        mock_module.fail_json = Mock(side_effect=SystemExit)
-        mock_module.params = {
-            "name": "test-realm",
-            "without_default_access_list": True,
-            "state": "present",
-            "qos_policy": None,
-            "eradicate": False,
-            "rename": None,
-        }
-        mock_module.check_mode = False
-        mock_ansible_module.return_value = mock_module
+        self.realms = {}
+        for name in realms:
+            self.realms[name.lower()] = {"name": name, "destroyed": False, "tls": None}
+        for name in destroyed:
+            self.realms[name.lower()] = {"name": name, "destroyed": True, "tls": None}
+        for realm, policy in (tls or {}).items():
+            self.realms[realm.lower()]["tls"] = policy
+        self.qos_policies = list(qos_policies)
+        self.qos = dict(
+            (realm.lower(), policy) for realm, policy in (qos or {}).items()
+        )
+        self.servers = list(servers)
+        self.defaults = dict(
+            (realm.lower(), server) for realm, server in (defaults or {}).items()
+        )
+        self.tls_policies = list(tls_policies)
+        self.accesses = [list(access) for access in accesses]
+        self.rules = [list(rule) for rule in rules]
+        self.entities = set(name.lower() for name in entities)
+        self.realm_admin = False
+        self.fail = {}
+        self.writes = []
 
-        # Mock blade
-        mock_blade = Mock()
-        mock_blade.get_versions.return_value.items = ["2.19"]
-        mock_get_system.return_value = mock_blade
+    def blade(self, api_version="2.30"):
+        blade = Mock()
+        for method in self.METHODS:
+            setattr(blade, method, Mock(side_effect=getattr(self, method)))
+        if api_version == "2.19":
+            for method in self.REST_2_20:
+                delattr(blade, method)
+        return blade
 
-        # Mock API version check
-        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+    # ---- state helpers ----
 
-        # Realm doesn't exist
-        mock_get_realm.return_value = None
-        mock_get_pending_realm.return_value = None
+    def _refused(self, key):
+        answer = self.fail.get(key)
+        if isinstance(answer, list):
+            answer = answer.pop(0) if answer else None
+        return answer
 
-        # Mock successful realm creation
-        mock_post_response = Mock()
-        mock_post_response.status_code = 200
-        mock_blade.post_realms.return_value = mock_post_response
+    def _realm(self, name):
+        return self.realms.get(name.lower())
 
-        # Call main
-        try:
-            main()
-        except SystemExit:
-            pass
+    def name_of(self, name):
+        """The name the array keeps for the realm, None when it has none."""
+        realm = self._realm(name)
+        return realm["name"] if realm else None
 
-        # Verify post_realms was called
-        mock_blade.post_realms.assert_called_once_with(
-            names=["test-realm"], without_default_access_list=True
+    def is_destroyed(self, name):
+        return self._realm(name)["destroyed"]
+
+    def tls_of(self, name):
+        return self._realm(name)["tls"]
+
+    def qos_of(self, name):
+        return self.qos.get(name.lower())
+
+    def default_of(self, name):
+        return self.defaults.get(name.lower())
+
+    def _holds_something(self, realm):
+        key = realm["name"].lower()
+        members = [
+            name
+            for name in self.servers + self.tls_policies
+            if _prefix(name).lower() == key
+        ]
+        scoped = [
+            entry for entry in self.accesses + self.rules if entry[-1].lower() == key
+        ]
+        return bool(members or scoped or key in self.qos or key in self.entities)
+
+    def _rename(self, realm, new):
+        old = realm["name"]
+
+        def moved(name):
+            if _prefix(name).lower() == old.lower():
+                return "{0}::{1}".format(new, name.rpartition("::")[2])
+            return name
+
+        del self.realms[old.lower()]
+        realm["name"] = new
+        self.realms[new.lower()] = realm
+        self.servers = [moved(name) for name in self.servers]
+        self.tls_policies = [moved(name) for name in self.tls_policies]
+        if old.lower() in self.defaults:
+            self.defaults[new.lower()] = moved(self.defaults.pop(old.lower()))
+        if old.lower() in self.qos:
+            self.qos[new.lower()] = self.qos.pop(old.lower())
+        if old.lower() in self.entities:
+            self.entities.discard(old.lower())
+            self.entities.add(new.lower())
+        for entry in self.accesses + self.rules:
+            if entry[-1].lower() == old.lower():
+                entry[-1] = new
+        # the reference to the default inbound TLS policy keeps the name the
+        # policy had before the rename
+
+    # ---- realms ----
+
+    def get_realms(self, names=None, destroyed=None, **kwargs):
+        refused = self._refused("get_realms")
+        if refused:
+            return _err(refused)
+        realm = self._realm(names[0])
+        if realm is None:
+            return _err(NO_REALM)
+        if destroyed is True and not realm["destroyed"]:
+            return _err("Realm is not destroyed.")
+        if destroyed is False and realm["destroyed"]:
+            return _err("Realm has been destroyed.")
+        policy = None
+        if realm["tls"]:
+            policy = _Item(name=realm["tls"], resource_type="tls-policies")
+        return _ok(
+            [
+                _Item(
+                    name=realm["name"],
+                    destroyed=realm["destroyed"],
+                    default_inbound_tls_policy=policy,
+                )
+            ]
         )
 
-        # Verify exit_json was called with changed=True
-        mock_module.exit_json.assert_called_once()
-        call_args = mock_module.exit_json.call_args[1]
-        assert call_args["changed"] is True
+    def post_realms(self, names=None, without_default_access_list=None, **kwargs):
+        name = names[0]
+        self.writes.append(("create", name))
+        refused = self._refused("post_realms")
+        if refused or self.realm_admin:
+            return _err(refused or DENIED)
+        if not without_default_access_list:
+            return _err(NEEDS_FLAG)
+        if "::" in name:
+            return _err("Realm name must be between 1 and 63 characters.")
+        if self._realm(name) is not None:
+            return _err(EXISTS)
+        self.realms[name.lower()] = {"name": name, "destroyed": False, "tls": None}
+        return _ok()
 
-    @patch("plugins.modules.purefb_realm.get_policy")
-    @patch("plugins.modules.purefb_realm.get_pending_realm")
-    @patch("plugins.modules.purefb_realm.get_realm")
-    @patch("plugins.modules.purefb_realm.LooseVersion")
-    @patch("plugins.modules.purefb_realm.get_system")
-    @patch("plugins.modules.purefb_realm.AnsibleModule")
-    @patch("plugins.modules.purefb_realm.HAS_PURESTORAGE", True)
-    def test_main_create_realm_with_qos_policy(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_get_policy,
-    ):
-        """Test creating a new realm with QoS policy"""
-        # Setup mock module
-        mock_module = Mock()
-        mock_module.exit_json = Mock(side_effect=SystemExit)
-        mock_module.fail_json = Mock(side_effect=SystemExit)
-        mock_module.params = {
-            "name": "test-realm",
-            "without_default_access_list": True,
-            "state": "present",
-            "qos_policy": "test-qos-policy",
-            "eradicate": False,
-            "rename": None,
-        }
-        mock_module.check_mode = False
-        mock_ansible_module.return_value = mock_module
+    def patch_realms(self, names=None, realm=None, **kwargs):
+        body = realm
+        current = self._realm(names[0])
+        if "name" in body:
+            self.writes.append(("rename", names[0], body["name"]))
+            refused = self._refused("patch_realms.name")
+            if refused or self.realm_admin:
+                return _err(refused or DENIED)
+            if current is None:
+                return _err(NO_REALM)
+            if body["name"] != current["name"]:
+                if self._realm(body["name"]) is not None:
+                    return _err(EXISTS)
+                self._rename(current, body["name"])
+        if "destroyed" in body:
+            action = "destroy" if body["destroyed"] else "recover"
+            self.writes.append((action, names[0]))
+            refused = self._refused("patch_realms.destroyed")
+            if refused:
+                return _err(refused)
+            if current is None:
+                return _err(NO_REALM)
+            if body["destroyed"] and self._holds_something(current):
+                return _err(CONTAINS)
+            current["destroyed"] = body["destroyed"]
+        if "default_inbound_tls_policy" in body:
+            wanted = body["default_inbound_tls_policy"]["name"]
+            self.writes.append(("tls", names[0], wanted))
+            refused = self._refused("patch_realms.tls")
+            if refused or self.realm_admin:
+                return _err(refused or DENIED)
+            if current is None:
+                return _err(NO_REALM)
+            if current["tls"] and (
+                _prefix(current["tls"]).lower() != current["name"].lower()
+            ):
+                return _err(STALE)
+            if wanted == "":
+                current["tls"] = None
+            else:
+                policy = _find(self.tls_policies, wanted)
+                if policy is None or (
+                    _prefix(policy).lower() != current["name"].lower()
+                ):
+                    return _err("TLS Policy does not exist.")
+                current["tls"] = policy
+        return _ok()
 
-        # Mock blade
-        mock_blade = Mock()
-        mock_blade.get_versions.return_value.items = ["2.19"]
-        mock_get_system.return_value = mock_blade
+    def delete_realms(self, names=None, **kwargs):
+        self.writes.append(("eradicate", names[0]))
+        refused = self._refused("delete_realms")
+        if refused:
+            return _err(refused)
+        realm = self._realm(names[0])
+        if realm is None:
+            return _err(NO_REALM)
+        if not realm["destroyed"]:
+            return _err(REFUSED)
+        del self.realms[realm["name"].lower()]
+        return _ok()
 
-        # Mock API version check
-        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+    # ---- QoS ----
 
-        # Realm doesn't exist
-        mock_get_realm.return_value = None
-        mock_get_pending_realm.return_value = None
+    def get_qos_policies(self, names=None, **kwargs):
+        refused = self._refused("get_qos_policies")
+        if refused:
+            return _err(refused)
+        policy = _find(self.qos_policies, names[0])
+        if policy is None or self.realm_admin:
+            return _err("QoS Policy does not exist.")
+        return _ok([_Item(name=policy)])
 
-        # QoS policy exists
-        mock_get_policy.return_value = True
-
-        # Mock successful realm creation
-        mock_post_response = Mock()
-        mock_post_response.status_code = 200
-        mock_blade.post_realms.return_value = mock_post_response
-        mock_blade.post_qos_policies_members.return_value = mock_post_response
-
-        # Call main
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        # Verify post_realms was called
-        mock_blade.post_realms.assert_called_once_with(
-            names=["test-realm"], without_default_access_list=True
+    def get_qos_policies_members(self, member_types=None, member_names=None, **kwargs):
+        refused = self._refused("get_qos_policies_members")
+        if refused:
+            return _err(refused)
+        realm = self._realm(member_names[0])
+        if realm is None:
+            return _err("Member does not exist.")
+        policy = self.qos.get(realm["name"].lower())
+        if policy is None or self.realm_admin:
+            return _ok()
+        return _ok(
+            [
+                _Item(
+                    policy=_Item(name=policy),
+                    member=_Item(name=realm["name"], resource_type="realms"),
+                )
+            ]
         )
 
-        # Verify QoS policy was assigned to the realm member type
-        mock_blade.post_qos_policies_members.assert_called_once_with(
-            policy_names=["test-qos-policy"],
-            member_names=["test-realm"],
-            member_types=["realms"],
+    def post_qos_policies_members(
+        self, policy_names=None, member_names=None, member_types=None, **kwargs
+    ):
+        self.writes.append(("attach", member_names[0], policy_names[0]))
+        refused = self._refused("post_qos_policies_members")
+        if refused:
+            return _err(refused)
+        realm = self._realm(member_names[0])
+        policy = _find(self.qos_policies, policy_names[0])
+        if realm is None or policy is None or realm["name"].lower() in self.qos:
+            return _err(REFUSED)
+        self.qos[realm["name"].lower()] = policy
+        return _ok()
+
+    def delete_qos_policies_members(
+        self, policy_names=None, member_names=None, member_types=None, **kwargs
+    ):
+        self.writes.append(("detach", member_names[0], policy_names[0]))
+        refused = self._refused("delete_qos_policies_members")
+        if refused:
+            return _err(refused)
+        realm = self._realm(member_names[0])
+        attached = self.qos.get(realm["name"].lower()) if realm else None
+        if attached is None or attached.lower() != policy_names[0].lower():
+            return _err(REFUSED)
+        del self.qos[realm["name"].lower()]
+        return _ok()
+
+    # ---- members of a realm ----
+
+    def get_servers(self, names=None, **kwargs):
+        refused = self._refused("get_servers")
+        if refused:
+            return _err(refused)
+        server = _find(self.servers, names[0])
+        if server is None:
+            return _err("Server does not exist.")
+        return _ok([_Item(name=server)])
+
+    def get_tls_policies(self, names=None, **kwargs):
+        refused = self._refused("get_tls_policies")
+        if refused:
+            return _err(refused)
+        policy = _find(self.tls_policies, names[0])
+        if policy is None:
+            return _err("TLS Policy does not exist.")
+        return _ok([_Item(name=policy)])
+
+    def get_realms_defaults(self, realm_names=None, **kwargs):
+        refused = self._refused("get_realms_defaults")
+        if refused:
+            return _err(refused)
+        realm = self._realm(realm_names[0])
+        if realm is None:
+            return _err(NO_REALM)
+        object_store = []
+        server = self.defaults.get(realm["name"].lower())
+        if server:
+            object_store = [_Item(server=_Item(name=server))]
+        return _ok([_Item(realm=_Item(name=realm["name"]), object_store=object_store)])
+
+    def patch_realms_defaults(
+        self, realm_names=None, default_realm_configuration=None, **kwargs
+    ):
+        object_store = default_realm_configuration["object_store"]
+        wanted = object_store[0]["server"]["name"] if object_store else None
+        self.writes.append(("default", realm_names[0], wanted))
+        refused = self._refused("patch_realms_defaults")
+        if refused:
+            return _err(refused)
+        realm = self._realm(realm_names[0])
+        if realm is None:
+            return _err(NO_REALM)
+        if wanted is None:
+            self.defaults.pop(realm["name"].lower(), None)
+            return _ok()
+        server = _find(self.servers, wanted)
+        if server is None or _prefix(server).lower() != realm["name"].lower():
+            return _err("Server does not exist.")
+        self.defaults[realm["name"].lower()] = server
+        return _ok()
+
+    # ---- what refers to a realm ----
+
+    def get_resource_accesses(self, **kwargs):
+        refused = self._refused("get_resource_accesses")
+        if refused or self.realm_admin:
+            return _err(refused or DENIED)
+        wanted = kwargs["filter"].split("'")[1]
+        return _ok(
+            [
+                _Item(
+                    resource=_Item(resource_type=kind, name=name),
+                    scope=_Item(resource_type="realms", name=realm),
+                )
+                for kind, name, realm in self.accesses
+                if realm.lower() == wanted.lower()
+            ]
         )
 
-        # Verify exit_json was called with changed=True
-        mock_module.exit_json.assert_called_once()
-        call_args = mock_module.exit_json.call_args[1]
-        assert call_args["changed"] is True
-
-    @patch("plugins.modules.purefb_realm.get_pending_realm")
-    @patch("plugins.modules.purefb_realm.get_realm")
-    @patch("plugins.modules.purefb_realm.LooseVersion")
-    @patch("plugins.modules.purefb_realm.get_system")
-    @patch("plugins.modules.purefb_realm.AnsibleModule")
-    @patch("plugins.modules.purefb_realm.HAS_PURESTORAGE", True)
-    def test_main_delete_realm(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-    ):
-        """Test deleting an existing realm"""
-        # Setup mock module
-        mock_module = Mock()
-        mock_module.exit_json = Mock(side_effect=SystemExit)
-        mock_module.fail_json = Mock(side_effect=SystemExit)
-        mock_module.params = {
-            "name": "test-realm",
-            "state": "absent",
-            "qos_policy": None,
-            "eradicate": False,
-            "rename": None,
-        }
-        mock_module.check_mode = False
-        mock_ansible_module.return_value = mock_module
-
-        # Mock blade
-        mock_blade = Mock()
-        mock_blade.get_versions.return_value.items = ["2.19"]
-        mock_get_system.return_value = mock_blade
-
-        # Mock API version check
-        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
-
-        # Realm exists
-        mock_get_realm.return_value = True
-        mock_get_pending_realm.return_value = None
-
-        # Mock successful realm deletion
-        mock_patch_response = Mock()
-        mock_patch_response.status_code = 200
-        mock_blade.patch_realms.return_value = mock_patch_response
-
-        # Call main
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        # Verify patch_realms was called
-        mock_blade.patch_realms.assert_called_once()
-
-        # Verify exit_json was called with changed=True
-        mock_module.exit_json.assert_called_once()
-        call_args = mock_module.exit_json.call_args[1]
-        assert call_args["changed"] is True
-
-    @patch("plugins.modules.purefb_realm.get_pending_realm")
-    @patch("plugins.modules.purefb_realm.get_realm")
-    @patch("plugins.modules.purefb_realm.LooseVersion")
-    @patch("plugins.modules.purefb_realm.get_system")
-    @patch("plugins.modules.purefb_realm.AnsibleModule")
-    @patch("plugins.modules.purefb_realm.HAS_PURESTORAGE", True)
-    def test_main_eradicate_realm(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-    ):
-        """Test deleting and eradicating a realm"""
-        # Setup mock module
-        mock_module = Mock()
-        mock_module.exit_json = Mock(side_effect=SystemExit)
-        mock_module.fail_json = Mock(side_effect=SystemExit)
-        mock_module.params = {
-            "name": "test-realm",
-            "state": "absent",
-            "qos_policy": None,
-            "eradicate": True,
-            "rename": None,
-        }
-        mock_module.check_mode = False
-        mock_ansible_module.return_value = mock_module
-
-        # Mock blade
-        mock_blade = Mock()
-        mock_blade.get_versions.return_value.items = ["2.19"]
-        mock_get_system.return_value = mock_blade
-
-        # Mock API version check
-        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
-
-        # Realm exists
-        mock_get_realm.return_value = True
-        mock_get_pending_realm.return_value = None
-
-        # Mock successful operations
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_blade.patch_realms.return_value = mock_response
-        mock_blade.delete_realms.return_value = mock_response
-
-        # Call main
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        # Verify patch_realms was called (delete)
-        mock_blade.patch_realms.assert_called_once()
-
-        # Verify delete_realms was called (eradicate)
-        mock_blade.delete_realms.assert_called_once_with(names=["test-realm"])
-
-        # Verify exit_json was called with changed=True
-        mock_module.exit_json.assert_called_once()
-        call_args = mock_module.exit_json.call_args[1]
-        assert call_args["changed"] is True
-
-    @patch("plugins.modules.purefb_realm.get_pending_realm")
-    @patch("plugins.modules.purefb_realm.get_realm")
-    @patch("plugins.modules.purefb_realm.LooseVersion")
-    @patch("plugins.modules.purefb_realm.get_system")
-    @patch("plugins.modules.purefb_realm.AnsibleModule")
-    @patch("plugins.modules.purefb_realm.HAS_PURESTORAGE", True)
-    def test_main_recover_realm(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-    ):
-        """Test recovering a deleted realm"""
-        # Setup mock module
-        mock_module = Mock()
-        mock_module.exit_json = Mock(side_effect=SystemExit)
-        mock_module.fail_json = Mock(side_effect=SystemExit)
-        mock_module.params = {
-            "name": "test-realm",
-            "state": "present",
-            "qos_policy": None,
-            "eradicate": False,
-            "rename": None,
-        }
-        mock_module.check_mode = False
-        mock_ansible_module.return_value = mock_module
-
-        # Mock blade
-        mock_blade = Mock()
-        mock_blade.get_versions.return_value.items = ["2.19"]
-        mock_get_system.return_value = mock_blade
-
-        # Mock API version check
-        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
-
-        # Realm is in pending deletion
-        mock_get_realm.return_value = None
-        mock_get_pending_realm.return_value = True
-
-        # Mock successful realm recovery
-        mock_patch_response = Mock()
-        mock_patch_response.status_code = 200
-        mock_blade.patch_realms.return_value = mock_patch_response
-
-        # Call main
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        # Verify patch_realms was called
-        mock_blade.patch_realms.assert_called_once()
-
-        # Verify exit_json was called with changed=True
-        mock_module.exit_json.assert_called_once()
-        call_args = mock_module.exit_json.call_args[1]
-        assert call_args["changed"] is True
-
-    @patch("plugins.modules.purefb_realm.RealmPatch")
-    @patch("plugins.modules.purefb_realm.get_pending_realm")
-    @patch("plugins.modules.purefb_realm.get_realm")
-    @patch("plugins.modules.purefb_realm.LooseVersion")
-    @patch("plugins.modules.purefb_realm.get_system")
-    @patch("plugins.modules.purefb_realm.AnsibleModule")
-    @patch("plugins.modules.purefb_realm.HAS_PURESTORAGE", True)
-    def test_main_rename_realm(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_realm_patch,
-    ):
-        """Test renaming an existing realm"""
-        # Setup mock module
-        mock_module = Mock()
-        mock_module.exit_json = Mock(side_effect=SystemExit)
-        mock_module.fail_json = Mock(side_effect=SystemExit)
-        mock_module.params = {
-            "name": "test-realm",
-            "state": "present",
-            "qos_policy": None,
-            "eradicate": False,
-            "rename": "new-realm-name",
-        }
-        mock_module.check_mode = False
-        mock_ansible_module.return_value = mock_module
-
-        # Mock blade
-        mock_blade = Mock()
-        mock_blade.get_versions.return_value.items = ["2.19"]
-        mock_get_system.return_value = mock_blade
-
-        # Mock API version check
-        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
-
-        # Realm exists
-        mock_get_realm.return_value = True
-        mock_get_pending_realm.return_value = None
-
-        # Mock successful rename (the SDK method is patch_realms, plural)
-        mock_patch_response = Mock()
-        mock_patch_response.status_code = 200
-        mock_blade.patch_realms.return_value = mock_patch_response
-
-        # Call main
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        # Verify patch_realms was called for the rename
-        mock_blade.patch_realms.assert_called_once()
-        assert mock_blade.patch_realms.call_args[1]["names"] == ["test-realm"]
-
-        # Verify exit_json was called with changed=True
-        mock_module.exit_json.assert_called_once()
-        call_args = mock_module.exit_json.call_args[1]
-        assert call_args["changed"] is True
-
-    @patch("plugins.modules.purefb_realm.get_pending_realm")
-    @patch("plugins.modules.purefb_realm.get_realm")
-    @patch("plugins.modules.purefb_realm.LooseVersion")
-    @patch("plugins.modules.purefb_realm.get_system")
-    @patch("plugins.modules.purefb_realm.AnsibleModule")
-    @patch("plugins.modules.purefb_realm.HAS_PURESTORAGE", True)
-    def test_main_update_qos_policy(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-    ):
-        """Test updating QoS policy for an existing realm"""
-        # Setup mock module
-        mock_module = Mock()
-        mock_module.exit_json = Mock(side_effect=SystemExit)
-        mock_module.fail_json = Mock(side_effect=SystemExit)
-        mock_module.params = {
-            "name": "test-realm",
-            "state": "present",
-            "qos_policy": "new-qos-policy",
-            "eradicate": False,
-            "rename": None,
-        }
-        mock_module.check_mode = False
-        mock_ansible_module.return_value = mock_module
-
-        # Mock blade
-        mock_blade = Mock()
-        mock_blade.get_versions.return_value.items = ["2.19"]
-        mock_get_system.return_value = mock_blade
-
-        # Mock API version check
-        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
-
-        # Realm exists
-        mock_get_realm.return_value = True
-        mock_get_pending_realm.return_value = None
-
-        # Mock current QoS policy
-        mock_policy_member = Mock()
-        mock_policy_member.policy = Mock()
-        mock_policy_member.policy.name = "old-qos-policy"
-        mock_blade.get_qos_policies_members.return_value.status_code = 200
-        mock_blade.get_qos_policies_members.return_value.items = [mock_policy_member]
-
-        # Mock successful QoS policy update (new policy exists)
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_blade.get_qos_policies.return_value = mock_response
-        mock_blade.delete_qos_policies_members.return_value = mock_response
-        mock_blade.post_qos_policies_members.return_value = mock_response
-
-        # Call main
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        # Verify old policy was removed
-        mock_blade.delete_qos_policies_members.assert_called_once()
-
-        # Verify new policy was added
-        mock_blade.post_qos_policies_members.assert_called_once()
-
-        # Verify exit_json was called with changed=True
-        mock_module.exit_json.assert_called_once()
-        call_args = mock_module.exit_json.call_args[1]
-        assert call_args["changed"] is True
-
-    @patch("plugins.modules.purefb_realm.get_pending_realm")
-    @patch("plugins.modules.purefb_realm.get_realm")
-    @patch("plugins.modules.purefb_realm.LooseVersion")
-    @patch("plugins.modules.purefb_realm.get_system")
-    @patch("plugins.modules.purefb_realm.AnsibleModule")
-    @patch("plugins.modules.purefb_realm.HAS_PURESTORAGE", True)
-    def test_main_create_realm_check_mode(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-    ):
-        """Test creating a realm in check mode"""
-        # Setup mock module
-        mock_module = Mock()
-        mock_module.exit_json = Mock(side_effect=SystemExit)
-        mock_module.fail_json = Mock(side_effect=SystemExit)
-        mock_module.params = {
-            "name": "test-realm",
-            "without_default_access_list": True,
-            "state": "present",
-            "qos_policy": None,
-            "eradicate": False,
-            "rename": None,
-        }
-        mock_module.check_mode = True
-        mock_ansible_module.return_value = mock_module
-
-        # Mock blade
-        mock_blade = Mock()
-        mock_blade.get_versions.return_value.items = ["2.19"]
-        mock_get_system.return_value = mock_blade
-
-        # Mock API version check
-        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
-
-        # Realm doesn't exist
-        mock_get_realm.return_value = None
-        mock_get_pending_realm.return_value = None
-
-        # Call main
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        # Verify post_realms was NOT called (check mode)
-        mock_blade.post_realms.assert_not_called()
-
-        # Verify exit_json was called with changed=True
-        mock_module.exit_json.assert_called_once()
-        call_args = mock_module.exit_json.call_args[1]
-        assert call_args["changed"] is True
-
-    @patch("plugins.modules.purefb_realm.get_pending_realm")
-    @patch("plugins.modules.purefb_realm.get_realm")
-    @patch("plugins.modules.purefb_realm.LooseVersion")
-    @patch("plugins.modules.purefb_realm.get_system")
-    @patch("plugins.modules.purefb_realm.AnsibleModule")
-    @patch("plugins.modules.purefb_realm.HAS_PURESTORAGE", True)
-    def test_main_create_realm_fails(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-    ):
-        """Test error handling when realm creation fails"""
-        # Setup mock module
-        mock_module = Mock()
-        mock_module.exit_json = Mock(side_effect=SystemExit)
-        mock_module.fail_json = Mock(side_effect=SystemExit)
-        mock_module.params = {
-            "name": "test-realm",
-            "without_default_access_list": True,
-            "state": "present",
-            "qos_policy": None,
-            "eradicate": False,
-            "rename": None,
-        }
-        mock_module.check_mode = False
-        mock_ansible_module.return_value = mock_module
-
-        # Mock blade
-        mock_blade = Mock()
-        mock_blade.get_versions.return_value.items = ["2.19"]
-        mock_get_system.return_value = mock_blade
-
-        # Mock API version check
-        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
-
-        # Realm doesn't exist
-        mock_get_realm.return_value = None
-        mock_get_pending_realm.return_value = None
-
-        # Mock failed realm creation
-        mock_post_response = Mock()
-        mock_post_response.status_code = 400
-        mock_error = Mock()
-        mock_error.message = "Realm creation failed"
-        mock_post_response.errors = [mock_error]
-        mock_blade.post_realms.return_value = mock_post_response
-
-        # Call main - expect failure
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        # Verify fail_json was called
-        mock_module.fail_json.assert_called_once()
-        call_args = mock_module.fail_json.call_args[1]
-        assert "Creation of realm" in call_args["msg"]
-
-    @patch("plugins.modules.purefb_realm.get_policy")
-    @patch("plugins.modules.purefb_realm.get_pending_realm")
-    @patch("plugins.modules.purefb_realm.get_realm")
-    @patch("plugins.modules.purefb_realm.LooseVersion")
-    @patch("plugins.modules.purefb_realm.get_system")
-    @patch("plugins.modules.purefb_realm.AnsibleModule")
-    @patch("plugins.modules.purefb_realm.HAS_PURESTORAGE", True)
-    def test_main_qos_policy_assignment_fails(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_get_policy,
-    ):
-        """Test error handling when QoS policy assignment fails"""
-        # Setup mock module
-        mock_module = Mock()
-        mock_module.exit_json = Mock(side_effect=SystemExit)
-        mock_module.fail_json = Mock(side_effect=SystemExit)
-        mock_module.params = {
-            "name": "test-realm",
-            "without_default_access_list": True,
-            "state": "present",
-            "qos_policy": "test-qos-policy",
-            "eradicate": False,
-            "rename": None,
-        }
-        mock_module.check_mode = False
-        mock_ansible_module.return_value = mock_module
-
-        # Mock blade
-        mock_blade = Mock()
-        mock_blade.get_versions.return_value.items = ["2.19"]
-        mock_get_system.return_value = mock_blade
-
-        # Mock API version check
-        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
-
-        # Realm doesn't exist
-        mock_get_realm.return_value = None
-        mock_get_pending_realm.return_value = None
-
-        # QoS policy exists
-        mock_get_policy.return_value = True
-
-        # Mock successful realm creation but failed QoS assignment
-        mock_post_response = Mock()
-        mock_post_response.status_code = 200
-        mock_blade.post_realms.return_value = mock_post_response
-
-        mock_qos_response = Mock()
-        mock_qos_response.status_code = 400
-        mock_error = Mock()
-        mock_error.message = "QoS policy assignment failed"
-        mock_qos_response.errors = [mock_error]
-        mock_blade.post_qos_policies_members.return_value = mock_qos_response
-
-        # Call main - expect failure
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        # Verify fail_json was called
-        mock_module.fail_json.assert_called_once()
-        call_args = mock_module.fail_json.call_args[1]
-        assert "QoS policy assignment failed" in call_args["msg"]
-
-    @patch("plugins.modules.purefb_realm.LooseVersion")
-    @patch("plugins.modules.purefb_realm.get_system")
-    @patch("plugins.modules.purefb_realm.AnsibleModule")
-    @patch("plugins.modules.purefb_realm.HAS_PURESTORAGE", True)
-    def test_main_api_version_too_old(
-        self, mock_ansible_module, mock_get_system, mock_loose_version
-    ):
-        """Test failure when API version is too old"""
-        # Setup mock module
-        mock_module = Mock()
-        mock_module.exit_json = Mock(side_effect=SystemExit)
-        mock_module.fail_json = Mock(side_effect=SystemExit)
-        mock_module.params = {
-            "name": "test-realm",
-            "state": "present",
-            "qos_policy": None,
-            "eradicate": False,
-            "rename": None,
-        }
-        mock_module.check_mode = False
-        mock_ansible_module.return_value = mock_module
-
-        # Mock blade with old API version
-        mock_blade = Mock()
-        mock_blade.get_versions.return_value.items = ["2.10"]
-        mock_get_system.return_value = mock_blade
-
-        # Mock API version check to fail
-        mock_loose_version.return_value.__gt__ = Mock(return_value=True)
-
-        # Call main - expect failure
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        # Verify fail_json was called
-        mock_module.fail_json.assert_called_once()
-        call_args = mock_module.fail_json.call_args[1]
-        assert "Purity//FB 4.6.1, or higher, is required" in call_args["msg"]
-
-    @patch("plugins.modules.purefb_realm.get_pending_realm")
-    @patch("plugins.modules.purefb_realm.get_realm")
-    @patch("plugins.modules.purefb_realm.LooseVersion")
-    @patch("plugins.modules.purefb_realm.get_system")
-    @patch("plugins.modules.purefb_realm.AnsibleModule")
-    @patch("plugins.modules.purefb_realm.HAS_PURESTORAGE", True)
-    def test_main_delete_nonexistent_realm(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-    ):
-        """Test deleting a nonexistent realm (no-op)"""
-        # Setup mock module
-        mock_module = Mock()
-        mock_module.exit_json = Mock(side_effect=SystemExit)
-        mock_module.fail_json = Mock(side_effect=SystemExit)
-        mock_module.params = {
-            "name": "nonexistent-realm",
-            "state": "absent",
-            "qos_policy": None,
-            "eradicate": False,
-            "rename": None,
-        }
-        mock_module.check_mode = False
-        mock_ansible_module.return_value = mock_module
-
-        # Mock blade
-        mock_blade = Mock()
-        mock_blade.get_versions.return_value.items = ["2.19"]
-        mock_get_system.return_value = mock_blade
-
-        # Mock API version check
-        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
-
-        # Realm doesn't exist
-        mock_get_realm.return_value = None
-        mock_get_pending_realm.return_value = None
-
-        # Call main
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        # Verify no API calls were made
-        mock_blade.patch_realms.assert_not_called()
-        mock_blade.delete_realms.assert_not_called()
-
-        # Verify exit_json was called with changed=False
-        mock_module.exit_json.assert_called_once()
-        call_args = mock_module.exit_json.call_args[1]
-        assert call_args["changed"] is False
-
-    def test_get_realm(self):
-        """Test get_realm function"""
-        # Setup mock module
-        mock_module = Mock()
-        mock_module.params = {"name": "test-realm"}
-
-        # Setup mock blade
-        mock_blade = Mock()
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_blade.get_realms.return_value = mock_response
-
-        # Call function
-        result = get_realm(mock_module, mock_blade)
-
-        # Verify result
-        assert result is True
-        mock_blade.get_realms.assert_called_once_with(
-            destroyed=False, names=["test-realm"]
-        )
-
-    def test_get_realm_not_found(self):
-        """Test get_realm when realm doesn't exist"""
-        # Setup mock module
-        mock_module = Mock()
-        mock_module.params = {"name": "nonexistent-realm"}
-
-        # Setup mock blade
-        mock_blade = Mock()
-        mock_response = Mock()
-        mock_response.status_code = 400
-        mock_blade.get_realms.return_value = mock_response
-
-        # Call function
-        result = get_realm(mock_module, mock_blade)
-
-        # Verify result
-        assert result is None
-
-    def test_get_pending_realm(self):
-        """Test get_pending_realm function"""
-        # Setup mock module
-        mock_module = Mock()
-        mock_module.params = {"name": "test-realm"}
-
-        # Setup mock blade
-        mock_blade = Mock()
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_blade.get_realms.return_value = mock_response
-
-        # Call function
-        result = get_pending_realm(mock_module, mock_blade)
-
-        # Verify result
-        assert result is True
-        mock_blade.get_realms.assert_called_once_with(
-            destroyed=True, names=["test-realm"]
-        )
-
-    def test_get_policy(self):
-        """Test get_policy function"""
-        # Setup mock module
-        mock_module = Mock()
-        mock_module.params = {"qos_policy": "test-policy"}
-
-        # Setup mock blade
-        mock_blade = Mock()
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_blade.get_qos_policies.return_value = mock_response
-
-        # Call function
-        result = get_policy(mock_module, mock_blade)
-
-        # Verify result
-        assert result is True
-        mock_blade.get_qos_policies.assert_called_once_with(names=["test-policy"])
-
-    def test_update_realm_without_qos_membership_is_noop(self):
-        """A realm with no QoS policy answers the members GET with an error
-        response that has no ``items``. update_realm must not touch
-        ``.items`` on it and must report no change.
-        """
-        mock_module = Mock()
-        mock_module.exit_json = Mock(side_effect=SystemExit)
-        mock_module.fail_json = Mock(side_effect=SystemExit)
-        mock_module.params = {
-            "name": "test-realm",
-            "state": "present",
-            "qos_policy": None,
-            "eradicate": False,
-            "rename": None,
-        }
-        mock_module.check_mode = False
-
-        mock_blade = Mock()
-        error_response = Mock(spec=["status_code"])
-        error_response.status_code = 400
-        mock_blade.get_qos_policies_members.return_value = error_response
-
-        try:
-            update_realm(mock_module, mock_blade)
-        except SystemExit:
-            pass
-
-        mock_blade.delete_qos_policies_members.assert_not_called()
-        mock_blade.post_qos_policies_members.assert_not_called()
-        mock_module.exit_json.assert_called_once_with(changed=False)
-
-    @patch("plugins.modules.purefb_realm.get_pending_realm")
-    @patch("plugins.modules.purefb_realm.get_realm")
-    @patch("plugins.modules.purefb_realm.LooseVersion")
-    @patch("plugins.modules.purefb_realm.get_system")
-    @patch("plugins.modules.purefb_realm.AnsibleModule")
-    @patch("plugins.modules.purefb_realm.HAS_PURESTORAGE", True)
-    def test_main_rename_already_done_is_noop(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-    ):
-        """Re-running a rename after it happened must not create a new
-        realm under the old name.
-        """
-        mock_module = Mock()
-        mock_module.exit_json = Mock(side_effect=SystemExit)
-        mock_module.fail_json = Mock(side_effect=SystemExit)
-        mock_module.params = {
-            "name": "old-realm",
-            "without_default_access_list": True,
-            "state": "present",
-            "qos_policy": None,
-            "eradicate": False,
-            "rename": "new-realm",
-        }
-        mock_module.check_mode = False
-        mock_ansible_module.return_value = mock_module
-
-        mock_blade = Mock()
-        mock_blade.get_versions.return_value.items = ["2.19"]
-        mock_get_system.return_value = mock_blade
-        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
-
-        # Old name is gone, but the rename target exists
-        mock_get_realm.return_value = None
-        mock_get_pending_realm.return_value = None
-        mock_blade.get_realms.return_value.status_code = 200
-
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        mock_blade.get_realms.assert_called_once_with(
-            destroyed=False, names=["new-realm"]
-        )
-        mock_blade.post_realms.assert_not_called()
-        mock_module.exit_json.assert_called_once_with(changed=False)
-
-    @patch("plugins.modules.purefb_realm.get_error_message", Mock(return_value="x"))
-    def test_make_realm_false_access_list_failure_carries_hint(self):
-        """Purity//FB rejects without_default_access_list=false; the failure
-        message must tell the user which setting to change.
-        """
-        mock_module = Mock()
-        mock_module.exit_json = Mock(side_effect=SystemExit)
-        mock_module.fail_json = Mock(side_effect=SystemExit)
-        mock_module.params = {
-            "name": "test-realm",
-            "without_default_access_list": False,
-            "state": "present",
-            "qos_policy": None,
-            "eradicate": False,
-            "rename": None,
-        }
-        mock_module.check_mode = False
-
-        mock_blade = Mock()
-        mock_post_response = Mock()
-        mock_post_response.status_code = 400
-        mock_blade.post_realms.return_value = mock_post_response
-
-        try:
-            make_realm(mock_module, mock_blade)
-        except SystemExit:
-            pass
-
-        mock_blade.post_realms.assert_called_once_with(
-            names=["test-realm"], without_default_access_list=False
-        )
-        mock_module.fail_json.assert_called_once()
-        assert (
-            "without_default_access_list" in mock_module.fail_json.call_args[1]["msg"]
-        )
-
-
-def _realm_module(default_object_server, check_mode=False, **overrides):
-    """Mock AnsibleModule for an existing realm with default_object_server."""
-    mock_module = Mock()
-    mock_module.exit_json = Mock(side_effect=SystemExit)
-    mock_module.fail_json = Mock(side_effect=SystemExit)
+    def get_management_access_policies(self, **kwargs):
+        refused = self._refused("get_management_access_policies")
+        if refused or self.realm_admin:
+            return _err(refused or DENIED)
+        policies = {}
+        for policy, realm in self.rules:
+            rule = _Item(scope=_Item(resource_type="realms", name=realm))
+            policies.setdefault(policy, []).append(rule)
+        built_in = _Item(scope=_Item(resource_type="arrays", name="array1"))
+        policies["pure:policy/array_admin"] = [built_in]
+        return _ok([_Item(name=name, rules=rules) for name, rules in policies.items()])
+
+
+def _params(**overrides):
     params = {
-        "name": "test-realm",
+        "name": "tenant1",
         "without_default_access_list": True,
         "state": "present",
         "qos_policy": None,
         "eradicate": False,
         "rename": None,
-        "default_object_server": default_object_server,
+        "default_object_server": None,
+        "default_inbound_tls_policy": None,
     }
     params.update(overrides)
-    mock_module.params = params
-    mock_module.check_mode = check_mode
-    return mock_module
+    return params
 
 
-def _defaults_response(server_name):
-    """GET realms/defaults answer: one entry whose object_store names the
-    server, or an empty object_store when server_name is None."""
-    res = Mock()
-    res.status_code = 200
-    entry = Mock()
-    if server_name is None:
-        entry.object_store = []
-    else:
-        store_default = Mock()
-        store_default.server = Mock()
-        store_default.server.name = server_name
-        entry.object_store = [store_default]
-    res.items = [entry]
-    return res
+def _run(array, check_mode=False, api_version="2.30", sdk=True, **overrides):
+    """Run main() against the stand-in array and return the module mock."""
+    module = Mock()
+    module.params = _params(**overrides)
+    module.check_mode = check_mode
+    module.exit_json = Mock(side_effect=SystemExit)
+    module.fail_json = Mock(side_effect=SystemExit)
+    module.blade = array.blade(api_version)
+    module.get_system = Mock(return_value=module.blade)
+    replaced = {
+        "AnsibleModule": Mock(return_value=module),
+        "get_system": module.get_system,
+        "get_rest_api_version": Mock(return_value=api_version),
+        "LooseVersion": RealLooseVersion,
+        "HAS_PURESTORAGE": sdk,
+        "RealmPatch": _body,
+        "RealmDefaults": _body,
+        "ObjectStoreDefault": _body,
+        "Reference": _body,
+        "get_error_message": _error_message,
+    }
+    with ExitStack() as stack:
+        for name, value in replaced.items():
+            stack.enter_context(patch(MOD + "." + name, value))
+        try:
+            main()
+        except SystemExit:
+            pass
+    return module
 
 
-def _ok():
-    res = Mock()
-    res.status_code = 200
-    return res
+def _changed(module):
+    module.fail_json.assert_not_called()
+    module.exit_json.assert_called_once()
+    return module.exit_json.call_args[1]["changed"]
 
 
-def _error(message="boom"):
-    res = Mock()
-    res.status_code = 400
-    err = Mock()
-    err.message = message
-    res.errors = [err]
-    return res
+def _failure(module):
+    """The message of the one and only fail_json; nothing may exit after it."""
+    module.fail_json.assert_called_once()
+    module.exit_json.assert_not_called()
+    return module.fail_json.call_args[1]["msg"]
 
 
-@patch("plugins.modules.purefb_realm.Reference")
-@patch("plugins.modules.purefb_realm.ObjectStoreDefault")
-@patch("plugins.modules.purefb_realm.RealmDefaults")
-@patch("plugins.modules.purefb_realm.get_pending_realm")
-@patch("plugins.modules.purefb_realm.get_realm")
-@patch("plugins.modules.purefb_realm.LooseVersion")
-@patch("plugins.modules.purefb_realm.get_system")
-@patch("plugins.modules.purefb_realm.AnsibleModule")
-@patch("plugins.modules.purefb_realm.HAS_PURESTORAGE", True)
+def _warnings(module):
+    return [call[0][0] for call in module.warn.call_args_list]
+
+
+class TestPurefbRealm:
+    """Create, destroy, recover, eradicate and rename"""
+
+    def test_create(self):
+        array = _Array(realms=())
+        module = _run(array)
+        assert _changed(module) is True
+        assert array.writes == [("create", "tenant1")]
+        module.blade.post_realms.assert_called_once_with(
+            names=["tenant1"], without_default_access_list=True
+        )
+
+    def test_create_again_is_noop(self):
+        array = _Array(realms=())
+        _run(array)
+        array.writes = []
+        assert _changed(_run(array)) is False
+        assert array.writes == []
+
+    def test_create_check_mode(self):
+        array = _Array(realms=())
+        assert _changed(_run(array, check_mode=True)) is True
+        assert array.writes == []
+
+    def test_create_failure_is_reported(self):
+        array = _Array(realms=())
+        array.realm_admin = True
+        message = _failure(_run(array))
+        assert "Creation of realm tenant1 failed" in message
+        assert DENIED in message
+
+    def test_create_with_default_access_list_failure_carries_hint(self):
+        array = _Array(realms=())
+        message = _failure(_run(array, without_default_access_list=False))
+        assert NEEDS_FLAG in message
+        assert "set without_default_access_list to true" in message
+
+    def test_refused_realm_read_is_reported(self):
+        array = _Array(realms=())
+        array.fail["get_realms"] = DENIED
+        message = _failure(_run(array))
+        assert "Failed to read realm tenant1" in message
+        assert DENIED in message
+        assert array.writes == []
+
+    def test_realm_in_other_case_is_found(self):
+        array = _Array(realms=("Tenant1",))
+        assert _changed(_run(array, name="TENANT1")) is False
+        assert array.writes == []
+
+    def test_destroy(self):
+        array = _Array()
+        assert _changed(_run(array, state="absent")) is True
+        assert array.writes == [("destroy", "tenant1")]
+        assert array.is_destroyed("tenant1")
+
+    def test_destroy_again_is_noop(self):
+        array = _Array(realms=(), destroyed=("tenant1",))
+        assert _changed(_run(array, state="absent")) is False
+        assert array.writes == []
+
+    def test_destroy_check_mode(self):
+        array = _Array()
+        assert _changed(_run(array, state="absent", check_mode=True)) is True
+        assert array.writes == []
+
+    def test_destroy_uses_the_name_the_array_keeps(self):
+        array = _Array(realms=("Tenant1",))
+        assert _changed(_run(array, name="TENANT1", state="absent")) is True
+        assert array.writes == [("destroy", "Tenant1")]
+
+    def test_destroy_failure_is_reported(self):
+        array = _Array(entities=("tenant1",))
+        message = _failure(_run(array, state="absent"))
+        assert "Deleting realm tenant1 failed" in message
+        assert CONTAINS in message
+
+    def test_destroy_and_eradicate(self):
+        array = _Array()
+        assert _changed(_run(array, state="absent", eradicate=True)) is True
+        assert array.writes == [("destroy", "tenant1"), ("eradicate", "tenant1")]
+        assert array.name_of("tenant1") is None
+
+    def test_destroy_and_eradicate_check_mode(self):
+        array = _Array()
+        module = _run(array, state="absent", eradicate=True, check_mode=True)
+        assert _changed(module) is True
+        assert array.writes == []
+
+    def test_eradicate_destroyed_realm(self):
+        array = _Array(realms=(), destroyed=("tenant1",))
+        assert _changed(_run(array, state="absent", eradicate=True)) is True
+        assert array.writes == [("eradicate", "tenant1")]
+
+    def test_eradicate_failure_is_reported(self):
+        array = _Array(realms=(), destroyed=("tenant1",))
+        array.fail["delete_realms"] = DENIED
+        message = _failure(_run(array, state="absent", eradicate=True))
+        assert "Eradicating realm tenant1 failed" in message
+        assert DENIED in message
+
+    def test_absent_on_missing_realm_is_noop(self):
+        array = _Array(realms=())
+        assert _changed(_run(array, state="absent", eradicate=True)) is False
+        assert array.writes == []
+
+    def test_recover(self):
+        array = _Array(realms=(), destroyed=("tenant1",))
+        assert _changed(_run(array)) is True
+        assert array.writes == [("recover", "tenant1")]
+        assert not array.is_destroyed("tenant1")
+
+    def test_recover_check_mode(self):
+        array = _Array(realms=(), destroyed=("tenant1",))
+        assert _changed(_run(array, check_mode=True)) is True
+        assert array.writes == []
+
+    def test_recover_failure_is_reported(self):
+        array = _Array(realms=(), destroyed=("tenant1",))
+        array.fail["patch_realms.destroyed"] = DENIED
+        message = _failure(_run(array))
+        assert "Recovery of realm tenant1 failed" in message
+        assert DENIED in message
+
+    def test_rename(self):
+        array = _Array()
+        assert _changed(_run(array, rename="tenant2")) is True
+        assert array.writes == [("rename", "tenant1", "tenant2")]
+        assert array.name_of("tenant2") == "tenant2"
+
+    def test_rename_check_mode(self):
+        array = _Array()
+        assert _changed(_run(array, rename="tenant2", check_mode=True)) is True
+        assert array.writes == []
+
+    def test_rename_again_is_noop_without_warning(self):
+        array = _Array(realms=("tenant2",))
+        module = _run(array, rename="tenant2")
+        assert _changed(module) is False
+        assert array.writes == []
+        assert _warnings(module) == []
+
+    def test_rename_failure_is_reported(self):
+        array = _Array()
+        array.realm_admin = True
+        message = _failure(_run(array, rename="tenant2"))
+        assert "Rename to tenant2 failed" in message
+        assert DENIED in message
+
+    def test_api_version_too_old(self):
+        array = _Array()
+        message = _failure(_run(array, api_version="2.18"))
+        assert "Realms are not supported" in message
+        assert array.writes == []
+
+    def test_missing_sdk_fails_before_any_array_call(self):
+        array = _Array()
+        module = _run(array, sdk=False)
+        assert "py-pure-client sdk is required" in _failure(module)
+        module.get_system.assert_not_called()
+
+
+class TestPurefbRealmNames:
+    """What a realm can be called and what rename asks for"""
+
+    def test_separator_in_name_fails_before_login(self):
+        array = _Array()
+        module = _run(array, name="tenant1::inner", check_mode=True)
+        assert "a realm name cannot contain '::'" in _failure(module)
+        module.get_system.assert_not_called()
+
+    def test_separator_in_rename_fails_before_login(self):
+        array = _Array()
+        module = _run(array, rename="tenant1::inner")
+        assert "rename tenant1::inner is not a realm name" in _failure(module)
+        module.get_system.assert_not_called()
+
+    def test_comma_in_name_fails_before_login(self):
+        array = _Array(realms=("tenant1", "tenant2"))
+        for state in ("present", "absent"):
+            module = _run(array, name="tenant1,tenant2", state=state)
+            assert "name tenant1,tenant2 is not a name" in _failure(module)
+            module.get_system.assert_not_called()
+        assert array.writes == []
+
+    def test_comma_in_rename_fails_before_login(self):
+        array = _Array()
+        module = _run(array, rename="tenant2,tenant3", check_mode=True)
+        assert "rename tenant2,tenant3 is not a name" in _failure(module)
+        module.get_system.assert_not_called()
+
+    def test_comma_in_a_reference_fails_before_login(self):
+        for option in (
+            "qos_policy",
+            "default_object_server",
+            "default_inbound_tls_policy",
+        ):
+            array = _Array()
+            module = _run(array, **{option: "one,two"})
+            assert "{0} one,two is not a name".format(option) in _failure(module)
+            module.get_system.assert_not_called()
+            assert array.writes == []
+
+    def test_rename_equal_to_name_is_noop(self):
+        array = _Array()
+        for check_mode in (True, False):
+            module = _run(array, rename="tenant1", check_mode=check_mode)
+            assert _changed(module) is False
+        assert array.writes == []
+
+    def test_rename_equal_to_name_creates_a_missing_realm(self):
+        array = _Array(realms=())
+        assert _changed(_run(array, rename="tenant1")) is True
+        assert array.writes == [("create", "tenant1")]
+
+    def test_rename_to_the_name_the_array_keeps_is_noop(self):
+        array = _Array(realms=("tenant1",))
+        assert _changed(_run(array, name="TENANT1", rename="tenant1")) is False
+        assert array.writes == []
+
+    def test_rename_that_differs_only_in_case_is_refused(self):
+        array = _Array()
+        for check_mode in (True, False):
+            module = _run(array, rename="Tenant1", check_mode=check_mode)
+            assert "only in letter case" in _failure(module)
+        assert array.writes == []
+
+    def test_rename_onto_existing_realm_is_refused(self):
+        array = _Array(realms=("tenant1", "tenant2"))
+        for check_mode in (True, False):
+            module = _run(array, rename="TENANT2", check_mode=check_mode)
+            message = _failure(module)
+            assert "a realm named tenant2 already exists." in message
+        assert array.writes == []
+
+    def test_rename_onto_destroyed_realm_is_refused(self):
+        array = _Array(destroyed=("tenant2",))
+        message = _failure(_run(array, rename="tenant2", check_mode=True))
+        assert "tenant2 already exists and is pending eradication" in message
+        assert array.writes == []
+
+    def test_rename_is_refused_before_other_options_are_applied(self):
+        array = _Array(realms=("tenant1", "tenant2"), qos={"tenant1": "gold"})
+        _failure(_run(array, rename="tenant2", qos_policy="silver"))
+        assert array.writes == []
+        assert array.qos_of("tenant1") == "gold"
+
+    def test_rename_of_a_missing_realm_creates_it_with_the_new_name(self):
+        array = _Array(realms=())
+        assert _changed(_run(array, rename="tenant2", check_mode=True)) is True
+        assert array.writes == []
+        assert _changed(_run(array, rename="tenant2")) is True
+        assert array.writes == [("create", "tenant2")]
+        array.writes = []
+        module = _run(array, rename="tenant2")
+        assert _changed(module) is False
+        assert array.writes == []
+        assert _warnings(module) == []
+
+    def test_missing_name_and_destroyed_new_name_is_refused(self):
+        array = _Array(realms=(), destroyed=("tenant2",))
+        message = _failure(_run(array, rename="tenant2"))
+        assert "Realm tenant1 does not exist and realm tenant2 is destroyed" in message
+        assert array.writes == []
+
+    def test_rename_sends_the_name_the_array_keeps(self):
+        array = _Array(realms=("Tenant1",))
+        assert _changed(_run(array, name="TENANT1", rename="tenant2")) is True
+        assert array.writes == [("rename", "Tenant1", "tenant2")]
+
+    def test_recover_and_rename_in_one_run(self):
+        array = _Array(realms=(), destroyed=("tenant1",))
+        assert _changed(_run(array, rename="tenant2")) is True
+        assert array.writes == [
+            ("recover", "tenant1"),
+            ("rename", "tenant1", "tenant2"),
+        ]
+        assert not array.is_destroyed("tenant2")
+        array.writes = []
+        assert _changed(_run(array, rename="tenant2")) is False
+        assert array.writes == []
+
+    def test_recover_and_rename_check_mode(self):
+        array = _Array(realms=(), destroyed=("tenant1",))
+        assert _changed(_run(array, rename="tenant2", check_mode=True)) is True
+        assert array.writes == []
+
+
+class TestPurefbRealmQos:
+    """qos_policy"""
+
+    def test_attach(self):
+        array = _Array()
+        assert _changed(_run(array, qos_policy="gold")) is True
+        assert array.writes == [("attach", "tenant1", "gold")]
+        module = _run(array, qos_policy="gold")
+        assert _changed(module) is False
+        module.blade.post_qos_policies_members.assert_not_called()
+
+    def test_attach_check_mode(self):
+        array = _Array()
+        assert _changed(_run(array, qos_policy="gold", check_mode=True)) is True
+        assert array.writes == []
+
+    def test_switch_detaches_then_attaches(self):
+        array = _Array(qos={"tenant1": "gold"})
+        assert _changed(_run(array, qos_policy="silver")) is True
+        assert array.writes == [
+            ("detach", "tenant1", "gold"),
+            ("attach", "tenant1", "silver"),
+        ]
+        assert array.qos_of("tenant1") == "silver"
+
+    def test_omitted_leaves_the_policy_alone(self):
+        array = _Array(qos={"tenant1": "gold"})
+        module = _run(array)
+        assert _changed(module) is False
+        assert array.writes == []
+        module.blade.get_qos_policies_members.assert_not_called()
+
+    def test_empty_string_detaches(self):
+        array = _Array(qos={"tenant1": "gold"})
+        assert _changed(_run(array, qos_policy="", check_mode=True)) is True
+        assert array.writes == []
+        assert _changed(_run(array, qos_policy="")) is True
+        assert array.writes == [("detach", "tenant1", "gold")]
+        assert array.qos_of("tenant1") is None
+
+    def test_empty_string_without_policy_is_noop(self):
+        array = _Array()
+        assert _changed(_run(array, qos_policy="")) is False
+        assert array.writes == []
+
+    def test_policy_in_other_case_is_noop(self):
+        array = _Array(qos={"tenant1": "gold"})
+        for check_mode in (True, False):
+            module = _run(array, qos_policy="GOLD", check_mode=check_mode)
+            assert _changed(module) is False
+        assert array.writes == []
+
+    def test_requests_carry_the_names_the_array_keeps(self):
+        array = _Array(realms=("Tenant1",), qos={"Tenant1": "gold"})
+        assert _changed(_run(array, name="TENANT1", qos_policy="SILVER")) is True
+        assert array.writes == [
+            ("detach", "Tenant1", "gold"),
+            ("attach", "Tenant1", "silver"),
+        ]
+
+    def test_unknown_policy_fails_before_any_write(self):
+        array = _Array(qos={"tenant1": "gold"})
+        for check_mode in (True, False):
+            module = _run(array, qos_policy="bronze", check_mode=check_mode)
+            message = _failure(module)
+            assert "QoS policy bronze was not found or is not visible" in message
+        assert array.writes == []
+        assert array.qos_of("tenant1") == "gold"
+
+    def test_refused_policy_read_is_reported(self):
+        array = _Array()
+        array.fail["get_qos_policies"] = DENIED
+        message = _failure(_run(array, qos_policy="gold"))
+        assert "Failed to read QoS policy gold" in message
+        assert DENIED in message
+        assert array.writes == []
+
+    def test_refused_membership_read_is_reported(self):
+        array = _Array()
+        array.fail["get_qos_policies_members"] = DENIED
+        message = _failure(_run(array, qos_policy="gold"))
+        assert "Failed to read the QoS policy of realm tenant1" in message
+        assert DENIED in message
+        assert array.writes == []
+
+    def test_attach_failure_is_reported(self):
+        array = _Array()
+        array.fail["post_qos_policies_members"] = DENIED
+        message = _failure(_run(array, qos_policy="gold"))
+        assert "QoS policy assignment failed for realm tenant1" in message
+        assert DENIED in message
+
+    def test_detach_failure_is_reported(self):
+        array = _Array(qos={"tenant1": "gold"})
+        array.fail["delete_qos_policies_members"] = DENIED
+        message = _failure(_run(array, qos_policy="silver"))
+        assert "Existing QoS policy removal failed for realm tenant1" in message
+        assert array.writes == [("detach", "tenant1", "gold")]
+
+    def test_create_with_policy(self):
+        array = _Array(realms=())
+        assert _changed(_run(array, qos_policy="gold")) is True
+        assert array.writes == [("create", "tenant1"), ("attach", "tenant1", "gold")]
+
+    def test_create_with_unknown_policy_creates_nothing(self):
+        array = _Array(realms=())
+        _failure(_run(array, qos_policy="bronze"))
+        assert array.writes == []
+
+    def test_rename_with_another_policy(self):
+        array = _Array(qos={"tenant1": "gold"})
+        params = {"rename": "tenant2", "qos_policy": "silver"}
+        assert _changed(_run(array, check_mode=True, **params)) is True
+        assert array.writes == []
+        assert _changed(_run(array, **params)) is True
+        assert array.writes == [
+            ("rename", "tenant1", "tenant2"),
+            ("detach", "tenant2", "gold"),
+            ("attach", "tenant2", "silver"),
+        ]
+        array.writes = []
+        module = _run(array, **params)
+        assert _changed(module) is False
+        assert array.writes == []
+        assert array.qos_of("tenant2") == "silver"
+        assert _warnings(module) == []
+
+    def test_already_renamed_realm_gets_the_policy_and_a_warning(self):
+        array = _Array(realms=("tenant2",), qos={"tenant2": "gold"})
+        params = {"rename": "tenant2", "qos_policy": "silver"}
+        for check_mode in (True, False):
+            module = _run(array, check_mode=check_mode, **params)
+            assert _changed(module) is True
+            warnings = _warnings(module)
+            assert len(warnings) == 1
+            assert (
+                "Realm tenant1 does not exist. Realm tenant2 was taken" in warnings[0]
+            )
+        assert array.qos_of("tenant2") == "silver"
+
+    def test_recover_with_policy_in_one_run(self):
+        array = _Array(realms=(), destroyed=("tenant1",))
+        assert _changed(_run(array, qos_policy="gold")) is True
+        assert array.writes == [("recover", "tenant1"), ("attach", "tenant1", "gold")]
+        array.writes = []
+        assert _changed(_run(array, qos_policy="gold")) is False
+        assert array.writes == []
+
+    def test_recover_rename_and_policy_in_one_run(self):
+        array = _Array(realms=(), destroyed=("tenant1",))
+        params = {"rename": "tenant2", "qos_policy": "gold"}
+        assert _changed(_run(array, **params)) is True
+        assert array.writes == [
+            ("recover", "tenant1"),
+            ("rename", "tenant1", "tenant2"),
+            ("attach", "tenant2", "gold"),
+        ]
+        array.writes = []
+        assert _changed(_run(array, **params)) is False
+        assert array.writes == []
+
+    def test_destroy_detaches_the_policy_first(self):
+        array = _Array(qos={"tenant1": "gold"})
+        assert _changed(_run(array, state="absent")) is True
+        assert array.writes == [("detach", "tenant1", "gold"), ("destroy", "tenant1")]
+        assert array.is_destroyed("tenant1")
+
+    def test_destroy_with_policy_check_mode(self):
+        array = _Array(qos={"tenant1": "gold"})
+        assert _changed(_run(array, state="absent", check_mode=True)) is True
+        assert array.writes == []
+
+    def test_destroy_and_eradicate_with_policy(self):
+        array = _Array(qos={"tenant1": "gold"})
+        assert _changed(_run(array, state="absent", eradicate=True)) is True
+        assert array.name_of("tenant1") is None
+        assert array.qos_of("tenant1") is None
+
+    def test_refused_destroy_attaches_the_policy_again(self):
+        array = _Array(qos={"tenant1": "gold"}, entities=("tenant1",))
+        message = _failure(_run(array, state="absent"))
+        assert CONTAINS in message
+        assert "could not be attached again" not in message
+        assert array.writes == [
+            ("detach", "tenant1", "gold"),
+            ("destroy", "tenant1"),
+            ("attach", "tenant1", "gold"),
+        ]
+        assert array.qos_of("tenant1") == "gold"
+
+    def test_refused_destroy_says_when_the_policy_stays_detached(self):
+        array = _Array(qos={"tenant1": "gold"}, entities=("tenant1",))
+        array.fail["post_qos_policies_members"] = DENIED
+        message = _failure(_run(array, state="absent"))
+        assert CONTAINS in message
+        assert "QoS policy gold was detached from the realm" in message
+
+    def test_destroy_with_refused_detach_is_reported(self):
+        array = _Array(qos={"tenant1": "gold"})
+        array.fail["delete_qos_policies_members"] = DENIED
+        message = _failure(_run(array, state="absent"))
+        assert "Existing QoS policy removal failed for realm tenant1" in message
+        assert array.writes == [("detach", "tenant1", "gold")]
+        assert not array.is_destroyed("tenant1")
+
+    def test_qos_policy_needs_rest_2_20(self):
+        array = _Array()
+        message = _failure(_run(array, qos_policy="gold", api_version="2.19"))
+        assert "qos_policy requires Purity//FB 4.6.3 (REST API 2.20)" in message
+        assert array.writes == []
+
+    def test_rest_2_19_manages_a_realm_without_qos_requests(self):
+        array = _Array()
+        module = _run(array, api_version="2.19")
+        assert _changed(module) is False
+        module.blade.get_qos_policies_members.assert_not_called()
+        module = _run(array, state="absent", api_version="2.19")
+        assert _changed(module) is True
+        module.blade.get_qos_policies_members.assert_not_called()
+
+    def test_realm_administrator_is_told_it_cannot_see_qos_policies(self):
+        array = _Array(qos={"tenant1": "gold"})
+        array.realm_admin = True
+        for check_mode in (True, False):
+            module = _run(array, qos_policy="gold", check_mode=check_mode)
+            message = _failure(module)
+            assert "not visible to a realm-scoped administrator" in message
+        assert array.writes == []
+
+    def test_realm_administrator_destroy_gets_the_answer_of_the_array(self):
+        array = _Array(qos={"tenant1": "gold"})
+        array.realm_admin = True
+        message = _failure(_run(array, state="absent"))
+        assert CONTAINS in message
+        assert array.writes == [("destroy", "tenant1")]
+
+
+class TestPurefbRealmDestroyGuards:
+    """What still refers to a realm that is to be destroyed"""
+
+    def test_resource_access_blocks_destroy(self):
+        array = _Array(accesses=[("dns", "shared-dns", "tenant1")])
+        for check_mode in (True, False):
+            module = _run(array, state="absent", eradicate=True, check_mode=check_mode)
+            message = _failure(module)
+            assert "Realm tenant1 cannot be destroyed" in message
+            assert "the resource access of dns shared-dns" in message
+        assert array.writes == []
+
+    def test_management_access_policy_rule_blocks_destroy(self):
+        array = _Array(rules=[("tenant-admins", "Tenant1")])
+        for check_mode in (True, False):
+            module = _run(array, state="absent", check_mode=check_mode)
+            message = _failure(module)
+            assert "a rule of management access policy tenant-admins" in message
+        assert array.writes == []
+
+    def test_everything_found_is_named(self):
+        array = _Array(
+            accesses=[("dns", "shared-dns", "tenant1")],
+            rules=[("tenant-admins", "tenant1")],
+            qos={"tenant1": "gold"},
+        )
+        message = _failure(_run(array, state="absent"))
+        assert (
+            "the resource access of dns shared-dns and a rule of management "
+            "access policy tenant-admins"
+        ) in message
+        assert array.writes == []
+        assert array.qos_of("tenant1") == "gold"
+
+    def test_what_refers_to_another_realm_does_not_block(self):
+        array = _Array(
+            realms=("tenant1", "tenant2"),
+            accesses=[("dns", "shared-dns", "tenant2")],
+            rules=[("tenant-admins", "tenant2")],
+        )
+        assert _changed(_run(array, state="absent")) is True
+        assert array.writes == [("destroy", "tenant1")]
+
+    def test_refused_reads_leave_the_answer_to_the_array(self):
+        array = _Array(accesses=[("dns", "shared-dns", "tenant1")])
+        array.fail["get_resource_accesses"] = DENIED
+        array.fail["get_management_access_policies"] = DENIED
+        assert _changed(_run(array, state="absent", check_mode=True)) is True
+        message = _failure(_run(array, state="absent"))
+        assert "Deleting realm tenant1 failed" in message
+        assert CONTAINS in message
+
+    def test_destroyed_realm_is_eradicated_without_these_reads(self):
+        array = _Array(realms=(), destroyed=("tenant1",))
+        module = _run(array, state="absent", eradicate=True)
+        assert _changed(module) is True
+        module.blade.get_resource_accesses.assert_not_called()
+        module.blade.get_management_access_policies.assert_not_called()
+
+
 class TestPurefbRealmDefaultObjectServer:
-    """default_object_server: GET/PATCH realms/defaults (REST 2.20)."""
+    """default_object_server"""
 
-    def _setup(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        module,
-        current_default,
-        realm_exists=True,
-        pending=None,
-    ):
-        mock_ansible_module.return_value = module
-        mock_blade = Mock()
-        mock_blade.get_versions.return_value.items = ["2.30"]
-        mock_get_system.return_value = mock_blade
-        # both version gates pass
-        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
-        mock_get_realm.return_value = realm_exists
-        mock_get_pending_realm.return_value = pending
-        # no QoS policy on the realm
-        mock_blade.get_qos_policies_members.return_value = _error()
-        mock_blade.get_realms_defaults.return_value = _defaults_response(
-            current_default
-        )
-        mock_blade.get_servers.return_value = _ok()
-        mock_blade.patch_realms_defaults.return_value = _ok()
-        mock_blade.patch_realms.return_value = _ok()
-        mock_blade.post_realms.return_value = _ok()
-        return mock_blade
+    @staticmethod
+    def _array(**kwargs):
+        kwargs.setdefault("servers", ("tenant1::s3srv", "tenant1::other"))
+        return _Array(**kwargs)
 
-    def test_set_qualifies_bare_name(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_realm_defaults,
-        mock_object_store_default,
-        mock_reference,
-    ):
-        """A bare server name is qualified with the realm name before the
-        existence check and the PATCH."""
-        module = _realm_module("srv")
-        blade = self._setup(
-            mock_ansible_module,
-            mock_get_system,
-            mock_loose_version,
-            mock_get_realm,
-            mock_get_pending_realm,
-            module,
-            current_default=None,
+    def test_set_qualifies_bare_name(self):
+        array = self._array()
+        module = _run(array, default_object_server="s3srv")
+        assert _changed(module) is True
+        assert array.writes == [("default", "tenant1", "tenant1::s3srv")]
+        module.blade.patch_realms_defaults.assert_called_once_with(
+            realm_names=["tenant1"],
+            default_realm_configuration={
+                "object_store": [{"server": {"name": "tenant1::s3srv"}}]
+            },
         )
 
-        try:
-            main()
-        except SystemExit:
-            pass
+    def test_already_set_is_noop(self):
+        array = self._array(defaults={"tenant1": "tenant1::s3srv"})
+        for value in ("s3srv", "tenant1::s3srv"):
+            assert _changed(_run(array, default_object_server=value)) is False
+        assert array.writes == []
 
-        blade.get_realms_defaults.assert_called_once_with(realm_names=["test-realm"])
-        blade.get_servers.assert_called_once_with(names=["test-realm::srv"])
-        mock_reference.assert_called_once_with(name="test-realm::srv")
-        mock_object_store_default.assert_called_once_with(
-            server=mock_reference.return_value
+    def test_other_letter_case_is_noop(self):
+        array = self._array(defaults={"tenant1": "tenant1::s3srv"})
+        for name, value in (
+            ("TENANT1", "s3srv"),
+            ("tenant1", "TENANT1::s3srv"),
+            ("tenant1", "S3SRV"),
+        ):
+            module = _run(array, name=name, default_object_server=value)
+            assert _changed(module) is False
+        assert array.writes == []
+
+    def test_replace(self):
+        array = self._array(defaults={"tenant1": "tenant1::s3srv"})
+        assert _changed(_run(array, default_object_server="other")) is True
+        assert array.default_of("tenant1") == "tenant1::other"
+
+    def test_clear_sends_empty_object_store(self):
+        array = self._array(defaults={"tenant1": "tenant1::s3srv"})
+        module = _run(array, default_object_server="")
+        assert _changed(module) is True
+        module.blade.patch_realms_defaults.assert_called_once_with(
+            realm_names=["tenant1"],
+            default_realm_configuration={"object_store": []},
         )
-        mock_realm_defaults.assert_called_once_with(
-            object_store=[mock_object_store_default.return_value]
-        )
-        blade.patch_realms_defaults.assert_called_once_with(
-            realm_names=["test-realm"],
-            default_realm_configuration=mock_realm_defaults.return_value,
-        )
-        module.exit_json.assert_called_once_with(changed=True)
+        assert array.default_of("tenant1") is None
 
-    def test_already_set_is_noop(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_realm_defaults,
-        mock_object_store_default,
-        mock_reference,
-    ):
-        """Fully qualified name equal to the current default: nothing sent."""
-        module = _realm_module("test-realm::srv")
-        blade = self._setup(
-            mock_ansible_module,
-            mock_get_system,
-            mock_loose_version,
-            mock_get_realm,
-            mock_get_pending_realm,
-            module,
-            current_default="test-realm::srv",
-        )
+    def test_clear_when_already_clear_is_noop(self):
+        array = self._array()
+        assert _changed(_run(array, default_object_server="")) is False
+        assert array.writes == []
 
-        try:
-            main()
-        except SystemExit:
-            pass
+    def test_check_mode_reports_change_without_patch(self):
+        array = self._array()
+        module = _run(array, default_object_server="s3srv", check_mode=True)
+        assert _changed(module) is True
+        assert array.writes == []
 
-        blade.get_servers.assert_not_called()
-        blade.patch_realms_defaults.assert_not_called()
-        module.exit_json.assert_called_once_with(changed=False)
+    def test_missing_server_fails_before_patch(self):
+        array = self._array()
+        for check_mode in (True, False):
+            module = _run(array, default_object_server="nosrv", check_mode=check_mode)
+            message = _failure(module)
+            assert message == "Server tenant1::nosrv does not exist in realm tenant1."
+        assert array.writes == []
 
-    def test_clear_sends_empty_object_store(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_realm_defaults,
-        mock_object_store_default,
-        mock_reference,
-    ):
-        """An empty string clears the default with object_store=[]."""
-        module = _realm_module("")
-        blade = self._setup(
-            mock_ansible_module,
-            mock_get_system,
-            mock_loose_version,
-            mock_get_realm,
-            mock_get_pending_realm,
-            module,
-            current_default="test-realm::srv",
-        )
+    def test_refused_server_read_is_reported(self):
+        array = self._array()
+        array.fail["get_servers"] = DENIED
+        message = _failure(_run(array, default_object_server="s3srv"))
+        assert "Failed to read server tenant1::s3srv" in message
+        assert DENIED in message
 
-        try:
-            main()
-        except SystemExit:
-            pass
+    def test_server_of_another_realm_is_refused(self):
+        array = self._array(realms=("tenant1", "tenant2"), servers=("tenant2::s3srv",))
+        for check_mode in (True, False):
+            module = _run(
+                array, default_object_server="tenant2::s3srv", check_mode=check_mode
+            )
+            message = _failure(module)
+            assert "tenant2::s3srv is not in realm tenant1" in message
+        assert array.writes == []
+        module.blade.get_servers.assert_not_called()
 
-        blade.get_servers.assert_not_called()
-        mock_object_store_default.assert_not_called()
-        mock_realm_defaults.assert_called_once_with(object_store=[])
-        blade.patch_realms_defaults.assert_called_once_with(
-            realm_names=["test-realm"],
-            default_realm_configuration=mock_realm_defaults.return_value,
-        )
-        module.exit_json.assert_called_once_with(changed=True)
+    def test_requires_rest_2_20(self):
+        array = self._array()
+        module = _run(array, default_object_server="s3srv", api_version="2.19")
+        assert "default_object_server requires Purity//FB 4.6.3" in _failure(module)
+        assert array.writes == []
 
-    def test_clear_when_already_clear_is_noop(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_realm_defaults,
-        mock_object_store_default,
-        mock_reference,
-    ):
-        module = _realm_module("")
-        blade = self._setup(
-            mock_ansible_module,
-            mock_get_system,
-            mock_loose_version,
-            mock_get_realm,
-            mock_get_pending_realm,
-            module,
-            current_default=None,
-        )
+    def test_patch_failure_is_reported(self):
+        array = self._array()
+        array.fail["patch_realms_defaults"] = DENIED
+        message = _failure(_run(array, default_object_server="s3srv"))
+        assert "Setting default object store server for realm tenant1" in message
+        assert DENIED in message
 
-        try:
-            main()
-        except SystemExit:
-            pass
+    def test_defaults_read_failure_is_reported(self):
+        array = self._array()
+        array.fail["get_realms_defaults"] = DENIED
+        message = _failure(_run(array, default_object_server="s3srv"))
+        assert "Failed to read defaults for realm tenant1" in message
+        assert array.writes == []
 
-        blade.patch_realms_defaults.assert_not_called()
-        module.exit_json.assert_called_once_with(changed=False)
+    def test_create_with_default_server_fails_before_post(self):
+        array = self._array(realms=(), servers=())
+        for check_mode in (True, False):
+            module = _run(array, default_object_server="s3srv", check_mode=check_mode)
+            assert "does not exist in realm tenant1" in _failure(module)
+        assert array.writes == []
 
-    def test_check_mode_reports_change_without_patch(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_realm_defaults,
-        mock_object_store_default,
-        mock_reference,
-    ):
-        module = _realm_module("srv", check_mode=True)
-        blade = self._setup(
-            mock_ansible_module,
-            mock_get_system,
-            mock_loose_version,
-            mock_get_realm,
-            mock_get_pending_realm,
-            module,
-            current_default=None,
-        )
+    def test_recover_with_default_server_fails_before_recover(self):
+        array = self._array(realms=(), destroyed=("tenant1",), servers=())
+        for check_mode in (True, False):
+            module = _run(array, default_object_server="s3srv", check_mode=check_mode)
+            assert "does not exist in realm tenant1" in _failure(module)
+        assert array.writes == []
 
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        blade.get_servers.assert_called_once_with(names=["test-realm::srv"])
-        blade.patch_realms_defaults.assert_not_called()
-        module.exit_json.assert_called_once_with(changed=True)
-
-    def test_missing_server_fails_before_patch(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_realm_defaults,
-        mock_object_store_default,
-        mock_reference,
-    ):
-        module = _realm_module("srv")
-        blade = self._setup(
-            mock_ansible_module,
-            mock_get_system,
-            mock_loose_version,
-            mock_get_realm,
-            mock_get_pending_realm,
-            module,
-            current_default=None,
-        )
-        blade.get_servers.return_value = _error()
-
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        blade.patch_realms_defaults.assert_not_called()
-        module.fail_json.assert_called_once()
-        msg = module.fail_json.call_args[1]["msg"]
-        assert "test-realm::srv does not exist in realm test-realm" in msg
-
-    def test_requires_rest_2_20(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_realm_defaults,
-        mock_object_store_default,
-        mock_reference,
-    ):
-        """Realms exist from 2.19 but the defaults endpoint needs 2.20; the
-        gate fails before any read or write."""
-        module = _realm_module("srv")
-        blade = self._setup(
-            mock_ansible_module,
-            mock_get_system,
-            mock_loose_version,
-            mock_get_realm,
-            mock_get_pending_realm,
-            module,
-            current_default=None,
-        )
-        # realm gate passes, realm-defaults gate fails
-        mock_loose_version.return_value.__gt__ = Mock(side_effect=[False, True])
-
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        blade.get_realms_defaults.assert_not_called()
-        blade.patch_realms_defaults.assert_not_called()
-        module.fail_json.assert_called_once()
-        assert "4.6.3" in module.fail_json.call_args[1]["msg"]
-
-    def test_patch_failure_is_reported(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_realm_defaults,
-        mock_object_store_default,
-        mock_reference,
-    ):
-        module = _realm_module("srv")
-        blade = self._setup(
-            mock_ansible_module,
-            mock_get_system,
-            mock_loose_version,
-            mock_get_realm,
-            mock_get_pending_realm,
-            module,
-            current_default=None,
-        )
-        blade.patch_realms_defaults.return_value = _error("nope")
-
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        module.fail_json.assert_called_once()
-        msg = module.fail_json.call_args[1]["msg"]
-        assert "Setting default object store server for realm test-realm" in msg
-
-    def test_defaults_read_failure_is_reported(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_realm_defaults,
-        mock_object_store_default,
-        mock_reference,
-    ):
-        module = _realm_module("srv")
-        blade = self._setup(
-            mock_ansible_module,
-            mock_get_system,
-            mock_loose_version,
-            mock_get_realm,
-            mock_get_pending_realm,
-            module,
-            current_default=None,
-        )
-        blade.get_realms_defaults.return_value = _error("nope")
-
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        blade.patch_realms_defaults.assert_not_called()
-        module.fail_json.assert_called_once()
-        assert "Failed to read defaults" in module.fail_json.call_args[1]["msg"]
-
-    def test_no_defaults_entry_means_unset(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_realm_defaults,
-        mock_object_store_default,
-        mock_reference,
-    ):
-        """A realm with no defaults entry at all counts as unset."""
-        module = _realm_module("srv")
-        blade = self._setup(
-            mock_ansible_module,
-            mock_get_system,
-            mock_loose_version,
-            mock_get_realm,
-            mock_get_pending_realm,
-            module,
-            current_default=None,
-        )
-        blade.get_realms_defaults.return_value.items = []
-
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        blade.patch_realms_defaults.assert_called_once()
-        module.exit_json.assert_called_once_with(changed=True)
-
-    def test_create_checks_server_before_post_then_sets_default(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_realm_defaults,
-        mock_object_store_default,
-        mock_reference,
-    ):
-        module = _realm_module("srv")
-        blade = self._setup(
-            mock_ansible_module,
-            mock_get_system,
-            mock_loose_version,
-            mock_get_realm,
-            mock_get_pending_realm,
-            module,
-            current_default=None,
-            realm_exists=None,
-        )
-
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        blade.get_servers.assert_called_with(names=["test-realm::srv"])
-        blade.post_realms.assert_called_once_with(
-            names=["test-realm"], without_default_access_list=True
-        )
-        blade.patch_realms_defaults.assert_called_once_with(
-            realm_names=["test-realm"],
-            default_realm_configuration=mock_realm_defaults.return_value,
-        )
-        module.exit_json.assert_called_once_with(changed=True)
-
-    def test_create_with_missing_server_fails_before_post(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_realm_defaults,
-        mock_object_store_default,
-        mock_reference,
-    ):
-        module = _realm_module("srv")
-        blade = self._setup(
-            mock_ansible_module,
-            mock_get_system,
-            mock_loose_version,
-            mock_get_realm,
-            mock_get_pending_realm,
-            module,
-            current_default=None,
-            realm_exists=None,
-        )
-        blade.get_servers.return_value = _error()
-
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        blade.post_realms.assert_not_called()
-        blade.patch_realms_defaults.assert_not_called()
-        module.fail_json.assert_called_once()
-        assert "does not exist in realm" in module.fail_json.call_args[1]["msg"]
-
-    def test_rename_applies_default_under_new_name(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_realm_defaults,
-        mock_object_store_default,
-        mock_reference,
-    ):
-        module = _realm_module("srv", rename="new-realm")
-        blade = self._setup(
-            mock_ansible_module,
-            mock_get_system,
-            mock_loose_version,
-            mock_get_realm,
-            mock_get_pending_realm,
-            module,
-            current_default=None,
-        )
-
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        blade.patch_realms.assert_called_once()
-        blade.get_realms_defaults.assert_called_once_with(realm_names=["new-realm"])
-        # checked under the old name before the rename, under the new name
-        # when the default is applied
-        assert [c[1]["names"] for c in blade.get_servers.call_args_list] == [
-            ["test-realm::srv"],
-            ["new-realm::srv"],
+    def test_rename_sets_the_default_under_the_new_name(self):
+        array = self._array()
+        params = {"rename": "tenant2", "default_object_server": "s3srv"}
+        assert _changed(_run(array, check_mode=True, **params)) is True
+        assert array.writes == []
+        assert _changed(_run(array, **params)) is True
+        assert array.writes == [
+            ("rename", "tenant1", "tenant2"),
+            ("default", "tenant2", "tenant2::s3srv"),
         ]
-        mock_reference.assert_called_once_with(name="new-realm::srv")
-        blade.patch_realms_defaults.assert_called_once_with(
-            realm_names=["new-realm"],
-            default_realm_configuration=mock_realm_defaults.return_value,
+        array.writes = []
+        for value in ("s3srv", "tenant1::s3srv", "tenant2::s3srv"):
+            params["default_object_server"] = value
+            module = _run(array, **params)
+            assert _changed(module) is False
+            assert _warnings(module) == []
+        assert array.writes == []
+
+    def test_rename_accepts_server_qualified_with_old_name(self):
+        array = self._array()
+        params = {"rename": "tenant2", "default_object_server": "tenant1::s3srv"}
+        assert _changed(_run(array, **params)) is True
+        assert array.default_of("tenant2") == "tenant2::s3srv"
+
+    def test_rename_refuses_missing_server_before_the_rename(self):
+        array = self._array()
+        params = {"rename": "tenant2", "default_object_server": "nosrv"}
+        for check_mode in (True, False):
+            module = _run(array, check_mode=check_mode, **params)
+            assert "Server tenant1::nosrv does not exist" in _failure(module)
+        assert array.writes == []
+
+    def test_already_renamed_realm_gets_the_default_and_a_warning(self):
+        array = self._array(
+            realms=("tenant2",),
+            servers=("tenant2::s3srv",),
+            defaults={"tenant2": "tenant2::s3srv"},
         )
-        module.exit_json.assert_called_once_with(changed=True)
+        params = {"rename": "tenant2", "default_object_server": ""}
+        for check_mode in (True, False):
+            module = _run(array, check_mode=check_mode, **params)
+            assert _changed(module) is True
+            assert len(_warnings(module)) == 1
+        assert array.default_of("tenant2") is None
+        module = _run(array, **params)
+        assert _changed(module) is False
+        assert _warnings(module) == []
 
-    def test_recover_applies_default(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_realm_defaults,
-        mock_object_store_default,
-        mock_reference,
-    ):
-        module = _realm_module("srv")
-        blade = self._setup(
-            mock_ansible_module,
-            mock_get_system,
-            mock_loose_version,
-            mock_get_realm,
-            mock_get_pending_realm,
-            module,
-            current_default=None,
-            realm_exists=None,
-            pending=True,
+    def test_absent_ignores_default_object_server(self):
+        array = _Array()
+        module = _run(array, state="absent", default_object_server="s3srv")
+        assert _changed(module) is True
+        assert array.writes == [("destroy", "tenant1")]
+
+
+class TestPurefbRealmDefaultInboundTlsPolicy:
+    """default_inbound_tls_policy"""
+
+    @staticmethod
+    def _array(**kwargs):
+        kwargs.setdefault("tls_policies", ("tenant1::strict", "tenant1::legacy"))
+        return _Array(**kwargs)
+
+    def test_set_qualifies_bare_name(self):
+        array = self._array()
+        module = _run(array, default_inbound_tls_policy="strict")
+        assert _changed(module) is True
+        module.blade.patch_realms.assert_called_once_with(
+            names=["tenant1"],
+            realm={"default_inbound_tls_policy": {"name": "tenant1::strict"}},
         )
+        assert array.tls_of("tenant1") == "tenant1::strict"
 
-        try:
-            main()
-        except SystemExit:
-            pass
+    def test_already_set_is_noop(self):
+        array = self._array(tls={"tenant1": "tenant1::strict"})
+        for name, value in (
+            ("tenant1", "strict"),
+            ("tenant1", "tenant1::strict"),
+            ("TENANT1", "STRICT"),
+            ("tenant1", "TENANT1::strict"),
+        ):
+            module = _run(array, name=name, default_inbound_tls_policy=value)
+            assert _changed(module) is False
+        assert array.writes == []
 
-        blade.patch_realms.assert_called_once()
-        blade.patch_realms_defaults.assert_called_once_with(
-            realm_names=["test-realm"],
-            default_realm_configuration=mock_realm_defaults.return_value,
+    def test_replace(self):
+        array = self._array(tls={"tenant1": "tenant1::strict"})
+        assert _changed(_run(array, default_inbound_tls_policy="legacy")) is True
+        assert array.writes == [("tls", "tenant1", "tenant1::legacy")]
+
+    def test_clear_sends_an_empty_name(self):
+        array = self._array(tls={"tenant1": "tenant1::strict"})
+        module = _run(array, default_inbound_tls_policy="")
+        assert _changed(module) is True
+        module.blade.patch_realms.assert_called_once_with(
+            names=["tenant1"], realm={"default_inbound_tls_policy": {"name": ""}}
         )
-        module.exit_json.assert_called_once_with(changed=True)
+        assert array.tls_of("tenant1") is None
 
-    def test_absent_ignores_default_object_server(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_realm_defaults,
-        mock_object_store_default,
-        mock_reference,
-    ):
-        module = _realm_module("srv", state="absent")
-        blade = self._setup(
-            mock_ansible_module,
-            mock_get_system,
-            mock_loose_version,
-            mock_get_realm,
-            mock_get_pending_realm,
-            module,
-            current_default=None,
-        )
+    def test_clear_when_already_clear_is_noop(self):
+        array = self._array()
+        assert _changed(_run(array, default_inbound_tls_policy="")) is False
+        assert array.writes == []
 
-        try:
-            main()
-        except SystemExit:
-            pass
+    def test_check_mode_reports_change_without_patch(self):
+        array = self._array(tls={"tenant1": "tenant1::strict"})
+        for value in ("legacy", ""):
+            module = _run(array, default_inbound_tls_policy=value, check_mode=True)
+            assert _changed(module) is True
+        assert array.writes == []
 
-        blade.patch_realms.assert_called_once()
-        blade.get_realms_defaults.assert_not_called()
-        blade.patch_realms_defaults.assert_not_called()
-        module.exit_json.assert_called_once_with(changed=True)
+    def test_missing_policy_fails_before_patch(self):
+        array = self._array()
+        for check_mode in (True, False):
+            module = _run(
+                array, default_inbound_tls_policy="nope", check_mode=check_mode
+            )
+            message = _failure(module)
+            assert (
+                message == "TLS policy tenant1::nope does not exist in realm tenant1."
+            )
+        assert array.writes == []
 
-    def test_rename_check_mode_refuses_missing_server(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_realm_defaults,
-        mock_object_store_default,
-        mock_reference,
-    ):
-        """Until the rename lands the server is named under the old realm;
-        check mode refuses a missing one without renaming anything."""
-        module = _realm_module("srv", rename="new-realm", check_mode=True)
-        blade = self._setup(
-            mock_ansible_module,
-            mock_get_system,
-            mock_loose_version,
-            mock_get_realm,
-            mock_get_pending_realm,
-            module,
-            current_default=None,
-        )
-        blade.get_servers.return_value = _error()
+    def test_policy_of_another_realm_is_refused(self):
+        array = self._array(tls_policies=("tenant2::strict",))
+        module = _run(array, default_inbound_tls_policy="tenant2::strict")
+        assert "tenant2::strict is not in realm tenant1" in _failure(module)
+        assert array.writes == []
 
-        try:
-            main()
-        except SystemExit:
-            pass
+    def test_patch_failure_is_reported(self):
+        array = self._array()
+        array.realm_admin = True
+        message = _failure(_run(array, default_inbound_tls_policy="strict"))
+        assert "Setting default inbound TLS policy for realm tenant1" in message
+        assert DENIED in message
 
-        blade.get_servers.assert_called_once_with(names=["test-realm::srv"])
-        blade.patch_realms.assert_not_called()
-        blade.patch_realms_defaults.assert_not_called()
-        module.fail_json.assert_called_once()
-        msg = module.fail_json.call_args[1]["msg"]
-        assert "test-realm::srv does not exist in realm test-realm" in msg
+    def test_create_with_policy_fails_before_post(self):
+        array = self._array(realms=(), tls_policies=())
+        module = _run(array, default_inbound_tls_policy="strict")
+        assert "does not exist in realm tenant1" in _failure(module)
+        assert array.writes == []
 
-    def test_rename_check_mode_reports_change_without_writes(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_realm_defaults,
-        mock_object_store_default,
-        mock_reference,
-    ):
-        module = _realm_module("srv", rename="new-realm", check_mode=True)
-        blade = self._setup(
-            mock_ansible_module,
-            mock_get_system,
-            mock_loose_version,
-            mock_get_realm,
-            mock_get_pending_realm,
-            module,
-            current_default=None,
-        )
+    def test_absent_ignores_the_option(self):
+        array = _Array()
+        module = _run(array, state="absent", default_inbound_tls_policy="strict")
+        assert _changed(module) is True
+        assert array.writes == [("destroy", "tenant1")]
 
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        blade.get_servers.assert_called_once_with(names=["test-realm::srv"])
-        blade.patch_realms.assert_not_called()
-        blade.get_realms_defaults.assert_not_called()
-        blade.patch_realms_defaults.assert_not_called()
-        module.exit_json.assert_called_once_with(changed=True)
-
-    def test_rename_accepts_server_qualified_with_old_name(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_realm_defaults,
-        mock_object_store_default,
-        mock_reference,
-    ):
-        """A value qualified with the old realm name is applied under the
-        new one after the rename."""
-        module = _realm_module("test-realm::srv", rename="new-realm")
-        blade = self._setup(
-            mock_ansible_module,
-            mock_get_system,
-            mock_loose_version,
-            mock_get_realm,
-            mock_get_pending_realm,
-            module,
-            current_default=None,
-        )
-
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        assert [c[1]["names"] for c in blade.get_servers.call_args_list] == [
-            ["test-realm::srv"],
-            ["new-realm::srv"],
+    def test_rename_carries_the_policy_over(self):
+        array = self._array(tls={"tenant1": "tenant1::strict"})
+        assert _changed(_run(array, rename="tenant2", check_mode=True)) is True
+        assert array.writes == []
+        assert _changed(_run(array, rename="tenant2")) is True
+        assert array.writes == [
+            ("tls", "tenant1", ""),
+            ("rename", "tenant1", "tenant2"),
+            ("tls", "tenant2", "tenant2::strict"),
         ]
-        mock_reference.assert_called_once_with(name="new-realm::srv")
-        blade.patch_realms_defaults.assert_called_once_with(
-            realm_names=["new-realm"],
-            default_realm_configuration=mock_realm_defaults.return_value,
+        assert array.tls_of("tenant2") == "tenant2::strict"
+        array.writes = []
+        assert _changed(_run(array, rename="tenant2")) is False
+        assert array.writes == []
+
+    def test_rename_with_another_policy(self):
+        array = self._array(tls={"tenant1": "tenant1::strict"})
+        params = {"rename": "tenant2", "default_inbound_tls_policy": "legacy"}
+        assert _changed(_run(array, **params)) is True
+        assert array.writes == [
+            ("tls", "tenant1", ""),
+            ("rename", "tenant1", "tenant2"),
+            ("tls", "tenant2", "tenant2::legacy"),
+        ]
+        array.writes = []
+        for value in ("legacy", "tenant1::legacy", "tenant2::legacy"):
+            params["default_inbound_tls_policy"] = value
+            assert _changed(_run(array, **params)) is False
+        assert array.writes == []
+
+    def test_rename_with_clear(self):
+        array = self._array(tls={"tenant1": "tenant1::strict"})
+        params = {"rename": "tenant2", "default_inbound_tls_policy": ""}
+        assert _changed(_run(array, **params)) is True
+        assert array.writes == [
+            ("tls", "tenant1", ""),
+            ("rename", "tenant1", "tenant2"),
+        ]
+        assert array.tls_of("tenant2") is None
+
+    def test_rename_without_policy_sets_the_one_given(self):
+        array = self._array()
+        params = {"rename": "tenant2", "default_inbound_tls_policy": "strict"}
+        assert _changed(_run(array, **params)) is True
+        assert array.writes == [
+            ("rename", "tenant1", "tenant2"),
+            ("tls", "tenant2", "tenant2::strict"),
+        ]
+
+    def test_refused_rename_sets_the_policy_again(self):
+        array = self._array(tls={"tenant1": "tenant1::strict"})
+        array.fail["patch_realms.name"] = DENIED
+        message = _failure(_run(array, rename="tenant2"))
+        assert "Rename to tenant2 failed" in message
+        assert "could not be set again" not in message
+        assert array.writes == [
+            ("tls", "tenant1", ""),
+            ("rename", "tenant1", "tenant2"),
+            ("tls", "tenant1", "tenant1::strict"),
+        ]
+        assert array.tls_of("tenant1") == "tenant1::strict"
+
+    def test_refused_rename_says_when_the_policy_stays_cleared(self):
+        array = self._array(tls={"tenant1": "tenant1::strict"})
+        array.fail["patch_realms.name"] = DENIED
+        array.fail["patch_realms.tls"] = [None, DENIED]
+        message = _failure(_run(array, rename="tenant2"))
+        assert "Rename to tenant2 failed" in message
+        assert "tenant1::strict was cleared for the rename" in message
+
+    def test_policy_that_cannot_be_set_after_the_rename_is_reported(self):
+        array = self._array(tls={"tenant1": "tenant1::strict"})
+        array.fail["patch_realms.tls"] = [None, DENIED]
+        message = _failure(_run(array, rename="tenant2", qos_policy="gold"))
+        assert "Realm tenant1 was renamed to tenant2" in message
+        assert "could not be set to tenant2::strict" in message
+        assert DENIED in message
+        assert array.writes == [
+            ("tls", "tenant1", ""),
+            ("rename", "tenant1", "tenant2"),
+            ("tls", "tenant2", "tenant2::strict"),
+        ]
+
+    def test_refused_clear_stops_the_rename(self):
+        array = self._array(tls={"tenant1": "tenant1::strict"})
+        array.realm_admin = True
+        message = _failure(_run(array, rename="tenant2"))
+        assert "Clearing default inbound TLS policy tenant1::strict" in message
+        assert array.writes == [("tls", "tenant1", "")]
+
+    def test_policy_kept_from_before_a_rename_cannot_be_changed(self):
+        array = self._array(
+            realms=("tenant2",),
+            tls_policies=("tenant2::strict", "tenant2::legacy"),
+            tls={"tenant2": "tenant1::strict"},
         )
-        module.exit_json.assert_called_once_with(changed=True)
-
-    def test_already_renamed_rerun_reconciles_default(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_realm_defaults,
-        mock_object_store_default,
-        mock_reference,
-    ):
-        """name=old rename=new after the rename happened: no realm write,
-        but the default is still reconciled under the new name."""
-        module = _realm_module("srv", rename="new-realm")
-        blade = self._setup(
-            mock_ansible_module,
-            mock_get_system,
-            mock_loose_version,
-            mock_get_realm,
-            mock_get_pending_realm,
-            module,
-            current_default=None,
-            realm_exists=None,
+        for value in ("legacy", ""):
+            for check_mode in (True, False):
+                module = _run(
+                    array,
+                    name="tenant2",
+                    default_inbound_tls_policy=value,
+                    check_mode=check_mode,
+                )
+                message = _failure(module)
+                assert "Rename the realm back to tenant1 first" in message
+        module = _run(
+            array, name="tenant2", rename="tenant3", default_inbound_tls_policy=""
         )
-        # the old name is gone, the new one exists
-        blade.get_realms.return_value = _ok()
+        assert "Rename the realm back to tenant1 first" in _failure(module)
+        assert array.writes == []
 
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        blade.post_realms.assert_not_called()
-        blade.patch_realms.assert_not_called()
-        blade.get_realms_defaults.assert_called_once_with(realm_names=["new-realm"])
-        blade.get_servers.assert_called_once_with(names=["new-realm::srv"])
-        blade.patch_realms_defaults.assert_called_once_with(
-            realm_names=["new-realm"],
-            default_realm_configuration=mock_realm_defaults.return_value,
+    def test_policy_kept_from_before_a_rename_is_noop_when_unchanged(self):
+        array = self._array(
+            realms=("tenant2",),
+            tls_policies=("tenant2::strict",),
+            tls={"tenant2": "tenant1::strict"},
         )
-        module.exit_json.assert_called_once_with(changed=True)
+        for params in ({}, {"default_inbound_tls_policy": "strict"}):
+            assert _changed(_run(array, name="tenant2", **params)) is False
+        assert array.writes == []
 
-    def test_already_renamed_rerun_with_default_in_place_is_noop(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_realm_defaults,
-        mock_object_store_default,
-        mock_reference,
-    ):
-        module = _realm_module("test-realm::srv", rename="new-realm")
-        blade = self._setup(
-            mock_ansible_module,
-            mock_get_system,
-            mock_loose_version,
-            mock_get_realm,
-            mock_get_pending_realm,
-            module,
-            current_default="new-realm::srv",
-            realm_exists=None,
+    def test_rename_back_is_a_plain_rename(self):
+        array = self._array(
+            realms=("tenant2",),
+            tls_policies=("tenant2::strict", "tenant2::legacy"),
+            tls={"tenant2": "tenant1::strict"},
         )
-        blade.get_realms.return_value = _ok()
-
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        blade.post_realms.assert_not_called()
-        blade.patch_realms.assert_not_called()
-        blade.get_servers.assert_not_called()
-        blade.patch_realms_defaults.assert_not_called()
-        module.exit_json.assert_called_once_with(changed=False)
-
-    def test_recover_check_mode_refuses_missing_server(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_realm_defaults,
-        mock_object_store_default,
-        mock_reference,
-    ):
-        module = _realm_module("srv", check_mode=True)
-        blade = self._setup(
-            mock_ansible_module,
-            mock_get_system,
-            mock_loose_version,
-            mock_get_realm,
-            mock_get_pending_realm,
-            module,
-            current_default=None,
-            realm_exists=None,
-            pending=True,
+        module = _run(
+            array, name="tenant2", rename="tenant1", default_inbound_tls_policy="legacy"
         )
-        blade.get_servers.return_value = _error()
+        assert _changed(module) is True
+        assert array.writes == [
+            ("rename", "tenant2", "tenant1"),
+            ("tls", "tenant1", "tenant1::legacy"),
+        ]
+        assert array.tls_of("tenant1") == "tenant1::legacy"
 
-        try:
-            main()
-        except SystemExit:
-            pass
-
-        blade.patch_realms.assert_not_called()
-        blade.patch_realms_defaults.assert_not_called()
-        module.fail_json.assert_called_once()
-        msg = module.fail_json.call_args[1]["msg"]
-        assert "test-realm::srv does not exist in realm test-realm" in msg
-
-    def test_missing_sdk_fails_before_any_array_call(
-        self,
-        mock_ansible_module,
-        mock_get_system,
-        mock_loose_version,
-        mock_get_realm,
-        mock_get_pending_realm,
-        mock_realm_defaults,
-        mock_object_store_default,
-        mock_reference,
-    ):
-        module = _realm_module("srv")
-        self._setup(
-            mock_ansible_module,
-            mock_get_system,
-            mock_loose_version,
-            mock_get_realm,
-            mock_get_pending_realm,
-            module,
-            current_default=None,
+    def test_rename_elsewhere_without_the_option_is_a_plain_rename(self):
+        array = self._array(
+            realms=("tenant2",),
+            tls_policies=("tenant2::strict",),
+            tls={"tenant2": "tenant1::strict"},
         )
-
-        # a method-level patch decorator would be entered before the
-        # class-level HAS_PURESTORAGE=True patch, so patch inline instead
-        with patch("plugins.modules.purefb_realm.HAS_PURESTORAGE", False):
-            try:
-                main()
-            except SystemExit:
-                pass
-
-        module.fail_json.assert_called_once_with(
-            msg="py-pure-client sdk is required for this module"
-        )
-        mock_get_system.assert_not_called()
+        assert _changed(_run(array, name="tenant2", rename="tenant3")) is True
+        assert array.writes == [("rename", "tenant2", "tenant3")]

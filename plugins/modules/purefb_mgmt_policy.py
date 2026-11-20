@@ -24,6 +24,13 @@ description:
 - Reconcile the declarative list of rules (role + scope) attached to the policy.
 - Attachment of policies to admins or directory-service roles is handled by
   M(everpure.flashblade.purefb_mgmt_role).
+- Management access policies are array-level objects and cannot be placed in
+  a realm. Access to a realm is granted by a rule whose scope has
+  I(resource_type=realms). An administrator who holds only policies whose
+  rules are all scoped to realms is confined to those realms.
+- An administrator confined to a realm may not read or change management
+  access policies. Run this module as an administrator with array-wide
+  access; otherwise the task fails with the message of the array.
 author:
 - Pure Storage Ansible Team (@avk) <pure-ansible-team@everpuredata.com>
 options:
@@ -32,6 +39,10 @@ options:
     - Name of the management access policy.
     - Case-insensitive, case-preserving. This is the handle used for
       attachment and for naming child rules.
+    - The array refuses a realm-qualified name (C(realm::name)).
+    - A task manages one policy. The array reads a comma as the separator
+      of a list of names and C(*) as a wildcard, so a name that holds
+      either is refused.
     type: str
     required: true
   state:
@@ -99,6 +110,15 @@ options:
             - Name of the target (the FlashBlade array name for
               I(resource_type=arrays), or the realm name for
               I(resource_type=realms)).
+            - A realm is named by its bare name, in any letter case, and
+              must exist. A rule to add that names a realm the array does
+              not know fails the task before anything is changed, in check
+              mode too. That includes a C(realm::name), a list of names
+              and a name with the wildcard C(*), as a rule names one realm.
+            - A rule follows its realm through a rename. After a realm has
+              been renamed, give the new realm name here.
+            - Remove the rules that name a realm before the realm is
+              destroyed.
             type: str
             required: true
           resource_type:
@@ -139,6 +159,26 @@ EXAMPLES = r"""
         scope:
           name: realm-a
           resource_type: realms
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Create a policy that grants the admin role inside one realm
+  everpure.flashblade.purefb_mgmt_policy:
+    name: realm-a-admins
+    rules:
+      - role: admin
+        scope:
+          name: realm-a
+          resource_type: realms
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Create a service account that is confined to that realm
+  everpure.flashblade.purefb_user:
+    name: realm-a-svc
+    admin_type: service-account
+    management_access_policies:
+      - realm-a-admins
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
@@ -276,14 +316,53 @@ def _validate_rules(module):
         seen.add(key)
 
 
+def _check_one_name(module):
+    """Fail when ``name`` is not the name of one policy.
+
+    The array reads a comma as the separator of a list of names and * as a
+    wildcard, and answers a read with every policy that matches. The rules
+    and members of all of them would be taken for those of one policy, and
+    rules are changed and removed by id, so one task would reach into every
+    policy that matches. Neither character can be part of a policy name, so
+    the name is refused before the array is asked.
+    """
+    name = module.params["name"]
+    if "," in name or "*" in name:
+        module.fail_json(
+            msg=(
+                "Policy name {0} is not the name of one policy: the array "
+                "reads a comma as the separator of a list of names and * as "
+                "a wildcard. A task manages one policy."
+            ).format(name)
+        )
+
+
+def _does_not_exist(error):
+    """Whether an error of the array says that the object does not exist."""
+    return "does not exist" in str(error).lower()
+
+
 def _get_policy(module, blade, ctx_kwargs):
+    """The policy object, or None when it does not exist.
+
+    A missing policy is itself an error answer ("Management access policy
+    does not exist."), so only that error reads as None. Any other failed
+    read fails the task with the array's message instead of being taken
+    for an absent policy: an administrator confined to a realm, for
+    example, may not read management access policies at all.
+    """
     res = blade.get_management_access_policies(
         names=[module.params["name"]], **ctx_kwargs
     )
-    if res.status_code != 200:
+    if res.status_code == 200:
+        items = list(res.items)
+        return items[0] if items else None
+    error = get_error_message(res)
+    if _does_not_exist(error):
         return None
-    items = list(res.items)
-    return items[0] if items else None
+    module.fail_json(
+        msg="Failed to read policy {0}. Error: {1}".format(module.params["name"], error)
+    )
 
 
 def _get_current_rules(module, blade, ctx_kwargs):
@@ -300,12 +379,88 @@ def _get_current_rules(module, blade, ctx_kwargs):
 
 
 def _members_attached(module, blade, ctx_kwargs):
+    """Whether the policy has members. A failed read fails the task, so
+    that the delete guard never takes it for "no members"."""
     res = blade.get_management_access_policies_members(
         policy_names=[module.params["name"]], **ctx_kwargs
     )
     if res.status_code != 200:
-        return False
+        module.fail_json(
+            msg="Failed to list members of policy {0}. Error: {1}".format(
+                module.params["name"], get_error_message(res)
+            )
+        )
     return bool(list(res.items))
+
+
+def _find_realm(blade, ctx_kwargs, name):
+    """Look a realm up by the scope name of a rule.
+
+    Returns the name as the array holds it, None when the array has no
+    realm of that name, and ``name`` unchanged when the read is refused or
+    fails, which says nothing about the realm.
+
+    The array finds a realm without regard to letter case and ignores
+    blanks around the name. It also reads a comma as the separator of a
+    list of names and * as a wildcard, and then answers with every realm
+    that matches (or with "was not found"). Only a realm of this very name
+    counts, so that a rule is never put on a realm the task did not name.
+    """
+    res = blade.get_realms(names=[name], **ctx_kwargs)
+    if res.status_code == 200:
+        wanted = name.strip().lower()
+        for item in list(res.items):
+            stored = getattr(item, "name", None)
+            if stored and str(stored).lower() == wanted:
+                return stored
+        return None
+    error = get_error_message(res)
+    if _does_not_exist(error) or "was not found" in str(error).lower():
+        return None
+    return name
+
+
+def _resolve_realm_scopes(module, blade, ctx_kwargs, current_rules):
+    """Settle the realm scopes of the desired rules before any write.
+
+    The array refuses a rule that names a realm it does not know, but only
+    once the rule is sent: check mode would report a change that the real
+    run cannot make, and a real run would stop after other settings or
+    rules of the policy had been changed. So a rule to add that names a
+    realm which does not exist fails the task here.
+
+    The array finds a realm without regard to letter case when the realm
+    is read, yet accepts a rule only with the spelling it holds. The scope
+    name of a desired rule is therefore replaced by that spelling: the one
+    on a rule the policy already has at that scope, or else the name the
+    realm read returns for the realm of that very name.
+
+    Only a definite answer fails the task: a realm read that is refused or
+    fails says nothing about the realm and leaves the decision to the
+    array.
+    """
+    stored = {}
+    for rule in current_rules:
+        scope_name = getattr(getattr(rule, "scope", None), "name", None)
+        if scope_name:
+            stored[_current_rule_key(rule)[1:]] = scope_name
+    for rule in module.params["rules"] or []:
+        scope = rule["scope"]
+        if scope["resource_type"] != "realms":
+            continue
+        key = _rule_key(rule["role"], scope["resource_type"], scope["name"])[1:]
+        if key not in stored:
+            spelling = _find_realm(blade, ctx_kwargs, scope["name"])
+            if spelling is None:
+                module.fail_json(
+                    msg=(
+                        "Cannot add rule (role={0}, scope=realms/{1}) to policy "
+                        "{2}: realm {1} does not exist. The scope name of a rule "
+                        "is the bare name of an existing realm."
+                    ).format(rule["role"], scope["name"], module.params["name"])
+                )
+            stored[key] = spelling
+        scope["name"] = stored[key]
 
 
 def delete_policy(module, blade, ctx_kwargs):
@@ -329,8 +484,11 @@ def delete_policy(module, blade, ctx_kwargs):
     module.exit_json(changed=True)
 
 
-def _reconcile_rules(module, blade, ctx_kwargs):
+def _reconcile_rules(module, blade, ctx_kwargs, current=None):
     """Diff desired rule list against actual; add/remove to converge.
+
+    ``current`` is the rule list of the policy when the caller has read it
+    already; it is read here otherwise.
 
     Returns True if any change was made (or would be made in check-mode).
     """
@@ -338,7 +496,8 @@ def _reconcile_rules(module, blade, ctx_kwargs):
     if desired is None:
         return False
 
-    current = _get_current_rules(module, blade, ctx_kwargs)
+    if current is None:
+        current = _get_current_rules(module, blade, ctx_kwargs)
     current_by_key = {}
     for rule in current:
         current_by_key[_current_rule_key(rule)] = rule
@@ -512,6 +671,8 @@ def create_policy(module, blade, ctx_kwargs):
     if enabled is None:
         enabled = True
 
+    _resolve_realm_scopes(module, blade, ctx_kwargs, [])
+
     if module.check_mode:
         module.exit_json(changed=True)
 
@@ -537,6 +698,21 @@ def create_policy(module, blade, ctx_kwargs):
 
 def update_policy(module, blade, ctx_kwargs, existing, api_version=None):
     changed = False
+
+    # Read the rules and settle a refused scope before the first write, so
+    # that a task the array would refuse changes nothing and check mode
+    # reports the same failure as the real run.
+    inline_rules = False
+    current_rules = None
+    if module.params["rules"] is not None:
+        inline_rules = api_version is not None and LooseVersion(
+            MIN_RULE_API_VERSION
+        ) > LooseVersion(api_version)
+        if inline_rules:
+            current_rules = list(getattr(existing, "rules", None) or [])
+        else:
+            current_rules = _get_current_rules(module, blade, ctx_kwargs)
+        _resolve_realm_scopes(module, blade, ctx_kwargs, current_rules)
 
     patch_kwargs = {}
     if (
@@ -566,12 +742,10 @@ def update_policy(module, blade, ctx_kwargs, existing, api_version=None):
                 )
 
     if module.params["rules"] is not None:
-        if api_version is not None and LooseVersion(
-            MIN_RULE_API_VERSION
-        ) > LooseVersion(api_version):
+        if inline_rules:
             rules_changed = _replace_inline_rules(module, blade, ctx_kwargs, existing)
         else:
-            rules_changed = _reconcile_rules(module, blade, ctx_kwargs)
+            rules_changed = _reconcile_rules(module, blade, ctx_kwargs, current_rules)
         if rules_changed:
             changed = True
 
@@ -619,6 +793,7 @@ def main():
 
     state = module.params["state"]
     name = module.params["name"]
+    _check_one_name(module)
     # Policy names are case-insensitive/case-preserving on the array, so
     # the guard must match case variants (e.g. "Readonly") too.
     is_builtin = name.lower() in BUILTIN_POLICIES

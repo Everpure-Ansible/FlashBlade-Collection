@@ -21,6 +21,8 @@ version_added: '1.4.0'
 short_description: Manage FlashBlade Certifcate Groups
 description:
 - Manage certifcate groups for FlashBlades
+- A certificate group lives at array level or in a realm. A group in a realm
+  is named C(realm::group) and holds only certificates of that realm.
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
@@ -33,6 +35,10 @@ options:
   name:
     description:
     - Name of the certificate group
+    - A group that lives in a realm is named C(realm::group). The same name
+      without the realm is a different group at array level.
+    - A realm-scoped administrator must use the realm-qualified name; a bare
+      name is not placed in, or resolved to, the administrator's realm.
     type: str
     required: true
   certificates:
@@ -42,6 +48,10 @@ options:
     - Certificates already in the group are left alone, so repeated runs
       report no change.
     - With I(state=absent) and no certificates the whole group is deleted.
+    - A group can only hold certificates of its own realm. Certificates in a
+      realm are named C(realm::certificate), and a group at array level
+      holds only certificates at array level. A certificate from another
+      scope is refused before anything is changed.
     type: list
     elements: str
 extends_documentation_fragment:
@@ -60,6 +70,13 @@ EXAMPLES = r"""
     certificates:
       - cert1
       - cert2
+    fb_url: 10.10.10.2
+    api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+- name: Create a certificate group in realm realm1 with a certificate of that realm
+  everpure.flashblade.purefb_certgrp:
+    name: realm1::ca-group
+    certificates:
+      - realm1::ca1
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
 - name: Delete a certifcate from a group
@@ -88,7 +105,102 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.purefb import 
 )
 from ansible_collections.everpure.flashblade.plugins.module_utils.common import (
     get_error_message,
+    get_rest_api_version,
 )
+from ansible_collections.everpure.flashblade.plugins.module_utils.version import (
+    LooseVersion,
+)
+
+# Realms arrived with REST 2.19; an older array has no realm to read.
+REALM_API_VERSION = "2.19"
+
+
+def _realm_of(name):
+    """Return the realm of a realm::name name, empty for an array-level name."""
+    return name.rpartition("::")[0]
+
+
+def _check_certificate_realms(module):
+    """Fail when certificates names a certificate the group cannot hold.
+
+    A group in a realm holds only certificates of that realm and a group at
+    array level only certificates at array level. The array refuses any
+    other certificate when it is added, which check mode cannot foresee, and
+    such a name never matches a member when it is removed, so the member it
+    was meant for would stay in the group. Both are settled here, before
+    anything is read or written. The array matches names without regard to
+    case, so the realms are compared that way.
+    """
+    name = module.params["name"]
+    realm = _realm_of(name)
+    for certificate in module.params["certificates"] or []:
+        if _realm_of(certificate).lower() == realm.lower():
+            continue
+        if realm:
+            module.fail_json(
+                msg=(
+                    "Certificate {0} is not in realm {1}. Certificate group {2} "
+                    "can only hold certificates of its own realm, named "
+                    "{1}::<certificate>."
+                ).format(certificate, realm, name)
+            )
+        module.fail_json(
+            msg=(
+                "Certificate {0} is in a realm. Certificate group {1} is not in "
+                "a realm and can only hold certificates that are not in one "
+                "either."
+            ).format(certificate, name)
+        )
+
+
+def _check_realm(module, blade):
+    """Fail a check mode run that would create a group in an unusable realm.
+
+    The array refuses to create a group in a realm that does not exist or
+    has been destroyed. A real run gets that answer from the create itself;
+    check mode sends nothing, so it reads the realm instead of reporting a
+    change the real run cannot make. Only a definite answer fails the task.
+    """
+    name = module.params["name"]
+    realm = _realm_of(name)
+    if not realm or LooseVersion(REALM_API_VERSION) > LooseVersion(
+        get_rest_api_version(blade)
+    ):
+        return
+    res = blade.get_realms(names=[realm])
+    if res.status_code == 200:
+        items = list(res.items)
+        if not items or getattr(items[0], "destroyed", False) is not True:
+            return
+        error = "Realm has been destroyed."
+    else:
+        error = get_error_message(res)
+        if "does not exist" not in str(error).lower():
+            return
+    module.fail_json(
+        msg="Failed to create certificate group {0}. Error: {1}".format(name, error)
+    )
+
+
+def _group_exists(module, blade):
+    """Return True when the certificate group exists.
+
+    A missing group is itself a 400 here ("Certificate group does not
+    exist."), so only that answer reads as absent. Any other failure fails
+    the task rather than passing for "absent", which would let state=absent
+    report no change, or state=present attempt a create, on an error.
+    """
+    res = blade.get_certificate_groups(names=[module.params["name"]])
+    if res.status_code == 200:
+        return True
+    error = get_error_message(res)
+    if "does not exist" not in str(error).lower():
+        module.fail_json(
+            msg="Failed to read certificate group {0}. Error: {1}".format(
+                module.params["name"], error
+            )
+        )
+    return False
 
 
 def delete_certgrp(module, blade):
@@ -108,7 +220,9 @@ def delete_certgrp(module, blade):
 def create_certgrp(module, blade):
     """Create certificate group"""
     changed = True
-    if not module.check_mode:
+    if module.check_mode:
+        _check_realm(module, blade)
+    else:
         res = blade.post_certificate_groups(names=[module.params["name"]])
         if res.status_code != 200:
             module.fail_json(
@@ -149,8 +263,16 @@ def update_certgrp(module, blade):
     """Add certificates to, or remove certificates from, an existing group"""
     changed = False
     current = get_group_certificates(module, blade)
+    # The array matches names without regard to case and returns the stored
+    # spelling, so members are compared lower-cased and removed by the name
+    # the array reports.
+    members = [cert.lower() for cert in current]
     if module.params["state"] == "present":
-        to_add = [cert for cert in module.params["certificates"] if cert not in current]
+        to_add = [
+            cert
+            for cert in module.params["certificates"]
+            if cert.lower() not in members
+        ]
         if to_add:
             changed = True
             if not module.check_mode:
@@ -165,7 +287,8 @@ def update_certgrp(module, blade):
                         )
                     )
     else:
-        to_remove = [cert for cert in module.params["certificates"] if cert in current]
+        unwanted = [cert.lower() for cert in module.params["certificates"]]
+        to_remove = [cert for cert in current if cert.lower() in unwanted]
         if to_remove:
             changed = True
             if not module.check_mode:
@@ -195,11 +318,10 @@ def main():
     module = AnsibleModule(argument_spec, supports_check_mode=True)
 
     state = module.params["state"]
+    _check_certificate_realms(module)
     blade = get_system(module)
 
-    certgrp = bool(
-        blade.get_certificate_groups(names=[module.params["name"]]).status_code == 200
-    )
+    certgrp = _group_exists(module, blade)
 
     if certgrp and state == "present" and module.params["certificates"]:
         update_certgrp(module, blade)

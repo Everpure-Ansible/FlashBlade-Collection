@@ -186,6 +186,14 @@ def main():
         module.fail_json(msg="py-pure-client SDK is required for this module")
 
     state = module.params["state"]
+    if state == "present":
+        # An option given as null passes the argument check and is no value.
+        missing = [key for key in ("host", "port") if module.params[key] is None]
+        if missing:
+            module.fail_json(
+                msg="state is present but all of the following are missing: "
+                "{0}".format(", ".join(missing))
+            )
     blade = get_system(module)
     current_proxy = _get_proxy(module, blade)
 

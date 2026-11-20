@@ -172,7 +172,7 @@ def _run(module, blade, sdk=True):
         ansible_module = stack.enter_context(
             patch(MOD + ".AnsibleModule", return_value=module)
         )
-        stack.enter_context(patch(MOD + ".get_system", return_value=blade))
+        get_system = stack.enter_context(patch(MOD + ".get_system", return_value=blade))
         stack.enter_context(
             patch(MOD + ".get_error_message", side_effect=_error_message)
         )
@@ -188,7 +188,9 @@ def _run(module, blade, sdk=True):
         except FailJson:
             outcome = "fail"
     assert outcome is not None, "main() ended without exit_json or fail_json"
-    return SimpleNamespace(outcome=outcome, ansible_module=ansible_module)
+    return SimpleNamespace(
+        outcome=outcome, ansible_module=ansible_module, get_system=get_system
+    )
 
 
 def _failure(module):
@@ -440,3 +442,40 @@ class TestPurefbProxyMain:
         run = _run(module, _blade())
         kwargs = run.ansible_module.call_args[1]
         assert kwargs["required_if"] == [["state", "present", ["host", "port"]]]
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("proxy", [None, HTTPS_PROXY])
+    @pytest.mark.parametrize(
+        "params, missing",
+        [
+            ({}, "host, port"),
+            ({"host": None, "port": None}, "host, port"),
+            ({"host": None, "port": 8080}, "host"),
+            ({"host": HOST, "port": None}, "port"),
+        ],
+    )
+    def test_present_with_a_null_host_or_port_is_refused(
+        self, params, missing, proxy, check_mode
+    ):
+        """An option given as null passes the argument check: the module refuses it."""
+        module = _module(check_mode=check_mode, **params)
+        blade = _blade(proxy=proxy)
+        run = _run(module, blade)
+        assert run.outcome == "fail"
+        assert _failure(module) == (
+            "state is present but all of the following are missing: " + missing
+        )
+        run.get_system.assert_not_called()
+        blade.get_support.assert_not_called()
+        blade.patch_support.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "params", [{}, {"host": None, "port": 8080}, {"host": HOST, "port": None}]
+    )
+    def test_absent_takes_a_null_host_or_port(self, params):
+        """state=absent uses neither option, so a null one is no reason to refuse."""
+        module = _module(state="absent", **params)
+        blade = _blade(proxy=HTTPS_PROXY)
+        assert _run(module, blade).outcome == "exit"
+        assert _result(module) == {"changed": True}
+        assert _sent(blade) == ""

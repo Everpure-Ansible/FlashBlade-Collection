@@ -27,6 +27,16 @@ description:
   C(storage_admin) are updated in place and cleared, rather than deleted,
   with I(state=absent). A built-in mapping missing from the array is created.
 - Any other I(name) is a custom mapping, which is created and deleted.
+- Mappings are array-level objects. A mapping cannot be created in a realm,
+  so the module refuses a realm-qualified I(name) (C(realm::name)).
+- Access to a realm is granted by naming in I(policies) a management access
+  policy whose rules are scoped to that realm, created with
+  M(everpure.flashblade.purefb_mgmt_policy). Such a policy is an array-level
+  object as well and is named without a realm prefix.
+- Mappings are managed by an administrator with array-wide access. The array
+  refuses an administrator whose access is limited to a realm the read of a
+  mapping, so every task run as that administrator fails with the array's
+  message.
 - Requires FlashBlade REST API version 2.14 or later (Purity//FB 4.4.2+).
   I(policies) requires REST API version 2.19 or later (Purity//FB 4.6.1+).
 author:
@@ -42,6 +52,12 @@ options:
     description:
     - Name of the directory service role mapping.
     - Defaults to I(role), which addresses the built-in mapping of that name.
+    - Mappings are array-level objects, so a realm-qualified name
+      (C(realm::name)) is refused.
+    - This is the name of one mapping. A name with a comma, which the array
+      reads as a separator of names, is refused.
+    - The name is matched without regard to letter case, as the array does,
+      so a built-in mapping is recognised in any letter case.
     - One of I(name) or I(role) is required.
     type: str
     version_added: '1.30.0'
@@ -63,6 +79,12 @@ options:
     - The mapping's policy set is reconciled to this list. Policies are
       attached before any are detached, and names are compared
       case-insensitively. At least one policy is required.
+    - A policy whose rules are scoped to a realm grants access to that realm
+      only. Management access policies are array-level objects, so every
+      policy is named without a realm prefix and a realm-qualified name
+      (C(realm::policy)) is refused.
+    - Each policy is an entry of its own. An entry with a comma, which the
+      array reads as a separator of names, is refused.
     - Requires REST API version 2.19 or later.
     - Mutually exclusive with I(role).
     type: list
@@ -136,6 +158,27 @@ EXAMPLES = r"""
     fb_url: 10.10.10.2
     api_token: e31060a7-21fc-e277-6240-25983c6c4592
 
+- name: Create a management access policy granting the admin role in realm1
+  everpure.flashblade.purefb_mgmt_policy:
+    name: realm1-admin
+    rules:
+      - role: admin
+        scope:
+          name: realm1
+          resource_type: realms
+    fb_url: 10.10.10.2
+    api_token: e31060a7-21fc-e277-6240-25983c6c4592
+
+- name: Create a custom mapping granting a group access to realm1 only
+  everpure.flashblade.purefb_dsrole:
+    name: realm1-admins
+    group_base: "OU=PureGroups"
+    group: realm1-admins
+    policies:
+      - realm1-admin
+    fb_url: 10.10.10.2
+    api_token: e31060a7-21fc-e277-6240-25983c6c4592
+
 - name: Delete a custom mapping
   everpure.flashblade.purefb_dsrole:
     name: nfs-operators
@@ -174,6 +217,73 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.version import
 MIN_REQUIRED_API_VERSION = "2.14"
 MIN_POLICIES_API_VERSION = "2.19"
 BUILTIN_ROLES = ["array_admin", "ops_admin", "readonly", "storage_admin"]
+EMPTY_NAME_MSG = (
+    "name is empty and role is not set. Name the mapping with name, or "
+    "address a built-in mapping with role."
+)
+NAME_LIST_MSG = (
+    "Invalid name '{0}': a task manages one directory service role mapping. "
+    "The array reads a comma in a name as a separator of names, so this "
+    "name addresses more than one mapping. Use the exact name of one mapping."
+)
+POLICY_LIST_MSG = (
+    "Invalid policy '{0}': the array reads a comma in a name as a separator "
+    "of names. Give each management access policy as an entry of its own in "
+    "policies."
+)
+REALM_NAME_MSG = (
+    "Invalid name '{0}': directory service role mappings are array-level "
+    "objects and their names cannot be realm-qualified (realm::name). Use an "
+    "unqualified mapping name. To grant access to a realm, name in policies "
+    "a management access policy whose rules are scoped to that realm."
+)
+REALM_POLICY_MSG = (
+    "Invalid policy '{0}': management access policies are array-level "
+    "objects, also when their rules are scoped to a realm, and are named "
+    "without a realm prefix (realm::name). Use the unqualified policy name."
+)
+
+
+def _refuse_name_lists(module):
+    """Refuse a name the array reads as several names, before any request
+
+    In a request the array reads a comma in a name as a separator of names.
+    The lookup of such a mapping name returns every mapping named in it: the
+    first would be taken for the mapping of the task, and a change of the
+    group or of the policies would be applied to all of them. An entry of
+    policies with a comma is read as several policies when it is attached
+    to an existing mapping, so it never matches the policies the mapping
+    reports. Neither kind of name can contain a comma. policies is only
+    read for state=present.
+    """
+    name = module.params["name"]
+    if "," in name:
+        module.fail_json(msg=NAME_LIST_MSG.format(name))
+    if module.params["state"] != "present":
+        return
+    for policy in module.params["policies"] or []:
+        if "," in policy:
+            module.fail_json(msg=POLICY_LIST_MSG.format(policy))
+
+
+def _refuse_realm_names(module):
+    """Refuse realm-qualified names the array never accepts, before any request
+
+    Mappings and management access policies are array-level objects. The
+    array's name rule rejects the realm separator in a new mapping's name
+    with a message that does not mention realms, and answers a lookup of
+    such a mapping or policy like any missing one. Left to the array, check
+    mode would predict a change that cannot happen. policies is only read
+    for state=present.
+    """
+    name = module.params["name"]
+    if "::" in name:
+        module.fail_json(msg=REALM_NAME_MSG.format(name))
+    if module.params["state"] != "present":
+        return
+    for policy in module.params["policies"] or []:
+        if "::" in policy:
+            module.fail_json(msg=REALM_POLICY_MSG.format(policy))
 
 
 def _current_policy_names(mapping):
@@ -241,6 +351,17 @@ def _get_mapping(module, blade):
     module.fail_json(
         msg="Fetch Directory Service Role {0} failed. Error: {1}".format(name, error)
     )
+
+
+def _use_stored_name(module, mapping):
+    """Address the mapping by the name the array reports for it.
+
+    The array finds a mapping under any letter case of its name, but it
+    answers a delete sent under another spelling than the stored one with
+    success and deletes nothing. Every request after the lookup therefore
+    uses the stored spelling.
+    """
+    module.params["name"] = getattr(mapping, "name", None) or module.params["name"]
 
 
 def _patch_mapping(module, blade, body, action):
@@ -316,7 +437,7 @@ def update_mapping(module, blade, mapping, policies_supported):
 def delete_mapping(module, blade, mapping):
     """Delete a custom mapping, or clear the group of a built-in one"""
     name = module.params["name"]
-    if name in BUILTIN_ROLES:
+    if name.lower() in BUILTIN_ROLES:
         if not (
             getattr(mapping, "group", None) or getattr(mapping, "group_base", None)
         ):
@@ -390,9 +511,13 @@ def main():
 
     if not module.params["name"]:
         module.params["name"] = module.params["role"]
+    if not module.params["name"]:
+        module.fail_json(msg=EMPTY_NAME_MSG)
     state = module.params["state"]
     if state == "present" and module.params["policies"] == []:
         module.fail_json(msg="policies must name at least one management access policy")
+    _refuse_name_lists(module)
+    _refuse_realm_names(module)
 
     blade = get_system(module)
     api_version = get_rest_api_version(blade)
@@ -415,6 +540,8 @@ def main():
         )
 
     mapping = _get_mapping(module, blade)
+    if mapping is not None:
+        _use_stored_name(module, mapping)
     if state == "absent":
         if mapping is None:
             module.exit_json(changed=False)

@@ -1,0 +1,4 @@
+bugfixes:
+  - purefb_pingtrace - documentation of ``source`` now names what the array accepts, the IP
+    address or the name of a network interface or the name of a subnet, instead of a hostname,
+    and the trace example uses options that exist.

@@ -52,7 +52,7 @@ options:
     default: 56
   destination:
     description:
-    - IP addtress or hostname used to run ping or trace against.
+    - IP address or hostname used to run ping or trace against.
     type: str
     required: true
   method:
@@ -78,8 +78,10 @@ options:
     type: str
   source:
     description:
-    - IP address or hostname used by ping and trace to specify where
-      to start to run the specified operation
+    - Used by ping and trace to specify where to start to run the
+      specified operation.
+    - This is the IP address or the name of a network interface of the
+      array, or the name of a subnet. A hostname is not accepted.
     - If not specified will use all available sources
     type: str
   component:
@@ -99,12 +101,20 @@ EXAMPLES = r"""
     fb_url: 10.10.10.2
     api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
 
-- name: trace to Google DNS server from CH1.FM0
+- name: ping Google DNS server from network interface vir0 on CH1.FM1
+  everpure.flashblade.purefb_pingtrace:
+    destination: 8.8.8.8
+    source: vir0
+    component: CH1.FM1
+    fb_url: 10.10.10.2
+    api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
+
+- name: trace to Google DNS server from CH1.FM1
   everpure.flashblade.purefb_pingtrace:
     action: trace
     destination: 8.8.8.8
-    fragment_packet: true
-    source: CH1.FM0
+    fragment: true
+    component: CH1.FM1
     discover_mtu: true
     fb_url: 10.10.10.2
     api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3

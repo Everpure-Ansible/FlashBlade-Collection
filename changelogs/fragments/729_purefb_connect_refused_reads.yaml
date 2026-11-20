@@ -1,0 +1,8 @@
+bugfixes:
+  - purefb_connect - ``state=present`` no longer creates a connection key on the target array in
+    check mode. The key is requested only when the connection is about to be created.
+  - purefb_connect - a read on either array that is refused or fails, a failed login to the target
+    array and a refused connection key are now reported with the message of the array instead of a
+    traceback.
+  - purefb_connect - check mode now refuses a disconnect on the array that did not form the
+    connection, as the real run does.

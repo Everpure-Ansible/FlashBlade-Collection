@@ -38,6 +38,8 @@ options:
       realm is a different LDS at the array level.
     - A realm-scoped administrator must use the realm-qualified name; a bare
       name is not placed in, or resolved to, the administrator's realm.
+    - A task manages one LDS. A name that contains a comma is refused,
+      because the array reads a comma as the separator of a list of names.
     type: str
     required: true
   state:
@@ -183,6 +185,26 @@ def _context_kwargs(module):
     return {}
 
 
+def _check_name(module):
+    """Fail on a name that is not the name of one LDS, before any request.
+
+    The array reads a comma as the separator of a list of names, so a name
+    with a comma addresses several LDSes in one request: the lookup returns
+    the first of them, a change or a delete goes to all of them, and the
+    delete preflight, which filters the servers on the name as given, finds
+    no attached server.
+    """
+    name = module.params["name"]
+    if "," in name:
+        module.fail_json(
+            msg=(
+                "name {0} is not valid: the array reads a comma as the "
+                "separator of a list of names, so this would address more "
+                "than one local directory service. Give one name."
+            ).format(name)
+        )
+
+
 def _get_lds(module, blade):
     ctx = _context_kwargs(module)
     res = blade.get_directory_services_local_directory_services(
@@ -278,8 +300,8 @@ def update_lds(module, blade, lds):
         module.warn(
             (
                 "Changing domain on local directory service '{0}' is disruptive "
-                "and is only permitted when detached; the array may reject this "
-                "while '{0}' is attached to server '{1}'."
+                "while it is attached to server '{1}'; the array may reject the "
+                "change."
             ).format(module.params["name"], attached_name)
         )
 
@@ -323,6 +345,8 @@ def main():
 
     if not HAS_PYPURECLIENT:
         module.fail_json(msg="py-pure-client sdk is required for this module")
+
+    _check_name(module)
 
     blade = get_system(module)
     api_version = get_rest_api_version(blade)

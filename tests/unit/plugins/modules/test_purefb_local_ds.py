@@ -905,8 +905,10 @@ def _run_main(
 
     blade = Mock()
     blade.get_versions.return_value.items = ["2.24"]
+    if not isinstance(existing, list):
+        existing = [existing] if existing else []
     blade.get_directory_services_local_directory_services.return_value = _response(
-        [existing] if existing else []
+        existing
     )
     blade.get_servers.return_value = _response(servers or [])
     blade.post_directory_services_local_directory_services.return_value = _response()
@@ -1101,3 +1103,74 @@ class TestPurefbLocalDsExamples:
         for task in realm_tasks:
             realm, sep, leaf = task["name"].rpartition("::")
             assert realm and sep and leaf
+
+
+# ---------------- one name per task ----------------
+
+
+class TestPurefbLocalDsOneName:
+    """The array reads a comma in a name as the separator of a list"""
+
+    def _assert_refused(self, module, blade):
+        module.fail_json.assert_called_once()
+        assert "comma" in module.fail_json.call_args[1]["msg"]
+        module.exit_json.assert_not_called()
+        blade.get_directory_services_local_directory_services.assert_not_called()
+        blade.get_servers.assert_not_called()
+        blade.post_directory_services_local_directory_services.assert_not_called()
+        blade.patch_directory_services_local_directory_services.assert_not_called()
+        blade.delete_directory_services_local_directory_services.assert_not_called()
+
+    def test_delete_of_two_names_refused_before_any_request(self):
+        # the array answers the lookup with both; the server filter on the
+        # text "lds-a,lds-b" matches no server although lds-a is attached
+        for check_mode in (False, True):
+            module, blade, _post_model, _patch_model = _run_main(
+                params=_base_params(name="lds-a,lds-b", state="absent"),
+                existing=[_lds("lds-a", "lds-a", server="srv-a"), _lds("lds-b", "b")],
+                check_mode=check_mode,
+            )
+
+            self._assert_refused(module, blade)
+            assert "lds-a,lds-b" in module.fail_json.call_args[1]["msg"]
+
+    def test_domain_change_of_two_names_refused_before_any_request(self):
+        for check_mode in (False, True):
+            module, blade, _post_model, _patch_model = _run_main(
+                params=_base_params(name="lds-b,lds-a", domain="corp-local"),
+                existing=[_lds("lds-b", "b"), _lds("lds-a", "lds-a", server="srv-a")],
+                check_mode=check_mode,
+            )
+
+            self._assert_refused(module, blade)
+
+    def test_two_realm_names_refused_before_any_request(self):
+        name = "tenant_local,{0}".format(REALM_LDS)
+        for state in ("present", "absent"):
+            module, blade, _post_model, _patch_model = _run_main(
+                params=_base_params(name=name, state=state, domain="tenant1"),
+                existing=[
+                    _lds("tenant_local", "local"),
+                    _lds(REALM_LDS, "tenant1", server=REALM_SERVER),
+                ],
+            )
+
+            self._assert_refused(module, blade)
+
+    def test_comma_name_refused_when_nothing_exists(self):
+        module, blade, _post_model, _patch_model = _run_main(
+            params=_base_params(name="lds-a,lds-b", domain="corp-local")
+        )
+
+        self._assert_refused(module, blade)
+
+    def test_attached_domain_change_warning_does_not_say_refused(self):
+        module, _blade, _post_model, _patch_model = _run_main(
+            params=_base_params(name=REALM_LDS, domain="tenant2"),
+            existing=_lds(REALM_LDS, "tenant1", server=REALM_SERVER),
+        )
+
+        text = module.warn.call_args[0][0]
+        assert REALM_LDS in text and REALM_SERVER in text
+        assert "only permitted when detached" not in text
+        assert "may reject" in text

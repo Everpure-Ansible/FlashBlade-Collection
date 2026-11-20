@@ -135,7 +135,21 @@ def _member(group, certificate):
     return item
 
 
-def _blade(groups=None, realms=("realm1", "realm2"), destroyed=()):
+def _read(names):
+    """The names of a request as the array reads them.
+
+    A comma separates names, white space around a name is ignored and an
+    empty name is skipped.
+    """
+    found = []
+    for entry in names:
+        for name in entry.split(","):
+            if name.strip():
+                found.append(name.strip())
+    return found
+
+
+def _blade(groups=None, realms=("realm1", "realm2"), destroyed=(), hidden=()):
     """A small stateful stand-in for the array.
 
     groups maps a group name to the names of its members, as the array
@@ -145,6 +159,8 @@ def _blade(groups=None, realms=("realm1", "realm2"), destroyed=()):
     exists and is not destroyed, and it takes only certificates that exist
     and are in its own realm. Adding a certificate that is already a member
     is accepted. Writes change the state so that a later read sees them.
+    A hidden realm exists but is not open to the caller: its lookup answers
+    200 without items and a create in it "Realm does not exist.".
     """
     state = dict((name, list(members)) for name, members in (groups or {}).items())
     blade = Mock()
@@ -157,18 +173,20 @@ def _blade(groups=None, realms=("realm1", "realm2"), destroyed=()):
         return None
 
     def _get_groups(names):
-        stored = _find(names[0], state)
+        stored = _find(_read(names)[0], state)
         if stored is None:
             return _error(GROUP_NOT_FOUND)
         return _ok([_named(stored, realms=[])])
 
     def _get_members(certificate_group_names):
-        stored = _find(certificate_group_names[0], state)
+        stored = _find(_read(certificate_group_names)[0], state)
         if stored is None:
             return _error(GROUP_NOT_FOUND)
         return _ok([_member(stored, cert) for cert in state[stored]])
 
     def _get_realms(names):
+        if _find(names[0], hidden):
+            return _ok()
         if _find(names[0], destroyed):
             return _ok([_named(_find(names[0], destroyed), destroyed=True)])
         if _find(names[0], realms):
@@ -176,28 +194,31 @@ def _blade(groups=None, realms=("realm1", "realm2"), destroyed=()):
         return _error(REALM_NOT_FOUND)
 
     def _post_groups(names):
-        realm = _realm(names[0])
+        name = _read(names)[0]
+        realm = _realm(name)
         if realm and _find(realm, destroyed):
             return _error(REALM_DESTROYED)
-        if realm and not _find(realm, realms):
+        if realm and (_find(realm, hidden) or not _find(realm, realms)):
             return _error(REALM_NOT_FOUND)
-        assert _find(names[0], state) is None, "create of a group that exists"
-        state[names[0]] = []
-        return _ok([_named(names[0], realms=[])])
+        assert _find(name, state) is None, "create of a group that exists"
+        state[name] = []
+        return _ok([_named(name, realms=[])])
 
     def _delete_groups(names):
-        stored = _find(names[0], state)
+        stored = _find(_read(names)[0], state)
         if stored is None:
             return _error(GROUP_NOT_FOUND)
         del state[stored]
         return _ok()
 
     def _post_members(certificate_names, certificate_group_names):
-        stored = _find(certificate_group_names[0], state)
+        stored = _find(_read(certificate_group_names)[0], state)
         if stored is None:
             return _error(GROUP_NOT_FOUND)
+        certificates = _read(certificate_names)
+        assert certificates, "membership request that names no certificate"
         known = []
-        for cert in certificate_names:
+        for cert in certificates:
             certificate = _find(cert, CERTIFICATES)
             if certificate is None:
                 return _error(CERT_NOT_FOUND)
@@ -210,10 +231,12 @@ def _blade(groups=None, realms=("realm1", "realm2"), destroyed=()):
         return _ok()
 
     def _delete_members(certificate_names, certificate_group_names):
-        stored = _find(certificate_group_names[0], state)
+        stored = _find(_read(certificate_group_names)[0], state)
         if stored is None:
             return _error(GROUP_NOT_FOUND)
-        for cert in certificate_names:
+        certificates = _read(certificate_names)
+        assert certificates, "membership request that names no certificate"
+        for cert in certificates:
             member = _find(cert, state[stored])
             assert member is not None, "removal of a certificate that is no member"
             state[stored].remove(member)
@@ -556,6 +579,152 @@ class TestPurefbCertgrpLetterCase:
         assert blade.groups[REALM_GROUP] == ["realm1::ca1", "realm1::ca2"]
 
 
+class TestPurefbCertgrpNameForms:
+    """A comma separates names and white space around a name is ignored"""
+
+    def test_names(self):
+        assert purefb_certgrp._names(None) == []
+        assert purefb_certgrp._names("ca-group") == ["ca-group"]
+        assert purefb_certgrp._names(["ca1", " ca2 ", "ca3,ca4", "", " , "]) == [
+            "ca1",
+            "ca2",
+            "ca3",
+            "ca4",
+        ]
+
+    def test_list_written_as_one_string_is_added_to_a_realm_group(self):
+        # "realm1::ca1, realm1::ca2" reaches the module as two entries, the
+        # second one with a leading space
+        blade = _twins()
+        certificates = ["realm1::ca1", " realm1::ca2"]
+        module = _run(blade, name=REALM_GROUP, certificates=certificates)
+        assert _changed(module) is True
+        blade.post_certificate_groups_certificates.assert_called_once_with(
+            certificate_names=["realm1::ca2"], certificate_group_names=[REALM_GROUP]
+        )
+        blade.reset_mock()
+        module = _run(blade, name=REALM_GROUP, certificates=certificates)
+        assert _changed(module) is False
+        assert _writes(blade) == []
+
+    def test_list_written_as_one_string_is_idempotent_at_array_level(self):
+        blade = _blade({GROUP: ["ca1"]})
+        module = _run(blade, certificates=["ca1", " ca2"])
+        assert _changed(module) is True
+        blade.post_certificate_groups_certificates.assert_called_once_with(
+            certificate_names=["ca2"], certificate_group_names=[GROUP]
+        )
+        blade.reset_mock()
+        assert _changed(_run(blade, certificates=["ca1", " ca2"])) is False
+        assert _writes(blade) == []
+
+    def test_entry_holding_two_names_is_two_certificates(self):
+        blade = _twins()
+        certificates = ["realm1::ca2,realm1::ca3"]
+        module = _run(blade, name=REALM_GROUP, certificates=certificates)
+        assert _changed(module) is True
+        blade.post_certificate_groups_certificates.assert_called_once_with(
+            certificate_names=["realm1::ca2", "realm1::ca3"],
+            certificate_group_names=[REALM_GROUP],
+        )
+        blade.reset_mock()
+        module = _run(blade, name=REALM_GROUP, certificates=certificates)
+        assert _changed(module) is False
+        assert _writes(blade) == []
+
+    def test_entry_holding_a_name_of_another_scope_is_refused(self):
+        blade = _twins()
+        for check_mode in (True, False):
+            module = _run(
+                blade,
+                check_mode=check_mode,
+                name=REALM_GROUP,
+                certificates=["realm1::ca2,ca2"],
+            )
+            assert _failure(module) == (
+                "Certificate ca2 is not in realm realm1. Certificate group "
+                "realm1::ca-group can only hold certificates of its own realm, "
+                "named realm1::<certificate>."
+            )
+        assert blade.method_calls == []
+
+    def test_members_written_with_white_space_are_removed(self):
+        blade = _blade({REALM_GROUP: ["realm1::ca1", "realm1::ca2", "realm1::ca3"]})
+        certificates = ["realm1::ca1", " realm1::ca2"]
+        module = _run(
+            blade, name=REALM_GROUP, state="absent", certificates=certificates
+        )
+        assert _changed(module) is True
+        blade.delete_certificate_groups_certificates.assert_called_once_with(
+            certificate_names=["realm1::ca1", "realm1::ca2"],
+            certificate_group_names=[REALM_GROUP],
+        )
+        assert blade.groups == {REALM_GROUP: ["realm1::ca3"]}
+        blade.reset_mock()
+        module = _run(
+            blade, name=REALM_GROUP, state="absent", certificates=certificates
+        )
+        assert _changed(module) is False
+        assert _writes(blade) == []
+
+    def test_group_name_with_white_space_is_the_same_group(self):
+        blade = _twins()
+        module = _run(blade, name=" realm1::ca-group", certificates=["realm1::ca1"])
+        assert _changed(module) is False
+        assert _writes(blade) == []
+
+    def test_new_group_takes_the_names_as_the_array_reads_them(self):
+        blade = _blade()
+        module = _run(
+            blade, name=REALM_GROUP, certificates=["realm1::ca1", " realm1::ca2"]
+        )
+        assert _changed(module) is True
+        blade.post_certificate_groups_certificates.assert_called_once_with(
+            certificate_names=["realm1::ca1", "realm1::ca2"],
+            certificate_group_names=[REALM_GROUP],
+        )
+        assert blade.groups == {REALM_GROUP: ["realm1::ca1", "realm1::ca2"]}
+
+    def test_empty_name_names_no_certificate(self):
+        # a templated list that comes out as one empty string adds and
+        # removes nothing, and is not taken for "no certificates", which
+        # deletes the group
+        for group in (GROUP, REALM_GROUP):
+            for state in ("present", "absent"):
+                blade = _twins()
+                module = _run(blade, name=group, state=state, certificates=[""])
+                assert _changed(module) is False
+                assert _writes(blade) == []
+                assert sorted(blade.groups) == sorted([GROUP, REALM_GROUP, OTHER_GROUP])
+
+    def test_new_group_with_an_empty_name_gets_no_member_request(self):
+        blade = _blade()
+        module = _run(blade, certificates=[""])
+        assert _changed(module) is True
+        blade.post_certificate_groups.assert_called_once_with(names=[GROUP])
+        blade.post_certificate_groups_certificates.assert_not_called()
+        assert blade.groups == {GROUP: []}
+
+    def test_every_group_the_name_addresses_is_held_to_the_rule(self):
+        module = Mock()
+        module.params = {
+            "name": "realm1::ca-group, realm1::other",
+            "certificates": ["realm1::ca1"],
+        }
+        purefb_certgrp._check_certificate_realms(module)
+        module.fail_json.assert_not_called()
+        blade = _twins()
+        module = _run(
+            blade, name="realm1::ca-group,ca-group", certificates=["realm1::ca1"]
+        )
+        assert _failure(module) == (
+            "Certificate realm1::ca1 is in a realm. Certificate group ca-group is "
+            "not in a realm and can only hold certificates that are not in one "
+            "either."
+        )
+        assert blade.method_calls == []
+
+
 class TestPurefbCertgrpRealms:
     """Groups in a realm, named realm::group, next to array-level namesakes"""
 
@@ -731,12 +900,33 @@ class TestPurefbCertgrpCheckModeRealm:
         assert _writes(blade) == []
         assert blade.groups == {}
 
-    def test_realm_read_without_items_reports_changed(self):
+    def test_realm_not_open_to_the_caller_fails_like_the_real_run(self):
+        # a realm-scoped administrator naming a realm that is not its own:
+        # the realm is read as 200 without items, the create is refused
+        blade = _blade(hidden=("realm3",))
+        messages = []
+        for check_mode in (True, False):
+            module = _run(blade, check_mode=check_mode, name="realm3::ca-group")
+            messages.append(_failure(module))
+        assert messages[0] == (
+            "Failed to create certificate group realm3::ca-group. Error: "
+            + REALM_NOT_FOUND
+        )
+        assert messages[1] == messages[0]
+        assert blade.groups == {}
+
+    def test_every_realm_the_name_addresses_is_read(self):
         blade = _blade()
-        blade.get_realms.side_effect = None
-        blade.get_realms.return_value = _ok()
-        module = _run(blade, check_mode=True, name=REALM_GROUP)
-        assert _changed(module) is True
+        name = "realm1::ca-group,nowhere::ca-group"
+        module = _run(blade, check_mode=True, name=name)
+        assert _failure(module) == (
+            "Failed to create certificate group " + name + ". Error: " + REALM_NOT_FOUND
+        )
+        assert [call[1]["names"] for call in blade.get_realms.call_args_list] == [
+            ["realm1"],
+            ["nowhere"],
+        ]
+        assert _writes(blade) == []
 
     def test_refused_realm_read_is_no_answer(self):
         blade = _blade()

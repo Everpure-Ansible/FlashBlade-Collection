@@ -120,6 +120,24 @@ def _realm_of(name):
     return name.rpartition("::")[0]
 
 
+def _names(value):
+    """Return the names in value the way the array reads them.
+
+    The array takes a comma for a separator between names and ignores white
+    space around a name, so "a, b" names a and b, whether it arrives as two
+    entries of a list or as one. An empty name names nothing and is left
+    out. Certificate names are compared, and sent, in this form.
+    """
+    if not isinstance(value, list):
+        value = [value]
+    names = []
+    for entry in value:
+        for name in str(entry or "").split(","):
+            if name.strip():
+                names.append(name.strip())
+    return names
+
+
 def _check_certificate_realms(module):
     """Fail when certificates names a certificate the group cannot hold.
 
@@ -131,55 +149,67 @@ def _check_certificate_realms(module):
     anything is read or written. The array matches names without regard to
     case, so the realms are compared that way.
     """
-    name = module.params["name"]
-    realm = _realm_of(name)
-    for certificate in module.params["certificates"] or []:
-        if _realm_of(certificate).lower() == realm.lower():
-            continue
-        if realm:
+    certificates = _names(module.params["certificates"])
+    for group in _names(module.params["name"]):
+        realm = _realm_of(group)
+        for certificate in certificates:
+            if _realm_of(certificate).lower() == realm.lower():
+                continue
+            if realm:
+                module.fail_json(
+                    msg=(
+                        "Certificate {0} is not in realm {1}. Certificate group "
+                        "{2} can only hold certificates of its own realm, named "
+                        "{1}::<certificate>."
+                    ).format(certificate, realm, group)
+                )
             module.fail_json(
                 msg=(
-                    "Certificate {0} is not in realm {1}. Certificate group {2} "
-                    "can only hold certificates of its own realm, named "
-                    "{1}::<certificate>."
-                ).format(certificate, realm, name)
+                    "Certificate {0} is in a realm. Certificate group {1} is not "
+                    "in a realm and can only hold certificates that are not in "
+                    "one either."
+                ).format(certificate, group)
             )
-        module.fail_json(
-            msg=(
-                "Certificate {0} is in a realm. Certificate group {1} is not in "
-                "a realm and can only hold certificates that are not in one "
-                "either."
-            ).format(certificate, name)
-        )
 
 
 def _check_realm(module, blade):
     """Fail a check mode run that would create a group in an unusable realm.
 
-    The array refuses to create a group in a realm that does not exist or
-    has been destroyed. A real run gets that answer from the create itself;
-    check mode sends nothing, so it reads the realm instead of reporting a
-    change the real run cannot make. Only a definite answer fails the task.
+    The array refuses to create a group in a realm that does not exist, has
+    been destroyed or is not open to the caller. A real run gets that answer
+    from the create itself; check mode sends nothing, so it reads the realm
+    instead of reporting a change the real run cannot make. A realm the
+    caller has no access to is read as an empty list and its create is
+    refused with "Realm does not exist.". Only a definite answer fails the
+    task.
     """
     name = module.params["name"]
-    realm = _realm_of(name)
-    if not realm or LooseVersion(REALM_API_VERSION) > LooseVersion(
+    realms = []
+    for group in _names(name):
+        realm = _realm_of(group)
+        if realm and realm.lower() not in [known.lower() for known in realms]:
+            realms.append(realm)
+    if not realms or LooseVersion(REALM_API_VERSION) > LooseVersion(
         get_rest_api_version(blade)
     ):
         return
-    res = blade.get_realms(names=[realm])
-    if res.status_code == 200:
-        items = list(res.items)
-        if not items or getattr(items[0], "destroyed", False) is not True:
-            return
-        error = "Realm has been destroyed."
-    else:
-        error = get_error_message(res)
-        if "does not exist" not in str(error).lower():
-            return
-    module.fail_json(
-        msg="Failed to create certificate group {0}. Error: {1}".format(name, error)
-    )
+    for realm in realms:
+        res = blade.get_realms(names=[realm])
+        if res.status_code == 200:
+            items = list(res.items)
+            if not items:
+                error = "Realm does not exist."
+            elif getattr(items[0], "destroyed", False) is True:
+                error = "Realm has been destroyed."
+            else:
+                continue
+        else:
+            error = get_error_message(res)
+            if "does not exist" not in str(error).lower():
+                continue
+        module.fail_json(
+            msg="Failed to create certificate group {0}. Error: {1}".format(name, error)
+        )
 
 
 def _group_exists(module, blade):
@@ -230,16 +260,17 @@ def create_certgrp(module, blade):
                     module.params["name"], get_error_message(res)
                 )
             )
-        if module.params["certificates"]:
+        certificates = _names(module.params["certificates"])
+        if certificates:
             res = blade.post_certificate_groups_certificates(
-                certificate_names=module.params["certificates"],
+                certificate_names=certificates,
                 certificate_group_names=[module.params["name"]],
             )
             if res.status_code != 200:
                 blade.delete_certificate_groups(names=[module.params["name"]])
                 module.fail_json(
                     msg="Failed to add certificates {0}. Error: {1}".format(
-                        module.params["certificates"], get_error_message(res)
+                        certificates, get_error_message(res)
                     )
                 )
     module.exit_json(changed=changed)
@@ -266,13 +297,10 @@ def update_certgrp(module, blade):
     # The array matches names without regard to case and returns the stored
     # spelling, so members are compared lower-cased and removed by the name
     # the array reports.
+    wanted = _names(module.params["certificates"])
     members = [cert.lower() for cert in current]
     if module.params["state"] == "present":
-        to_add = [
-            cert
-            for cert in module.params["certificates"]
-            if cert.lower() not in members
-        ]
+        to_add = [cert for cert in wanted if cert.lower() not in members]
         if to_add:
             changed = True
             if not module.check_mode:
@@ -287,7 +315,7 @@ def update_certgrp(module, blade):
                         )
                     )
     else:
-        unwanted = [cert.lower() for cert in module.params["certificates"]]
+        unwanted = [cert.lower() for cert in wanted]
         to_remove = [cert for cert in current if cert.lower() in unwanted]
         if to_remove:
             changed = True

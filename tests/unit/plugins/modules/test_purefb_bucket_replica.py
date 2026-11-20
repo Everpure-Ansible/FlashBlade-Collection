@@ -86,6 +86,13 @@ def _ref(name):
     return ref
 
 
+def _bucket(name, destroyed=False):
+    """A bucket as GET /buckets returns it, destroyed ones included"""
+    bucket = _ref(name)
+    bucket.destroyed = destroyed
+    return bucket
+
+
 STATUS_DETAILS = (
     "Replica link set-up issue. Please enable versioning on the target bucket."
 )
@@ -137,7 +144,7 @@ def _module(params, check_mode=False):
 def _blade(link=None, patch_status=200):
     blade = Mock()
     blade.get_bucket_replica_links.return_value = _response([link] if link else [])
-    blade.get_buckets.return_value = _response([_ref("foo")])
+    blade.get_buckets.return_value = _response([_bucket("foo")])
     blade.get_object_store_remote_credentials.return_value = _response(
         [_ref(REMOTE + "/" + CRED)]
     )
@@ -500,3 +507,529 @@ class TestPurefbBucketReplica:
         module.fail_json.assert_not_called()
         blade.delete_bucket_replica_links.assert_not_called()
         assert module.exit_json.call_args[1]["changed"] is False
+
+
+# ---------------- realm names, letter case and refused reads ----------------
+
+REALM = "realm1"
+REALM_BUCKET = REALM + "::foo"
+REALM_CRED = REALM + "::" + CRED
+NOT_SAME_REALM = "must be in the same realm"
+MIXED_SCOPE_ERROR = (
+    "The local realm of the bucket does not match the local realm of the "
+    "realm connection."
+)
+
+
+def _error(message, status_code=400):
+    """An error response as the SDK returns it: errors, but no items"""
+    response = Mock(spec=["status_code", "errors"])
+    response.status_code = status_code
+    error = Mock()
+    error.message = message
+    response.errors = [error]
+    return response
+
+
+def _message(response, default="Unknown error"):
+    """What get_error_message() returns for an SDK error response"""
+    return response.errors[0].message
+
+
+def _realm_blade(link=None):
+    """The array holding bucket realm1::foo and credential realm1::cred_1"""
+    blade = _blade(link=link)
+    blade.get_buckets.return_value = _response([_bucket(REALM_BUCKET)])
+    blade.get_object_store_remote_credentials.return_value = _response(
+        [_ref(REMOTE + "/" + REALM_CRED)]
+    )
+    return blade
+
+
+@patch("plugins.modules.purefb_bucket_replica.get_error_message", _message)
+@patch("plugins.modules.purefb_bucket_replica.HAS_PYPURECLIENT", True)
+@patch("plugins.modules.purefb_bucket_replica.LooseVersion")
+@patch("plugins.modules.purefb_bucket_replica.BucketReplicaLinkPost")
+@patch("plugins.modules.purefb_bucket_replica.ReferenceWritable")
+@patch("plugins.modules.purefb_bucket_replica.BucketReplicaLink")
+@patch("plugins.modules.purefb_bucket_replica.get_system")
+@patch("plugins.modules.purefb_bucket_replica.AnsibleModule")
+def _main(
+    mock_ansible_module,
+    mock_get_system,
+    mock_rl,
+    mock_ref,
+    mock_rl_post,
+    mock_loose_version,
+    params=None,
+    blade=None,
+    check_mode=False,
+):
+    """Run main() against blade; return the module and the patched names"""
+    module = _module(params, check_mode=check_mode)
+    _run(module, blade, mock_ansible_module, mock_get_system, mock_loose_version)
+    mocks = {
+        "get_system": mock_get_system,
+        "link": mock_rl,
+        "reference": mock_ref,
+        "post": mock_rl_post,
+    }
+    return module, mocks
+
+
+def _failure(module):
+    """The message of the one fail_json call of a run"""
+    module.fail_json.assert_called_once()
+    return module.fail_json.call_args[1]["msg"]
+
+
+def _no_write(blade):
+    """Nothing was created, changed or deleted"""
+    blade.post_bucket_replica_links.assert_not_called()
+    blade.patch_bucket_replica_links.assert_not_called()
+    blade.delete_bucket_replica_links.assert_not_called()
+
+
+class TestPurefbBucketReplicaRealm:
+    """A replica link follows the realm of its local bucket"""
+
+    def test_realm_of(self):
+        """The realm is the prefix before the last separator"""
+        from plugins.modules.purefb_bucket_replica import _realm_of
+
+        assert _realm_of("realm1::foo") == "realm1"
+        assert _realm_of("foo") == ""
+        assert _realm_of("realm1::cred_1") == "realm1"
+
+    def test_main_creates_realm_link(self):
+        """A realm bucket with a credential of its realm is created"""
+        blade = _realm_blade()
+        module, mocks = _main(
+            params=_base_params(
+                name=REALM_BUCKET,
+                target=REMOTE,
+                credential=REALM_CRED,
+                target_bucket="bar",
+                paused=True,
+            ),
+            blade=blade,
+        )
+
+        module.fail_json.assert_not_called()
+        call_kwargs = blade.post_bucket_replica_links.call_args[1]
+        assert call_kwargs["local_bucket_names"] == [REALM_BUCKET]
+        assert call_kwargs["remote_bucket_names"] == [REMOTE_BUCKET]
+        assert call_kwargs["remote_credentials_names"] == [REMOTE + "/" + REALM_CRED]
+        blade.get_object_store_remote_credentials.assert_called_once_with(
+            names=[REMOTE + "/" + REALM_CRED]
+        )
+        mocks["post"].assert_called_once_with(cascading_enabled=False, paused=True)
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_main_create_refuses_realm_bucket_with_array_credential(self):
+        """A realm bucket and an array-level credential are never sent"""
+        blade = _realm_blade()
+        blade.get_object_store_remote_credentials.return_value = _response(
+            [_ref(REMOTE + "/" + CRED)]
+        )
+        module, mocks = _main(
+            params=_base_params(name=REALM_BUCKET, target=REMOTE, credential=CRED),
+            blade=blade,
+        )
+
+        msg = _failure(module)
+        assert NOT_SAME_REALM in msg
+        assert REALM_BUCKET in msg
+        assert "realm1::<credential>" in msg
+        _no_write(blade)
+        # decided from the names of the task, before the array is asked
+        mocks["get_system"].assert_not_called()
+        module.exit_json.assert_not_called()
+
+    def test_main_create_refuses_mixed_scope_in_check_mode(self):
+        """Check mode reports the refusal instead of a change"""
+        blade = _realm_blade()
+        module, mocks = _main(
+            params=_base_params(name=REALM_BUCKET, target=REMOTE, credential=CRED),
+            blade=blade,
+            check_mode=True,
+        )
+
+        assert NOT_SAME_REALM in _failure(module)
+        module.exit_json.assert_not_called()
+        _no_write(blade)
+
+    def test_main_create_refuses_array_bucket_with_realm_credential(self):
+        """An array-level bucket and a realm credential are never sent"""
+        blade = _blade()
+        blade.get_object_store_remote_credentials.return_value = _response(
+            [_ref(REMOTE + "/" + REALM_CRED)]
+        )
+        module, mocks = _main(
+            params=_base_params(target=REMOTE, credential=REALM_CRED), blade=blade
+        )
+
+        msg = _failure(module)
+        assert NOT_SAME_REALM in msg
+        assert "realm1::<bucket>" in msg
+        _no_write(blade)
+        module.exit_json.assert_not_called()
+
+    def test_main_refuses_credential_of_another_realm(self):
+        """Two different realms are not the same realm"""
+        blade = _realm_blade()
+        module, mocks = _main(
+            params=_base_params(
+                name=REALM_BUCKET, target=REMOTE, credential="other::" + CRED
+            ),
+            blade=blade,
+        )
+
+        assert NOT_SAME_REALM in _failure(module)
+        _no_write(blade)
+
+    def test_main_update_refuses_bare_credential_on_realm_link(self):
+        """A realm link is not re-pointed at an array-level credential"""
+        blade = _realm_blade(link=_link(paused=True, credential=REALM_CRED))
+        blade.get_object_store_remote_credentials.return_value = _response(
+            [_ref(REMOTE + "/" + CRED)]
+        )
+        module, mocks = _main(
+            params=_base_params(name=REALM_BUCKET, credential=CRED, paused=True),
+            blade=blade,
+        )
+
+        assert NOT_SAME_REALM in _failure(module)
+        _no_write(blade)
+        module.exit_json.assert_not_called()
+
+    def test_main_update_refuses_bare_credential_in_check_mode(self):
+        """Check mode refuses the mixed pair on an existing link too"""
+        blade = _realm_blade(link=_link(paused=True, credential=REALM_CRED))
+        module, mocks = _main(
+            params=_base_params(name=REALM_BUCKET, credential=CRED, paused=True),
+            blade=blade,
+            check_mode=True,
+        )
+
+        assert NOT_SAME_REALM in _failure(module)
+        module.exit_json.assert_not_called()
+
+    def test_main_realm_prefix_case_is_not_a_scope_difference(self):
+        """The realm prefix is compared without regard to case"""
+        blade = _realm_blade(link=_link(paused=True, credential=REALM_CRED))
+        module, mocks = _main(
+            params=_base_params(
+                name="REALM1::foo", credential="Realm1::" + CRED, paused=True
+            ),
+            blade=blade,
+        )
+
+        module.fail_json.assert_not_called()
+        _no_write(blade)
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    def test_main_pauses_realm_link_by_name(self):
+        """With only the name the credential of the link is kept"""
+        blade = _realm_blade(link=_link(credential=REALM_CRED))
+        module, mocks = _main(
+            params=_base_params(name=REALM_BUCKET, paused=True), blade=blade
+        )
+
+        module.fail_json.assert_not_called()
+        call_kwargs = blade.patch_bucket_replica_links.call_args[1]
+        assert call_kwargs["local_bucket_names"] == [REALM_BUCKET]
+        mocks["reference"].assert_called_once_with(name=REMOTE + "/" + REALM_CRED)
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_main_changes_credential_of_realm_link(self):
+        """Another credential of the same realm is sent"""
+        blade = _realm_blade(link=_link(paused=True, credential=REALM_CRED))
+        blade.get_object_store_remote_credentials.return_value = _response(
+            [_ref(REMOTE + "/" + REALM + "::cred_2")]
+        )
+        module, mocks = _main(
+            params=_base_params(
+                name=REALM_BUCKET, credential=REALM + "::cred_2", paused=True
+            ),
+            blade=blade,
+        )
+
+        module.fail_json.assert_not_called()
+        mocks["reference"].assert_called_once_with(name=REMOTE + "/realm1::cred_2")
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_main_absent_ignores_the_credential(self):
+        """Deleting a link needs no credential, so none is checked"""
+        blade = _realm_blade(link=_link(credential=REALM_CRED))
+        module, mocks = _main(
+            params=_base_params(name=REALM_BUCKET, credential=CRED, state="absent"),
+            blade=blade,
+        )
+
+        module.fail_json.assert_not_called()
+        blade.delete_bucket_replica_links.assert_called_once_with(
+            remote_names=[REMOTE],
+            local_bucket_names=[REALM_BUCKET],
+            remote_bucket_names=[REMOTE_BUCKET],
+        )
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    # ---------------- letter case ----------------
+
+    def test_main_credential_case_is_not_drift(self):
+        """A credential written in another case is the credential of the link"""
+        blade = _blade(link=_link(paused=True))
+        module, mocks = _main(
+            params=_base_params(credential=CRED.upper(), paused=True), blade=blade
+        )
+
+        module.fail_json.assert_not_called()
+        blade.patch_bucket_replica_links.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    def test_main_credential_case_keeps_the_stored_name(self):
+        """Another change sends the credential as the array stores it"""
+        blade = _blade(link=_link())
+        module, mocks = _main(
+            params=_base_params(credential=CRED.upper(), paused=True), blade=blade
+        )
+
+        module.fail_json.assert_not_called()
+        blade.patch_bucket_replica_links.assert_called_once()
+        mocks["reference"].assert_called_once_with(name=REMOTE + "/" + CRED)
+
+    def test_blocked_changes_credential_case_is_not_a_change(self):
+        """An unhealthy link is not refused for the case of its credential"""
+        module = Mock()
+        module.params = _base_params(paused=True, credential=CRED.upper())
+        assert get_unhealthy_blocked_changes(module, _link(status="unhealthy")) == []
+
+    def test_main_target_case_is_ignored(self):
+        """A target written in another case is the connected target"""
+        blade = _blade()
+        module, mocks = _main(
+            params=_base_params(
+                target=REMOTE.upper(), credential=CRED, target_bucket="bar"
+            ),
+            blade=blade,
+        )
+
+        module.fail_json.assert_not_called()
+        blade.get_object_store_remote_credentials.assert_called_once_with(
+            names=[REMOTE + "/" + CRED]
+        )
+        blade.post_bucket_replica_links.assert_called_once()
+
+    def test_main_s3_target_case_is_ignored(self):
+        """The same holds for an S3 target"""
+        blade = _blade()
+        blade.get_array_connections.return_value = _response([])
+        target = _ref("s3target")
+        target.status = "connected"
+        blade.get_targets.return_value = _response([target])
+        blade.get_object_store_remote_credentials.return_value = _response(
+            [_ref("s3target/" + CRED)]
+        )
+        module, mocks = _main(
+            params=_base_params(target="S3Target", credential=CRED), blade=blade
+        )
+
+        module.fail_json.assert_not_called()
+        call_kwargs = blade.post_bucket_replica_links.call_args[1]
+        assert call_kwargs["remote_credentials_names"] == ["s3target/" + CRED]
+
+    # ---------------- reads that do not answer 200 ----------------
+
+    def test_main_create_failure_reports_the_array_error(self):
+        """A refused create carries the reason the array gave"""
+        blade = _realm_blade()
+        blade.post_bucket_replica_links.return_value = _error(MIXED_SCOPE_ERROR)
+        module, mocks = _main(
+            params=_base_params(
+                name=REALM_BUCKET, target=REMOTE, credential=REALM_CRED
+            ),
+            blade=blade,
+        )
+
+        msg = _failure(module)
+        assert "Failed to create bucket replica link realm1::foo." in msg
+        assert MIXED_SCOPE_ERROR in msg
+
+    def test_main_absent_missing_bucket_is_unchanged(self):
+        """A bucket that does not exist has no link to delete"""
+        blade = _blade()
+        blade.get_bucket_replica_links.return_value = _error("Bucket does not exist.")
+        module, mocks = _main(params=_base_params(state="absent"), blade=blade)
+
+        module.fail_json.assert_not_called()
+        _no_write(blade)
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    def test_main_refused_link_read_is_reported(self):
+        """A refused read of the link is not read as no link"""
+        blade = _blade()
+        blade.get_bucket_replica_links.return_value = _error("Operation not permitted.")
+        module, mocks = _main(params=_base_params(state="absent"), blade=blade)
+
+        msg = _failure(module)
+        assert "Failed to get replica link of bucket foo." in msg
+        assert "Operation not permitted." in msg
+        _no_write(blade)
+        module.exit_json.assert_not_called()
+
+    def test_main_missing_bucket(self):
+        """A bucket the array does not know is reported as missing"""
+        blade = _blade()
+        blade.get_bucket_replica_links.return_value = _error("Bucket does not exist.")
+        blade.get_buckets.return_value = _error("Bucket does not exist.")
+        module, mocks = _main(
+            params=_base_params(target=REMOTE, credential=CRED), blade=blade
+        )
+
+        assert _failure(module) == "Selected local bucket foo does not exist."
+        _no_write(blade)
+
+    def test_main_refused_bucket_read_is_reported(self):
+        """A refused read of the bucket is not read as a missing bucket"""
+        blade = _blade()
+        blade.get_buckets.return_value = _error("Operation not permitted.")
+        module, mocks = _main(
+            params=_base_params(target=REMOTE, credential=CRED), blade=blade
+        )
+
+        msg = _failure(module)
+        assert "Failed to get bucket foo." in msg
+        assert "Operation not permitted." in msg
+        _no_write(blade)
+
+    def test_main_missing_credential(self):
+        """A credential the array does not know is reported as missing"""
+        blade = _blade()
+        blade.get_object_store_remote_credentials.return_value = _error(
+            "Remote credentials does not exist."
+        )
+        module, mocks = _main(
+            params=_base_params(target=REMOTE, credential=CRED), blade=blade
+        )
+
+        assert _failure(module) == (
+            "Selected remote credential cred_1 does not exist for target arrayb."
+        )
+        _no_write(blade)
+
+    def test_main_refused_credential_read_is_reported(self):
+        """A refused read of the credential is not read as a missing one"""
+        blade = _blade()
+        blade.get_object_store_remote_credentials.return_value = _error(
+            "Operation not permitted."
+        )
+        module, mocks = _main(
+            params=_base_params(target=REMOTE, credential=CRED), blade=blade
+        )
+
+        msg = _failure(module)
+        assert "Failed to get remote credential arrayb/cred_1." in msg
+        assert "Operation not permitted." in msg
+        _no_write(blade)
+
+    def test_main_refused_array_connections_read_is_reported(self):
+        """A refused read of the array connections fails with its message"""
+        blade = _blade()
+        blade.get_array_connections.return_value = _error("Operation not permitted.")
+        module, mocks = _main(
+            params=_base_params(target=REMOTE, credential=CRED), blade=blade
+        )
+
+        msg = _failure(module)
+        assert "Failed to get array connections." in msg
+        assert "Operation not permitted." in msg
+        _no_write(blade)
+
+    def test_main_refused_targets_read_is_reported(self):
+        """A refused read of the targets fails with its message"""
+        blade = _blade()
+        blade.get_array_connections.return_value = _response([])
+        blade.get_targets.return_value = _error("Operation not permitted.")
+        module, mocks = _main(
+            params=_base_params(target=REMOTE, credential=CRED), blade=blade
+        )
+
+        msg = _failure(module)
+        assert "Failed to get targets." in msg
+        assert "Operation not permitted." in msg
+        _no_write(blade)
+
+    # ---------------- destroyed bucket ----------------
+
+    def test_main_create_refuses_destroyed_bucket(self):
+        """No link is sent for a destroyed bucket"""
+        blade = _blade()
+        blade.get_buckets.return_value = _response([_bucket("foo", destroyed=True)])
+        module, mocks = _main(
+            params=_base_params(target=REMOTE, credential=CRED), blade=blade
+        )
+
+        assert _failure(module).startswith("Selected local bucket foo is destroyed.")
+        _no_write(blade)
+        module.exit_json.assert_not_called()
+
+    def test_main_create_refuses_destroyed_bucket_in_check_mode(self):
+        """Check mode reports the refusal instead of a change"""
+        blade = _realm_blade()
+        blade.get_buckets.return_value = _response(
+            [_bucket(REALM_BUCKET, destroyed=True)]
+        )
+        module, mocks = _main(
+            params=_base_params(
+                name=REALM_BUCKET, target=REMOTE, credential=REALM_CRED
+            ),
+            blade=blade,
+            check_mode=True,
+        )
+
+        assert _failure(module).startswith(
+            "Selected local bucket realm1::foo is destroyed."
+        )
+        _no_write(blade)
+        module.exit_json.assert_not_called()
+
+    def test_main_existing_link_of_destroyed_bucket_is_still_managed(self):
+        """Only a new link is refused for a destroyed bucket"""
+        blade = _blade(link=_link())
+        blade.get_buckets.return_value = _response([_bucket("foo", destroyed=True)])
+        module, mocks = _main(params=_base_params(paused=True), blade=blade)
+
+        module.fail_json.assert_not_called()
+        blade.patch_bucket_replica_links.assert_called_once()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    # ---------------- names the array does not return ----------------
+
+    def test_same_name(self):
+        """Names are compared without regard to case; no name matches no name"""
+        from plugins.modules.purefb_bucket_replica import _same_name
+
+        assert _same_name("Realm1", "realm1")
+        assert _same_name("", "")
+        assert not _same_name("realm1", "")
+        assert not _same_name(None, "arrayb")
+        assert not _same_name("arrayb", None)
+
+    def test_main_connection_without_a_name_is_no_match(self):
+        """A connection returned without a remote name is passed over"""
+        blade = _blade()
+        nameless = Mock()
+        nameless.remote = _ref(None)
+        nameless.status = "connected"
+        connection = Mock()
+        connection.remote = _ref(REMOTE)
+        connection.status = "connected"
+        blade.get_array_connections.return_value = _response([nameless, connection])
+        module, mocks = _main(
+            params=_base_params(target=REMOTE, credential=CRED, target_bucket="bar"),
+            blade=blade,
+        )
+
+        module.fail_json.assert_not_called()
+        blade.post_bucket_replica_links.assert_called_once()

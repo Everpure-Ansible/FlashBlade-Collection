@@ -631,6 +631,54 @@ class TestFileSystem:
         assert blade.quotas == quotas
 
 
+class TestRealmScopedAdministrator:
+    """The answers an administrator whose access is limited to a realm gets."""
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_refused_fleet_read_adds_no_context(self, check_mode):
+        """The fleet read is refused: its answer has no items to read."""
+        blade = _blade()
+        blade.get_fleets.return_value = _error(REFUSED)
+        module = _module(check_mode=check_mode, gid=GID, quota="1G")
+        _run(module, blade)
+        assert _changed(module) is True
+        blade.get_fleets.assert_called_once_with()
+        blade.get_arrays.assert_not_called()
+        assert module.params["context"] == ""
+        blade.get_quotas_groups.assert_called_once_with(
+            file_system_names=[REALM_FS], filter="group.id=1234"
+        )
+        if check_mode:
+            _no_write(blade)
+        else:
+            blade.post_quotas_groups.assert_called_once_with(
+                file_system_names=[REALM_FS], gids=[GID], quota={"quota": GIB}
+            )
+
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_bare_name_of_an_array_level_namesake(self, state, check_mode):
+        """A file system outside the realm is answered with an empty list.
+
+        The array-level namesake exists and has a quota of its own, but the
+        read of its name returns no items instead of an error.
+        """
+        quotas = {(REALM_FS, GID): GIB, (ARRAY_FS, GID): 3 * GIB}
+        blade = _blade(quotas=quotas)
+        blade.get_fleets.return_value = _error(REFUSED)
+        blade.get_file_systems.side_effect = None
+        blade.get_file_systems.return_value = _response()
+        module = _module(
+            check_mode=check_mode, name=ARRAY_FS, gid=GID, quota="2G", state=state
+        )
+        _run(module, blade)
+        assert _failure(module) == "Filesystem projects does not exist."
+        blade.get_file_systems.assert_called_once_with(names=[ARRAY_FS])
+        blade.get_quotas_groups.assert_not_called()
+        _no_write(blade)
+        assert blade.quotas == quotas
+
+
 class TestContext:
     """context is the fleet context; it has nothing to do with the realm."""
 

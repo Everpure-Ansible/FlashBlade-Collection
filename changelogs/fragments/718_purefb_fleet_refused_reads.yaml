@@ -1,5 +1,5 @@
 bugfixes:
-  - purefb_fleet - a read of the fleets, the fleet members or the remote array that is refused or
-    fails is now reported with the message of the array instead of a traceback.
+  - purefb_fleet - a read of the fleets, the fleet members or the name of the remote array that is
+    refused or fails is now reported with the message of the array instead of a traceback.
   - purefb_fleet - adding a member with ``member_url`` no longer creates a fleet key in check mode
     or when the array is already a member of the fleet.

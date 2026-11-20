@@ -637,3 +637,52 @@ class TestMainArrayLevel:
         assert blade.patch_kmip.call_count == (0 if check_mode else 1)
         blade.post_kmip.assert_not_called()
         module.exit_json.assert_called_once_with(changed=True)
+
+
+# What the array answers when the name it is asked to read is blank.
+INVALID = "Missing or invalid parameter."
+
+
+class TestBlankNames:
+    """A blank name is refused by the array, and that answer is reported too."""
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("state", ["absent", "present", "test"])
+    def test_blank_name_is_not_read_as_an_absent_object(self, state, check_mode):
+        module = _module(
+            name="", state=state, uris=["1.1.1.1:5696"], ca_certificate="ca1"
+        )
+        module.check_mode = check_mode
+        blade = _blade()
+        blade.get_kmip.return_value = _response(400, message=INVALID)
+        _run_main(module, blade)
+        blade.get_kmip.assert_called_once_with(names=[""])
+        module.fail_json.assert_called_once_with(
+            msg="Failed to read KMIP object . Error: " + INVALID
+        )
+        module.exit_json.assert_not_called()
+        for call in WRITES + ("get_kmip_test", "get_certificates"):
+            getattr(blade, call).assert_not_called()
+
+    @pytest.mark.parametrize(
+        "param, lookup, kind",
+        [
+            ("ca_certificate", "get_certificates", "certificate"),
+            ("ca_certificate_group", "get_certificate_groups", "certificate group"),
+        ],
+    )
+    def test_blank_certificate_name_is_not_reported_as_missing(
+        self, param, lookup, kind
+    ):
+        module = _module(uris=["1.1.1.1:5696"], **{param: " "})
+        module.check_mode = True
+        blade = _blade()
+        getattr(blade, lookup).return_value = _response(400, message=INVALID)
+        with pytest.raises(SystemExit):
+            create_kmip(module, blade)
+        getattr(blade, lookup).assert_called_once_with(names=[" "])
+        module.fail_json.assert_called_once_with(
+            msg="Failed to read {0}  . Error: {1}".format(kind, INVALID)
+        )
+        module.exit_json.assert_not_called()
+        blade.post_kmip.assert_not_called()

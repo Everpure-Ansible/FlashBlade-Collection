@@ -508,21 +508,21 @@ class TestPurefbInfo:
         mock_blade.get_blades.return_value.total_item_count = 4
         mock_blade.get_certificates.return_value.total_item_count = 1
 
-        # Mock policies with different types
+        # Mock policies with different types, named as the array names them
         mock_policy_snapshot = Mock()
         mock_policy_snapshot.policy_type = "snapshot"
         mock_policy_access = Mock()
-        mock_policy_access.policy_type = "access"
+        mock_policy_access.policy_type = "object-store-access"
         mock_policy_nfs = Mock()
-        mock_policy_nfs.policy_type = "nfs"
+        mock_policy_nfs.policy_type = "nfs-export"
         mock_policy_smb_share = Mock()
-        mock_policy_smb_share.policy_type = "smb_share"
+        mock_policy_smb_share.policy_type = "smb-share"
         mock_policy_smb_client = Mock()
-        mock_policy_smb_client.policy_type = "smb_client"
+        mock_policy_smb_client.policy_type = "smb-client"
         mock_policy_network = Mock()
-        mock_policy_network.policy_type = "network"
+        mock_policy_network.policy_type = "network-access"
         mock_policy_worm = Mock()
-        mock_policy_worm.policy_type = "worm"
+        mock_policy_worm.policy_type = "worm-data"
         mock_policy_telemetry = Mock()
         mock_policy_telemetry.policy_type = "telemetry-metrics"
 
@@ -1336,6 +1336,7 @@ class TestPurefbInfo:
             "get_kmip",
             "get_syslog_servers_settings",
             "get_sso_oidc_idps",
+            "get_directory_services_local_directory_services",
         ):
             getattr(mock_blade, method).return_value.items = []
         mock_ds = Mock()
@@ -1438,6 +1439,7 @@ class TestPurefbInfo:
             "get_kmip",
             "get_syslog_servers_settings",
             "get_sso_oidc_idps",
+            "get_directory_services_local_directory_services",
         ):
             getattr(mock_blade, method).return_value.items = []
         mock_ds = Mock()
@@ -3079,6 +3081,7 @@ class TestPurefbInfo:
                 "account": "acc1",
                 "policy": "s3exp",
                 "server": "_array_server",
+                "realms": [],
             }
         }
 
@@ -3105,10 +3108,12 @@ class TestPurefbInfo:
         assert result["vh1"] == {
             "hostname": "s3.example.com",
             "attached_servers": ["_array_server"],
+            "realms": [],
         }
         assert result["s3.old.example.com"] == {
             "hostname": "s3.old.example.com",
             "attached_servers": [],
+            "realms": [],
         }
 
     @patch("plugins.modules.purefb_info.LooseVersion")
@@ -9190,3 +9195,1104 @@ class TestPurefbInfoPolicyMembers:
         roles = _run_main(client, "accounts")[1]["object_store_roles"]
         assert roles["acc/role1"]["access_policies"] == []
         assert self._role_queries(client) == [None]
+
+
+# ---------------------------------------------------------------------------
+# Listings the array serves for ten objects per query, a file system that is
+# removed while it is gathered, the policy counters of the default subset,
+# the realms of the entries and the read-back of directory services and
+# SAML2 providers. The rows are shaped as Purity//FB 4.8.8 returns them.
+# ---------------------------------------------------------------------------
+
+FS_QUERY_REFUSED = (
+    "Querying is only supported for a maximum of 10 file systems per query."
+)
+BUCKET_QUERY_REFUSED = (
+    "Querying is only supported for a maximum of 10 buckets per query."
+)
+LDS_REALM_ID = "77777777-7777-4777-8777-777777777777"
+LDS_ARRAY_ID = "88888888-8888-4888-8888-888888888888"
+
+
+def _realm_refs(realm=None):
+    return [_ref(realm, REALM_ID, "realms")] if realm else []
+
+
+def _fail_main(client, subset, version="2.30"):
+    """Run main() for one subset that has to fail; returns the message"""
+    module = Mock()
+    module.params = {"gather_subset": [subset]}
+    module.check_mode = False
+    with patch.multiple(
+        purefb_info_module,
+        AnsibleModule=Mock(return_value=module),
+        get_system=Mock(return_value=client),
+        get_rest_api_version=Mock(return_value=version),
+        LooseVersion=_Version,
+    ):
+        main()
+    module.exit_json.assert_not_called()
+    module.fail_json.assert_called_once()
+    return module.fail_json.call_args[1]["msg"]
+
+
+def _reads_of(client, name):
+    return [call[1] for call in client.calls if call[0] == name]
+
+
+def _performance_served_for_ten(
+    refusal, gone=(), broken=(), gone_message="File system does not exist."
+):
+    """GET file-systems/performance or buckets/performance on an array that
+    holds more of them than one query may cover"""
+
+    def read(names=None, **kwargs):
+        if names is None or len(names) > 10:
+            return _SdkError(400, refusal)
+        if any(name in broken for name in names):
+            return _SdkError(500, "Unexpected error.")
+        if any(name in gone for name in names):
+            return _SdkError(400, gone_message)
+        return _listing(
+            [_Row(name=name, reads_per_sec=float(len(name)), time=4) for name in names]
+        )
+
+    return read
+
+
+class TestPurefbInfoPerformanceAboveTen:
+    """performance.filesystems and performance.buckets on an array that
+    holds more file systems or buckets than one query may cover"""
+
+    # file systems and buckets of a realm with array-level namesakes
+    FILE_SYSTEMS = ["realm1::fs{0}".format(index) for index in range(1, 13)] + [
+        "fs{0}".format(index) for index in range(1, 12)
+    ]
+    BUCKETS = ["realm1::bkt{0}".format(index) for index in range(1, 8)] + [
+        "bkt{0}".format(index) for index in range(1, 8)
+    ]
+
+    def _client(self, **overrides):
+        destroyed = _file_system_row("realm1::old")
+        destroyed.destroyed = True
+        reads = dict(
+            get_file_systems=_listing(
+                [_file_system_row(name) for name in self.FILE_SYSTEMS] + [destroyed]
+            ),
+            get_file_systems_performance=_performance_served_for_ten(FS_QUERY_REFUSED),
+            get_buckets_performance=_performance_served_for_ten(BUCKET_QUERY_REFUSED),
+            get_buckets_s3_specific_performance=_performance_served_for_ten(
+                BUCKET_QUERY_REFUSED
+            ),
+        )
+        reads.update(overrides)
+        return _array_admin_client(**reads)
+
+    @staticmethod
+    def _names_asked(client, read):
+        return [kwargs.get("names") for kwargs in _reads_of(client, read)]
+
+    def test_file_systems_are_read_ten_names_at_a_time(self):
+        """main(), performance subset: every file system has its sample, the
+        one in a realm and its array-level namesake each their own, and no
+        query names more than ten. A destroyed file system is not asked
+        for: the query that names none does not report it either."""
+        client = self._client()
+
+        performance = _run_main(client, "performance")[1]["performance"]
+
+        assert sorted(performance["filesystems"]) == sorted(self.FILE_SYSTEMS)
+        assert performance["filesystems"]["realm1::fs1"]["reads_per_sec"] == 11.0
+        assert performance["filesystems"]["fs1"]["reads_per_sec"] == 3.0
+        names = self.FILE_SYSTEMS
+        assert self._names_asked(client, "get_file_systems_performance") == [
+            None,
+            names[:10],
+            names[10:20],
+            names[20:],
+        ]
+
+    def test_buckets_are_read_ten_names_at_a_time(self):
+        """A destroyed bucket is not asked for: the array fails a query
+        that names one."""
+        client = self._client(
+            get_buckets=_listing(
+                [_Row(name=name, destroyed=False) for name in self.BUCKETS]
+                + [_Row(name="realm1::old", destroyed=True)]
+            )
+        )
+
+        performance = _run_main(client, "performance")[1]["performance"]
+
+        assert sorted(performance["buckets"]) == sorted(self.BUCKETS)
+        for name in self.BUCKETS:
+            assert performance["buckets"][name]["reads_per_sec"] == float(len(name))
+            assert set(performance["buckets"][name]["s3"]) == set(S3_OPS_FIELDS)
+        names = self.BUCKETS
+        for read in ("get_buckets_performance", "get_buckets_s3_specific_performance"):
+            assert self._names_asked(client, read) == [None, names[:10], names[10:]]
+
+    def test_all_subset_reports_the_file_system_samples(self):
+        info = _run_main(self._client(), "all")[1]
+
+        assert len(info["performance"]["filesystems"]) == len(self.FILE_SYSTEMS)
+        assert info["performance"]["buckets"] == {}
+
+    def test_file_system_removed_while_reading_is_skipped(self):
+        """A file system eradicated after it was listed fails the query of
+        its ten; the others of that query are read one by one."""
+        client = self._client(
+            get_file_systems_performance=_performance_served_for_ten(
+                FS_QUERY_REFUSED, gone=("realm1::fs12",)
+            )
+        )
+
+        performance = _run_main(client, "performance")[1]["performance"]
+
+        names = self.FILE_SYSTEMS
+        assert sorted(performance["filesystems"]) == sorted(
+            name for name in names if name != "realm1::fs12"
+        )
+        assert self._names_asked(client, "get_file_systems_performance") == (
+            [None, names[:10], names[10:20]]
+            + [[one] for one in names[10:20]]
+            + [names[20:]]
+        )
+
+    def test_bucket_destroyed_while_reading_is_skipped(self):
+        """A bucket destroyed after it was listed fails the query of its
+        ten with another message; it is left out and the others are read
+        one by one."""
+        refused = _performance_served_for_ten(
+            BUCKET_QUERY_REFUSED,
+            gone=("bkt3",),
+            gone_message="Bucket has been destroyed.",
+        )
+        client = self._client(
+            get_buckets=_listing(
+                [_Row(name=name, destroyed=False) for name in self.BUCKETS]
+            ),
+            get_buckets_performance=refused,
+            get_buckets_s3_specific_performance=refused,
+        )
+
+        performance = _run_main(client, "performance")[1]["performance"]
+
+        names = self.BUCKETS
+        assert sorted(performance["buckets"]) == sorted(
+            name for name in names if name != "bkt3"
+        )
+        assert self._names_asked(client, "get_buckets_performance") == (
+            [None, names[:10]] + [[one] for one in names[:10]] + [names[10:]]
+        )
+
+    def test_a_read_the_array_fails_leaves_its_sample_out(self):
+        """The performance subset reports what it can read: a file system
+        whose sample the array fails to give is left out, the gather goes
+        on."""
+        client = self._client(
+            get_file_systems_performance=_performance_served_for_ten(
+                FS_QUERY_REFUSED, broken=("fs11",)
+            )
+        )
+
+        performance = _run_main(client, "performance")[1]["performance"]
+
+        assert sorted(performance["filesystems"]) == sorted(
+            name for name in self.FILE_SYSTEMS if name != "fs11"
+        )
+
+    def test_file_system_without_a_sample_yet_is_left_out(self):
+        """The array has no sample yet for a file system it has just
+        created: the query that names it answers with the rows of the
+        others, and nothing is asked again name by name."""
+        served = _performance_served_for_ten(FS_QUERY_REFUSED)
+
+        def read(names=None, **kwargs):
+            response = served(names=names, **kwargs)
+            if response.status_code == 200:
+                response.items = [
+                    row for row in response.items if row.name != "realm1::fs3"
+                ]
+            return response
+
+        client = self._client(get_file_systems_performance=read)
+
+        performance = _run_main(client, "performance")[1]["performance"]
+
+        names = self.FILE_SYSTEMS
+        assert sorted(performance["filesystems"]) == sorted(
+            name for name in names if name != "realm1::fs3"
+        )
+        assert self._names_asked(client, "get_file_systems_performance") == [
+            None,
+            names[:10],
+            names[10:20],
+            names[20:],
+        ]
+
+    def test_no_samples_when_the_names_cannot_be_listed(self):
+        client = self._client(get_file_systems=_SdkError(500, "Unexpected error."))
+
+        performance = _run_main(client, "performance")[1]["performance"]
+
+        assert performance["filesystems"] == {}
+        assert self._names_asked(client, "get_file_systems_performance") == [None]
+
+    def test_one_query_when_the_array_serves_every_sample(self):
+        """Regression: up to ten file systems and buckets are read as
+        before, in one query that names none, and nothing is listed."""
+        client = _array_admin_client(
+            get_file_systems_performance=_listing(
+                [_Row(name="realm1::fs1", reads_per_sec=2.0, time=4)]
+            ),
+            get_buckets_performance=_listing(
+                [_Row(name="bkt1", writes_per_sec=4.0, time=4)]
+            ),
+        )
+
+        performance = _run_main(client, "performance")[1]["performance"]
+
+        assert list(performance["filesystems"]) == ["realm1::fs1"]
+        assert performance["filesystems"]["realm1::fs1"]["reads_per_sec"] == 2.0
+        assert performance["buckets"]["bkt1"]["writes_per_sec"] == 4.0
+        assert self._names_asked(client, "get_file_systems_performance") == [None]
+        assert self._names_asked(client, "get_buckets_performance") == [None]
+        assert _reads_of(client, "get_file_systems") == []
+        assert _reads_of(client, "get_buckets") == []
+
+    def test_refused_identity_makes_one_query(self):
+        """Regression: an administrator limited to a realm is refused the
+        samples; they stay empty and are not asked for again by name."""
+        client = _realm_admin_client()
+
+        performance = _run_main(client, "performance")[1]["performance"]
+
+        assert performance["filesystems"] == {}
+        assert performance["buckets"] == {}
+        assert self._names_asked(client, "get_file_systems_performance") == [None]
+        assert self._names_asked(client, "get_buckets_performance") == [None]
+
+
+class TestPurefbInfoFileSystemGone:
+    """A file system eradicated between the listing of the file systems and
+    the reads of its quotas"""
+
+    GONE = "realm1::gone"
+
+    def _client(self, failure=None):
+        failure = failure or _SdkError(400, "File system does not exist.")
+
+        def answer(rows):
+            def read(file_system_names=None, **kwargs):
+                if file_system_names == [self.GONE]:
+                    return failure
+                return _listing(rows(file_system_names[0]))
+
+            return read
+
+        return _array_admin_client(
+            get_file_systems=_listing(
+                [
+                    _file_system_with_id(self.GONE, FS_REALM_ID),
+                    _file_system_with_id("gone", FS_ARRAY_ID),
+                    _file_system_with_id("realm1::fs1", OTHER_ID),
+                ]
+            ),
+            get_file_systems_users=answer(lambda name: []),
+            get_file_systems_groups=answer(lambda name: []),
+            get_quotas_groups=answer(
+                lambda name: [
+                    _Row(
+                        name=name + "/2000",
+                        group=_Row(id=2000, name=None),
+                        quota=2048,
+                        usage=0,
+                    )
+                ]
+            ),
+            get_quotas_users=answer(
+                lambda name: [
+                    _Row(
+                        name=name + "/1000",
+                        user=_Row(id=1000, name=None),
+                        quota=1024,
+                        usage=0,
+                    )
+                ]
+            ),
+        )
+
+    @pytest.mark.parametrize("subset", ["filesystems", "all"])
+    def test_file_system_is_reported_without_quotas(self, subset):
+        """main(): no traceback. The file system keeps the entry of its
+        listing, without quotas; its array-level namesake and the other
+        file systems keep theirs."""
+        filesystems = _run_main(self._client(), subset)[1]["filesystems"]
+
+        assert list(filesystems) == [self.GONE, "gone", "realm1::fs1"]
+        assert filesystems[self.GONE]["provisioned"] == 1073741824
+        assert filesystems[self.GONE]["user_quotas"] == {}
+        assert filesystems[self.GONE]["group_quotas"] == {}
+        assert filesystems[self.GONE]["policy_quotas"] == {"users": [], "groups": []}
+        assert filesystems["gone"]["user_quotas"] == {
+            "1000": {"user_id": 1000, "user_name": None, "quota": 1024, "usage": 0}
+        }
+        assert filesystems["realm1::fs1"]["group_quotas"] == {
+            "2000": {"group_id": 2000, "group_name": None, "quota": 2048, "usage": 0}
+        }
+
+    def test_another_failure_is_reported_with_the_message_of_the_array(self):
+        """A quota read the array fails for another reason is neither a
+        traceback nor a file system without quotas."""
+        message = _fail_main(
+            self._client(_SdkError(500, "Internal error.")), "filesystems"
+        )
+
+        assert message == (
+            "Failed to read the group quotas of file system realm1::gone. "
+            "Error: Internal error."
+        )
+
+    def test_refused_quota_reads_hold_no_quotas(self):
+        """generate_fs_dict() on a client that is not guarded: a quota read
+        the role does not grant leaves the quotas empty."""
+        blade = self._client(_refused())
+
+        with patch.multiple(
+            purefb_info_module,
+            get_rest_api_version=Mock(return_value="2.30"),
+            LooseVersion=_Version,
+        ):
+            filesystems = generate_fs_dict(blade, [], "2.30", {})
+
+        assert filesystems[self.GONE]["user_quotas"] == {}
+        assert filesystems[self.GONE]["group_quotas"] == {}
+        assert list(filesystems["gone"]["group_quotas"]) == ["2000"]
+
+    def test_served_items(self):
+        served = purefb_info_module._served_items
+        named = purefb_info_module._items_of_named
+        gone = _SdkError(400, "File system does not exist.")
+
+        assert served(_listing([1, 2]), "x") == [1, 2]
+        assert served(_refused(), "x") == []
+        assert served(purefb_info_module._RefusedRead(gone), "x") == []
+        assert named(_listing([1]), "x") == [1]
+        assert named(gone, "x") == []
+        assert named(_refused(), "x") == []
+        for read in (served, named):
+            with pytest.raises(purefb_info_module._ReadFailure) as failure:
+                read(_SdkError(500, "Internal error."), "the quotas")
+            assert str(failure.value) == (
+                "Failed to read the quotas. Error: Internal error."
+            )
+        # "does not exist" only stands for no items where the read names
+        # the object that is gone
+        with pytest.raises(purefb_info_module._ReadFailure):
+            served(gone, "x")
+
+
+class TestPurefbInfoPolicyCounters:
+    """The per-type policy counters of the default subset"""
+
+    # policy types as GET policies-all names them
+    TYPES = (
+        ["snapshot"] * 2
+        + ["object-store-access"] * 3
+        + ["nfs-export"] * 2
+        + ["smb-share", "smb-client", "network-access"]
+        + ["worm-data"] * 2
+        + ["telemetry-metrics"] * 4
+        + ["qos", "user-group-quota", "s3-export", "tls"]
+    )
+
+    def _default(self, types):
+        policies = [
+            _Row(
+                name="{0}policy{1}".format("realm1::" if index % 2 else "", index),
+                policy_type=policy_type,
+            )
+            for index, policy_type in enumerate(types)
+        ]
+        client = _array_admin_client(get_policies_all=_listing(policies))
+        return _run_main(client, "minimum")[1]["default"]
+
+    def test_counters_use_the_policy_types_of_the_array(self):
+        default = self._default(self.TYPES)
+
+        assert default["policies"] == 20
+        assert default["snapshot_policies"] == 2
+        assert default["access_policies"] == 3
+        assert default["nfs_policies"] == 2
+        assert default["smb_share_policies"] == 1
+        assert default["smb_client_policies"] == 1
+        assert default["network_policies"] == 1
+        assert default["worm_policies"] == 2
+        assert default["telemetry_metrics_policies"] == 4
+
+    def test_counters_accept_the_type_names_of_the_rest_reference(self):
+        default = self._default(["nfs", "object-access", "nfs-export"])
+
+        assert default["nfs_policies"] == 2
+        assert default["access_policies"] == 1
+
+    def test_no_policy_is_counted_twice(self):
+        counted = [
+            policy_type
+            for counter, policy_types in purefb_info_module.POLICY_COUNTERS
+            for policy_type in policy_types
+        ]
+
+        assert len(counted) == len(set(counted))
+
+
+def _access_policy_row(name, realm=None):
+    return _Row(
+        name=name,
+        arn=None,
+        description="",
+        enabled=True,
+        is_local=True,
+        policy_type="object-store-access",
+        rules=[],
+        realms=_realm_refs(realm),
+    )
+
+
+class TestPurefbInfoEntryRealms:
+    """Every entry of an object type that can live in a realm reports the
+    realms of its object"""
+
+    def test_file_systems(self):
+        in_realm = _file_system_with_id("realm1::fs1", FS_REALM_ID)
+        in_realm.realms = _realm_refs("realm1")
+        at_array = _file_system_with_id("fs1", FS_ARRAY_ID)
+        at_array.realms = []
+        client = _array_admin_client(get_file_systems=_listing([in_realm, at_array]))
+
+        filesystems = _run_main(client, "filesystems")[1]["filesystems"]
+
+        assert filesystems["realm1::fs1"]["realms"] == ["realm1"]
+        assert filesystems["fs1"]["realms"] == []
+
+    def test_accounts_and_their_exports(self):
+        """An account export is named server::account, which is not a
+        realm prefix: only the realms the array reports are listed."""
+        client = _array_admin_client(
+            get_object_store_accounts=_listing(
+                [
+                    _Row(
+                        name="realm1::acc", object_count=0, realms=_realm_refs("realm1")
+                    ),
+                    _Row(name="acc", object_count=0, realms=[]),
+                ]
+            ),
+            get_object_store_account_exports=_listing(
+                [
+                    _Row(
+                        name="realm1::srv::realm1::acc",
+                        enabled=True,
+                        member=_ref("realm1::acc"),
+                        policy=_ref("realm1::s3ep"),
+                        server=_ref("realm1::srv"),
+                        realms=_realm_refs("realm1"),
+                    ),
+                    _Row(
+                        name="_array_server::acc",
+                        enabled=True,
+                        member=_ref("acc"),
+                        policy=_ref("_s3_export_allow_everything"),
+                        server=_ref("_array_server"),
+                        realms=[],
+                    ),
+                ]
+            ),
+        )
+
+        info = _run_main(client, "accounts")[1]
+
+        assert info["accounts"]["realm1::acc"]["realms"] == ["realm1"]
+        assert info["accounts"]["acc"]["realms"] == []
+        exports = info["object_store_account_exports"]
+        assert exports["realm1::srv::realm1::acc"]["realms"] == ["realm1"]
+        assert exports["_array_server::acc"]["realms"] == []
+
+    def test_virtual_hosts(self):
+        client = _array_admin_client(
+            get_object_store_virtual_hosts=_listing(
+                [
+                    _Row(
+                        name="realm1::vh1",
+                        hostname="a.example.com",
+                        attached_servers=[_ref("realm1::srv")],
+                        realms=_realm_refs("realm1"),
+                    ),
+                    _Row(
+                        name="vh1",
+                        hostname="b.example.com",
+                        attached_servers=[_ref("_array_server")],
+                        realms=[],
+                    ),
+                ]
+            )
+        )
+
+        vhosts = _run_main(client, "buckets")[1]["object_store_virtual_hosts"]
+
+        assert vhosts["realm1::vh1"] == {
+            "hostname": "a.example.com",
+            "attached_servers": ["realm1::srv"],
+            "realms": ["realm1"],
+        }
+        assert vhosts["vh1"]["realms"] == []
+
+    def test_dns_configurations_and_certificates(self):
+        def certificate(name, realm=None):
+            return _Row(
+                name=name,
+                valid_from=1795103101000,
+                valid_to=1797695101000,
+                realms=_realm_refs(realm),
+            )
+
+        client = _array_admin_client(
+            get_dns=_listing(
+                [
+                    _Row(
+                        name="realm1::dns1",
+                        nameservers=["192.0.2.53"],
+                        domain=None,
+                        services=["data"],
+                        realms=_realm_refs("realm1"),
+                    ),
+                    _Row(
+                        name="management",
+                        nameservers=["192.0.2.53"],
+                        domain="example.com",
+                        services=["management", "data"],
+                        realms=[],
+                    ),
+                ]
+            ),
+            get_certificates=_listing(
+                [certificate("realm1::cert1", "realm1"), certificate("cert1")]
+            ),
+        )
+
+        config = _run_main(client, "config")[1]["config"]
+
+        assert config["dns"]["realm1::dns1"]["realms"] == ["realm1"]
+        assert config["dns"]["management"]["realms"] == []
+        assert config["ssl_certs"]["realm1::cert1"]["realms"] == ["realm1"]
+        assert config["ssl_certs"]["cert1"]["realms"] == []
+
+    def test_active_directory_accounts(self):
+        def account(name, realm=None):
+            return _Row(
+                name=name,
+                computer_name="fb1",
+                domain="example.com",
+                directory_servers=[],
+                kerberos_servers=[],
+                service_principal_names=[],
+                join_ou="",
+                encryption_types=["aes256-cts-hmac-sha1-96"],
+                realms=_realm_refs(realm),
+            )
+
+        client = _array_admin_client(
+            get_active_directory=_listing(
+                [account("realm1::ad1", "realm1"), account("ad1")]
+            )
+        )
+
+        accounts = _run_main(client, "ad")[1]["active_directory"]
+
+        assert accounts["realm1::ad1"]["realms"] == ["realm1"]
+        assert accounts["ad1"]["realms"] == []
+
+    def test_policies_of_realm_accounts_and_buckets(self):
+        """The array reports no realm for the access policies of an account
+        in a realm, nor for the access and CORS policies of a bucket in a
+        realm. Their name places them; an array-level namesake and a
+        built-in policy stay outside a realm."""
+
+        def bucket_policies(suffix):
+            def read(bucket_names=None, **kwargs):
+                return _listing(
+                    [
+                        _Row(
+                            name=bucket_names[0] + suffix,
+                            enabled=True,
+                            is_local=True,
+                            rules=[],
+                            realms=[],
+                        )
+                    ]
+                )
+
+            return read
+
+        client = _array_admin_client(
+            get_policies_all=_listing(
+                [
+                    _Row(
+                        id=REALM_ID,
+                        name="realm1::acc/pol",
+                        enabled=True,
+                        is_local=True,
+                        location=_ref("fb1"),
+                        policy_type="object-store-access",
+                        realms=[],
+                    ),
+                    _Row(
+                        id=ARRAY_ID,
+                        name="acc/pol",
+                        enabled=True,
+                        is_local=True,
+                        location=_ref("fb1"),
+                        policy_type="object-store-access",
+                        realms=[],
+                    ),
+                    _Row(
+                        id=OTHER_ID,
+                        name="realm1::daily",
+                        enabled=True,
+                        is_local=True,
+                        location=_ref("realm1"),
+                        policy_type="snapshot",
+                        realms=_realm_refs("realm1"),
+                    ),
+                ]
+            ),
+            get_object_store_access_policies=_listing(
+                [
+                    _access_policy_row("realm1::acc/pol"),
+                    _access_policy_row("acc/pol"),
+                    _access_policy_row("pure:policy/full-access"),
+                ]
+            ),
+            get_buckets=_listing([_Row(name="realm1::bkt"), _Row(name="bkt")]),
+            get_buckets_bucket_access_policies=bucket_policies("/access-policy"),
+            get_buckets_cross_origin_resource_sharing_policies=bucket_policies(
+                "/cors-policy"
+            ),
+        )
+
+        info = _run_main(client, "policies")[1]
+
+        assert info["policies"]["realm1::acc/pol"]["realms"] == ["realm1"]
+        assert info["policies"]["acc/pol"]["realms"] == []
+        assert info["policies"]["realm1::daily"]["realms"] == ["realm1"]
+        access = info["access_policies"]
+        assert access["realm1::acc/pol"]["realms"] == ["realm1"]
+        assert access["acc/pol"]["realms"] == []
+        assert access["pure:policy/full-access"]["realms"] == []
+        bucket_access = info["bucket_access_policies"]
+        assert bucket_access["realm1::bkt/access-policy"]["realms"] == ["realm1"]
+        assert bucket_access["bkt/access-policy"]["realms"] == []
+        cors = info["bucket_cross_origin_policies"]
+        assert cors["realm1::bkt/cors-policy"]["realms"] == ["realm1"]
+        assert cors["bkt/cors-policy"]["realms"] == []
+
+    def test_name_realm_and_policy_realms(self):
+        name_realm = purefb_info_module._name_realm
+        policy_realms = purefb_info_module._policy_realms
+
+        assert name_realm("realm1::acc/pol") == "realm1"
+        assert name_realm("acc/pol") is None
+        assert name_realm("pure:policy/full-access") is None
+        assert name_realm(None) is None
+        # what the array reports comes first
+        assert policy_realms(_Row(name="realm1::p", realms=_realm_refs("realm2"))) == [
+            "realm2"
+        ]
+        assert policy_realms(_Row(name="realm1::p", realms=[])) == ["realm1"]
+        assert policy_realms(_Row(name="realm1::p")) == ["realm1"]
+        assert policy_realms(_Row(name="p", realms=[])) == []
+
+
+def _saml2_provider(name, services, **idp):
+    return _Row(
+        name=name,
+        enabled=False,
+        array_url="https://fb.example.com",
+        binding="none",
+        prn="prn::iam:array-id/local::saml-provider/" + name,
+        services=services,
+        idp=_Row(
+            encrypt_assertion_enabled=False,
+            sign_request_enabled=False,
+            metadata_url_ca_certificate=_Row(),
+            metadata_url_ca_certificate_group=_Row(),
+            **idp
+        ),
+        sp=_Row(
+            decryption_credential=_Row(),
+            signing_credential=_Row(),
+            entity_id="https://fb.example.com/saml2/service-provider-metadata/" + name,
+            assertion_consumer_url="https://fb.example.com/login/saml2/sso/" + name,
+            metadata_url="https://fb.example.com/saml2/service-provider-metadata/"
+            + name,
+        ),
+    )
+
+
+class TestPurefbInfoSaml2Providers:
+    """config.saml2_idps reports every SAML2 identity provider"""
+
+    def _config(self, providers):
+        client = _array_admin_client(get_sso_saml2_idps=_listing(providers))
+        return _run_main(client, "config")[1]["config"]
+
+    def test_every_provider_is_reported_under_its_name(self):
+        """An array holds a provider for management and, shared with a
+        realm, one for the object service; saml2sso keeps the first."""
+        config = self._config(
+            [
+                _saml2_provider(
+                    "PureSSO",
+                    ["management"],
+                    metadata_url="https://idp.example.com/metadata",
+                    verification_certificate=_Row(),
+                ),
+                _saml2_provider(
+                    "object-sso",
+                    ["object"],
+                    url="https://idp.example.com/sso",
+                    entity_id="https://idp.example.com/idp",
+                    verification_certificate=_ref("cert1"),
+                ),
+            ]
+        )
+
+        assert list(config["saml2_idps"]) == ["PureSSO", "object-sso"]
+        assert config["saml2sso"] == config["saml2_idps"]["PureSSO"]
+        assert config["saml2sso"]["name"] == "PureSSO"
+        shared = config["saml2_idps"]["object-sso"]
+        assert shared["services"] == ["object"]
+        assert shared["enabled"] is False
+        assert shared["prn"] == "prn::iam:array-id/local::saml-provider/object-sso"
+        assert shared["trust_other_saml_sps_in_fleet"] is None
+        assert shared["idp"] == {
+            "url": "https://idp.example.com/sso",
+            "entity_id": "https://idp.example.com/idp",
+            "encrypt_enabled": False,
+            "sign_enabled": False,
+            "metadata_url": None,
+            "metadata_url_ca_certificate": None,
+            "metadata_url_ca_certificate_group": None,
+            "verification_certificate": "cert1",
+        }
+        assert shared["sp"]["sign_cred"] is None
+        assert shared["sp"]["assertion_consumer_url"] == (
+            "https://fb.example.com/login/saml2/sso/object-sso"
+        )
+
+    def test_no_provider(self):
+        config = self._config([])
+
+        assert config["saml2sso"] == {}
+        assert config["saml2_idps"] == {}
+
+
+def _directory_service_row(name, **fields):
+    """A directory service as the array lists it; the one of a server holds
+    no base DN, bind user or URIs"""
+    row = _Row(
+        name=name,
+        enabled=False,
+        services=["nfs"],
+        uris=[],
+        ca_certificate=_Row(),
+        ca_certificate_group=_Row(),
+        management=_Row(user_login_attribute=None, user_object_class=None),
+        nfs=_Row(nis_domains=[], nis_servers=[]),
+        smb=_Row(join_ou=None),
+    )
+    for key, value in fields.items():
+        setattr(row, key, value)
+    return row
+
+
+def _lds_ref(name, lds_id):
+    return _ref(name, lds_id, "directory-services/local/directory-services")
+
+
+def _lds_row(name, lds_id, server, realm=None):
+    return _Row(
+        name=name,
+        id=lds_id,
+        domain=name.split("::")[-1],
+        server=_ref(server, None, "servers"),
+        realms=_realm_refs(realm),
+    )
+
+
+def _local_user_row(lds, name, uid, group, built_in=False):
+    return _Row(
+        name=name,
+        uid=uid,
+        sid="S-1-5-21-1-2-3-{0}".format(uid),
+        enabled=not built_in,
+        built_in=built_in,
+        primary_group=_ref(group, None, "directory-services/local/groups"),
+        local_directory_service=lds,
+    )
+
+
+def _local_group_row(lds, name, gid, built_in=False):
+    return _Row(
+        name=name,
+        gid=gid,
+        sid="S-1-5-32-{0}".format(gid),
+        built_in=built_in,
+        local_directory_service=lds,
+    )
+
+
+def _local_member_row(lds, group, member, kind="users", primary=False):
+    return _Row(
+        group=_ref(group, None, "directory-services/local/groups"),
+        member=_ref(member, None, "directory-services/local/" + kind),
+        is_primary_group=primary,
+        local_directory_service=lds,
+    )
+
+
+class TestPurefbInfoDirectoryServices:
+    """config.directory_services and config.local_directory_services"""
+
+    REALM_LDS = _lds_ref("realm1::lds1", LDS_REALM_ID)
+    ARRAY_LDS = _lds_ref("lds1", LDS_ARRAY_ID)
+
+    def test_directory_services_are_reported_under_their_full_name(self):
+        """The directory services of the array keep their own keys; the
+        ones of a server, in a realm or not, are reported as well."""
+        client = _array_admin_client(
+            get_directory_services=_listing(
+                [
+                    _directory_service_row(
+                        "management",
+                        enabled=True,
+                        services=["management"],
+                        uris=["ldap://ds.example.com"],
+                        base_dn="DC=example,DC=com",
+                        bind_user="svc",
+                        management=_Row(
+                            user_login_attribute="sAMAccountName",
+                            user_object_class="User",
+                        ),
+                    ),
+                    _directory_service_row(
+                        "nfs", uris=[], base_dn=None, bind_user=None
+                    ),
+                    _directory_service_row("srv1_nfs"),
+                    _directory_service_row("realm1::srv1_nfs"),
+                ]
+            )
+        )
+
+        config = _run_main(client, "config")[1]["config"]
+
+        services = config["directory_services"]
+        assert sorted(services) == ["management", "nfs", "realm1::srv1_nfs", "srv1_nfs"]
+        assert services["realm1::srv1_nfs"] == {
+            "base_dn": None,
+            "bind_user": None,
+            "ca_certificate": None,
+            "ca_certificate_group": None,
+            "enabled": False,
+            "management": {"user_login_attribute": None, "user_object_class": None},
+            "nis_servers": [],
+            "nis_domains": [],
+            "services": ["nfs"],
+            "join_ou": None,
+            "uris": [],
+        }
+        assert services["srv1_nfs"] == services["realm1::srv1_nfs"]
+        assert services["management"]["base_dn"] == "DC=example,DC=com"
+        assert services["management"]["management"] == {
+            "user_login_attribute": "sAMAccountName",
+            "user_object_class": "User",
+        }
+        assert config["management_directory_service"] == services["management"]
+        assert config["array_management"] == services["management"]
+        assert config["nfs_directory_service"] == services["nfs"]
+        assert "smb_directory_service" not in config
+
+    def _lds_client(self, **overrides):
+        reads = dict(
+            get_directory_services_local_directory_services=_listing(
+                [
+                    _lds_row("realm1::lds1", LDS_REALM_ID, "realm1::srv1", "realm1"),
+                    _lds_row("lds1", LDS_ARRAY_ID, "srv1"),
+                ]
+            ),
+            get_directory_services_local_users=_listing(
+                [
+                    _local_user_row(
+                        self.REALM_LDS, "Administrator", 0, "Administrators", True
+                    ),
+                    _local_user_row(self.REALM_LDS, "alice", 5001, "staff"),
+                    _local_user_row(self.ARRAY_LDS, "alice", 6001, "staff"),
+                    _local_user_row(self.ARRAY_LDS, "staff", 6002, "staff"),
+                ]
+            ),
+            get_directory_services_local_groups=_listing(
+                [
+                    _local_group_row(self.REALM_LDS, "Administrators", 0, True),
+                    _local_group_row(self.REALM_LDS, "staff", 7001),
+                    _local_group_row(self.ARRAY_LDS, "Backup Operators", 65535, True),
+                    _local_group_row(self.ARRAY_LDS, "staff", 8001),
+                ]
+            ),
+            get_directory_services_local_groups_members=_listing(
+                [
+                    _local_member_row(
+                        self.REALM_LDS, "Administrators", "Administrator", primary=True
+                    ),
+                    _local_member_row(self.REALM_LDS, "staff", "alice", primary=True),
+                    _local_member_row(self.REALM_LDS, "Administrators", "alice"),
+                    _local_member_row(self.ARRAY_LDS, "staff", "alice", primary=True),
+                    _local_member_row(self.ARRAY_LDS, "staff", "staff", primary=True),
+                    _local_member_row(
+                        self.ARRAY_LDS, "Backup Operators", "staff", kind="groups"
+                    ),
+                ]
+            ),
+        )
+        reads.update(overrides)
+        return _array_admin_client(**reads)
+
+    def test_local_directory_services_with_their_users_and_groups(self):
+        """A local directory service in a realm and an array-level one of
+        the same name, with users and groups of the same names: each
+        reports its own."""
+        client = self._lds_client()
+
+        services = _run_main(client, "config")[1]["config"]["local_directory_services"]
+
+        assert sorted(services) == ["lds1", "realm1::lds1"]
+        in_realm = services["realm1::lds1"]
+        assert in_realm["domain"] == "lds1"
+        assert in_realm["realms"] == ["realm1"]
+        assert in_realm["server"] == "realm1::srv1"
+        assert sorted(in_realm["users"]) == ["Administrator", "alice"]
+        assert in_realm["users"]["alice"] == {
+            "uid": 5001,
+            "sid": "S-1-5-21-1-2-3-5001",
+            "enabled": True,
+            "built_in": False,
+            "email": None,
+            "primary_group": "staff",
+            "groups": ["staff", "Administrators"],
+        }
+        assert in_realm["users"]["Administrator"]["built_in"] is True
+        assert in_realm["groups"]["staff"] == {
+            "gid": 7001,
+            "sid": "S-1-5-32-7001",
+            "built_in": False,
+            "email": None,
+            "members": [
+                {"name": "alice", "resource_type": "directory-services/local/users"}
+            ],
+        }
+        assert [
+            member["name"] for member in in_realm["groups"]["Administrators"]["members"]
+        ] == ["Administrator", "alice"]
+        at_array = services["lds1"]
+        assert at_array["realms"] == []
+        assert at_array["server"] == "srv1"
+        assert list(at_array["users"]) == ["alice", "staff"]
+        assert at_array["users"]["alice"]["uid"] == 6001
+        assert at_array["users"]["alice"]["groups"] == ["staff"]
+        assert at_array["groups"]["staff"]["gid"] == 8001
+        # a group that is a member of a group is listed with its type and
+        # is no group membership of the user of that name
+        assert at_array["groups"]["Backup Operators"]["members"] == [
+            {"name": "staff", "resource_type": "directory-services/local/groups"}
+        ]
+        assert at_array["users"]["staff"]["groups"] == ["staff"]
+
+    def test_local_directory_services_need_rest_2_24(self):
+        client = self._lds_client()
+
+        config = _run_main(client, "config", version="2.23")[1]["config"]
+
+        assert "local_directory_services" not in config
+        assert "directory_services" in config
+        assert not [
+            call for call in client.calls if "directory_services_local" in call[0]
+        ]
+
+    def test_users_and_groups_are_not_read_without_a_local_directory_service(self):
+        client = _array_admin_client()
+
+        config = _run_main(client, "config")[1]["config"]
+
+        assert config["local_directory_services"] == {}
+        assert [
+            call[0] for call in client.calls if "directory_services_local" in call[0]
+        ] == ["get_directory_services_local_directory_services"]
+
+    def test_refused_reads_leave_their_entries_empty(self):
+        """An identity the array refuses the local users sees the local
+        directory services without users; refused the services, none."""
+        client = self._lds_client(get_directory_services_local_users=_refused())
+        services = _run_main(client, "config")[1]["config"]["local_directory_services"]
+        assert services["realm1::lds1"]["users"] == {}
+        assert sorted(services["realm1::lds1"]["groups"]) == ["Administrators", "staff"]
+
+        client = self._lds_client(
+            get_directory_services_local_directory_services=_refused()
+        )
+        config = _run_main(client, "config")[1]["config"]
+        assert config["local_directory_services"] == {}
+
+    def test_rows_of_a_service_that_is_not_listed_are_left_out(self):
+        """Users, groups and memberships are attributed by the id of their
+        local directory service: a row whose service is not in the listing
+        belongs to no entry, the rows of a namesake outside the realm
+        included."""
+        client = self._lds_client(
+            get_directory_services_local_directory_services=_listing(
+                [_lds_row("realm1::lds1", LDS_REALM_ID, "realm1::srv1", "realm1")]
+            )
+        )
+
+        services = _run_main(client, "config")[1]["config"]["local_directory_services"]
+
+        assert list(services) == ["realm1::lds1"]
+        in_realm = services["realm1::lds1"]
+        assert sorted(in_realm["users"]) == ["Administrator", "alice"]
+        assert in_realm["users"]["alice"]["uid"] == 5001
+        assert in_realm["users"]["alice"]["groups"] == ["staff", "Administrators"]
+        assert sorted(in_realm["groups"]) == ["Administrators", "staff"]
+        assert in_realm["groups"]["staff"]["gid"] == 7001
+        assert in_realm["groups"]["staff"]["members"] == [
+            {"name": "alice", "resource_type": "directory-services/local/users"}
+        ]
+
+    @pytest.mark.parametrize(
+        "read, what",
+        [
+            (
+                "get_directory_services_local_directory_services",
+                "the local directory services",
+            ),
+            ("get_directory_services_local_users", "the local users"),
+            ("get_directory_services_local_groups", "the local groups"),
+            (
+                "get_directory_services_local_groups_members",
+                "the members of the local groups",
+            ),
+        ],
+    )
+    def test_a_failed_read_is_reported_with_the_message_of_the_array(self, read, what):
+        client = self._lds_client(**{read: _SdkError(500, "Internal error.")})
+
+        message = _fail_main(client, "config")
+
+        assert message == "Failed to read {0}. Error: Internal error.".format(what)

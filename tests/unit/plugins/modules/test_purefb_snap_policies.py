@@ -99,6 +99,7 @@ def _module(**overrides):
         "suffix": "snap",
         "now": False,
         "target": None,
+        "target_fs": None,
         "eradicate": False,
         "state": "present",
         "latest_replica": False,
@@ -176,7 +177,7 @@ def _run_main(module, blade, filesystem=None, api_version="2.30", expect=ExitJso
         )
         stack.enter_context(patch(MODULE + ".purefb_argument_spec", return_value={}))
         stack.enter_context(patch(MODULE + ".get_system", return_value=blade))
-        stack.enter_context(patch(MODULE + ".get_filesystem", return_value=filesystem))
+        stack.enter_context(patch(MODULE + "._get_filesystem", return_value=filesystem))
         stack.enter_context(
             patch(MODULE + ".get_rest_api_version", return_value=api_version)
         )

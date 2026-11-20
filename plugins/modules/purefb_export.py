@@ -20,24 +20,36 @@ DOCUMENTATION = """
 ---
 module: purefb_export
 version_added: "1.25.0"
-short_description:  Manage filesystem exports on Everpure FlashBlade`
+short_description:  Manage filesystem exports on Everpure FlashBlade
 description:
     - This module manages filesystem exports on Everpure FlashBlade.
+    - An export is in the realm of its file system and of its server, which
+      must be the same realm. For a file system in a realm give both as
+      C(realm::name). The export name itself is never realm-qualified.
+    - A realm-scoped administrator must use the realm-qualified name; a bare
+      name is not placed in, or resolved to, the administrator's realm.
 author: Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
   name:
     description:
       - Export Name.
+      - The export name is never realm-qualified. The realm of an export
+        is that of I(filesystem) and I(server).
     required: true
     type: str
   server:
     description:
       - Name of server to assign export to
+      - Required for a file system in a realm, a server of the same realm,
+        C(realm::server). The default server is not in a realm.
+      - The module fails, in check mode as well, when I(filesystem) and
+        I(server) are not in the same realm or not both outside of any realm.
     type: str
     default: "_array_server"
   filesystem:
     description:
       - Filesystem to create the export for.
+      - For a file system in a realm use C(realm::name).
     required: true
     type: str
   state:
@@ -56,18 +68,28 @@ options:
   export_policy:
     description:
     - Name of NFS export policy to assign to the export
+    - Required to create an NFS export.
+    - For an export in a realm use a policy of the same realm,
+      C(realm::policy).
     type: str
   share_policy:
     description:
     - Name of SMB share policy to assign to the export
+    - A new SMB export gets C(_smb_share_allow_everyone) when this is not set.
+    - For an export in a realm use a policy of the same realm,
+      C(realm::policy), or a built-in policy.
     type: str
   client_policy:
     description:
     - Name of SMB client policy to assign to the export
+    - A new SMB export gets C(_smb_client_allow_everyone) when this is not set.
+    - For an export in a realm use a policy of the same realm,
+      C(realm::policy), or a built-in policy.
     type: str
   rename:
     description:
       - New name for export
+      - Never realm-qualified.
     type: str
   context:
     description:
@@ -109,10 +131,21 @@ EXAMPLES = """
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
+- name: Create NFS export foo for file system bar of realm tenant1
+  everpure.flashblade.purefb_export:
+    name: foo
+    server: tenant1::test
+    filesystem: tenant1::bar
+    export_policy: tenant1::acme_1
+    state: present
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
 - name: Delete filesystem export foo on server test
   everpure.flashblade.purefb_export:
     name: foo
     server: test
+    filesystem: bar
     state: absent
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
@@ -175,6 +208,13 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
 )
 
 MIN_API_VERSION = "2.17"
+ARRAY_SERVER = "_array_server"
+# option: (what the array calls the policy, the SDK method that reads it)
+POLICY_READS = {
+    "export_policy": ("NFS export", "get_nfs_export_policies"),
+    "client_policy": ("SMB client", "get_smb_client_policies"),
+    "share_policy": ("SMB share", "get_smb_share_policies"),
+}
 
 
 def _context_kwargs(module):
@@ -186,6 +226,209 @@ def _context_kwargs(module):
     if module.params["context"]:
         return {"context_names": [module.params["context"]]}
     return {}
+
+
+def _realm_of(name):
+    """Return the realm of a realm::name name, empty for an array-level name."""
+    return (name or "").rpartition("::")[0]
+
+
+def _same_name(first, second):
+    """Compare two names as the array matches them, without regard to case."""
+    return (first or "").lower() == (second or "").lower()
+
+
+def _does_not_exist(error):
+    """Tell the array's answer for a missing object from any other failure."""
+    return "does not exist" in str(error).lower()
+
+
+def _check_names(module):
+    """Fail on names that cannot address an export, before any request.
+
+    An export is in the realm of its file system and of its server, and the
+    array creates one only where both are in the same realm or both outside
+    of any realm. A task that mixes the scopes, for instance a file system in
+    a realm with the default server, names an export that cannot exist. It is
+    refused for every state, in check mode as well, instead of reporting a
+    change the array refuses, or no change while the export that was meant
+    stays as it is. The export name itself carries no realm.
+
+    The file system, the server and each policy of an export are one object
+    each. The array reads a comma as the separator of a list of names, so a
+    name that holds one passes a lookup when every name in it exists,
+    although it is not the name of one object, and the lookup of the
+    export never finds it again. An empty name addresses nothing.
+    """
+    for option in ("name", "filesystem", "server"):
+        if not (module.params[option] or "").strip():
+            module.fail_json(msg="{0} cannot be empty.".format(option))
+    kinds = {"filesystem": "file system", "server": "server"}
+    if module.params["type"] == "NFS":
+        policies = ["export_policy"]
+    else:
+        policies = ["client_policy", "share_policy"]
+    for option in ["filesystem", "server"] + policies:
+        value = module.params[option]
+        if value and "," in value:
+            module.fail_json(
+                msg=(
+                    "{0} {1} is not valid: a comma separates the names of a "
+                    "list, and an export has one {2}."
+                ).format(
+                    option,
+                    value,
+                    kinds.get(option) or POLICY_READS[option][0] + " policy",
+                )
+            )
+    for option in ("name", "rename"):
+        value = module.params[option]
+        if value and "::" in value:
+            module.fail_json(
+                msg=(
+                    "{0} {1} is not valid: an export name is never "
+                    "realm-qualified. An export is in the realm of its file "
+                    "system and server."
+                ).format(option, value)
+            )
+    filesystem = module.params["filesystem"]
+    server = module.params["server"]
+    fs_realm = _realm_of(filesystem)
+    server_realm = _realm_of(server)
+    if _same_name(fs_realm, server_realm):
+        return
+    scopes = [
+        "in realm {0}".format(realm) if realm else "not in a realm"
+        for realm in (fs_realm, server_realm)
+    ]
+    msg = (
+        "File system {0} is {1} and server {2} is {3}. The file system and "
+        "the server of an export must be in the same realm, or both outside "
+        "of any realm."
+    ).format(filesystem, scopes[0], server, scopes[1])
+    if fs_realm and server == ARRAY_SERVER:
+        msg += (
+            " Set server to a server of realm {0}, named {0}::<server>: the "
+            "default server is not in a realm."
+        ).format(fs_realm)
+    module.fail_json(msg=msg)
+
+
+def _check_server(module, blade):
+    """Fail unless the server of the export can be read."""
+    server = module.params["server"]
+    res = blade.get_servers(names=[server])
+    if res.status_code == 200:
+        return
+    error = get_error_message(res)
+    if _does_not_exist(error):
+        module.fail_json(msg="Server {0} does not exist.".format(server))
+    module.fail_json(msg="Failed to read server {0}. Error: {1}".format(server, error))
+
+
+def _require_file_system(module, blade):
+    """Fail unless the file system to export exists.
+
+    The array answers a name it does not find with an error or with an empty
+    list, depending on who asks.
+    """
+    filesystem = module.params["filesystem"]
+    res = blade.get_file_systems(names=[filesystem], **_context_kwargs(module))
+    if res.status_code == 200:
+        if list(res.items):
+            return
+    else:
+        error = get_error_message(res)
+        if not _does_not_exist(error):
+            module.fail_json(
+                msg="Failed to read file system {0}. Error: {1}".format(
+                    filesystem, error
+                )
+            )
+    module.fail_json(msg="File system {0} does not exist.".format(filesystem))
+
+
+def _realm_policy_hint(module, policy):
+    """Name the realm form of a policy that an export in a realm cannot find."""
+    realm = _realm_of(module.params["filesystem"])
+    if not realm or _same_name(_realm_of(policy), realm):
+        return ""
+    return (
+        " The export is in realm {0}, where a policy of that realm is named "
+        "{0}::{1}."
+    ).format(realm, policy.rpartition("::")[2])
+
+
+def _require_policy(module, blade, option):
+    """Fail unless the policy an option names exists.
+
+    Looked up before a change is reported, so that check mode does not
+    predict a change the array refuses. Whether an existing policy may serve
+    the export is left to the array: the built-in policies serve every realm.
+    """
+    policy = module.params[option]
+    kind, method = POLICY_READS[option]
+    res = getattr(blade, method)(names=[policy], **_context_kwargs(module))
+    if res.status_code == 200:
+        if list(res.items):
+            return
+    else:
+        error = get_error_message(res)
+        if not _does_not_exist(error):
+            module.fail_json(
+                msg="Failed to read {0} policy {1}. Error: {2}".format(
+                    kind, policy, error
+                )
+            )
+    module.fail_json(
+        msg="{0} policy {1} does not exist.{2}".format(
+            kind, policy, _realm_policy_hint(module, policy)
+        )
+    )
+
+
+def _refusal_hint(module, error):
+    """Say which policies an export can use when the array refuses one.
+
+    The array refuses a policy from another scope than the export. Its
+    message does not say how a policy of the right scope is named.
+    """
+    text = str(error).lower()
+    if "polic" not in text or "same realm" not in text:
+        return ""
+    lead = " " if text.rstrip().endswith(".") else ". "
+    realm = _realm_of(module.params["filesystem"])
+    if not realm:
+        return lead + (
+            "The export is not in a realm: use a policy that is not in a "
+            "realm either."
+        )
+    built_in = ", or a built-in policy" if module.params["type"] == "SMB" else ""
+    return lead + (
+        "The export is in realm {0}: use a policy of that realm, named "
+        "{0}::<policy>{1}."
+    ).format(realm, built_in)
+
+
+def _check_create(module, blade):
+    """Fail where the array would refuse to create the export.
+
+    Decided before the check-mode branch, so check mode fails where a real
+    run does: an NFS export is created with an NFS export policy, and the
+    file system and every policy the task names have to exist.
+    """
+    nfs = module.params["type"] == "NFS"
+    if nfs and not module.params["export_policy"]:
+        module.fail_json(
+            msg=(
+                "export_policy is required to create NFS export {0} for file "
+                "system {1}."
+            ).format(module.params["name"], module.params["filesystem"])
+        )
+    _require_file_system(module, blade)
+    for option in ("export_policy",) if nfs else ("client_policy", "share_policy"):
+        if module.params[option]:
+            _require_policy(module, blade, option)
 
 
 def _warn_fs_policy_collision(module, blade):
@@ -266,9 +509,17 @@ def get_export(module, blade):
         + "'"
     )
     res = blade.get_file_system_exports(filter=filter_string, **_context_kwargs(module))
-    if res.status_code == 200 and res.total_item_count != 0:
-        return list(res.items)[0]
-    return None
+    if res.status_code != 200:
+        # an export that cannot be read is not an export that is absent
+        module.fail_json(
+            msg="Failed to read export {0} of file system {1}. Error: {2}".format(
+                module.params["name"],
+                module.params["filesystem"],
+                get_error_message(res),
+            )
+        )
+    items = list(res.items)
+    return items[0] if items else None
 
 
 def _warn_type_transition(module, blade):
@@ -342,11 +593,13 @@ def create_export(module, blade):
         # Only evaluated when a request was made; in check mode there is
         # no response to inspect.
         if res.status_code != 200:
+            error = get_error_message(res)
             module.fail_json(
-                msg="Failed to create export {0} for {1}. Error: {2}".format(
+                msg="Failed to create export {0} for {1}. Error: {2}{3}".format(
                     module.params["name"],
                     module.params["filesystem"],
-                    get_error_message(res),
+                    error,
+                    _refusal_hint(module, error),
                 )
             )
     module.exit_json(changed=changed)
@@ -363,10 +616,10 @@ def modify_export(module, blade, export):
     else:
         export_name = module.params["name"]
     if module.params["type"] == "NFS":
-        if (
-            module.params["export_policy"]
-            and module.params["export_policy"] != export.policy.name
+        if module.params["export_policy"] and not _same_name(
+            module.params["export_policy"], export.policy.name
         ):
+            _require_policy(module, blade, "export_policy")
             export_policy = module.params["export_policy"]
             changed_policy = True
         else:
@@ -388,24 +641,25 @@ def modify_export(module, blade, export):
                     names=[export.name], file_system_export=exp_obj
                 )
                 if res.status_code != 200:
+                    error = get_error_message(res)
                     module.fail_json(
-                        msg="Failed to update export {0}. Error: {1}".format(
-                            export.name, get_error_message(res)
+                        msg="Failed to update export {0}. Error: {1}{2}".format(
+                            export.name, error, _refusal_hint(module, error)
                         )
                     )
     else:
-        if (
-            module.params["client_policy"]
-            and module.params["client_policy"] != export.policy.name
+        if module.params["client_policy"] and not _same_name(
+            module.params["client_policy"], export.policy.name
         ):
+            _require_policy(module, blade, "client_policy")
             client_policy = module.params["client_policy"]
             changed_policy = True
         else:
             client_policy = export.policy.name
-        if (
-            module.params["share_policy"]
-            and module.params["share_policy"] != export.share_policy.name
+        if module.params["share_policy"] and not _same_name(
+            module.params["share_policy"], export.share_policy.name
         ):
+            _require_policy(module, blade, "share_policy")
             share_policy = module.params["share_policy"]
             changed_policy = True
         else:
@@ -432,9 +686,10 @@ def modify_export(module, blade, export):
                     names=[export.name], file_system_export=exp_obj
                 )
                 if res.status_code != 200:
+                    error = get_error_message(res)
                     module.fail_json(
-                        msg="Failed to update export {0}. Error: {1}".format(
-                            export.name, get_error_message(res)
+                        msg="Failed to update export {0}. Error: {1}{2}".format(
+                            export.name, error, _refusal_hint(module, error)
                         )
                     )
 
@@ -460,7 +715,7 @@ def main():
     argument_spec.update(
         dict(
             name=dict(type="str", required=True),
-            server=dict(type="str", default="_array_server"),
+            server=dict(type="str", default=ARRAY_SERVER),
             filesystem=dict(type="str", required=True),
             rename=dict(type="str"),
             type=dict(type="str", choices=["NFS", "SMB"], default="NFS"),
@@ -475,6 +730,7 @@ def main():
     module = AnsibleModule(argument_spec, supports_check_mode=True)
 
     state = module.params["state"]
+    _check_names(module)
     blade = get_system(module)
     api_version = get_rest_api_version(blade)
     if (
@@ -485,16 +741,11 @@ def main():
         fleet_res = blade.get_fleets()
         if fleet_res.status_code == 200 and list(fleet_res.items):
             module.params["context"] = list(blade.get_arrays().items)[0].name
-    server_exists = bool(
-        blade.get_servers(names=[module.params["server"]]).status_code == 200
-    )
-    if not server_exists:
-        module.fail_json(
-            msg="Server {0} does not exist.".format(module.params["server"])
-        )
+    _check_server(module, blade)
     export = get_export(module, blade)
 
     if state == "present" and not export and not module.params["rename"]:
+        _check_create(module, blade)
         _warn_type_transition(module, blade)
         create_export(module, blade)
     elif state == "present" and export:

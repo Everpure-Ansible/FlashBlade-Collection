@@ -1,0 +1,12 @@
+bugfixes:
+  - purefb_local_group - the local directory service is read first. When it does not exist,
+    ``state=present`` fails in check mode as in a real run and ``state=absent`` reports no change.
+    A read that fails is reported with the message of the array.
+  - purefb_local_group - a rename task that is run again carries on with the renamed group instead
+    of creating the old name anew.
+  - purefb_local_group - a group name with a realm prefix is refused. A group of a local directory
+    service in a realm is addressed with ``local_directory_service`` as ``realm::name``.
+  - purefb_local_group - a name with a comma is refused, because the array reads it as a list of
+    names and the task would address more than one group or local directory service.
+  - purefb_local_group - members in ``local_users`` are compared without regard to case, as the
+    array matches them, so a member named in another case is no longer a change.

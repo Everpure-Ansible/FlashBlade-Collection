@@ -1,0 +1,11 @@
+bugfixes:
+  - purefb_ds - a directory service that does not exist, or that the user is not allowed to see,
+    fails the task for ``state=present`` and ``state=test`` instead of reporting ok, and the
+    message names the ``realm::server`` form of ``nfs_server``. ``state=absent`` stays unchanged.
+  - purefb_ds - a read or a test the array refuses is reported with the array's error instead of
+    "does not exist" or a traceback.
+  - purefb_ds - ``state=absent`` in check mode reports changed only when there is something to
+    clear, as the run does.
+  - purefb_ds - ``nfs_server`` set to ``_array_server`` is recognised in any letter case.
+  - purefb_ds - an ``nfs_server`` that holds a comma is refused. The array reads such a name as a
+    list of names, so the task addressed more than one directory service.

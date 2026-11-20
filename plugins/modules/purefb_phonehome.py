@@ -179,6 +179,25 @@ def _check_edge_support(module, api_version):
             )
 
 
+def _get_support(module, blade):
+    """Return the support settings of the array.
+
+    A read the array refuses or fails is reported with the message of the
+    array.
+    """
+    res = blade.get_support()
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to read the support settings. Error: {0}".format(
+                get_error_message(res)
+            )
+        )
+    items = list(res.items)
+    if not items:
+        module.fail_json(msg="The array returned no support settings.")
+    return items[0]
+
+
 def _pending_changes(module, support):
     """Return the Support fields whose desired value differs from the array."""
     changes = {}
@@ -210,8 +229,12 @@ def update_support(module, blade, changes):
 def test_ph(module, blade):
     """Test phonehome configuration"""
     test_response = []
-    response = list(blade.get_support_test(test_type="phonehome").items)
-    for component in response:
+    res = blade.get_support_test(test_type="phonehome")
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Phone Home test failed. Error: {0}".format(get_error_message(res))
+        )
+    for component in list(res.items):
         if component.enabled:
             enabled = "true"
         else:
@@ -267,7 +290,7 @@ def main():
     if module.params["state"] == "test":
         test_ph(module, blade)
 
-    support = list(blade.get_support().items)[0]
+    support = _get_support(module, blade)
     changes = _pending_changes(module, support)
     if changes:
         update_support(module, blade, changes)

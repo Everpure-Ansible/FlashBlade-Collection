@@ -1,7 +1,7 @@
 # Copyright: (c) 2026, Everpure Ansible Team <pure-ansible-team@everpuredata.com>
 # GNU General Public License v3.0+ (see COPYING.GPLv3 or https://www.gnu.org/licenses/gpl-3.0.txt)
 
-"""Unit tests for the purefb_fleet batch member join and member_name removal."""
+"""Unit tests for the purefb_fleet module."""
 
 from __future__ import absolute_import, division, print_function
 
@@ -77,6 +77,7 @@ from plugins.modules.purefb_fleet import (
     main,
     _current_fleet_name,
     _get_fleet_members,
+    _remote_array_name,
     _batch_entry,
     _batch_result_dict,
     _wait_for_join,
@@ -1080,3 +1081,439 @@ class TestFleetRenameMain:
         module = _run_main(_base_params(rename="fleet2"), blade)
         module.fail_json.assert_called_once()
         assert "Fleet rename failed" in module.fail_json.call_args[1]["msg"]
+
+
+def _error_text(response, default="Unknown error"):
+    """Stand-in for get_error_message: the first message of an error response"""
+    errors = getattr(response, "errors", None)
+    return errors[0].message if errors else default
+
+
+def _error_response(message="Operation not permitted.", status_code=400):
+    """A refused request as the SDK returns it: errors and no items attribute"""
+    error = Mock(spec=["context", "message", "location_context"])
+    error.context = None
+    error.message = message
+    error.location_context = None
+    response = Mock(spec=["status_code", "errors", "headers"])
+    response.status_code = status_code
+    response.errors = [error]
+    response.headers = None
+    return response
+
+
+def _array(name):
+    array = Mock()
+    array.name = name
+    return array
+
+
+def _fleet_key(value="fleet-key-1"):
+    key = Mock()
+    key.fleet_key = value
+    return key
+
+
+def _fleet_blade(members=None):
+    """Local array that is in fleet1, with a fleet key ready to be issued"""
+    blade = Mock()
+    blade.get_fleets.return_value = _response([_fleet("fleet1")])
+    blade.get_fleets_members.return_value = _response(
+        members if members is not None else [_member("local", is_local=True)]
+    )
+    blade.post_fleets_fleet_key.return_value = _response([_fleet_key()])
+    blade.delete_fleets_members.return_value = _response([])
+    return blade
+
+
+def _remote(name="array2", rest_version="2.42"):
+    """Client of the array at member_url"""
+    remote = Mock()
+    remote.get_arrays.return_value = _response([_array(name)])
+    remote.get_rest_version.return_value = rest_version
+    remote.post_fleets_members.return_value = _response([])
+    return remote
+
+
+def _member_url_params(**overrides):
+    params = _base_params(
+        name="fleet1",
+        member_url="array2.example.com",
+        member_api="T-11111111-2222-3333-4444-555555555555",
+    )
+    params.update(overrides)
+    return params
+
+
+def _run_refused(params, blade, check_mode=False):
+    """Run main() with the text of the array's answer passed through"""
+    with patch(MODULE + ".get_error_message", _error_text):
+        return _run_main(params, blade, check_mode=check_mode)
+
+
+def _run_member_url(params, blade, remote, check_mode=False, remote_version="2.30"):
+    """Run main() for the member_url paths with the remote client patched"""
+    module = _module(params, check_mode)
+
+    def _version(system):
+        return remote_version if system is remote else "2.30"
+
+    with patch(MODULE + ".AnsibleModule", return_value=module), patch(
+        MODULE + ".get_system", return_value=blade
+    ), patch(MODULE + ".get_rest_api_version", side_effect=_version), patch(
+        MODULE + ".LooseVersion", RealLooseVersion
+    ), patch(
+        MODULE + ".HAS_PYPURECLIENT", True
+    ), patch(
+        MODULE + ".get_error_message", _error_text
+    ), patch(
+        MODULE + ".flashblade"
+    ) as mock_fb, patch(
+        MODULE + ".flasharray"
+    ) as mock_fa:
+        mock_fb.Client.return_value = remote
+        mock_fa.Client.return_value = remote
+        try:
+            main()
+        except SystemExit:
+            pass
+    return module, mock_fb, mock_fa
+
+
+def _assert_no_write(blade):
+    blade.post_fleets.assert_not_called()
+    blade.patch_fleets.assert_not_called()
+    blade.delete_fleets.assert_not_called()
+    blade.delete_fleets_members.assert_not_called()
+    blade.post_fleets_members_batch.assert_not_called()
+    blade.post_fleets_fleet_key.assert_not_called()
+
+
+class TestFleetRefusedRead:
+    """A read of the fleets that the array refuses is reported, not raised"""
+
+    def _cases(self):
+        batch = [
+            {
+                "management_address": "10.0.0.2",
+                "name": "array2",
+                "username": "admin",
+                "password": "secret",
+                "ca_certificate": None,
+                "ca_certificate_group": None,
+            }
+        ]
+        return [
+            _base_params(state="absent"),
+            _base_params(state="absent", name="fleet1"),
+            _base_params(state="create", name="fleet1"),
+            _base_params(rename="fleet2"),
+            _base_params(state="absent", member_name=["array2"]),
+            _base_params(members=batch),
+            _member_url_params(),
+            _member_url_params(state="absent"),
+        ]
+
+    def test_refused_fleet_read_reports_the_array_message(self):
+        for params in self._cases():
+            for check_mode in [False, True]:
+                blade = Mock()
+                blade.get_fleets.return_value = _error_response()
+                module = _run_refused(params, blade, check_mode=check_mode)
+                module.fail_json.assert_called_once_with(
+                    msg="Failed to read fleets. Error: Operation not permitted."
+                )
+                module.exit_json.assert_not_called()
+                blade.get_fleets_members.assert_not_called()
+                _assert_no_write(blade)
+
+    def test_failed_fleet_read_reports_the_array_message(self):
+        blade = Mock()
+        blade.get_fleets.return_value = _error_response("Internal error", 500)
+        module = _run_refused(_base_params(state="absent"), blade)
+        module.fail_json.assert_called_once_with(
+            msg="Failed to read fleets. Error: Internal error"
+        )
+        module.exit_json.assert_not_called()
+        _assert_no_write(blade)
+
+    def test_fleet_read_404_still_reports_fusion_not_enabled(self):
+        blade = Mock()
+        blade.get_fleets.return_value = _error_response("Not found", 404)
+        module = _run_refused(_base_params(state="absent"), blade)
+        module.fail_json.assert_called_once()
+        assert "Fusion is not enabled" in module.fail_json.call_args[1]["msg"]
+        module.exit_json.assert_not_called()
+        _assert_no_write(blade)
+
+    def test_remote_array_name_returns_name(self):
+        module = _module(_member_url_params())
+        assert _remote_array_name(module, _remote("array2")) == "array2"
+        module.fail_json.assert_not_called()
+
+    def test_remote_array_name_fails_on_refused_read(self):
+        module = _module(_member_url_params())
+        remote = _remote()
+        remote.get_arrays.return_value = _error_response()
+        with patch(MODULE + ".get_error_message", _error_text):
+            try:
+                _remote_array_name(module, remote)
+            except SystemExit:
+                pass
+        module.fail_json.assert_called_once_with(
+            msg="Failed to read the array name from array2.example.com. "
+            "Error: Operation not permitted."
+        )
+
+
+class TestFleetMemberUrlAdd:
+    """main() flows for state=present with member_url and member_api"""
+
+    def test_add_member_check_mode_requests_no_fleet_key(self):
+        blade = _fleet_blade()
+        remote = _remote("array2")
+        module, mock_fb, mock_fa = _run_member_url(
+            _member_url_params(), blade, remote, check_mode=True
+        )
+        _assert_no_write(blade)
+        remote.post_fleets_members.assert_not_called()
+        mock_fb.Client.assert_called_once()
+        mock_fa.Client.assert_not_called()
+        module.fail_json.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_add_existing_member_requests_no_fleet_key(self):
+        for check_mode in [False, True]:
+            blade = _fleet_blade(
+                [_member("local", is_local=True), _member("array2", "joined")]
+            )
+            remote = _remote("array2")
+            module = _run_member_url(
+                _member_url_params(), blade, remote, check_mode=check_mode
+            )[0]
+            _assert_no_write(blade)
+            remote.post_fleets_members.assert_not_called()
+            module.fail_json.assert_not_called()
+            module.exit_json.assert_called_once_with(changed=False)
+
+    @patch(MODULE + ".FleetMemberPostMembers")
+    def test_add_member_requests_key_after_the_reads_and_joins(self, mock_entry):
+        blade = _fleet_blade()
+        remote = _remote("array2")
+
+        def _issue_key():
+            assert remote.get_arrays.called
+            assert blade.get_fleets_members.called
+            return _response([_fleet_key("fleet-key-1")])
+
+        blade.post_fleets_fleet_key.side_effect = _issue_key
+        module = _run_member_url(_member_url_params(), blade, remote)[0]
+        blade.post_fleets_fleet_key.assert_called_once_with()
+        assert mock_entry.call_args[1]["key"] == "fleet-key-1"
+        remote.post_fleets_members.assert_called_once()
+        assert remote.post_fleets_members.call_args[1]["fleet_names"] == ["fleet1"]
+        module.fail_json.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_add_flashblade_below_minimum_version_requests_no_fleet_key(self):
+        for check_mode in [False, True]:
+            blade = _fleet_blade()
+            remote = _remote("array2")
+            module = _run_member_url(
+                _member_url_params(),
+                blade,
+                remote,
+                check_mode=check_mode,
+                remote_version="2.16",
+            )[0]
+            module.fail_json.assert_called_once()
+            msg = module.fail_json.call_args[1]["msg"]
+            assert "Remote FlashBlade must be a minimum of REST API 2.17" in msg
+            _assert_no_write(blade)
+            remote.post_fleets_members.assert_not_called()
+            module.exit_json.assert_not_called()
+
+    def test_add_flasharray_member_check_mode_requests_no_fleet_key(self):
+        blade = _fleet_blade()
+        remote = _remote("fa1")
+        module, mock_fb, mock_fa = _run_member_url(
+            _member_url_params(member_api="11111111-2222-3333-4444-555555555555"),
+            blade,
+            remote,
+            check_mode=True,
+        )
+        mock_fa.Client.assert_called_once()
+        mock_fb.Client.assert_not_called()
+        _assert_no_write(blade)
+        remote.post_fleets_members.assert_not_called()
+        module.fail_json.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_add_flasharray_below_minimum_version_requests_no_fleet_key(self):
+        blade = _fleet_blade()
+        remote = _remote("fa1", rest_version="2.41")
+        module = _run_member_url(
+            _member_url_params(member_api="11111111-2222-3333-4444-555555555555"),
+            blade,
+            remote,
+        )[0]
+        module.fail_json.assert_called_once()
+        assert "Purity//FA 6.8.5" in module.fail_json.call_args[1]["msg"]
+        _assert_no_write(blade)
+        remote.post_fleets_members.assert_not_called()
+
+    def test_add_member_refused_member_list_reports_the_array_message(self):
+        for check_mode in [False, True]:
+            blade = _fleet_blade()
+            blade.get_fleets_members.return_value = _error_response()
+            remote = _remote("array2")
+            module = _run_member_url(
+                _member_url_params(), blade, remote, check_mode=check_mode
+            )[0]
+            module.fail_json.assert_called_once_with(
+                msg="Failed to list fleet members. Error: Operation not permitted."
+            )
+            _assert_no_write(blade)
+            remote.post_fleets_members.assert_not_called()
+            module.exit_json.assert_not_called()
+
+    def test_add_member_refused_remote_read_reports_the_array_message(self):
+        for check_mode in [False, True]:
+            blade = _fleet_blade()
+            remote = _remote("array2")
+            remote.get_arrays.return_value = _error_response()
+            module = _run_member_url(
+                _member_url_params(), blade, remote, check_mode=check_mode
+            )[0]
+            module.fail_json.assert_called_once_with(
+                msg="Failed to read the array name from array2.example.com. "
+                "Error: Operation not permitted."
+            )
+            _assert_no_write(blade)
+            remote.post_fleets_members.assert_not_called()
+            module.exit_json.assert_not_called()
+
+    def test_add_member_refused_fleet_key(self):
+        blade = _fleet_blade()
+        blade.post_fleets_fleet_key.return_value = _error_response()
+        remote = _remote("array2")
+        module = _run_member_url(_member_url_params(), blade, remote)[0]
+        module.fail_json.assert_called_once_with(
+            msg="Fleet key generation failed. Error: Operation not permitted."
+        )
+        remote.post_fleets_members.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    def test_add_member_refused_join(self):
+        blade = _fleet_blade()
+        remote = _remote("array2")
+        remote.post_fleets_members.return_value = _error_response("Invalid fleet key.")
+        module = _run_member_url(_member_url_params(), blade, remote)[0]
+        blade.post_fleets_fleet_key.assert_called_once_with()
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[0][0]
+        assert (
+            msg == "Array array2 failed to join fleet fleet1. Error: Invalid fleet key."
+        )
+        module.exit_json.assert_not_called()
+
+    def test_add_member_without_fleet_is_unchanged(self):
+        for check_mode in [False, True]:
+            blade = _fleet_blade()
+            blade.get_fleets.return_value = _response([])
+            remote = _remote("array2")
+            module, mock_fb, mock_fa = _run_member_url(
+                _member_url_params(), blade, remote, check_mode=check_mode
+            )
+            mock_fb.Client.assert_not_called()
+            mock_fa.Client.assert_not_called()
+            _assert_no_write(blade)
+            module.exit_json.assert_called_once_with(changed=False)
+
+
+class TestFleetMemberUrlDelete:
+    """main() flows for state=absent with member_url and member_api"""
+
+    def _params(self):
+        return _member_url_params(state="absent")
+
+    def test_remove_member_refused_member_list_reports_the_array_message(self):
+        for check_mode in [False, True]:
+            blade = _fleet_blade()
+            blade.get_fleets_members.return_value = _error_response()
+            remote = _remote("array2")
+            module = _run_member_url(
+                self._params(), blade, remote, check_mode=check_mode
+            )[0]
+            module.fail_json.assert_called_once_with(
+                msg="Failed to list fleet members. Error: Operation not permitted."
+            )
+            _assert_no_write(blade)
+            module.exit_json.assert_not_called()
+
+    def test_remove_member_refused_remote_read_reports_the_array_message(self):
+        for check_mode in [False, True]:
+            blade = _fleet_blade(
+                [_member("local", is_local=True), _member("array2", "joined")]
+            )
+            remote = _remote("array2")
+            remote.get_arrays.return_value = _error_response()
+            module = _run_member_url(
+                self._params(), blade, remote, check_mode=check_mode
+            )[0]
+            module.fail_json.assert_called_once_with(
+                msg="Failed to read the array name from array2.example.com. "
+                "Error: Operation not permitted."
+            )
+            _assert_no_write(blade)
+            module.exit_json.assert_not_called()
+
+    def test_remove_joined_member(self):
+        blade = _fleet_blade(
+            [_member("local", is_local=True), _member("array2", "joined")]
+        )
+        module = _run_member_url(self._params(), blade, _remote("array2"))[0]
+        blade.delete_fleets_members.assert_called_once_with(member_names=["array2"])
+        blade.post_fleets_fleet_key.assert_not_called()
+        module.fail_json.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_remove_member_that_is_not_joined_uses_unreachable(self):
+        blade = _fleet_blade(
+            [_member("local", is_local=True), _member("array2", "joining")]
+        )
+        module = _run_member_url(self._params(), blade, _remote("array2"))[0]
+        blade.delete_fleets_members.assert_called_once_with(
+            member_names=["array2"], unreachable=True
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_remove_member_check_mode(self):
+        blade = _fleet_blade(
+            [_member("local", is_local=True), _member("array2", "joined")]
+        )
+        module = _run_member_url(
+            self._params(), blade, _remote("array2"), check_mode=True
+        )[0]
+        _assert_no_write(blade)
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_remove_array_that_is_not_a_member_is_unchanged(self):
+        blade = _fleet_blade()
+        module = _run_member_url(self._params(), blade, _remote("array2"))[0]
+        _assert_no_write(blade)
+        module.fail_json.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+    def test_remove_member_api_error(self):
+        blade = _fleet_blade(
+            [_member("local", is_local=True), _member("array2", "joined")]
+        )
+        blade.delete_fleets_members.return_value = _error_response()
+        module = _run_member_url(self._params(), blade, _remote("array2"))[0]
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[0][0]
+        assert msg == (
+            "Array array2.example.com failed to be removed from fleet. "
+            "Error: Operation not permitted."
+        )

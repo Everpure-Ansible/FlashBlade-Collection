@@ -76,6 +76,7 @@ from plugins.modules.purefb_mgmt_role import (
     _normalize_resource,
     _normalize_actions,
     _validate_role_name,
+    _read_named,
     _get_role,
     _get_permissions,
     _role_referenced_by_rule,
@@ -105,6 +106,76 @@ def _base_params(**overrides):
     }
     params.update(overrides)
     return params
+
+
+GEM = "plugins.modules.purefb_mgmt_role.get_error_message"
+LOOSE = "plugins.modules.purefb_mgmt_role.LooseVersion"
+
+# Messages of the array (Purity//FB 4.8.8) for a name that does not exist,
+# for a read it refuses and for a context that is not a fleet member.
+ROLE_MISSING = "Management access policy role does not exist."
+ADMIN_MISSING = "Admin does not exist."
+DS_ROLE_MISSING = "Directory service role does not exist."
+REFUSED = "Operation not permitted."
+REFUSED_VERB = (
+    "Operation not permitted. Authorization for 'get' on "
+    "'purestorage.com/api/v2/policies/management-access/members' is required."
+)
+NOT_IN_FLEET = "Cannot find array in fleet"
+
+
+def _ok(items):
+    """A 200 answer holding items."""
+    res = Mock()
+    res.status_code = 200
+    res.items = items
+    return res
+
+
+def _err(status_code=400):
+    """An error answer: like the SDK's ErrorResponse it has no items.
+
+    The message is what the patched get_error_message returns.
+    """
+    res = Mock(spec=["status_code", "errors"])
+    res.status_code = status_code
+    res.errors = [Mock()]
+    return res
+
+
+def _role_obj(name="backup-operator", role_id="role-id-1", pure_defined=False):
+    """A role as GET management-access-policies/roles returns it."""
+    role = Mock()
+    role.name = name
+    role.id = role_id
+    role.pure_defined = pure_defined
+    return role
+
+
+def _rule(role_name="backup-operator", role_id="role-id-1"):
+    """A policy rule as GET management-access-policies/rules returns it."""
+    rule = Mock()
+    rule.name = "tenant-a-ops.1"
+    rule.role = Mock()
+    rule.role.name = role_name
+    rule.role.id = role_id
+    return rule
+
+
+def _module(check_mode=False, **overrides):
+    module = Mock()
+    module.params = _base_params(**overrides)
+    module.check_mode = check_mode
+    module.exit_json = Mock(side_effect=SystemExit)
+    module.fail_json = Mock(side_effect=SystemExit)
+    return module
+
+
+def _run(func, *args):
+    try:
+        func(*args)
+    except SystemExit:
+        pass
 
 
 class TestPurefbMgmtRole:
@@ -263,18 +334,16 @@ class TestPurefbMgmtRole:
 
         assert _get_role(mock_module, mock_blade, {}) is None
 
-    def test_get_role_returns_none_on_error(self):
-        """Test _get_role returns None on non-200 status"""
-        mock_module = Mock()
-        mock_module.params = _base_params()
+    @patch(GEM, return_value=ROLE_MISSING)
+    def test_get_role_returns_none_when_array_says_missing(self, mock_gem):
+        """Test _get_role returns None on the array's 400 for an unknown name"""
+        mock_module = _module()
 
         mock_blade = Mock()
-        get_response = Mock()
-        get_response.status_code = 400
-        get_response.items = []
-        mock_blade.get_management_access_policies_roles.return_value = get_response
+        mock_blade.get_management_access_policies_roles.return_value = _err()
 
         assert _get_role(mock_module, mock_blade, {}) is None
+        mock_module.fail_json.assert_not_called()
 
     # ---------------- _get_permissions ----------------
 
@@ -325,40 +394,35 @@ class TestPurefbMgmtRole:
     # ---------------- _role_referenced_by_rule ----------------
 
     def test_role_referenced_by_rule_true_when_match(self):
-        """Test _role_referenced_by_rule returns True when a rule's role.name matches"""
+        """Test _role_referenced_by_rule returns True when a rule grants the role"""
         mock_blade = Mock()
-        rule = Mock()
-        rule.role = Mock()
-        rule.role.name = "backup-operator"
-        res = Mock()
-        res.status_code = 200
-        res.items = [rule]
-        mock_blade.get_management_access_policies_rules.return_value = res
+        mock_blade.get_management_access_policies_rules.return_value = _ok([_rule()])
 
-        assert _role_referenced_by_rule(mock_blade, "backup-operator", {}) is True
+        assert _role_referenced_by_rule(_module(), mock_blade, _role_obj(), {}) is True
 
     def test_role_referenced_by_rule_false_when_no_match(self):
         """Test _role_referenced_by_rule returns False when no rule references the role"""
         mock_blade = Mock()
-        rule = Mock()
-        rule.role = Mock()
-        rule.role.name = "some-other-role"
-        res = Mock()
-        res.status_code = 200
-        res.items = [rule]
-        mock_blade.get_management_access_policies_rules.return_value = res
+        mock_blade.get_management_access_policies_rules.return_value = _ok(
+            [_rule(role_name="some-other-role", role_id="role-id-2")]
+        )
 
-        assert _role_referenced_by_rule(mock_blade, "backup-operator", {}) is False
+        assert _role_referenced_by_rule(_module(), mock_blade, _role_obj(), {}) is False
 
-    def test_role_referenced_by_rule_false_on_error(self):
-        """Test _role_referenced_by_rule returns False on non-200 status"""
+    @patch(GEM, return_value=REFUSED)
+    def test_role_referenced_by_rule_fails_on_error(self, mock_gem):
+        """Test _role_referenced_by_rule fails when the rules cannot be listed"""
+        mock_module = _module()
         mock_blade = Mock()
-        res = Mock()
-        res.status_code = 400
-        res.items = []
-        mock_blade.get_management_access_policies_rules.return_value = res
+        mock_blade.get_management_access_policies_rules.return_value = _err()
 
-        assert _role_referenced_by_rule(mock_blade, "backup-operator", {}) is False
+        _run(_role_referenced_by_rule, mock_module, mock_blade, _role_obj(), {})
+
+        mock_module.fail_json.assert_called_once()
+        msg = mock_module.fail_json.call_args[1]["msg"]
+        assert "Failed to list management access policy rules" in msg
+        assert "role backup-operator" in msg
+        assert msg.endswith("Error: Operation not permitted.")
 
     # ================ _delete_role ================
 
@@ -395,18 +459,10 @@ class TestPurefbMgmtRole:
         mock_module.fail_json = Mock(side_effect=SystemExit)
         mock_module.exit_json = Mock(side_effect=SystemExit)
 
-        existing = Mock()
-        existing.pure_defined = False
-
-        rule = Mock()
-        rule.role = Mock()
-        rule.role.name = "backup-operator"
-        rules_res = Mock()
-        rules_res.status_code = 200
-        rules_res.items = [rule]
+        existing = _role_obj()
 
         mock_blade = Mock()
-        mock_blade.get_management_access_policies_rules.return_value = rules_res
+        mock_blade.get_management_access_policies_rules.return_value = _ok([_rule()])
 
         try:
             _delete_role(mock_module, mock_blade, {}, existing)
@@ -1010,20 +1066,16 @@ class TestPurefbMgmtRole:
 
         assert _subject_exists(mock_module, mock_blade, "admin", {}) is False
 
-    def test_subject_exists_false_on_error(self):
-        """Test _subject_exists returns False when the lookup errors"""
-        mock_module = Mock()
-        mock_module.params = _base_params(
-            object="admin_attach", admin="ghost", policies=["p1"]
-        )
+    @patch(GEM, return_value=ADMIN_MISSING)
+    def test_subject_exists_false_when_array_says_missing(self, mock_gem):
+        """Test _subject_exists returns False on the array's 400 for an unknown admin"""
+        mock_module = _module(object="admin_attach", admin="ghost", policies=["p1"])
 
         mock_blade = Mock()
-        res = Mock()
-        res.status_code = 400
-        res.items = []
-        mock_blade.get_admins.return_value = res
+        mock_blade.get_admins.return_value = _err()
 
         assert _subject_exists(mock_module, mock_blade, "admin", {}) is False
+        mock_module.fail_json.assert_not_called()
 
     # ================ _handle_role dispatcher ================
 
@@ -2275,3 +2327,997 @@ class TestPurefbMgmtRole:
             "py-pure-client sdk is required"
             in mock_module.fail_json.call_args[1]["msg"]
         )
+
+
+class TestPurefbMgmtRoleRefusedReads:
+    """A read the array does not answer is reported, never read as absent."""
+
+    # ---------------- _read_named ----------------
+
+    def test_read_named_returns_items_on_200(self):
+        """Test _read_named returns the items of a 200 answer"""
+        mock_module = _module()
+        item = Mock()
+        assert _read_named(mock_module, _ok([item]), "role x") == [item]
+        mock_module.fail_json.assert_not_called()
+
+    @patch(GEM, return_value=ROLE_MISSING)
+    def test_read_named_empty_when_array_says_missing(self, mock_gem):
+        """Test _read_named reads only the array's does-not-exist as absent"""
+        mock_module = _module()
+        assert _read_named(mock_module, _err(), "role x") == []
+        mock_module.fail_json.assert_not_called()
+
+    @patch(GEM, return_value=REFUSED)
+    def test_read_named_fails_on_refused_read(self, mock_gem):
+        """Test _read_named fails with the array's message on a refused read"""
+        mock_module = _module()
+        _run(_read_named, mock_module, _err(), "role x")
+        mock_module.fail_json.assert_called_once_with(
+            msg="Failed to read role x. Error: Operation not permitted."
+        )
+
+    @patch(GEM, return_value="Unknown error")
+    def test_read_named_fails_on_server_error(self, mock_gem):
+        """Test _read_named fails on an answer that carries no usable message"""
+        mock_module = _module()
+        _run(_read_named, mock_module, _err(500), "admin x")
+        mock_module.fail_json.assert_called_once_with(
+            msg="Failed to read admin x. Error: Unknown error"
+        )
+
+    # ---------------- _get_role ----------------
+
+    @patch(GEM, return_value=ROLE_MISSING)
+    def test_get_role_realm_style_name_reads_as_missing(self, mock_gem):
+        """Test a realm-style role name gets the same does-not-exist answer"""
+        mock_module = _module(name="tenant1::backup-operator")
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_roles.return_value = _err()
+
+        assert _get_role(mock_module, mock_blade, {}) is None
+        mock_blade.get_management_access_policies_roles.assert_called_once_with(
+            names=["tenant1::backup-operator"]
+        )
+        mock_module.fail_json.assert_not_called()
+
+    @patch(GEM, return_value=REFUSED)
+    def test_get_role_fails_on_refused_read(self, mock_gem):
+        """Test _get_role fails when the array refuses the read"""
+        mock_module = _module()
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_roles.return_value = _err()
+
+        _run(_get_role, mock_module, mock_blade, {})
+
+        mock_module.fail_json.assert_called_once_with(
+            msg="Failed to read role backup-operator. Error: Operation not permitted."
+        )
+
+    @patch(GEM, return_value=REFUSED_VERB)
+    def test_get_role_fails_on_refusal_naming_the_verb(self, mock_gem):
+        """Test the longer refusal text of a custom role is not read as absent"""
+        mock_module = _module()
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_roles.return_value = _err()
+
+        _run(_get_role, mock_module, mock_blade, {})
+
+        mock_module.fail_json.assert_called_once()
+        msg = mock_module.fail_json.call_args[1]["msg"]
+        assert msg.startswith("Failed to read role backup-operator. Error: ")
+        assert msg.endswith(REFUSED_VERB)
+
+    @patch(GEM, return_value=NOT_IN_FLEET)
+    def test_get_role_fails_on_unknown_context(self, mock_gem):
+        """Test a context that is not a fleet member is reported, not absent"""
+        mock_module = _module(context="other-array")
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_roles.return_value = _err()
+
+        _run(_get_role, mock_module, mock_blade, {"context_names": ["other-array"]})
+
+        mock_blade.get_management_access_policies_roles.assert_called_once_with(
+            names=["backup-operator"], context_names=["other-array"]
+        )
+        mock_module.fail_json.assert_called_once_with(
+            msg="Failed to read role backup-operator. Error: Cannot find array in fleet"
+        )
+
+    # ---------------- _subject_exists ----------------
+
+    @patch(GEM, return_value=DS_ROLE_MISSING)
+    def test_subject_exists_false_when_mapping_missing(self, mock_gem):
+        """Test a role mapping the array does not know reads as missing"""
+        mock_module = _module(
+            object="ds_attach", ds_role="tenant-a-admins", policies=["p1"]
+        )
+        mock_blade = Mock()
+        mock_blade.get_directory_services_roles.return_value = _err()
+
+        assert _subject_exists(mock_module, mock_blade, "ds_role", {}) is False
+        mock_module.fail_json.assert_not_called()
+
+    @patch(GEM, return_value=ADMIN_MISSING)
+    def test_subject_exists_false_for_realm_style_admin(self, mock_gem):
+        """Test a realm-style admin name gets the same does-not-exist answer"""
+        mock_module = _module(
+            object="admin_attach", admin="tenant1::svc-automation", policies=["p1"]
+        )
+        mock_blade = Mock()
+        mock_blade.get_admins.return_value = _err()
+
+        assert _subject_exists(mock_module, mock_blade, "admin", {}) is False
+        mock_blade.get_admins.assert_called_once_with(names=["tenant1::svc-automation"])
+        mock_module.fail_json.assert_not_called()
+
+    @patch(GEM, return_value=REFUSED)
+    def test_subject_exists_fails_on_refused_mapping_read(self, mock_gem):
+        """Test a refused read of the role mapping fails the task"""
+        mock_module = _module(
+            object="ds_attach", ds_role="tenant-a-admins", policies=["p1"]
+        )
+        mock_blade = Mock()
+        mock_blade.get_directory_services_roles.return_value = _err()
+
+        _run(_subject_exists, mock_module, mock_blade, "ds_role", {})
+
+        mock_module.fail_json.assert_called_once_with(
+            msg="Failed to read ds_role tenant-a-admins. Error: Operation not permitted."
+        )
+
+    @patch(GEM, return_value=NOT_IN_FLEET)
+    def test_subject_exists_fails_on_refused_admin_read(self, mock_gem):
+        """Test a failed read of the admin fails the task"""
+        mock_module = _module(
+            object="admin_attach", admin="svc-automation", policies=["p1"]
+        )
+        mock_blade = Mock()
+        mock_blade.get_admins.return_value = _err()
+
+        _run(_subject_exists, mock_module, mock_blade, "admin", {})
+
+        mock_module.fail_json.assert_called_once_with(
+            msg="Failed to read admin svc-automation. Error: Cannot find array in fleet"
+        )
+
+    # ---------------- _handle_role ----------------
+
+    @patch(GEM, return_value=REFUSED)
+    @patch(LOOSE)
+    def test_handle_role_present_refused_read_sends_no_create(
+        self, mock_loose_version, mock_gem
+    ):
+        """Test an existing role the caller may not read is not created again"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module()
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_roles.return_value = _err()
+
+        _run(_handle_role, mock_module, mock_blade, "2.30", {})
+
+        mock_module.fail_json.assert_called_once_with(
+            msg="Failed to read role backup-operator. Error: Operation not permitted."
+        )
+        mock_blade.post_management_access_policies_roles.assert_not_called()
+        mock_module.exit_json.assert_not_called()
+
+    @patch(GEM, return_value=REFUSED)
+    @patch(LOOSE)
+    def test_handle_role_present_refused_read_check_mode(
+        self, mock_loose_version, mock_gem
+    ):
+        """Test check mode reports the refused read instead of a change"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(check_mode=True)
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_roles.return_value = _err()
+
+        _run(_handle_role, mock_module, mock_blade, "2.30", {})
+
+        mock_module.fail_json.assert_called_once()
+        assert "Failed to read role" in mock_module.fail_json.call_args[1]["msg"]
+        mock_module.exit_json.assert_not_called()
+
+    @patch(GEM, return_value=REFUSED)
+    @patch(LOOSE)
+    def test_handle_role_absent_refused_read_is_not_ok(
+        self, mock_loose_version, mock_gem
+    ):
+        """Test state=absent does not report ok when the role cannot be read"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(state="absent")
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_roles.return_value = _err()
+
+        _run(_handle_role, mock_module, mock_blade, "2.30", {})
+
+        mock_module.fail_json.assert_called_once_with(
+            msg="Failed to read role backup-operator. Error: Operation not permitted."
+        )
+        mock_module.exit_json.assert_not_called()
+        mock_blade.delete_management_access_policies_roles.assert_not_called()
+
+    @patch(GEM, return_value=ROLE_MISSING)
+    @patch(LOOSE)
+    def test_handle_role_absent_realm_style_name_is_noop(
+        self, mock_loose_version, mock_gem
+    ):
+        """Test state=absent on a realm-style name the array does not know is ok"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(state="absent", name="tenant1::backup-operator")
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_roles.return_value = _err()
+
+        _run(_handle_role, mock_module, mock_blade, "2.30", {})
+
+        mock_module.fail_json.assert_not_called()
+        mock_module.exit_json.assert_called_once_with(changed=False)
+
+    @patch(GEM, return_value=ROLE_MISSING)
+    @patch(LOOSE)
+    def test_handle_role_absent_missing_role_is_noop(
+        self, mock_loose_version, mock_gem
+    ):
+        """Test state=absent on an array-level role that does not exist is ok"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(state="absent")
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_roles.return_value = _err()
+
+        _run(_handle_role, mock_module, mock_blade, "2.30", {})
+
+        mock_module.fail_json.assert_not_called()
+        mock_module.exit_json.assert_called_once_with(changed=False)
+        mock_blade.get_management_access_policies_rules.assert_not_called()
+
+    @patch(GEM, return_value=ROLE_MISSING)
+    @patch(LOOSE)
+    def test_handle_role_present_missing_role_check_mode_creates(
+        self, mock_loose_version, mock_gem
+    ):
+        """Test a role the array does not know is still created (check mode)"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(check_mode=True)
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_roles.return_value = _err()
+
+        _run(_handle_role, mock_module, mock_blade, "2.30", {})
+
+        mock_module.fail_json.assert_not_called()
+        mock_module.exit_json.assert_called_once_with(changed=True)
+        mock_blade.post_management_access_policies_roles.assert_not_called()
+
+    # ---------------- _handle_attach ----------------
+
+    @patch(GEM, return_value=REFUSED)
+    @patch(LOOSE)
+    def test_handle_attach_present_refused_mapping_read(
+        self, mock_loose_version, mock_gem
+    ):
+        """Test ds_attach reports the refused read, not a missing mapping"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(
+            check_mode=True,
+            object="ds_attach",
+            ds_role="tenant-a-admins",
+            policies=["tenant-a-ops"],
+        )
+        mock_blade = Mock()
+        mock_blade.get_directory_services_roles.return_value = _err()
+
+        _run(_handle_attach, mock_module, mock_blade, "2.30", {}, "ds_role")
+
+        mock_module.fail_json.assert_called_once_with(
+            msg="Failed to read ds_role tenant-a-admins. Error: Operation not permitted."
+        )
+        mock_module.exit_json.assert_not_called()
+
+    @patch(GEM, return_value=REFUSED)
+    @patch(LOOSE)
+    def test_handle_attach_absent_refused_mapping_read_is_not_ok(
+        self, mock_loose_version, mock_gem
+    ):
+        """Test a detach does not report ok when the mapping cannot be read"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(
+            object="ds_attach",
+            state="absent",
+            ds_role="tenant-a-admins",
+            policies=["tenant-a-ops"],
+        )
+        mock_blade = Mock()
+        mock_blade.get_directory_services_roles.return_value = _err()
+
+        _run(_handle_attach, mock_module, mock_blade, "2.30", {}, "ds_role")
+
+        mock_module.fail_json.assert_called_once_with(
+            msg="Failed to read ds_role tenant-a-admins. Error: Operation not permitted."
+        )
+        mock_module.exit_json.assert_not_called()
+        mock_blade.delete_management_access_policies_directory_services_roles.assert_not_called()
+
+    @patch(GEM, return_value=REFUSED)
+    @patch(LOOSE)
+    def test_handle_attach_absent_refused_admin_read_is_not_ok(
+        self, mock_loose_version, mock_gem
+    ):
+        """Test an admin detach does not report ok when the admin cannot be read"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(
+            object="admin_attach",
+            state="absent",
+            admin="svc-automation",
+            policies=["tenant-a-ops"],
+        )
+        mock_blade = Mock()
+        mock_blade.get_admins.return_value = _err()
+
+        _run(_handle_attach, mock_module, mock_blade, "2.30", {}, "admin")
+
+        mock_module.fail_json.assert_called_once_with(
+            msg="Failed to read admin svc-automation. Error: Operation not permitted."
+        )
+        mock_module.exit_json.assert_not_called()
+
+    @patch(GEM, return_value=ADMIN_MISSING)
+    @patch(LOOSE)
+    def test_handle_attach_realm_style_admin_does_not_exist(
+        self, mock_loose_version, mock_gem
+    ):
+        """Test attaching to a realm-style admin name fails as a missing admin"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(
+            object="admin_attach",
+            admin="tenant1::svc-automation",
+            policies=["tenant-a-ops"],
+        )
+        mock_blade = Mock()
+        mock_blade.get_admins.return_value = _err()
+
+        _run(_handle_attach, mock_module, mock_blade, "2.30", {}, "admin")
+
+        mock_module.fail_json.assert_called_once_with(
+            msg="admin tenant1::svc-automation does not exist"
+        )
+        mock_blade.post_management_access_policies_admins.assert_not_called()
+
+    @patch(GEM, return_value=DS_ROLE_MISSING)
+    @patch(LOOSE)
+    def test_handle_attach_absent_missing_mapping_is_noop(
+        self, mock_loose_version, mock_gem
+    ):
+        """Test detaching from a mapping the array does not know stays a no-op"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(
+            object="ds_attach",
+            state="absent",
+            ds_role="tenant1::tenant-a-admins",
+            policies=["tenant-a-ops"],
+        )
+        mock_blade = Mock()
+        mock_blade.get_directory_services_roles.return_value = _err()
+
+        _run(_handle_attach, mock_module, mock_blade, "2.30", {}, "ds_role")
+
+        mock_module.fail_json.assert_not_called()
+        mock_module.exit_json.assert_called_once_with(changed=False)
+
+    @patch(LOOSE)
+    def test_handle_attach_realm_scoped_policy_uses_bare_name(self, mock_loose_version):
+        """Test a realm-scoped policy is attached to an admin under its bare name"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(
+            object="admin_attach", admin="svc-automation", policies=["tenant-a-ops"]
+        )
+        attached = Mock()
+        attached.policy = Mock()
+        attached.policy.name = "readonly"
+        mock_blade = Mock()
+        mock_blade.get_admins.return_value = _ok([Mock()])
+        mock_blade.get_management_access_policies_admins.return_value = _ok([attached])
+        mock_blade.post_management_access_policies_admins.return_value = _ok([])
+
+        _run(_handle_attach, mock_module, mock_blade, "2.30", {}, "admin")
+
+        mock_blade.post_management_access_policies_admins.assert_called_once_with(
+            member_names=["svc-automation"], policy_names=["tenant-a-ops"]
+        )
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    # ---------------- main ----------------
+
+    @patch(GEM, return_value=REFUSED)
+    @patch(LOOSE)
+    @patch("plugins.modules.purefb_mgmt_role.get_system")
+    @patch("plugins.modules.purefb_mgmt_role.AnsibleModule")
+    @patch("plugins.modules.purefb_mgmt_role.HAS_PYPURECLIENT", True)
+    def test_main_role_absent_refused_read_fails(
+        self, mock_ansible_module, mock_get_system, mock_loose_version, mock_gem
+    ):
+        """Test main does not report ok for state=absent on a refused read"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(state="absent")
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_roles.return_value = _err()
+        mock_get_system.return_value = mock_blade
+
+        _run(main)
+
+        mock_module.fail_json.assert_called_once_with(
+            msg="Failed to read role backup-operator. Error: Operation not permitted."
+        )
+        mock_module.exit_json.assert_not_called()
+        mock_blade.delete_management_access_policies_roles.assert_not_called()
+
+    @patch(GEM, return_value=REFUSED)
+    @patch(LOOSE)
+    @patch("plugins.modules.purefb_mgmt_role.get_system")
+    @patch("plugins.modules.purefb_mgmt_role.AnsibleModule")
+    @patch("plugins.modules.purefb_mgmt_role.HAS_PYPURECLIENT", True)
+    def test_main_ds_attach_refused_read_fails(
+        self, mock_ansible_module, mock_get_system, mock_loose_version, mock_gem
+    ):
+        """Test main reports a refused mapping read for object=ds_attach"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(
+            object="ds_attach", ds_role="tenant-a-admins", policies=["tenant-a-ops"]
+        )
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_blade.get_directory_services_roles.return_value = _err()
+        mock_get_system.return_value = mock_blade
+
+        _run(main)
+
+        mock_module.fail_json.assert_called_once_with(
+            msg="Failed to read ds_role tenant-a-admins. Error: Operation not permitted."
+        )
+        mock_blade.post_management_access_policies_directory_services_roles.assert_not_called()
+
+
+class TestPurefbMgmtRoleDeleteGuardCase:
+    """The delete guard holds whatever letter case the task uses."""
+
+    # ---------------- _role_referenced_by_rule ----------------
+
+    def test_referenced_by_id_under_case_variant(self):
+        """Test a rule matches the stored role when the task uses another case"""
+        mock_module = _module(name="BACKUP-Operator", state="absent")
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_rules.return_value = _ok(
+            [_rule(role_name="other", role_id="role-id-9"), _rule()]
+        )
+
+        assert (
+            _role_referenced_by_rule(mock_module, mock_blade, _role_obj(), {}) is True
+        )
+
+    def test_referenced_by_lowercased_name_without_ids(self):
+        """Test names are compared lower-cased when a reference has no id"""
+        mock_module = _module(name="backup-operator", state="absent")
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_rules.return_value = _ok(
+            [_rule(role_name="backup-operator", role_id=None)]
+        )
+        stored = _role_obj(name="Backup-Operator", role_id=None)
+
+        assert _role_referenced_by_rule(mock_module, mock_blade, stored, {}) is True
+
+    def test_referenced_by_id_when_reference_has_no_name(self):
+        """Test the id alone identifies the role"""
+        mock_module = _module(state="absent")
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_rules.return_value = _ok(
+            [_rule(role_name=None, role_id="role-id-1")]
+        )
+
+        assert (
+            _role_referenced_by_rule(mock_module, mock_blade, _role_obj(), {}) is True
+        )
+
+    def test_rule_without_role_is_skipped(self):
+        """Test a rule that carries no role reference does not match or crash"""
+        mock_module = _module(state="absent")
+        orphan = Mock()
+        orphan.role = None
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_rules.return_value = _ok(
+            [orphan, _rule(role_name="viewer", role_id="role-id-2")]
+        )
+
+        assert (
+            _role_referenced_by_rule(mock_module, mock_blade, _role_obj(), {}) is False
+        )
+
+    def test_rules_listing_uses_the_context(self):
+        """Test the rule listing is read in the context of the task"""
+        mock_module = _module(state="absent", context="other-array")
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_rules.return_value = _ok([])
+
+        assert (
+            _role_referenced_by_rule(
+                mock_module,
+                mock_blade,
+                _role_obj(),
+                {"context_names": ["other-array"]},
+            )
+            is False
+        )
+        mock_blade.get_management_access_policies_rules.assert_called_once_with(
+            context_names=["other-array"]
+        )
+
+    # ---------------- _delete_role ----------------
+
+    def test_delete_refused_under_case_variant(self):
+        """Test no DELETE is sent for a granted role named in another case"""
+        mock_module = _module(name="BACKUP-OPERATOR", state="absent")
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_rules.return_value = _ok([_rule()])
+
+        _run(_delete_role, mock_module, mock_blade, {}, _role_obj())
+
+        mock_module.fail_json.assert_called_once()
+        msg = mock_module.fail_json.call_args[1]["msg"]
+        assert "Role BACKUP-OPERATOR is referenced by one or more policy rules" in msg
+        mock_blade.delete_management_access_policies_roles.assert_not_called()
+        mock_module.exit_json.assert_not_called()
+
+    def test_delete_refused_under_case_variant_check_mode(self):
+        """Test check mode predicts the refusal instead of a change"""
+        mock_module = _module(check_mode=True, name="BACKUP-OPERATOR", state="absent")
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_rules.return_value = _ok([_rule()])
+
+        _run(_delete_role, mock_module, mock_blade, {}, _role_obj())
+
+        mock_module.fail_json.assert_called_once()
+        assert "is referenced by" in mock_module.fail_json.call_args[1]["msg"]
+        mock_module.exit_json.assert_not_called()
+        mock_blade.delete_management_access_policies_roles.assert_not_called()
+
+    @patch(GEM, return_value=REFUSED_VERB)
+    def test_delete_not_sent_when_rules_cannot_be_listed(self, mock_gem):
+        """Test no DELETE is sent when the guard cannot be evaluated"""
+        mock_module = _module(state="absent")
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_rules.return_value = _err()
+
+        _run(_delete_role, mock_module, mock_blade, {}, _role_obj())
+
+        mock_module.fail_json.assert_called_once()
+        msg = mock_module.fail_json.call_args[1]["msg"]
+        assert msg.startswith("Failed to list management access policy rules")
+        assert msg.endswith(REFUSED_VERB)
+        mock_blade.delete_management_access_policies_roles.assert_not_called()
+        mock_module.exit_json.assert_not_called()
+
+    def test_delete_unreferenced_role_under_case_variant(self):
+        """Test a role no rule grants is deleted under the task's spelling"""
+        mock_module = _module(name="BACKUP-OPERATOR", state="absent")
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_rules.return_value = _ok(
+            [_rule(role_name="viewer", role_id="role-id-2")]
+        )
+        mock_blade.delete_management_access_policies_roles.return_value = _ok([])
+
+        _run(_delete_role, mock_module, mock_blade, {}, _role_obj())
+
+        mock_module.fail_json.assert_not_called()
+        mock_blade.delete_management_access_policies_roles.assert_called_once_with(
+            names=["BACKUP-OPERATOR"]
+        )
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    # ---------------- main ----------------
+
+    @patch(LOOSE)
+    @patch("plugins.modules.purefb_mgmt_role.get_system")
+    @patch("plugins.modules.purefb_mgmt_role.AnsibleModule")
+    @patch("plugins.modules.purefb_mgmt_role.HAS_PYPURECLIENT", True)
+    def test_main_delete_refused_under_case_variant(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        """Test main refuses to delete a granted role named in another case"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(name="Backup-Operator", state="absent")
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_roles.return_value = _ok(
+            [_role_obj()]
+        )
+        mock_blade.get_management_access_policies_rules.return_value = _ok(
+            [_rule(role_name="admin", role_id="role-id-0"), _rule()]
+        )
+        mock_get_system.return_value = mock_blade
+
+        _run(main)
+
+        mock_blade.get_management_access_policies_roles.assert_called_once_with(
+            names=["Backup-Operator"]
+        )
+        mock_module.fail_json.assert_called_once()
+        assert "is referenced by" in mock_module.fail_json.call_args[1]["msg"]
+        mock_blade.delete_management_access_policies_roles.assert_not_called()
+
+
+def _attached(policy_name):
+    """A policy membership as GET management-access-policies/admins returns it."""
+    member = Mock()
+    member.policy = Mock()
+    member.policy.name = policy_name
+    return member
+
+
+def _ds_roles_get(names=None):
+    """Like the SDK's get_directory_services_roles: it takes no context_names."""
+    return _ok([Mock()])
+
+
+class TestPurefbMgmtRoleOneName:
+    """A task manages one role, one admin or one role mapping."""
+
+    # ---------------- _validate_role_name ----------------
+
+    def test_validate_role_name_rejects_list_of_names(self):
+        """Test a comma, which the array reads as a separator of names, is refused"""
+        mock_module = _module()
+
+        _run(_validate_role_name, mock_module, "backup-operator,viewer")
+
+        mock_module.fail_json.assert_called_once_with(
+            msg=(
+                "Role name backup-operator,viewer must be the name of one role: "
+                "the array reads a comma as a separator of names and * as a "
+                "pattern."
+            )
+        )
+
+    def test_validate_role_name_rejects_pattern(self):
+        """Test a *, which the array reads as a pattern, is refused"""
+        mock_module = _module()
+
+        _run(_validate_role_name, mock_module, "backup-*")
+
+        mock_module.fail_json.assert_called_once()
+        msg = mock_module.fail_json.call_args[1]["msg"]
+        assert msg.startswith("Role name backup-* must be the name of one role")
+
+    def test_validate_role_name_accepts_every_legal_character(self):
+        """Test letters, digits, hyphen and underscore pass"""
+        mock_module = _module()
+
+        _validate_role_name(mock_module, "Backup_operator-2")
+
+        mock_module.fail_json.assert_not_called()
+
+    # ---------------- _handle_role ----------------
+
+    @patch(LOOSE)
+    def test_handle_role_absent_list_is_not_deleted_on_its_first_role(
+        self, mock_loose_version
+    ):
+        """Test a list whose second role a rule grants sends no DELETE"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(state="absent", name="free-role,backup-operator")
+        mock_blade = Mock()
+        # The array answers a list of names with every role on it.
+        mock_blade.get_management_access_policies_roles.return_value = _ok(
+            [_role_obj(name="free-role", role_id="role-id-7"), _role_obj()]
+        )
+        mock_blade.get_management_access_policies_rules.return_value = _ok([_rule()])
+        mock_blade.delete_management_access_policies_roles.return_value = _ok([])
+
+        _run(_handle_role, mock_module, mock_blade, "2.30", {})
+
+        mock_module.fail_json.assert_called_once()
+        msg = mock_module.fail_json.call_args[1]["msg"]
+        assert "must be the name of one role" in msg
+        mock_blade.get_management_access_policies_roles.assert_not_called()
+        mock_blade.delete_management_access_policies_roles.assert_not_called()
+        mock_module.exit_json.assert_not_called()
+
+    @patch(LOOSE)
+    def test_handle_role_absent_pattern_check_mode_predicts_no_change(
+        self, mock_loose_version
+    ):
+        """Test check mode refuses a pattern instead of predicting a delete"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(check_mode=True, state="absent", name="backup-*")
+        mock_blade = Mock()
+        # The array answers a pattern with every role that matches it.
+        mock_blade.get_management_access_policies_roles.return_value = _ok(
+            [_role_obj(name="backup-free", role_id="role-id-7"), _role_obj()]
+        )
+        mock_blade.get_management_access_policies_rules.return_value = _ok([_rule()])
+
+        _run(_handle_role, mock_module, mock_blade, "2.30", {})
+
+        mock_module.fail_json.assert_called_once()
+        assert (
+            "must be the name of one role" in mock_module.fail_json.call_args[1]["msg"]
+        )
+        mock_module.exit_json.assert_not_called()
+        mock_blade.delete_management_access_policies_roles.assert_not_called()
+
+    @patch(LOOSE)
+    def test_handle_role_absent_list_with_builtin_role_is_refused(
+        self, mock_loose_version
+    ):
+        """Test a built-in role behind a custom one on a list is not addressed"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(state="absent", name="free-role,viewer")
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_roles.return_value = _ok(
+            [
+                _role_obj(name="free-role", role_id="role-id-7"),
+                _role_obj(name="viewer", role_id="role-id-8", pure_defined=True),
+            ]
+        )
+        mock_blade.get_management_access_policies_rules.return_value = _ok([])
+        mock_blade.delete_management_access_policies_roles.return_value = _ok([])
+
+        _run(_handle_role, mock_module, mock_blade, "2.30", {})
+
+        mock_module.fail_json.assert_called_once()
+        mock_blade.delete_management_access_policies_roles.assert_not_called()
+        mock_module.exit_json.assert_not_called()
+
+    @patch(LOOSE)
+    def test_handle_role_present_pattern_is_not_an_existing_role(
+        self, mock_loose_version
+    ):
+        """Test a pattern that matches a role does not report that role as present"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(name="backup-*")
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_roles.return_value = _ok(
+            [_role_obj()]
+        )
+
+        _run(_handle_role, mock_module, mock_blade, "2.30", {})
+
+        mock_module.fail_json.assert_called_once()
+        mock_module.exit_json.assert_not_called()
+        mock_blade.get_management_access_policies_roles.assert_not_called()
+
+    # ---------------- _handle_attach ----------------
+
+    @patch(LOOSE)
+    def test_handle_attach_admin_list_is_not_read_as_one_admin(
+        self, mock_loose_version
+    ):
+        """Test a policy one admin of a list holds does not count for the other"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(
+            object="admin_attach", admin="svc-a,svc-b", policies=["tenant-a-ops"]
+        )
+        mock_blade = Mock()
+        # The array answers a list of members with the policies of all of them.
+        mock_blade.get_admins.return_value = _ok([Mock(), Mock()])
+        mock_blade.get_management_access_policies_admins.return_value = _ok(
+            [_attached("tenant-a-ops")]
+        )
+
+        _run(_handle_attach, mock_module, mock_blade, "2.30", {}, "admin")
+
+        mock_module.fail_json.assert_called_once_with(
+            msg=(
+                "admin svc-a,svc-b must be the name of one admin: the array "
+                "reads a comma as a separator of names."
+            )
+        )
+        mock_module.exit_json.assert_not_called()
+        mock_blade.get_admins.assert_not_called()
+        mock_blade.post_management_access_policies_admins.assert_not_called()
+
+    @patch(LOOSE)
+    def test_handle_attach_admin_list_detach_sends_nothing(self, mock_loose_version):
+        """Test a detach from a list of admins is refused before any request"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(
+            object="admin_attach",
+            state="absent",
+            admin="svc-a,svc-b",
+            policies=["tenant-a-ops"],
+        )
+        mock_blade = Mock()
+        mock_blade.get_admins.return_value = _ok([Mock(), Mock()])
+        mock_blade.get_management_access_policies_admins.return_value = _ok(
+            [_attached("tenant-a-ops")]
+        )
+        mock_blade.delete_management_access_policies_admins.return_value = _ok([])
+
+        _run(_handle_attach, mock_module, mock_blade, "2.30", {}, "admin")
+
+        mock_module.fail_json.assert_called_once()
+        assert (
+            "must be the name of one admin" in mock_module.fail_json.call_args[1]["msg"]
+        )
+        mock_blade.delete_management_access_policies_admins.assert_not_called()
+        mock_module.exit_json.assert_not_called()
+
+    @patch(LOOSE)
+    def test_handle_attach_mapping_list_is_not_read_as_one_mapping(
+        self, mock_loose_version
+    ):
+        """Test a list of role mappings is refused, check mode included"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(
+            check_mode=True,
+            object="ds_attach",
+            ds_role="tenant-a-admins,tenant-b-admins",
+            policies=["tenant-a-ops"],
+        )
+        mock_blade = Mock()
+        mock_blade.get_directory_services_roles.return_value = _ok([Mock(), Mock()])
+        mock_blade.get_management_access_policies_directory_services_roles.return_value = _ok(
+            [_attached("tenant-a-ops")]
+        )
+
+        _run(_handle_attach, mock_module, mock_blade, "2.30", {}, "ds_role")
+
+        mock_module.fail_json.assert_called_once_with(
+            msg=(
+                "ds_role tenant-a-admins,tenant-b-admins must be the name of one "
+                "role mapping: the array reads a comma as a separator of names."
+            )
+        )
+        mock_module.exit_json.assert_not_called()
+        mock_blade.get_directory_services_roles.assert_not_called()
+
+    # ---------------- ds_attach and a fleet context ----------------
+
+    @patch(LOOSE)
+    def test_handle_attach_mapping_with_context_fails_with_a_message(
+        self, mock_loose_version
+    ):
+        """Test ds_attach with a context is refused, not passed to the SDK"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(
+            object="ds_attach",
+            ds_role="tenant-a-admins",
+            policies=["tenant-a-ops"],
+            context="other-array",
+        )
+        mock_blade = Mock()
+        mock_blade.get_directory_services_roles = Mock(side_effect=_ds_roles_get)
+
+        _run(
+            _handle_attach,
+            mock_module,
+            mock_blade,
+            "2.30",
+            {"context_names": ["other-array"]},
+            "ds_role",
+        )
+
+        mock_module.fail_json.assert_called_once_with(
+            msg=(
+                "context is not supported with object=ds_attach: the REST API "
+                "offers no fleet context for directory-service role mappings."
+            )
+        )
+        mock_blade.get_directory_services_roles.assert_not_called()
+        mock_module.exit_json.assert_not_called()
+
+    @patch(LOOSE)
+    def test_handle_attach_mapping_detach_with_context_check_mode(
+        self, mock_loose_version
+    ):
+        """Test the refusal comes in check mode and for a detach as well"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(
+            check_mode=True,
+            object="ds_attach",
+            state="absent",
+            ds_role="tenant-a-admins",
+            policies=["tenant-a-ops"],
+            context="other-array",
+        )
+        mock_blade = Mock()
+        mock_blade.get_directory_services_roles = Mock(side_effect=_ds_roles_get)
+
+        _run(
+            _handle_attach,
+            mock_module,
+            mock_blade,
+            "2.30",
+            {"context_names": ["other-array"]},
+            "ds_role",
+        )
+
+        mock_module.fail_json.assert_called_once()
+        assert "context is not supported" in mock_module.fail_json.call_args[1]["msg"]
+        mock_blade.get_directory_services_roles.assert_not_called()
+        mock_module.exit_json.assert_not_called()
+
+    @patch(LOOSE)
+    def test_handle_attach_admin_with_context_still_uses_it(self, mock_loose_version):
+        """Test admin_attach keeps sending the context with every call"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(
+            object="admin_attach",
+            admin="svc-automation",
+            policies=["tenant-a-ops"],
+            context="other-array",
+        )
+        ctx = {"context_names": ["other-array"]}
+        mock_blade = Mock()
+        mock_blade.get_admins.return_value = _ok([Mock()])
+        mock_blade.get_management_access_policies_admins.return_value = _ok([])
+        mock_blade.post_management_access_policies_admins.return_value = _ok([])
+
+        _run(_handle_attach, mock_module, mock_blade, "2.30", ctx, "admin")
+
+        mock_module.fail_json.assert_not_called()
+        mock_blade.get_admins.assert_called_once_with(
+            names=["svc-automation"], context_names=["other-array"]
+        )
+        mock_blade.post_management_access_policies_admins.assert_called_once_with(
+            member_names=["svc-automation"],
+            policy_names=["tenant-a-ops"],
+            context_names=["other-array"],
+        )
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    # ---------------- main ----------------
+
+    @patch(LOOSE)
+    @patch("plugins.modules.purefb_mgmt_role.get_system")
+    @patch("plugins.modules.purefb_mgmt_role.AnsibleModule")
+    @patch("plugins.modules.purefb_mgmt_role.HAS_PYPURECLIENT", True)
+    def test_main_role_absent_list_sends_no_delete(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        """Test main refuses a list of roles before the array is asked"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_module = _module(state="absent", name="free-role,backup-operator")
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_blade.get_management_access_policies_roles.return_value = _ok(
+            [_role_obj(name="free-role", role_id="role-id-7"), _role_obj()]
+        )
+        mock_blade.get_management_access_policies_rules.return_value = _ok([_rule()])
+        mock_blade.delete_management_access_policies_roles.return_value = _ok([])
+        mock_get_system.return_value = mock_blade
+
+        _run(main)
+
+        mock_module.fail_json.assert_called_once()
+        assert (
+            "must be the name of one role" in mock_module.fail_json.call_args[1]["msg"]
+        )
+        mock_blade.delete_management_access_policies_roles.assert_not_called()
+        mock_module.exit_json.assert_not_called()
+
+    @patch(LOOSE)
+    @patch("plugins.modules.purefb_mgmt_role.get_system")
+    @patch("plugins.modules.purefb_mgmt_role.AnsibleModule")
+    @patch("plugins.modules.purefb_mgmt_role.HAS_PYPURECLIENT", True)
+    def test_main_ds_attach_with_context_fails_with_a_message(
+        self, mock_ansible_module, mock_get_system, mock_loose_version
+    ):
+        """Test main reports that ds_attach takes no context"""
+        mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+        mock_loose_version.return_value.__le__ = Mock(return_value=True)
+        mock_module = _module(
+            object="ds_attach",
+            ds_role="tenant-a-admins",
+            policies=["tenant-a-ops"],
+            context="other-array",
+        )
+        mock_ansible_module.return_value = mock_module
+        mock_blade = Mock()
+        mock_blade.get_directory_services_roles = Mock(side_effect=_ds_roles_get)
+        mock_get_system.return_value = mock_blade
+
+        _run(main)
+
+        mock_module.fail_json.assert_called_once()
+        assert "context is not supported" in mock_module.fail_json.call_args[1]["msg"]
+        mock_blade.get_directory_services_roles.assert_not_called()
+        mock_blade.post_management_access_policies_directory_services_roles.assert_not_called()

@@ -1,0 +1,3 @@
+bugfixes:
+  - purefb_inventory - a hardware read that the array refuses or fails is reported with the message
+    of the array instead of a traceback.

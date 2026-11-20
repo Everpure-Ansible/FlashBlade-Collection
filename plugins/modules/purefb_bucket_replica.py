@@ -30,11 +30,19 @@ description:
     - The array itself refuses to pause a link whose set-up has not completed,
       for example when the target bucket has no versioning enabled; the
       failure message then includes the link's status details.
+    - A replica link belongs to the realm of its local bucket. For a bucket
+      in a realm give I(name) as C(realm::bucket) and I(credential) as
+      C(realm::credential), and use an S3 target that is shared with the
+      realm as I(target).
+    - A realm-scoped administrator must use the realm-qualified names; a bare
+      name is not placed in, or resolved to, the administrator's realm.
 author: Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
   name:
     description:
       - Local Bucket Name.
+      - A bucket in a realm is named C(realm::bucket). Its replica link
+        belongs to the same realm.
     required: true
     type: str
   state:
@@ -47,12 +55,17 @@ options:
   target:
     description:
       - Remote array or target name to create replica on.
+      - The name of a target never carries a realm prefix. For a bucket in a
+        realm use an S3 target that has been shared with the realm, see
+        M(everpure.flashblade.purefb_resource_access).
     required: false
     type: str
   target_bucket:
     description:
       - Name of target bucket name
-      - If not supplied, will default to I(name).
+      - If not supplied, will default to I(name). For a bucket in a realm
+        that replicates to an S3 target the array stores this default without
+        the realm prefix.
     type: str
     required: false
   paused:
@@ -63,7 +76,13 @@ options:
     default: false
   credential:
     description:
-      - Name of remote credential name to use.
+      - Name of remote credential name to use, without the name of its
+        target.
+      - For a bucket in a realm use a remote credential of the same realm,
+        named C(realm::credential).
+      - The task fails, and nothing is changed, when I(name) and
+        I(credential) are not in the same realm.
+      - The name is not case sensitive.
     required: false
     type: str
   cascading:
@@ -93,6 +112,16 @@ EXAMPLES = """
     target: arrayB
     target_bucket: bar
     credential: cred_1
+    state: present
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Create new bucket replica for bucket foo of realm realm1 to S3 target s3target
+  everpure.flashblade.purefb_bucket_replica:
+    name: realm1::foo
+    target: s3target
+    target_bucket: bar
+    credential: realm1::cred_1
     state: present
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
@@ -142,6 +171,68 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
 )
 
 
+def _realm_of(name):
+    """Return the realm of a realm::name name, empty for an array-level name"""
+    return name.rpartition("::")[0].strip()
+
+
+def _same_name(first, second):
+    """Return True when the array reads both names as the same name
+
+    The array matches names without regard to case. A name the array did
+    not return is the same as no name.
+    """
+    return (first or "").lower() == (second or "").lower()
+
+
+def _check_same_realm(module):
+    """Fail unless the bucket and the remote credential are in the same realm
+
+    A replica link belongs to the realm of its local bucket and uses a remote
+    credential of that realm, so both names carry the same realm prefix or
+    neither does. The array refuses any other pair when a link is created
+    and when the credential of a link is changed, so such a pair is refused
+    before anything is read or written, in check mode too.
+    """
+    name = module.params["name"]
+    credential = module.params["credential"]
+    if not credential:
+        return
+    realm = _realm_of(name)
+    credential_realm = _realm_of(credential)
+    if _same_name(realm, credential_realm):
+        return
+    if realm:
+        hint = "A remote credential of this bucket is named {0}::<credential>".format(
+            realm
+        )
+    else:
+        hint = (
+            "A remote credential of realm {0} is used by buckets named "
+            "{0}::<bucket>".format(credential_realm)
+        )
+    module.fail_json(
+        msg="Bucket {0} cannot use remote credential {1}: a bucket and the "
+        "remote credential of its replica link must be in the same realm. "
+        "{2}.".format(name, credential, hint)
+    )
+
+
+def _items(module, res, what):
+    """Return the items a read answered with, an empty list when absent
+
+    Only the array's "does not exist" means absent. Any other refusal fails
+    the task with the array's message, so it is never mistaken for a missing
+    object.
+    """
+    if res.status_code == 200:
+        return list(res.items)
+    error = get_error_message(res)
+    if "does not exist" not in str(error).lower():
+        module.fail_json(msg="Failed to get {0}. Error: {1}".format(what, error))
+    return []
+
+
 def get_local_bucket(module, blade):
     """Return Bucket or None"""
     api_version = get_rest_api_version(blade)
@@ -155,11 +246,8 @@ def get_local_bucket(module, blade):
         )
     else:
         res = blade.get_buckets(names=[module.params["name"]])
-    if res.status_code == 200:
-        items = list(res.items)
-        if items:
-            return items[0]
-    return None
+    items = _items(module, res, "bucket {0}".format(module.params["name"]))
+    return items[0] if items else None
 
 
 def get_remote_cred(module, blade, target):
@@ -177,11 +265,12 @@ def get_remote_cred(module, blade, target):
         res = blade.get_object_store_remote_credentials(
             names=[target + "/" + module.params["credential"]]
         )
-    if res.status_code == 200:
-        items = list(res.items)
-        if items:
-            return items[0]
-    return None
+    items = _items(
+        module,
+        res,
+        "remote credential {0}/{1}".format(target, module.params["credential"]),
+    )
+    return items[0] if items else None
 
 
 def get_local_rl(module, blade):
@@ -197,11 +286,10 @@ def get_local_rl(module, blade):
         )
     else:
         res = blade.get_bucket_replica_links(local_bucket_names=[module.params["name"]])
-    if res.status_code == 200:
-        items = list(res.items)
-        if items:
-            return items[0]
-    return None
+    items = _items(
+        module, res, "replica link of bucket {0}".format(module.params["name"])
+    )
+    return items[0] if items else None
 
 
 def get_connected(module, blade):
@@ -215,8 +303,8 @@ def get_connected(module, blade):
         )
     else:
         connected_blades = blade.get_array_connections()
-    for item in list(connected_blades.items):
-        if item.remote.name == module.params["target"] and item.status in [
+    for item in _items(module, connected_blades, "array connections"):
+        if _same_name(item.remote.name, module.params["target"]) and item.status in [
             "connected",
             "connecting",
             "partially_connected",
@@ -229,8 +317,8 @@ def get_connected(module, blade):
         connected_targets = blade.get_targets(context_names=[module.params["context"]])
     else:
         connected_targets = blade.get_targets()
-    for target in list(connected_targets.items):
-        if target.name == module.params["target"] and target.status in [
+    for target in _items(module, connected_targets, "targets"):
+        if _same_name(target.name, module.params["target"]) and target.status in [
             "connected",
             "connecting",
             "partially_connected",
@@ -272,8 +360,8 @@ def create_rl(module, blade, remote_cred):
             )
         if res.status_code != 200:
             module.fail_json(
-                msg="Failed to create bucket replica link {0}.".format(
-                    module.params["name"]
+                msg="Failed to create bucket replica link {0}. Error: {1}".format(
+                    module.params["name"], get_error_message(res)
                 )
             )
     module.exit_json(changed=changed)
@@ -289,7 +377,7 @@ def update_rl_policy(module, blade, local_replica_link):
         changed = True
     else:
         paused = local_replica_link.paused
-    if local_replica_link.remote_credentials.name != new_cred:
+    if not _same_name(local_replica_link.remote_credentials.name, new_cred):
         new_rl_cred = new_cred
         changed = True
     else:
@@ -382,7 +470,7 @@ def get_unhealthy_blocked_changes(module, local_replica_link):
     if local_replica_link.paused and not module.params["paused"]:
         blocked.append("resume")
     new_cred = local_replica_link.remote.name + "/" + module.params["credential"]
-    if local_replica_link.remote_credentials.name != new_cred:
+    if not _same_name(local_replica_link.remote_credentials.name, new_cred):
         blocked.append("credential")
     if local_replica_link.cascading_enabled != module.params["cascading"]:
         blocked.append("cascading")
@@ -411,6 +499,8 @@ def main():
 
     state = module.params["state"]
     module.params["name"] = module.params["name"].lower()
+    if state == "present":
+        _check_same_realm(module)
     blade = get_system(module)
     api_version = get_rest_api_version(blade)
     if (
@@ -473,6 +563,13 @@ def main():
             msg="Selected local bucket {0} does not exist.".format(
                 module.params["name"]
             )
+        )
+    if not local_replica_link and local_bucket.destroyed:
+        # The array refuses a new replica link for a destroyed bucket, so the
+        # create is refused before anything is written, in check mode too.
+        module.fail_json(
+            msg="Selected local bucket {0} is destroyed. Recover the bucket "
+            "before creating a replica link.".format(module.params["name"])
         )
 
     if local_replica_link and local_replica_link.status == "unhealthy":

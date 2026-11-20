@@ -77,6 +77,7 @@ from plugins.modules.purefb_subnet import main
 MOD = "plugins.modules.purefb_subnet"
 REFUSED = "Operation not permitted."
 NO_SUBNET = "Subnet does not exist."
+NO_NAME = "Missing or invalid parameter."
 NAME_RULE = (
     "Subnet name must be between 1 and 63 characters (alphanumeric, '_' and "
     "'-') in length and begin and end with a letter or number. The name must "
@@ -233,8 +234,9 @@ def _blade(
 
     A read of subnets by name answers as the array does: a comma separates
     names, white space around a name and its letter case are ignored, the
-    stored spelling is returned and a name the array does not hold answers
-    400 "Subnet does not exist.". A change finds a subnet only under its
+    stored spelling is returned, a name the array does not hold answers
+    400 "Subnet does not exist." and a blank name answers 400 "Missing or
+    invalid parameter.". A change finds a subnet only under its
     stored spelling and answers 400 "Subnet <name> does not exist." to any
     other, a delete finds it whatever the letter case. A LAG is matched by
     its exact name and a missing one answers 400 "LAG <name> does not
@@ -251,13 +253,13 @@ def _blade(
             return list_read if list_read is not None else _valid(held)
         if named_read is not None:
             return named_read
+        asked_names = [asked.strip() for asked in ",".join(names).split(",")]
+        asked_names = [asked for asked in asked_names if asked]
+        if not asked_names:
+            return _error(NO_NAME)
         found = []
-        for asked in ",".join(names).split(","):
-            match = [
-                subnet
-                for subnet in held
-                if subnet.name.lower() == asked.strip().lower()
-            ]
+        for asked in asked_names:
+            match = [subnet for subnet in held if subnet.name.lower() == asked.lower()]
             if not match:
                 return _error(NO_SUBNET)
             found.extend(match)
@@ -546,6 +548,22 @@ class TestPurefbSubnetName:
         assert _failure(module) == ONE_NAME.format(name)
         run.get_system.assert_not_called()
         assert blade.mock_calls == []
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    @pytest.mark.parametrize("name", ["", " "])
+    def test_blank_name_is_reported_with_the_error_of_the_array(
+        self, name, state, check_mode
+    ):
+        """The answer to a blank name is an error, not a missing subnet."""
+        module = _module(
+            check_mode=check_mode, state=state, name=name, prefix=PREFIX, vlan=VLAN
+        )
+        blade = _blade(subnets=_others() + [_own()])
+        _run(module, blade)
+        assert _failure(module) == READ_FAILED.format(name, NO_NAME)
+        blade.get_link_aggregation_groups.assert_not_called()
+        _no_write(blade)
 
     @pytest.mark.parametrize("name", ["PROD-NET", "Prod-Net", " prod-net "])
     def test_other_spelling_of_the_name_is_the_same_subnet(self, name):

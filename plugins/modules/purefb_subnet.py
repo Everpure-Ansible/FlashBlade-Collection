@@ -31,6 +31,9 @@ description:
       shared with the realm and cannot read the Link Aggregation Groups that
       a new subnet needs. The array refuses these requests and the module
       fails with the error of the array.
+    - Check mode does not know what the array refuses to such an
+      administrator. For a subnet that is shared with the realm it reports
+      the change the task asks for.
 author: Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
   name:
@@ -72,6 +75,9 @@ options:
     description:
       - IPv4 or IPv6 address associated with the subnet.
       - Supply the prefix length (CIDR) as well as the IP address.
+      - Give the network address of the subnet, for example
+        C(10.21.200.0/24). Purity//FB 4.8 refuses a prefix that has host
+        bits set, such as C(10.21.200.3/24).
       - Required for subnet creation.
     required: false
     type: str
@@ -90,7 +96,7 @@ EXAMPLES = """
 - name: Create new network subnet named foo
   everpure.flashblade.purefb_subnet:
     name: foo
-    prefix: "10.21.200.3/24"
+    prefix: "10.21.200.0/24"
     gateway: 10.21.200.1
     mtu: 9000
     vlan: 2200
@@ -103,7 +109,7 @@ EXAMPLES = """
   everpure.flashblade.purefb_subnet:
     name: foo
     state: present
-    prefix: "10.21.100.3/24"
+    prefix: "10.21.100.0/24"
     gateway: 10.21.100.1
     mtu: 1500
     fb_url: 10.10.10.2

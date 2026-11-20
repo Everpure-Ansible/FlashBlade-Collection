@@ -16,7 +16,70 @@ sys.modules["pypureclient.flashblade"] = MagicMock()
 sys.modules["urllib3"] = MagicMock()
 sys.modules["distro"] = MagicMock()
 
+import pytest
+
+from plugins.module_utils.common import get_error_message as real_get_error_message
 from plugins.modules.purefb_eula import main, set_eula
+
+MOD = "plugins.modules.purefb_eula"
+REFUSAL = "Operation not permitted."
+ACCEPTED = 1700000000000
+
+
+@pytest.fixture(autouse=True)
+def real_error_message():
+    """Use the get_error_message of the collection, whatever was mocked before"""
+    with patch(MOD + ".get_error_message", real_get_error_message):
+        yield
+
+
+def _module(check_mode=False):
+    """A module whose exit_json and fail_json end the run, as the real ones do"""
+    module = Mock()
+    module.check_mode = check_mode
+    module.params = {
+        "company": "ACME Storage, Inc.",
+        "name": "Fred Bloggs",
+        "title": "Storage Manager",
+    }
+    module.exit_json = Mock(side_effect=SystemExit("exit_json"))
+    module.fail_json = Mock(side_effect=SystemExit("fail_json"))
+    return module
+
+
+def _error_response(status_code=400, message=REFUSAL):
+    """The SDK answer to a refused or failed call: a status and errors, no items"""
+    res = Mock(spec=["status_code", "errors", "headers"])
+    res.status_code = status_code
+    res.errors = []
+    if message:
+        error = Mock(spec=["context", "message", "location_context"])
+        error.message = message
+        res.errors.append(error)
+    return res
+
+
+def _signature(accepted=None):
+    """An SDK EulaSignature: the deprecated signatory fields are null"""
+    signature = Mock(spec=["accepted", "company", "name", "title"])
+    signature.accepted = accepted
+    signature.company = None
+    signature.name = None
+    signature.title = None
+    return signature
+
+
+def _eula_response(*signatures):
+    """The SDK answer to a successful read of the EULA"""
+    items = []
+    for signature in signatures:
+        eula = Mock(spec=["agreement", "signature"])
+        eula.signature = signature
+        items.append(eula)
+    res = Mock(spec=["status_code", "items", "errors", "headers"])
+    res.status_code = 200
+    res.items = iter(items)
+    return res
 
 
 class TestPurefbEula:
@@ -53,6 +116,7 @@ class TestPurefbEula:
         mock_current_signature.title = "Different Title"
         mock_eula_response = Mock()
         mock_eula_response.signature = mock_current_signature
+        mock_blade.get_arrays_eula.return_value.status_code = 200
         mock_blade.get_arrays_eula.return_value.items = [mock_eula_response]
 
         mock_response = Mock()
@@ -96,6 +160,7 @@ class TestPurefbEula:
         mock_current_signature.title = "Different Title"
         mock_eula_response = Mock()
         mock_eula_response.signature = mock_current_signature
+        mock_blade.get_arrays_eula.return_value.status_code = 200
         mock_blade.get_arrays_eula.return_value.items = [mock_eula_response]
         mock_get_system.return_value = mock_blade
 
@@ -129,6 +194,7 @@ class TestPurefbEula:
         mock_current_signature.accepted = True
         mock_eula_response = Mock()
         mock_eula_response.signature = mock_current_signature
+        mock_blade.get_arrays_eula.return_value.status_code = 200
         mock_blade.get_arrays_eula.return_value.items = [mock_eula_response]
         mock_get_system.return_value = mock_blade
 
@@ -170,10 +236,12 @@ class TestPurefbEula:
         mock_current_signature.title = "Different Title"
         mock_eula_response = Mock()
         mock_eula_response.signature = mock_current_signature
+        mock_blade.get_arrays_eula.return_value.status_code = 200
         mock_blade.get_arrays_eula.return_value.items = [mock_eula_response]
 
         mock_response = Mock()
         mock_response.status_code = 400
+        mock_response.errors = [Mock(message=REFUSAL)]
         mock_blade.patch_arrays_eula.return_value = mock_response
         mock_get_system.return_value = mock_blade
 
@@ -205,6 +273,7 @@ class TestPurefbEula:
         mock_current_signature.accepted = True  # Already accepted
         mock_eula_response = Mock()
         mock_eula_response.signature = mock_current_signature
+        mock_blade.get_arrays_eula.return_value.status_code = 200
         mock_blade.get_arrays_eula.return_value.items = [mock_eula_response]
         mock_get_system.return_value = mock_blade
 
@@ -238,6 +307,7 @@ class TestPurefbEula:
         mock_current_signature.title = "Storage Manager"  # Same
         mock_eula_response = Mock()
         mock_eula_response.signature = mock_current_signature
+        mock_blade.get_arrays_eula.return_value.status_code = 200
         mock_blade.get_arrays_eula.return_value.items = [mock_eula_response]
         mock_get_system.return_value = mock_blade
 
@@ -279,6 +349,7 @@ class TestPurefbEula:
         mock_current_signature.title = "Storage Manager"
         mock_eula_response = Mock()
         mock_eula_response.signature = mock_current_signature
+        mock_blade.get_arrays_eula.return_value.status_code = 200
         mock_blade.get_arrays_eula.return_value.items = [mock_eula_response]
 
         mock_response = Mock()
@@ -329,6 +400,7 @@ class TestPurefbEula:
         mock_current_signature.title = "Storage Manager"
         mock_eula_response = Mock()
         mock_eula_response.signature = mock_current_signature
+        mock_blade.get_arrays_eula.return_value.status_code = 200
         mock_blade.get_arrays_eula.return_value.items = [mock_eula_response]
 
         mock_response = Mock()
@@ -379,6 +451,7 @@ class TestPurefbEula:
         mock_current_signature.title = "Storage Manager"  # Different
         mock_eula_response = Mock()
         mock_eula_response.signature = mock_current_signature
+        mock_blade.get_arrays_eula.return_value.status_code = 200
         mock_blade.get_arrays_eula.return_value.items = [mock_eula_response]
 
         mock_response = Mock()
@@ -458,3 +531,120 @@ class TestPurefbEula:
 
         # Verify - should call set_eula with module and blade
         mock_set_eula.assert_called_once_with(mock_module, mock_blade)
+
+
+class TestPurefbEulaRefusedRead:
+    """A read of the EULA that the array refuses or fails"""
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_refused_read_reports_the_array_message(self, check_mode):
+        """An administrator limited to a realm may not read the EULA"""
+        module = _module(check_mode=check_mode)
+        blade = Mock()
+        blade.get_arrays_eula.return_value = _error_response()
+
+        with pytest.raises(SystemExit):
+            set_eula(module, blade)
+
+        module.fail_json.assert_called_once_with(
+            msg="Failed to read the EULA. Error: Operation not permitted."
+        )
+        blade.patch_arrays_eula.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "status_code, message, reported",
+        [
+            (500, "Unexpected error.", "Unexpected error."),
+            (429, None, "Unknown error"),
+            (503, None, "Unknown error"),
+        ],
+    )
+    def test_failed_read_reports_the_answer(self, status_code, message, reported):
+        """Any status but 200 is a failed read, with or without an error text"""
+        module = _module()
+        blade = Mock()
+        blade.get_arrays_eula.return_value = _error_response(status_code, message)
+
+        with pytest.raises(SystemExit):
+            set_eula(module, blade)
+
+        module.fail_json.assert_called_once_with(
+            msg="Failed to read the EULA. Error: {0}".format(reported)
+        )
+        blade.patch_arrays_eula.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    def test_answer_without_an_eula(self):
+        """A successful answer that holds no EULA is reported"""
+        module = _module()
+        blade = Mock()
+        blade.get_arrays_eula.return_value = _eula_response()
+
+        with pytest.raises(SystemExit):
+            set_eula(module, blade)
+
+        module.fail_json.assert_called_once_with(msg="The array returned no EULA.")
+        blade.patch_arrays_eula.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    @patch(MOD + ".get_system")
+    @patch(MOD + ".AnsibleModule")
+    @patch(MOD + ".HAS_PYPURECLIENT", True)
+    def test_main_refused_read(self, mock_ansible_module, mock_get_system):
+        """The refusal reaches the user through main, in check mode too"""
+        module = _module(check_mode=True)
+        mock_ansible_module.return_value = module
+        blade = Mock()
+        blade.get_arrays_eula.return_value = _error_response()
+        mock_get_system.return_value = blade
+
+        with pytest.raises(SystemExit):
+            main()
+
+        module.fail_json.assert_called_once_with(
+            msg="Failed to read the EULA. Error: Operation not permitted."
+        )
+        blade.patch_arrays_eula.assert_not_called()
+        module.exit_json.assert_not_called()
+
+
+class TestPurefbEulaRefusedSignature:
+    """A signature that the array refuses"""
+
+    def test_refused_signature_reports_the_array_message(self):
+        """The reason of the array follows the fixed text"""
+        module = _module()
+        blade = Mock()
+        blade.get_arrays_eula.return_value = _eula_response(_signature())
+        blade.patch_arrays_eula.return_value = _error_response()
+
+        with pytest.raises(SystemExit):
+            set_eula(module, blade)
+
+        blade.patch_arrays_eula.assert_called_once()
+        module.fail_json.assert_called_once_with(
+            msg="Signing EULA failed. Error: Operation not permitted."
+        )
+        module.exit_json.assert_not_called()
+
+
+class TestPurefbEulaSignedArray:
+    """An administrator who may read the EULA sees no difference"""
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_signed_eula_is_left_alone(self, check_mode):
+        """A signed EULA carries its acceptance time and is never signed again"""
+        module = _module(check_mode=check_mode)
+        blade = Mock()
+        blade.get_arrays_eula.return_value = _eula_response(
+            _signature(accepted=ACCEPTED)
+        )
+
+        with pytest.raises(SystemExit):
+            set_eula(module, blade)
+
+        blade.get_arrays_eula.assert_called_once_with()
+        blade.patch_arrays_eula.assert_not_called()
+        module.fail_json.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)

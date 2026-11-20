@@ -1,0 +1,14 @@
+bugfixes:
+  - purefb_ad - the ``server`` option is joined to ``name`` as ``server::name``, and the account
+    is looked up once under that full name. An account on a named server or on a server in a
+    realm (``realm::server::account``) can now be created and is found again, ``test``,
+    ``rotate`` and ``absent`` act on it, and an account of the same name on the default server
+    no longer ends in a traceback.
+  - purefb_ad - ``computer`` defaults to the account part of ``name``, without its server and
+    realm.
+  - purefb_ad - a lookup the array refuses fails the task instead of reading as a missing
+    account, ``state=test`` and ``state=rotate`` fail when the account does not exist, and a
+    join onto a missing server or without ``domain``, ``username`` and ``password`` is refused
+    before the join is sent, in check mode too.
+  - purefb_ad - an empty ``name`` is refused before any request. With ``server`` it was
+    sent as an account named after the server.

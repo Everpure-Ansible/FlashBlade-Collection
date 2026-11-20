@@ -1,0 +1,3 @@
+bugfixes:
+  - purefb_phonehome - a read of the support settings, or a Phone Home test, that the array refuses
+    or fails now fails with the message of the array instead of a traceback.

@@ -1206,6 +1206,68 @@ class TestPurefbApiclientArrayLevel:
         blade.patch_api_clients.assert_not_called()
         module.exit_json.assert_called_once_with(changed=False)
 
+    def test_main_refuses_a_list_of_names_and_an_empty_name_before_login(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_version,
+        mock_lv,
+        mock_post_model,
+        mock_ref,
+        mock_api_client,
+        mock_err,
+    ):
+        # The array reads a comma as the separator of a list of names
+        for name in ("ansible-client,other-client", "", " "):
+            for state in ("present", "absent"):
+                module, blade = self._setup(
+                    mock_ansible_module,
+                    mock_get_system,
+                    mock_lv,
+                    name=name,
+                    state=state,
+                )
+                module.check_mode = True
+
+                _run(main)
+
+                module.fail_json.assert_called_once_with(
+                    msg="API Client name {0} does not conform to required "
+                    "naming convention".format(name)
+                )
+                module.exit_json.assert_not_called()
+        mock_get_system.assert_not_called()
+
+    def test_main_policy_name_in_another_letter_case_is_another_name(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_version,
+        mock_lv,
+        mock_post_model,
+        mock_ref,
+        mock_api_client,
+        mock_err,
+    ):
+        # The array refuses a policy name in another letter case when a client
+        # is created, so the comparison with an existing client is exact too.
+        module, blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_lv,
+            access_policies=[REALM_POLICY.upper()],
+        )
+        blade.get_api_clients.return_value = _response(
+            200, [_client(policies=(REALM_POLICY,), max_role=None)]
+        )
+
+        _run(main)
+
+        module.warn.assert_called_once()
+        assert "access_policies cannot be changed" in module.warn.call_args[0][0]
+        blade.patch_api_clients.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
 
 class TestPurefbApiclientDocumentation:
     """The documentation says where API clients live and what a policy

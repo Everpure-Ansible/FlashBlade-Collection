@@ -1,0 +1,7 @@
+bugfixes:
+  - purefb_alert - ``state=test`` now fails with the message of the array when the array refuses or
+    fails the test, and returns the result with an empty ``resource_name`` and a warning for an
+    address that is not an alert watcher. Both cases ended in a traceback.
+  - purefb_alert - an address in another letter case than the one the array stored now finds the
+    alert watcher. ``state=present`` failed with ``Alert watcher already exists.`` and
+    ``state=absent`` reported no change.

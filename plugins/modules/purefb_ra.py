@@ -84,6 +84,25 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
 DURATION_API = "2.14"
 
 
+def _get_support(module, blade):
+    """Return the support settings of the array.
+
+    A read the array refuses or fails is reported with the message of the
+    array.
+    """
+    res = blade.get_support()
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to read the support settings. Error: {0}".format(
+                get_error_message(res)
+            )
+        )
+    items = list(res.items)
+    if not items:
+        module.fail_json(msg="The array returned no support settings.")
+    return items[0]
+
+
 def enable_ra(module, blade):
     """Enable Remote Assist"""
     changed = True
@@ -124,7 +143,14 @@ def disable_ra(module, blade):
 def test_ra(module, blade):
     """Test support/remote assist configuration"""
     test_response = []
-    response = list(blade.get_support_test(test_type="remote-assist").items)
+    res = blade.get_support_test(test_type="remote-assist")
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Testing Remote Assist failed. Error: {0}".format(
+                get_error_message(res)
+            )
+        )
+    response = list(res.items)
     for component in response:
         if component.enabled:
             enabled = "true"
@@ -166,7 +192,7 @@ def main():
 
     if not HAS_PYPURECLIENT:
         module.fail_json(msg="pypureclient SDK is required for this module")
-    active = list(blade.get_support().items)[0].remote_assist_active
+    active = _get_support(module, blade).remote_assist_active
     if module.params["state"] == "present" and not active:
         enable_ra(module, blade)
     elif module.params["state"] == "absent" and active:

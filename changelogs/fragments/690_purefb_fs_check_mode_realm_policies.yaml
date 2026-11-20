@@ -1,0 +1,11 @@
+bugfixes:
+  - purefb_fs - check mode no longer attaches or detaches the snapshot policy named by ``policy``.
+  - purefb_fs - creating a filesystem fails before anything is written, in check mode too, when the
+    realm does not exist or is destroyed, or when ``policy`` does not exist or is not in the realm
+    of the filesystem.
+  - purefb_fs - ``export_policy``, ``share_policy`` and ``client_policy`` are refused for a
+    filesystem in a realm before anything is written, as the array does not accept them there.
+  - purefb_fs - ``promote=false`` demotes a writable filesystem. Only the attributes that change
+    are sent, and the task fails before anything is changed when ``discard_snaps`` is not set.
+  - purefb_fs - a destroyed filesystem is recovered before ``policy`` is attached or detached, so
+    one task recovers the filesystem and changes its snapshot policy.

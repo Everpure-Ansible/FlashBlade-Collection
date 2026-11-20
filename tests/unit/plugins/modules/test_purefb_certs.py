@@ -2395,3 +2395,41 @@ class TestBuiltInCertificate:
 
         assert _changed(module) is True
         blade.delete_certificates.assert_called_once_with(names=["realm1::global"])
+
+
+class TestOneCertificate:
+    """A name the array reads as a pattern or as a list of names is refused"""
+
+    @pytest.mark.parametrize(
+        "name", ["glob*", "*", "realm1::*", "cert,global", "realm1::cert,cert"]
+    )
+    @pytest.mark.parametrize("state", ["present", "absent", "import", "export", "sign"])
+    def test_pattern_or_list_is_refused_before_any_read(self, state, name):
+        module = _module(
+            name=name,
+            state=state,
+            org_unit="Storage",
+            certificate=PEM if state == "import" else None,
+            export_file="/tmp/out",
+        )
+        blade = _blade([_cert("global"), _cert("cert"), _cert("realm1::cert")])
+
+        opened = _run(module, blade)
+
+        assert _failure(module) == (
+            "Certificate name {0} is not valid. A name cannot hold '*' or ',': "
+            "name exactly one certificate.".format(name)
+        )
+        blade.get_certificates.assert_not_called()
+        _no_writes(blade)
+        opened.assert_not_called()
+
+    def test_pattern_is_refused_in_check_mode(self):
+        module = _module(check_mode=True, name="glob*", state="absent")
+        blade = _blade([_cert("global")])
+
+        _run(module, blade)
+
+        assert "is not valid" in _failure(module)
+        blade.get_certificates.assert_not_called()
+        _no_writes(blade)

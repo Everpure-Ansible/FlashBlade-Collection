@@ -30,6 +30,8 @@ options:
     - A certificate that lives in a realm is named C(realm::certificate).
     - A realm-scoped administrator must use the realm-qualified name; a bare
       name is not placed in, or resolved to, the administrator's realm.
+    - The name of exactly one certificate. A name that holds C(*) or C(,)
+      is refused.
     type: str
     required: true
   state:
@@ -280,6 +282,24 @@ def _realm_of(name):
     if name and "::" in name:
         return name.rsplit("::", 1)[0]
     return ""
+
+
+def _check_name(module):
+    """Refuse a name the array reads as a pattern or as a list of names.
+
+    A read matches a * in a name as a pattern and takes a comma as the
+    separator of several names, so such a name can address more than one
+    certificate while the module looks at the first. No certificate can be
+    created under such a name.
+    """
+    name = module.params["name"]
+    if "*" in name or "," in name:
+        module.fail_json(
+            msg=(
+                "Certificate name {0} is not valid. A name cannot hold '*' "
+                "or ',': name exactly one certificate."
+            ).format(name)
+        )
 
 
 def _cert_exists(module, blade):
@@ -673,6 +693,8 @@ def main():
 
     if not HAS_PYCOUNTRY:
         module.fail_json(msg="pycountry sdk is required for this module")
+
+    _check_name(module)
 
     email_pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
     blade = get_system(module)

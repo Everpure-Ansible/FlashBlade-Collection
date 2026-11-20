@@ -171,13 +171,13 @@ def _server(
     return server
 
 
-def _realm_server(dns=("rzaudit::dns1",), lds=None):
-    """Server rzaudit::srv as the array returns a server in a realm."""
+def _realm_server(dns=("tenant1::dns1",), lds=None):
+    """Server tenant1::srv as the array returns a server in a realm."""
     return _server(
         dns=dns,
-        directory_services=("rzaudit::srv_nfs",),
+        directory_services=("tenant1::srv_nfs",),
         lds=lds,
-        name="rzaudit::srv",
+        name="tenant1::srv",
     )
 
 
@@ -1220,7 +1220,7 @@ class TestPurefbServer:
         blade.get_servers.return_value = _response(200, [_realm_server()])
 
         module = _run_main(
-            _base_params(name="rzaudit::srv", directory_service=["srv_nfs"]), blade
+            _base_params(name="tenant1::srv", directory_service=["srv_nfs"]), blade
         )
 
         blade.patch_servers.assert_not_called()
@@ -1233,7 +1233,7 @@ class TestPurefbServer:
         blade.get_servers.return_value = _response(200, [_realm_server()])
 
         module = _run_main(
-            _base_params(name="rzaudit::srv", directory_service=["rzaudit::srv_nfs"]),
+            _base_params(name="tenant1::srv", directory_service=["tenant1::srv_nfs"]),
             blade,
         )
 
@@ -1303,14 +1303,14 @@ class TestPurefbServer:
         blade.get_servers.return_value = _response(200, [_realm_server()])
 
         module = _run_main(
-            _base_params(name="rzaudit::srv", directory_service=["other::srv_nfs"]),
+            _base_params(name="tenant1::srv", directory_service=["other::srv_nfs"]),
             blade,
         )
 
         blade.patch_servers.assert_not_called()
         module.fail_json.assert_called_once()
         msg = module.fail_json.call_args[1]["msg"]
-        assert "are rzaudit::srv_nfs, not other::srv_nfs." in msg
+        assert "are tenant1::srv_nfs, not other::srv_nfs." in msg
 
     def test_directory_service_realm_name_fails_on_array_server(self):
         """An array-level server does not have the directory service of its
@@ -1321,13 +1321,13 @@ class TestPurefbServer:
         )
 
         module = _run_main(
-            _base_params(name="srv", directory_service=["rzaudit::srv_nfs"]), blade
+            _base_params(name="srv", directory_service=["tenant1::srv_nfs"]), blade
         )
 
         blade.patch_servers.assert_not_called()
         module.fail_json.assert_called_once()
         msg = module.fail_json.call_args[1]["msg"]
-        assert "are srv_nfs, not rzaudit::srv_nfs." in msg
+        assert "are srv_nfs, not tenant1::srv_nfs." in msg
 
     def test_directory_service_difference_fails_before_the_dns_change(self):
         """The refusal is decided before any other change is sent"""
@@ -1387,8 +1387,8 @@ class TestPurefbServer:
 
         module = _run_main(
             _base_params(
-                name="rzaudit::srv",
-                dns=["rzaudit::dns1"],
+                name="tenant1::srv",
+                dns=["tenant1::dns1"],
                 directory_service=["srv_nfs"],
             ),
             blade,
@@ -1396,7 +1396,7 @@ class TestPurefbServer:
 
         module.fail_json.assert_not_called()
         assert list(mock_server_post.call_args[1]) == ["dns"]
-        assert blade.post_servers.call_args[1]["create_ds"] == "rzaudit::srv_nfs"
+        assert blade.post_servers.call_args[1]["create_ds"] == "tenant1::srv_nfs"
         assert module.exit_json.call_args[1]["changed"] is True
 
     def test_create_with_another_directory_service_is_refused(self):
@@ -1438,13 +1438,13 @@ class TestPurefbServer:
         blade.get_servers.return_value = _response(200, [_realm_server()])
         blade.patch_servers.return_value = _response(400, message="DNS does not exist.")
 
-        module = _run_main(_base_params(name="rzaudit::srv", dns=["mydns"]), blade)
+        module = _run_main(_base_params(name="tenant1::srv", dns=["mydns"]), blade)
 
         msg = module.fail_json.call_args[1]["msg"]
         assert msg.startswith(
-            "Failed to update DNS config for server rzaudit::srv. Error: DNS "
-            "does not exist. A server in realm rzaudit can only use a DNS "
-            "configuration of that realm, named rzaudit::<name>"
+            "Failed to update DNS config for server tenant1::srv. Error: DNS "
+            "does not exist. A server in realm tenant1 can only use a DNS "
+            "configuration of that realm, named tenant1::<name>"
         )
         assert "shared with the realm through purefb_resource_access." in msg
         assert "local directory service" not in msg
@@ -1458,11 +1458,11 @@ class TestPurefbServer:
         )
 
         module = _run_main(
-            _base_params(name="rzaudit::srv", dns=["other::dns1"]), blade
+            _base_params(name="tenant1::srv", dns=["other::dns1"]), blade
         )
 
         msg = module.fail_json.call_args[1]["msg"]
-        assert "DNS is not accessible to the server. A server in realm rzaudit" in msg
+        assert "DNS is not accessible to the server. A server in realm tenant1" in msg
 
     def test_realm_server_dns_realm_in_another_case_gets_the_rule(self):
         """The realm of a DNS configuration is given as the array reports it"""
@@ -1473,11 +1473,11 @@ class TestPurefbServer:
         )
 
         module = _run_main(
-            _base_params(name="rzaudit::srv", dns=["RZAUDIT::dns2"]), blade
+            _base_params(name="tenant1::srv", dns=["TENANT1::dns2"]), blade
         )
 
         msg = module.fail_json.call_args[1]["msg"]
-        assert "named rzaudit::<name> with the realm written as in the name" in msg
+        assert "named tenant1::<name> with the realm written as in the name" in msg
 
     def test_realm_server_dns_in_its_realm_gets_no_rule(self):
         """A reference that is named in the realm fails for another reason"""
@@ -1486,11 +1486,11 @@ class TestPurefbServer:
         blade.patch_servers.return_value = _response(400, message="DNS does not exist.")
 
         module = _run_main(
-            _base_params(name="rzaudit::srv", dns=["rzaudit::nodns"]), blade
+            _base_params(name="tenant1::srv", dns=["tenant1::nodns"]), blade
         )
 
         assert module.fail_json.call_args[1]["msg"] == (
-            "Failed to update DNS config for server rzaudit::srv. Error: DNS "
+            "Failed to update DNS config for server tenant1::srv. Error: DNS "
             "does not exist."
         )
 
@@ -1508,15 +1508,15 @@ class TestPurefbServer:
         )
 
         module = _run_main(
-            _base_params(name="RZAUDIT::srv", local_directory_service="rzaudit::lds1"),
+            _base_params(name="TENANT1::srv", local_directory_service="tenant1::lds1"),
             blade,
         )
 
         assert module.fail_json.call_args[1]["msg"] == (
-            "Failed to update local directory service for server RZAUDIT::srv. "
+            "Failed to update local directory service for server TENANT1::srv. "
             "Error: Cannot update server. Local directory service is not "
-            "accessible to the server. A server in realm RZAUDIT can only use "
-            "a local directory service of that realm, named RZAUDIT::lds1 with "
+            "accessible to the server. A server in realm TENANT1 can only use "
+            "a local directory service of that realm, named TENANT1::lds1 with "
             "the realm written as in the name of the server."
         )
 
@@ -1532,16 +1532,16 @@ class TestPurefbServer:
         )
 
         module = _run_main(
-            _base_params(name="RZAUDIT::SRV", local_directory_service="lds1"), blade
+            _base_params(name="TENANT1::SRV", local_directory_service="lds1"), blade
         )
 
         msg = module.fail_json.call_args[1]["msg"]
         assert msg.endswith(
-            "A server in realm RZAUDIT can only use a local directory service "
-            "of that realm, named RZAUDIT::lds1 with the realm written as in "
+            "A server in realm TENANT1 can only use a local directory service "
+            "of that realm, named TENANT1::lds1 with the realm written as in "
             "the name of the server."
         )
-        assert "rzaudit::lds1" not in msg
+        assert "tenant1::lds1" not in msg
 
     def test_local_ds_realm_in_another_case_than_the_name_gets_the_rule(self):
         """A local directory service whose realm is in another case than in
@@ -1555,12 +1555,12 @@ class TestPurefbServer:
         )
 
         module = _run_main(
-            _base_params(name="rzaudit::srv", local_directory_service="RZAUDIT::lds1"),
+            _base_params(name="tenant1::srv", local_directory_service="TENANT1::lds1"),
             blade,
         )
 
         assert module.fail_json.call_args[1]["msg"].endswith(
-            "named rzaudit::lds1 with the realm written as in the name of the "
+            "named tenant1::lds1 with the realm written as in the name of the "
             "server."
         )
 
@@ -1574,12 +1574,12 @@ class TestPurefbServer:
         )
 
         module = _run_main(
-            _base_params(name="RZAUDIT::srv", local_directory_service="RZAUDIT::nolds"),
+            _base_params(name="TENANT1::srv", local_directory_service="TENANT1::nolds"),
             blade,
         )
 
         assert module.fail_json.call_args[1]["msg"] == (
-            "Failed to update local directory service for server RZAUDIT::srv. "
+            "Failed to update local directory service for server TENANT1::srv. "
             "Error: Local directory service does not exist."
         )
 
@@ -1596,18 +1596,18 @@ class TestPurefbServer:
 
         module = _run_main(
             _base_params(
-                name="RZAUDIT::srv",
+                name="TENANT1::srv",
                 dns=["shareddns"],
-                local_directory_service="rzaudit::lds1",
+                local_directory_service="tenant1::lds1",
             ),
             blade,
         )
 
         assert module.fail_json.call_args[1]["msg"] == (
-            "Failed to add server RZAUDIT::srv. Error: Cannot create server. "
+            "Failed to add server TENANT1::srv. Error: Cannot create server. "
             "Local directory service is not accessible to the server. A server "
-            "in realm RZAUDIT can only use a local directory service of that "
-            "realm, named RZAUDIT::lds1 with the realm written as in the name "
+            "in realm TENANT1 can only use a local directory service of that "
+            "realm, named TENANT1::lds1 with the realm written as in the name "
             "of the server."
         )
 
@@ -1623,15 +1623,15 @@ class TestPurefbServer:
 
         module = _run_main(
             _base_params(
-                name="RZAUDIT::srv",
+                name="TENANT1::srv",
                 dns=["shareddns"],
-                create_local_directory_service="rzaudit::lds2",
+                create_local_directory_service="tenant1::lds2",
             ),
             blade,
         )
 
         assert module.fail_json.call_args[1]["msg"].endswith(
-            "named RZAUDIT::lds2 with the realm written as in the name of the "
+            "named TENANT1::lds2 with the realm written as in the name of the "
             "server."
         )
 
@@ -1641,13 +1641,13 @@ class TestPurefbServer:
         blade.get_servers.return_value = _absent()
         blade.post_servers.return_value = _response(400, message="DNS does not exist.")
 
-        module = _run_main(_base_params(name="RZAUDIT::srv", dns=["mydns"]), blade)
+        module = _run_main(_base_params(name="TENANT1::srv", dns=["mydns"]), blade)
 
         msg = module.fail_json.call_args[1]["msg"]
         assert msg.startswith(
-            "Failed to add server RZAUDIT::srv. Error: DNS does not exist. A "
-            "server in realm RZAUDIT can only use a DNS configuration of that "
-            "realm, named RZAUDIT::<name> with the realm written as in the "
+            "Failed to add server TENANT1::srv. Error: DNS does not exist. A "
+            "server in realm TENANT1 can only use a DNS configuration of that "
+            "realm, named TENANT1::<name> with the realm written as in the "
             "name of the server, or an array-level DNS configuration"
         )
         assert "the array reports" not in msg
@@ -1676,15 +1676,15 @@ class TestPurefbServer:
         )
 
         module = _run_main(
-            _base_params(name="rzaudit::srv", local_directory_service="lds1"), blade
+            _base_params(name="tenant1::srv", local_directory_service="lds1"), blade
         )
 
         msg = module.fail_json.call_args[1]["msg"]
         assert msg.startswith(
-            "Failed to update local directory service for server rzaudit::srv. "
+            "Failed to update local directory service for server tenant1::srv. "
             "Error: Cannot update server. Local directory service is not "
-            "accessible to the server. A server in realm rzaudit can only use "
-            "a local directory service of that realm, named rzaudit::lds1 with "
+            "accessible to the server. A server in realm tenant1 can only use "
+            "a local directory service of that realm, named tenant1::lds1 with "
             "the realm written as in the name of the server."
         )
         assert "DNS configuration" not in msg
@@ -1699,12 +1699,12 @@ class TestPurefbServer:
         )
 
         module = _run_main(
-            _base_params(name="rzaudit::srv", local_directory_service="rzaudit::nolds"),
+            _base_params(name="tenant1::srv", local_directory_service="tenant1::nolds"),
             blade,
         )
 
         assert module.fail_json.call_args[1]["msg"] == (
-            "Failed to update local directory service for server rzaudit::srv. "
+            "Failed to update local directory service for server tenant1::srv. "
             "Error: Local directory service does not exist."
         )
 
@@ -1712,16 +1712,16 @@ class TestPurefbServer:
         """Clearing the local directory service names no reference"""
         blade = Mock()
         blade.get_servers.return_value = _response(
-            200, [_realm_server(lds="rzaudit::lds1")]
+            200, [_realm_server(lds="tenant1::lds1")]
         )
         blade.patch_servers.return_value = _response(400, message="Not now.")
 
         module = _run_main(
-            _base_params(name="rzaudit::srv", local_directory_service=""), blade
+            _base_params(name="tenant1::srv", local_directory_service=""), blade
         )
 
         assert module.fail_json.call_args[1]["msg"] == (
-            "Failed to update local directory service for server rzaudit::srv. "
+            "Failed to update local directory service for server tenant1::srv. "
             "Error: Not now."
         )
 
@@ -1734,12 +1734,12 @@ class TestPurefbServer:
             400, message="DNS is required for servers inside a realm."
         )
 
-        module = _run_main(_base_params(name="rzaudit::srv"), blade)
+        module = _run_main(_base_params(name="tenant1::srv"), blade)
 
         msg = module.fail_json.call_args[1]["msg"]
         assert msg.startswith(
-            "Failed to add server rzaudit::srv. Error: DNS is required for "
-            "servers inside a realm. A server in realm rzaudit can only use a "
+            "Failed to add server tenant1::srv. Error: DNS is required for "
+            "servers inside a realm. A server in realm tenant1 can only use a "
             "DNS configuration of that realm"
         )
         assert "purefb_resource_access" in msg
@@ -1756,8 +1756,8 @@ class TestPurefbServer:
 
         module = _run_main(
             _base_params(
-                name="rzaudit::srv",
-                dns=["rzaudit::dns1"],
+                name="tenant1::srv",
+                dns=["tenant1::dns1"],
                 create_local_directory_service="lds2",
             ),
             blade,
@@ -1765,8 +1765,8 @@ class TestPurefbServer:
 
         msg = module.fail_json.call_args[1]["msg"]
         assert msg.endswith(
-            "accessible to the server. A server in realm rzaudit can only use "
-            "a local directory service of that realm, named rzaudit::lds2 with "
+            "accessible to the server. A server in realm tenant1 can only use "
+            "a local directory service of that realm, named tenant1::lds2 with "
             "the realm written as in the name of the server."
         )
         assert "DNS configuration" not in msg
@@ -1785,7 +1785,7 @@ class TestPurefbServer:
 
         module = _run_main(
             _base_params(
-                name="rzaudit::srv",
+                name="tenant1::srv",
                 dns=["shareddns"],
                 create_local_directory_service="lds2",
             ),
@@ -1793,10 +1793,10 @@ class TestPurefbServer:
         )
 
         assert module.fail_json.call_args[1]["msg"] == (
-            "Failed to add server rzaudit::srv. Error: Cannot create server. "
+            "Failed to add server tenant1::srv. Error: Cannot create server. "
             "Local directory service is not accessible to the server. A server "
-            "in realm rzaudit can only use a local directory service of that "
-            "realm, named rzaudit::lds2 with the realm written as in the name "
+            "in realm tenant1 can only use a local directory service of that "
+            "realm, named tenant1::lds2 with the realm written as in the name "
             "of the server."
         )
 
@@ -1808,13 +1808,13 @@ class TestPurefbServer:
 
         module = _run_main(
             _base_params(
-                name="rzaudit::srv", dns=["mydns"], local_directory_service="lds1"
+                name="tenant1::srv", dns=["mydns"], local_directory_service="lds1"
             ),
             blade,
         )
 
         msg = module.fail_json.call_args[1]["msg"]
-        assert "named rzaudit::<name>" in msg
+        assert "named tenant1::<name>" in msg
         assert msg.endswith("through purefb_resource_access.")
         assert "local directory service" not in msg
 
@@ -1868,11 +1868,11 @@ class TestPurefbServer:
         """The attached local directory service is matched whatever the case"""
         blade = Mock()
         blade.get_servers.return_value = _response(
-            200, [_realm_server(lds="rzaudit::lds1")]
+            200, [_realm_server(lds="tenant1::lds1")]
         )
 
         module = _run_main(
-            _base_params(name="rzaudit::srv", local_directory_service="rzaudit::LDS1"),
+            _base_params(name="tenant1::srv", local_directory_service="tenant1::LDS1"),
             blade,
         )
 
@@ -1884,11 +1884,11 @@ class TestPurefbServer:
         writes its realm in another case: nothing is sent"""
         blade = Mock()
         blade.get_servers.return_value = _response(
-            200, [_realm_server(lds="rzaudit::lds1")]
+            200, [_realm_server(lds="tenant1::lds1")]
         )
 
         module = _run_main(
-            _base_params(name="RZAUDIT::srv", local_directory_service="RZAUDIT::lds1"),
+            _base_params(name="TENANT1::srv", local_directory_service="TENANT1::lds1"),
             blade,
         )
 

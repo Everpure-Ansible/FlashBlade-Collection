@@ -1,0 +1,12 @@
+bugfixes:
+  - purefb_lifecycle - a rule can be created with ``keep_current_for``, ``keep_current_until`` or
+    ``abort_uploads_after`` alone. A zero was sent for each duration that was not given, which
+    the array refuses for the previous versions.
+  - purefb_lifecycle - on an existing rule ``keep_current_until`` takes the place of a duration
+    set with ``keep_current_for``, and the reverse. Both were sent and the array refused the pair.
+  - purefb_lifecycle - a bucket name given in another letter case than the array stores no longer
+    prevents a rule from being changed.
+  - purefb_lifecycle - a pattern for ``bucket``, a ``bucket`` or ``name`` that holds a comma and a
+    rule for a destroyed bucket are refused before anything is changed, in check mode as well.
+  - purefb_lifecycle - a failed read of the bucket or the rule is reported with the message of the
+    array instead of being taken for a missing bucket or a missing rule.

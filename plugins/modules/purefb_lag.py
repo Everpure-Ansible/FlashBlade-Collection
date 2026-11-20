@@ -27,6 +27,8 @@ options:
   name:
     description:
     - Name of the Link Aggregation Group
+    - This is the name of one LAG. A name that holds a comma, which the
+      array reads as a list of names, is refused.
     type: str
     default: uplink
   state:
@@ -114,6 +116,8 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
     get_error_message,
 )
 
+PRECONFIGURED_LAG = "uplink"
+
 
 def normalize_port(module, port):
     """Return the CHx.FMy.ETHz port names a requested port expands to
@@ -132,6 +136,30 @@ def normalize_port(module, port):
             msg="Invalid port name {0}. Format must be CHx.ETHy".format(port)
         )
     return [f"{parts[0]}.FM1.{parts[1]}", f"{parts[0]}.FM2.{parts[1]}"]
+
+
+def _single_name(module):
+    """Refuse a name that the array does not read as the name of one LAG
+
+    In a request the array reads a comma as a separator of names, so such a
+    name reaches several LAGs at once while only one of them is compared.
+    This module manages the one LAG that has the name given, so the name is
+    refused before anything is read.
+    """
+    name = module.params["name"]
+    if name and "," in name:
+        module.fail_json(
+            msg="name must be the name of one Link Aggregation Group: in {0} "
+            "the array reads a comma as a separator of names.".format(name)
+        )
+
+
+def _is_preconfigured(name):
+    """Tell whether name is the name of the preconfigured LAG
+
+    The array ignores white space around a name, so it is ignored here.
+    """
+    return str(name).strip().lower() == PRECONFIGURED_LAG
 
 
 def _get_lags(module, blade, name=None):
@@ -279,6 +307,8 @@ def main():
     if not HAS_PYPURECLIENT:
         module.fail_json(msg="py-pure-client sdk is required for this module")
 
+    # Whatever the state, the task names one LAG.
+    _single_name(module)
     blade = get_system(module)
     state = module.params["state"]
 
@@ -292,7 +322,10 @@ def main():
     elif exists and state == "present":
         update_lag(module, blade, current_lags[0])
     elif exists and state == "absent":
-        if module.params["name"].lower() == "uplink":
+        # The LAG the array returned decides, as well as the name given
+        if _is_preconfigured(module.params["name"]) or any(
+            _is_preconfigured(lag.name) for lag in current_lags
+        ):
             module.fail_json(
                 msg="Preconfigured Link Aggregation Group cannot be deleted"
             )

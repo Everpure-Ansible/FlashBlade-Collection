@@ -78,6 +78,11 @@ REFUSED = "Operation not permitted."
 READ_FAILED = "Failed to read LAG {0}. Error: {1}"
 LIST_FAILED = "Failed to read the LAGs. Error: {0}"
 IN_USE = "Selected port {0} is currently in use by another LAG."
+PRECONFIGURED = "Preconfigured Link Aggregation Group cannot be deleted"
+ONE_NAME = (
+    "name must be the name of one Link Aggregation Group: in {0} "
+    "the array reads a comma as a separator of names."
+)
 UPLINK_PORTS = ["CH1.ETH1", "CH1.ETH2", "CH1.ETH3", "CH1.ETH4"]
 
 
@@ -162,10 +167,12 @@ def _error_message(response, default="Unknown error"):
 def _blade(lags=None, named_read=None, list_read=None, write=None):
     """An array holding LAG uplink with its four chassis port pairs.
 
-    lags replaces the LAGs the array holds. A read by name of a LAG the
-    array does not hold answers 400 "LAG <name> does not exist.", as the
-    array does. named_read and list_read replace the answer of the read
-    with and without a name, write the answer of POST, PATCH and DELETE.
+    lags replaces the LAGs the array holds. A read by name answers as the
+    array does: a comma separates names, white space around a name is
+    ignored, the letter case counts, a LAG the array does not hold answers
+    400 "LAG <name> does not exist." and no name at all 400 "Missing or
+    invalid parameter.". named_read and list_read replace the answer of the
+    read with and without a name, write the answer of POST, PATCH and DELETE.
     """
     held = {lag.name: lag for lag in (lags or [_lag("uplink", UPLINK_PORTS)])}
     blade = Mock()
@@ -178,9 +185,14 @@ def _blade(lags=None, named_read=None, list_read=None, write=None):
             return _valid(held.values())
         if named_read is not None:
             return named_read
-        if names[0] not in held:
-            return _error("LAG {0} does not exist.".format(names[0]))
-        return _valid([held[names[0]]])
+        asked = [name.strip() for name in ",".join(names).split(",")]
+        asked = list(dict.fromkeys(name for name in asked if name))
+        if not asked:
+            return _error("Missing or invalid parameter.")
+        for name in asked:
+            if name not in held:
+                return _error("LAG {0} does not exist.".format(name))
+        return _valid([held[name] for name in asked])
 
     def _written(**kwargs):
         if write is not None:
@@ -364,6 +376,77 @@ class TestPurefbLagRefusedRead:
         assert named[0][1] == {"names": ["uplink"]}
 
 
+class TestPurefbLagName:
+    """The task names one LAG, in whatever way the array reads the name."""
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    @pytest.mark.parametrize(
+        "name", ["uplink,uplink", "uplink,", ",uplink", "lag2,uplink", "lag2, lag3"]
+    )
+    def test_list_of_names_is_refused_before_any_request(self, name, state, check_mode):
+        """The array would read the LAGs lag2 and uplink for lag2,uplink."""
+        module = _module(
+            check_mode=check_mode, name=name, state=state, ports=["CH1.ETH5"]
+        )
+        blade = _blade(
+            lags=[
+                _lag("uplink", UPLINK_PORTS),
+                _lag("lag2", ["CH1.ETH5"]),
+                _lag("lag3", ["CH1.ETH6"]),
+            ]
+        )
+        assert _run(module, blade).outcome == "fail"
+        assert _failure(module) == ONE_NAME.format(name)
+        blade.get_link_aggregation_groups.assert_not_called()
+        _no_write(blade)
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("name", [" uplink", "uplink ", " uplink "])
+    def test_preconfigured_lag_with_white_space_is_not_deleted(self, name, check_mode):
+        """The array ignores white space around a name: the read finds uplink."""
+        module = _module(check_mode=check_mode, name=name, state="absent")
+        blade = _blade(lags=[_lag(name.strip(), UPLINK_PORTS)])
+        assert _run(module, blade).outcome == "fail"
+        assert _failure(module) == PRECONFIGURED
+        _no_write(blade)
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_lag_the_array_returned_decides_the_delete(self, check_mode):
+        """Whatever the spelling, the preconfigured LAG the read returned stays."""
+        module = _module(check_mode=check_mode, name="lag2", state="absent")
+        blade = _blade(named_read=_valid([_lag("uplink", UPLINK_PORTS)]))
+        assert _run(module, blade).outcome == "fail"
+        assert _failure(module) == PRECONFIGURED
+        _no_write(blade)
+
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    @pytest.mark.parametrize("name", ["", " "])
+    def test_blank_name_reports_the_answer_of_the_array(self, name, state):
+        module = _module(name=name, state=state, ports=["CH1.ETH5"])
+        blade = _blade()
+        assert _run(module, blade).outcome == "fail"
+        assert _failure(module) == READ_FAILED.format(
+            name, "Missing or invalid parameter."
+        )
+        _no_write(blade)
+
+    def test_white_space_around_a_name_reaches_the_lag(self):
+        module = _module(name=" lag2 ", state="absent")
+        blade = _blade(lags=[_lag("uplink", UPLINK_PORTS), _lag("lag2", ["CH1.ETH5"])])
+        assert _run(module, blade).outcome == "exit"
+        blade.delete_link_aggregation_groups.assert_called_once_with(names=[" lag2 "])
+        assert _result(module) == {"changed": True}
+
+    def test_name_in_another_letter_case_is_another_lag(self):
+        """The array answers "LAG UPLINK does not exist." beside uplink."""
+        module = _module(name="UPLINK", state="absent")
+        blade = _blade()
+        assert _run(module, blade).outcome == "exit"
+        assert _result(module) == {"changed": False}
+        _no_write(blade)
+
+
 class TestPurefbLagCreate:
     """state=present for a LAG the array does not hold."""
 
@@ -506,9 +589,7 @@ class TestPurefbLagDelete:
         module = _module(check_mode=check_mode, state="absent")
         blade = _blade()
         assert _run(module, blade).outcome == "fail"
-        assert _failure(module) == (
-            "Preconfigured Link Aggregation Group cannot be deleted"
-        )
+        assert _failure(module) == PRECONFIGURED
         _no_write(blade)
 
     def test_delete_refused_by_the_array(self):

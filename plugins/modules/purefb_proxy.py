@@ -33,10 +33,12 @@ options:
   host:
     description:
     - The proxy host name.
+    - Required when I(state=present).
     type: str
   port:
     description:
     - The proxy TCP/IP port number.
+    - Required when I(state=present).
     type: int
   secure:
     description:
@@ -84,6 +86,25 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
 )
 
 
+def _get_proxy(module, blade):
+    """Return the proxy of the support settings, an empty string when none is set.
+
+    A read the array refuses or fails is reported with the message of the
+    array.
+    """
+    res = blade.get_support()
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to read the support settings. Error: {0}".format(
+                get_error_message(res)
+            )
+        )
+    items = list(res.items)
+    if not items:
+        module.fail_json(msg="The array returned no support settings.")
+    return getattr(items[0], "proxy", None) or ""
+
+
 def delete_proxy(module, blade):
     """Delete proxy settings"""
     changed = True
@@ -118,10 +139,9 @@ def create_proxy(module, blade):
     module.exit_json(changed=changed)
 
 
-def update_proxy(module, blade):
+def update_proxy(module, blade, current_proxy):
     """Update proxy settings"""
     changed = False
-    current_proxy = list(blade.get_support().items)[0].proxy
     if module.params["secure"]:
         protocol = "https://"
     else:
@@ -153,9 +173,13 @@ def main():
     )
 
     required_together = [["host", "port"]]
+    required_if = [["state", "present", ["host", "port"]]]
 
     module = AnsibleModule(
-        argument_spec, required_together=required_together, supports_check_mode=True
+        argument_spec,
+        required_together=required_together,
+        required_if=required_if,
+        supports_check_mode=True,
     )
 
     if not HAS_PYPURECLIENT:
@@ -163,14 +187,14 @@ def main():
 
     state = module.params["state"]
     blade = get_system(module)
-    current_proxy = bool(list(blade.get_support().items)[0].proxy)
+    current_proxy = _get_proxy(module, blade)
 
     if state == "absent" and current_proxy:
         delete_proxy(module, blade)
     elif state == "present" and not current_proxy:
         create_proxy(module, blade)
     elif state == "present" and current_proxy:
-        update_proxy(module, blade)
+        update_proxy(module, blade, current_proxy)
     else:
         module.exit_json(changed=False)
 

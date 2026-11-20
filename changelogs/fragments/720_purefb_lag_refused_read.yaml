@@ -1,0 +1,8 @@
+bugfixes:
+  - purefb_lag - a read of the LAGs that the array refuses or fails now fails with the error of the
+    array instead of a traceback (``state=present``) or an unchanged result (``state=absent``), in
+    check mode too. Purity//FB refuses this read to an administrator whose management access is
+    limited to a realm. Only a LAG that the array reports as not existing is treated as absent.
+  - purefb_lag - ``state=absent`` is also refused for the preconfigured LAG ``uplink`` when ``name``
+    is written with white space around it, which the array ignores. A ``name`` that holds a comma,
+    which the array reads as a list of names, is refused.

@@ -43,6 +43,11 @@ options:
   target_api:
     description:
     - API token for target FlashBlade system
+    - Creating a connection creates a connection key on the target FlashBlade
+      with this token. No connection key is created in check mode.
+    - Required with C(state=present). With C(state=absent) it is needed only
+      when the array holds a connection that another array formed, because
+      such a connection is identified by the name of the array at I(target_url).
     type: str
   target_repl:
     description:
@@ -155,31 +160,71 @@ FAN_IN_MAXIMUM = 5
 FAN_OUT_MAXIMUM = 5
 
 
+def _checked(module, res, what):
+    """Return a response that answered 200, or fail with the answer of the array"""
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to read {0}. Error: {1}".format(what, get_error_message(res))
+        )
+    return res
+
+
+def _remote_client(module):
+    """Return a client for the array at I(target_url)"""
+    if not module.params["target_api"]:
+        # Only state=absent can come here: a connection that the other array
+        # formed is known by the name of that array, not by its address
+        module.fail_json(
+            msg="target_api is required to identify a connection that was "
+            "formed by the remote array"
+        )
+    try:
+        remote_system = Client(
+            target=module.params["target_url"], api_token=module.params["target_api"]
+        )
+    except Exception as exc:
+        module.fail_json(
+            msg="Failed to connect to remote array {0}. Error: {1}".format(
+                module.params["target_url"], exc
+            )
+        )
+    return remote_system
+
+
+def _remote_array_name(module, remote_system):
+    """Return the name of the array at I(target_url)"""
+    res = _checked(
+        module,
+        remote_system.get_arrays(),
+        "the array name from {0}".format(module.params["target_url"]),
+    )
+    return list(res.items)[0].name
+
+
+def _connection_key(module, remote_system, remote_array):
+    """Create a connection key on the remote array and return it"""
+    res = remote_system.post_array_connections_connection_key()
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to create a connection key on remote array {0}. "
+            "Error: {1}".format(remote_array, get_error_message(res))
+        )
+    return list(res.items)[0].connection_key
+
+
 def _check_connected(module, blade):
     api_version = get_rest_api_version(blade)
     if (
         LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
         and module.params["context"]
     ):
-        connected_blades = list(
-            blade.get_array_connections(context_names=[module.params["context"]]).items
-        )
+        res = blade.get_array_connections(context_names=[module.params["context"]])
     else:
-        connected_blades = list(blade.get_array_connections().items)
+        res = blade.get_array_connections()
+    connected_blades = list(_checked(module, res, "the array connections").items)
     for target in connected_blades:
         if target.management_address is None:
-            remote_system = Client(
-                target=module.params["target_url"],
-                api_token=module.params["target_api"],
-            )
-            res = remote_system.get_arrays()
-            if res.status_code != 200:
-                module.fail_json(
-                    msg="Failed to connect to remote array {0}.".format(
-                        module.params["target_url"]
-                    )
-                )
-            remote_array = list(res.items)[0].name
+            remote_array = _remote_array_name(module, _remote_client(module))
             if target.remote.name == remote_array:
                 return target
         if target.management_address == module.params[
@@ -197,20 +242,21 @@ def break_connection(module, blade, target_blade):
     """Break connection between arrays"""
     api_version = get_rest_api_version(blade)
     changed = True
+    if target_blade.management_address is None:
+        module.fail_json(
+            msg="Disconnect can only happen from the array that formed the connection"
+        )
+    # Read in check mode too, so that it reports a refused read as the real
+    # run does
+    if (
+        LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
+        and module.params["context"]
+    ):
+        res = blade.get_arrays(context_names=[module.params["context"]])
+    else:
+        res = blade.get_arrays()
+    source_blade = list(_checked(module, res, "the array name").items)[0].name
     if not module.check_mode:
-        if (
-            LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-            and module.params["context"]
-        ):
-            source_blade = list(
-                blade.get_arrays(context_names=[module.params["context"]]).items
-            )[0].name
-        else:
-            source_blade = list(blade.get_arrays().items)[0].name
-        if target_blade.management_address is None:
-            module.fail_json(
-                msg="Disconnect can only happen from the array that formed the connection"
-            )
         if (
             LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
             and module.params["context"]
@@ -243,34 +289,28 @@ def create_connection(module, blade):
         res = blade.get_array_connections(context_names=[module.params["context"]])
     else:
         res = blade.get_array_connections()
+    res = _checked(module, res, "the array connections")
     if res.total_item_count >= FAN_OUT_MAXIMUM:
         module.fail_json(
             msg="FlashBlade fan-out maximum of {0} already reached".format(
                 FAN_OUT_MAXIMUM
             )
         )
-    try:
-        remote_system = Client(
-            target=module.params["target_url"], api_token=module.params["target_api"]
-        )
-    except Exception:
-        module.fail_json(
-            msg="Failed to connect to remote array {0}.".format(
-                module.params["target_url"]
-            )
-        )
-    remote_array = list(remote_system.get_arrays().items)[0].name
-    remote_conn_cnt = remote_system.get_array_connections().total_item_count
+    remote_system = _remote_client(module)
+    remote_array = _remote_array_name(module, remote_system)
+    remote_conn_cnt = _checked(
+        module,
+        remote_system.get_array_connections(),
+        "the array connections of remote array {0}".format(remote_array),
+    ).total_item_count
     if remote_conn_cnt >= FAN_IN_MAXIMUM:
         module.fail_json(
             msg="Remote array {0} already connected to {1} other array. Fan-In not supported".format(
                 remote_array, remote_conn_cnt
             )
         )
-    connection_key = list(remote_system.post_array_connections_connection_key().items)[
-        0
-    ].connection_key
 
+    throttle = None
     if module.params["default_limit"] or module.params["window_limit"]:
         if module.params["window_limit"]:
             if not module.params["window_start"]:
@@ -296,21 +336,18 @@ def create_connection(module, blade):
             throttle = Throttle(
                 default_limit=human_to_bytes(module.params["default_limit"]),
             )
-        connection_info = ArrayConnectionPost(
-            management_address=module.params["target_url"],
-            replication_addresses=module.params["target_repl"],
-            encrypted=module.params["encrypted"],
-            connection_key=connection_key,
-            throttle=throttle,
-        )
-    else:
-        connection_info = ArrayConnectionPost(
-            management_address=module.params["target_url"],
-            replication_addresses=module.params["target_repl"],
-            encrypted=module.params["encrypted"],
-            connection_key=connection_key,
-        )
     if not module.check_mode:
+        # The connection key is created on the remote array, so it is
+        # requested only when the connection is about to be made
+        connection = dict(
+            management_address=module.params["target_url"],
+            replication_addresses=module.params["target_repl"],
+            encrypted=module.params["encrypted"],
+            connection_key=_connection_key(module, remote_system, remote_array),
+        )
+        if throttle is not None:
+            connection["throttle"] = throttle
+        connection_info = ArrayConnectionPost(**connection)
         if (
             LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
             and module.params["context"]
@@ -334,13 +371,25 @@ def update_connection(module, blade):
     """Update REST 2 based array connection"""
     changed = False
     api_version = get_rest_api_version(blade)
-    remote_blade = Client(
-        target=module.params["target_url"], api_token=module.params["target_api"]
-    )
-    remote_name = list(remote_blade.get_arrays().items)[0].name
-    remote_connection = list(
-        blade.get_array_connections(filter="remote.name='" + remote_name + "'").items
-    )[0]
+    remote_name = _remote_array_name(module, _remote_client(module))
+    # Read the connection on the array that the lookup read and that the
+    # change is sent to
+    if (
+        LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
+        and module.params["context"]
+    ):
+        res = blade.get_array_connections(
+            context_names=[module.params["context"]],
+            filter="remote.name='" + remote_name + "'",
+        )
+    else:
+        res = blade.get_array_connections(filter="remote.name='" + remote_name + "'")
+    connections = list(_checked(module, res, "the array connections").items)
+    if not connections:
+        module.fail_json(
+            msg="No connection to remote array {0} found".format(remote_name)
+        )
+    remote_connection = connections[0]
     if remote_connection.management_address is None:
         module.fail_json(
             msg="Update can only happen from the array that formed the connection"
@@ -355,10 +404,12 @@ def update_connection(module, blade):
             )
         else:
             res = blade.get_file_system_replica_links()
-        if module.params["encrypted"] and res.total_item_count != 0:
-            module.fail_json(
-                msg="Cannot turn array connection encryption on if file system replica links exist"
-            )
+        if module.params["encrypted"]:
+            res = _checked(module, res, "the file system replica links")
+            if res.total_item_count != 0:
+                module.fail_json(
+                    msg="Cannot turn array connection encryption on if file system replica links exist"
+                )
     current_connection = {
         "encrypted": remote_connection.encrypted,
         "replication_addresses": sorted(remote_connection.replication_addresses),
@@ -377,12 +428,12 @@ def update_connection(module, blade):
             )
         else:
             res = blade.get_bucket_replica_links()
-        if (
-            module.params["default_limit"] or module.params["window_limit"]
-        ) and res.total_item_count != 0:
-            module.fail_json(
-                msg="Cannot set throttle when bucket replica links already exist"
-            )
+        if module.params["default_limit"] or module.params["window_limit"]:
+            res = _checked(module, res, "the bucket replica links")
+            if res.total_item_count != 0:
+                module.fail_json(
+                    msg="Cannot set throttle when bucket replica links already exist"
+                )
     current_connection["throttle"] = {
         "default_limit": remote_connection.throttle.default_limit,
         "window_limit": remote_connection.throttle.window_limit,
@@ -396,7 +447,7 @@ def update_connection(module, blade):
     if module.params["target_repl"]:
         target_repl = sorted(module.params["target_repl"])
     else:
-        target_repl = remote_connection.replication_addresses
+        target_repl = sorted(remote_connection.replication_addresses)
     if module.params["default_limit"]:
         default_limit = human_to_bytes(module.params["default_limit"])
         if default_limit == 0:
@@ -502,7 +553,9 @@ def main():
         # If no context is provided set the context to the local array name
         fleet_res = blade.get_fleets()
         if fleet_res.status_code == 200 and list(fleet_res.items):
-            module.params["context"] = list(blade.get_arrays().items)[0].name
+            module.params["context"] = list(
+                _checked(module, blade.get_arrays(), "the array name").items
+            )[0].name
 
     if module.params["default_limit"]:
         default_limit = human_to_bytes(module.params["default_limit"])

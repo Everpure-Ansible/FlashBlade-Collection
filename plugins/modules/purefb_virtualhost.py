@@ -21,7 +21,6 @@ version_added: '1.6.0'
 short_description: Manage FlashBlade Object Store Virtual Hosts
 description:
 - Add, modify or delete FlashBlade Object Store Virtual Hosts
-- A FlashBlade supports a maximum of 10 Object Store Virtual Hosts.
 - The built-in I(s3.amazonaws.com) virtual host cannot be deleted or
   modified by this module.
 - From Purity//FB 4.6.3 (REST 2.20) a virtual host is attached to object
@@ -30,6 +29,11 @@ description:
   this module never creates a virtual host without an attached server and
   never detaches the last server from one. Use I(state=absent) to remove a
   virtual host.
+- A virtual host in a realm is named C(realm::host). Its servers and a new
+  name are given in the same form and belong to the same realm. A
+  realm-scoped administrator must use the realm-qualified names as well. A
+  bare name is not placed in, or resolved to, the realm of the
+  administrator.
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
@@ -40,6 +44,10 @@ options:
       array can be addressed for virtual hosted-style S3 requests.
     - A realm-scoped virtual host is named C(realm::host). Such a name
       cannot contain dots and the array requires I(hostname) for it.
+    - Names are not case sensitive. A name is never completed with a realm.
+    - This is the name of one virtual host. A name with a C(*) or a comma,
+      which the array reads as a pattern or as a list of names, is refused,
+      for I(rename) as well.
     type: str
     required: true
   hostname:
@@ -50,7 +58,8 @@ options:
       superset or subset of an existing hostname with the same root.
     - When omitted on creation of an array-scoped virtual host the array
       sets the hostname to I(name). The array requires a hostname for
-      realm-scoped virtual hosts.
+      realm-scoped virtual hosts, so a realm-scoped virtual host is not
+      created without one.
     - Requires Purity//FB 4.6.3 or higher (REST 2.20).
     type: str
     version_added: '1.30.0'
@@ -60,6 +69,10 @@ options:
     - Servers are attached and detached so that the attached set matches
       this list. New servers are attached before any other is detached.
     - Server names are not case sensitive.
+    - A realm-scoped virtual host can only be attached to servers of its
+      own realm, named C(realm::server), and an array-scoped virtual host
+      only to servers outside of any realm. Any other server is refused
+      before anything is changed.
     - A virtual host must stay attached to at least one object store
       server, so an empty list is refused. List the servers that should
       stay attached, or use I(state=absent) to remove the virtual host.
@@ -80,9 +93,18 @@ options:
   rename:
     description:
     - New name for the Object Store Virtual Host.
+    - A rename cannot move a virtual host into or out of a realm. The new
+      name of a realm-scoped virtual host is given as C(realm::newname)
+      with the realm of I(name), and the new name of an array-scoped
+      virtual host without a realm. Any other new name is refused before
+      anything is changed.
+    - Names are not case sensitive, so a new name that differs from
+      I(name) only in letter case is not a rename. The array refuses a new
+      name that contains dots.
     - When no virtual host called I(name) exists but one called I(rename)
       does, the rename is treated as already done and the host is managed
       under its new name, so a rename task can be re-run.
+    - When both exist the task fails before anything is changed.
     - Requires Purity//FB 4.6.3 or higher (REST 2.20).
     type: str
     version_added: '1.30.0'
@@ -148,6 +170,13 @@ EXAMPLES = r"""
     fb_url: 10.10.10.2
     api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
 
+- name: Rename realm-scoped Object Store Virtual Host within its realm
+  everpure.flashblade.purefb_virtualhost:
+    name: "tenant1::acme-s3"
+    rename: "tenant1::acme-object"
+    fb_url: 10.10.10.2
+    api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
+
 - name: Delete Object Store Virtual Host
   everpure.flashblade.purefb_virtualhost:
     name: "nohost.acme.com"
@@ -182,7 +211,6 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
     get_rest_api_version,
 )
 
-MAX_HOST_COUNT = 10
 CONTEXT_API_VERSION = "2.17"
 SERVER_API_VERSION = "2.20"
 RESERVED_HOST = "s3.amazonaws.com"
@@ -203,13 +231,164 @@ def _context_kwargs(module, api_version):
     return {}
 
 
-def _get_host(blade, name, ctx):
-    """Return the virtual host object for name, or None when it is absent."""
+def _realm_of(name):
+    """Return the realm of a realm::name name, empty for an array-level name."""
+    return name.rpartition("::")[0]
+
+
+def _same_realm(first, second):
+    """Tell whether two names are in the same realm, or both in none.
+
+    The array matches names without regard to case and to white space
+    around them.
+    """
+    return _realm_of(first).strip().lower() == _realm_of(second).strip().lower()
+
+
+def _same_name(first, second):
+    """Tell whether two names are the same name on the array.
+
+    The array matches a name without regard to case and to white space
+    around it.
+    """
+    return first.strip().lower() == second.strip().lower()
+
+
+def _single_name(module, option):
+    """Refuse a name that the array does not read as the name of one host.
+
+    In a request the array reads * in a name as a pattern and a comma as a
+    separator of names, so such a name reaches virtual hosts that only match
+    it, or several at once. This module manages the one virtual host that
+    has the name given, so the name is refused before anything is read.
+    """
+    value = module.params[option]
+    if value and ("*" in value or "," in value):
+        module.fail_json(
+            msg="{0} must be the name of one Object Store Virtual Host: in {1} "
+            "the array reads * as a pattern and a comma as a separator of "
+            "names.".format(option, value)
+        )
+
+
+def _pick(items, name):
+    """Return the virtual host called name from the answer to a look-up.
+
+    Only a virtual host that has the name asked for is taken, never one the
+    array returned because it matches that name in some other way.
+    """
+    for item in items:
+        if _same_name(str(getattr(item, "name", "")), name):
+            return item
+    return None
+
+
+def _check_scope(module):
+    """Refuse a new name or a server outside the scope of the virtual host.
+
+    A virtual host is in a realm when it is named realm::host. The array
+    does not move it into or out of a realm with a rename ("Realm can't be
+    changed with rename.") and attaches only servers of its own scope
+    ("Realms for Virtual host (...) and Server (...) don't match"). Both
+    are settled here from the task alone, before anything is read or
+    written, so check mode agrees with a real run, no option is applied
+    before another one is refused, and the look-up of a rename that was
+    already done cannot find a namesake in another scope. A bare name is
+    never completed with a realm. The wildcard is not a server object and
+    is left to the array, an empty name to _validate_servers.
+    """
+    name = module.params["name"]
+    realm = _realm_of(name)
+    rename = module.params["rename"]
+    if rename and not _same_realm(name, rename):
+        if realm:
+            hint = "Give the new name as {0}::<name>".format(realm)
+        else:
+            hint = "Give the new name without a realm"
+        module.fail_json(
+            msg="Cannot rename Object Store Virtual Host {0} to {1}: a rename "
+            "cannot move a virtual host into or out of a realm. {2}.".format(
+                name, rename, hint
+            )
+        )
+    for srv in module.params["servers"] or []:
+        if srv == WILDCARD_SERVER or not str(srv).strip() or _same_realm(name, srv):
+            continue
+        if realm:
+            reason = (
+                "a virtual host in realm {0} can only be attached to servers "
+                "of that realm, named {0}::<server>".format(realm)
+            )
+        else:
+            reason = (
+                "an array-scoped virtual host can only be attached to servers "
+                "outside of any realm"
+            )
+        module.fail_json(
+            msg="Server {0} cannot be attached to Object Store Virtual Host "
+            "{1}: {2}.".format(srv, name, reason)
+        )
+
+
+def _new_name(vhost, rename):
+    """Return the new name with its realm spelled as the array reports it.
+
+    The array matches names without regard to case, but refuses a new name
+    whose realm is not spelled as the array stores it ("Realm can't be
+    changed with rename."). _check_scope has already settled that the realm
+    is the same one.
+    """
+    realm = _realm_of(vhost.name)
+    if realm:
+        return "{0}::{1}".format(realm, rename.rpartition("::")[2])
+    return rename
+
+
+def _find_host(module, blade, name, ctx):
+    """Return the virtual host called name, or None when the array has none.
+
+    The array answers the look-up of a name it does not have with an error
+    ("Virtual host does not exist."), so only that answer reads as None.
+    Any other answer fails the task with the array's message. Read as
+    "absent" it would let state=absent report that there is nothing to
+    delete, or state=present send a create for a virtual host that exists.
+    An answer that holds only virtual hosts of another name fails the task
+    as well: none of them is the virtual host the task names.
+    """
     res = blade.get_object_store_virtual_hosts(names=[name], **ctx)
     if res.status_code == 200:
         items = list(res.items)
-        if items:
-            return items[0]
+        vhost = _pick(items, name)
+        if vhost is None and items:
+            module.fail_json(
+                msg="Failed to read Object Store Virtual Host {0}: the array "
+                "answered with {1}, which does not have that name. Give the "
+                "name of one virtual host.".format(
+                    name,
+                    ", ".join(str(getattr(item, "name", "")) for item in items[:5]),
+                )
+            )
+        return vhost
+    error = get_error_message(res)
+    if "does not exist" in str(error).lower():
+        return None
+    module.fail_json(
+        msg="Failed to read Object Store Virtual Host {0}. Error: {1}".format(
+            name, error
+        )
+    )
+
+
+def _get_host(blade, name, ctx):
+    """Return the virtual host object for name, or None when it cannot be
+    read.
+
+    Used for the reads between and after the requests of a task, where a
+    virtual host that cannot be read is handled by the caller.
+    """
+    res = blade.get_object_store_virtual_hosts(names=[name], **ctx)
+    if res.status_code == 200:
+        return _pick(list(res.items), name)
     return None
 
 
@@ -299,7 +478,11 @@ def _require_servers(module, blade, servers, ctx):
                 module.params["name"], ", ".join(names), get_error_message(res)
             )
         )
-    if len(list(res.items)) < len(names):
+    # By name, not by number: the array reads a comma in a name as a
+    # separator of names, so one entry can be answered with several servers
+    # although no server has that name.
+    found = set(str(getattr(item, "name", "")).strip().lower() for item in res.items)
+    if [srv for srv in names if srv.strip().lower() not in found]:
         module.fail_json(
             msg="Object Store Virtual Host {0} was not created: servers {1} "
             "could not all be found.".format(module.params["name"], ", ".join(names))
@@ -581,6 +764,11 @@ def add_host(module, blade, api_version, ctx):
     # never depends on a default the array may not have. Every refusal
     # below happens before the request, in check mode as well.
     _validate_servers(module)
+    if hostname is None and _realm_of(name):
+        module.fail_json(
+            msg="Object Store Virtual Host {0} was not created: the array "
+            "requires hostname for a virtual host in a realm.".format(name)
+        )
     if servers is None:
         servers = [_default_server(module, blade, ctx)]
     else:
@@ -618,12 +806,15 @@ def update_host(module, blade, vhost, api_version, ctx):
     # Before REST 2.20 the name is the hostname
     current_hostname = getattr(vhost, "hostname", None) or vhost.name
     current_servers = _server_names(vhost)
+    # Names are not case sensitive on the array: a new name that differs
+    # from the current one only in case is the same name, not a rename.
+    new_name = bool(rename and not _same_name(rename, name))
 
     if name == RESERVED_HOST:
         if (
             (hostname is not None and hostname != current_hostname)
             or (servers is not None and set(servers) != current_servers)
-            or (rename and rename != name)
+            or new_name
         ):
             module.warn(
                 "{0} is a reserved name and cannot be modified".format(RESERVED_HOST)
@@ -631,7 +822,6 @@ def update_host(module, blade, vhost, api_version, ctx):
         module.exit_json(changed=False)
 
     new_hostname = hostname is not None and hostname != current_hostname
-    new_name = bool(rename and rename != name)
     add = []
     remove = []
     # Attached servers exist from REST 2.20; before it there is nothing to
@@ -705,12 +895,13 @@ def update_host(module, blade, vhost, api_version, ctx):
     if new_name:
         changed = True
         if not module.check_mode:
+            target = _new_name(vhost, rename)
             _patch_host(
                 module,
                 blade,
-                ObjectStoreVirtualHostPatch(name=rename),
+                ObjectStoreVirtualHostPatch(name=target),
                 ctx,
-                "rename to {0}".format(rename),
+                "rename to {0}".format(target),
             )
 
     module.exit_json(changed=changed)
@@ -752,31 +943,53 @@ def main():
         # If no context is provided set the context to the local array name
         fleet_res = blade.get_fleets()
         if fleet_res.status_code == 200 and list(fleet_res.items):
-            module.params["context"] = list(blade.get_arrays().items)[0].name
+            arrays_res = blade.get_arrays()
+            if arrays_res.status_code != 200:
+                module.fail_json(
+                    msg="Failed to read the name of the array for the fleet "
+                    "context. Error: {0}".format(get_error_message(arrays_res))
+                )
+            module.params["context"] = list(arrays_res.items)[0].name
     ctx = _context_kwargs(module, api_version)
     state = module.params["state"]
+    name = module.params["name"]
+    rename = module.params["rename"]
 
-    vhost = _get_host(blade, module.params["name"], ctx)
-    if vhost is None and state == "present" and module.params["rename"]:
-        # The rename may already have happened on an earlier run: if a host
-        # with the new name exists, manage it under that name and treat the
-        # rename as done, so a repeated rename task still converges.
-        renamed = _get_host(blade, module.params["rename"], ctx)
+    # Whatever the state, the task names one virtual host.
+    _single_name(module, "name")
+    # A delete renames and attaches nothing, and the reserved host is never
+    # modified and keeps its own handling.
+    managed = state == "present" and not _same_name(name, RESERVED_HOST)
+    if managed:
+        _single_name(module, "rename")
+        _check_scope(module)
+    vhost = _find_host(module, blade, name, ctx)
+    if managed and rename and not _same_name(rename, name):
+        # _check_scope has settled that the new name is in the scope of the
+        # old one, so a host found here is never a namesake in another realm.
+        renamed = _find_host(module, blade, rename, ctx)
         if renamed is not None:
-            module.params["name"] = module.params["rename"]
+            if vhost is not None:
+                module.fail_json(
+                    msg="Cannot rename Object Store Virtual Host {0} to {1}: a "
+                    "virtual host called {1} already exists.".format(name, rename)
+                )
+            # The rename already happened on an earlier run: manage the host
+            # under its new name and treat the rename as done, so a repeated
+            # rename task still converges.
+            module.params["name"] = rename
             module.params["rename"] = None
             vhost = renamed
+    if vhost is not None and getattr(vhost, "name", None):
+        # The array finds a virtual host whatever the letter case of the
+        # name, but only changes or deletes one that is addressed by the name
+        # as it is stored ("Object changed during processing." otherwise).
+        module.params["name"] = vhost.name
     if vhost and state == "absent":
         delete_host(module, blade, ctx)
     elif not vhost and state == "present":
-        # The host cap only limits additions; deleting, or re-asserting a
-        # host that already exists, must not be blocked by it.
-        vhosts = blade.get_object_store_virtual_hosts(**ctx)
-        if vhosts.total_item_count >= MAX_HOST_COUNT:
-            module.fail_json(
-                msg="Maximum Object Store Virtual Host count ({0}) reached. "
-                "Cannot add {1}.".format(MAX_HOST_COUNT, module.params["name"])
-            )
+        # The array decides how many virtual hosts it holds; its refusal is
+        # reported by add_host.
         add_host(module, blade, api_version, ctx)
     elif vhost and state == "present":
         update_host(module, blade, vhost, api_version, ctx)

@@ -21,6 +21,10 @@ version_added: '1.0.0'
 short_description: Configure Everpure FlashBlade NTP settings
 description:
 - Set or erase NTP configuration for Everpure FlashBlades.
+- The NTP servers are an array-wide setting that the array returns only to an
+  administrator with array-wide access; for a realm-scoped administrator the
+  module reads an empty list, so I(state=present) always tries to set the
+  servers and I(state=absent) changes nothing.
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:

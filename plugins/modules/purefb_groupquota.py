@@ -28,6 +28,10 @@ options:
   name:
     description:
       - Filesystem Name.
+      - For a file system in a realm use C(realm::name). The same name
+        without the realm is a different file system at the array level.
+      - A realm-scoped administrator must use the realm-qualified name; a
+        bare name is not placed in, or resolved to, the administrator's realm.
     required: true
     type: str
   state:
@@ -68,6 +72,15 @@ EXAMPLES = """
 - name: Create new group (using GID) quota for filesystem named foo
   everpure.flashblade.purefb_groupquota:
     name: foo
+    quota: 1T
+    gid: 1234
+    state: present
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Create new group (using GID) quota for filesystem foo in realm tenant1
+  everpure.flashblade.purefb_groupquota:
+    name: tenant1::foo
     quota: 1T
     gid: 1234
     state: present

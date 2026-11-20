@@ -1,0 +1,17 @@
+minor_changes:
+  - purefb_keytabs - added ``ad_account`` to name the Active Directory account that
+    ``state=rotate`` rotates.
+bugfixes:
+  - purefb_keytabs - ``state=rotate`` no longer rotates the first Active Directory account the
+    array lists; with several accounts it fails unless ``ad_account`` names one.
+  - purefb_keytabs - ``state=export`` and ``state=absent`` need only ``name``, and a keytab read
+    that fails is reported with the error of the array instead of as an absent keytab.
+  - purefb_keytabs - ``state=import`` is idempotent, in check mode as well; the file is uploaded
+    only when one of its entries is missing from the keytabs of the prefix.
+  - purefb_keytabs - an import leaves no copy of the keytab in the temporary directory, and an
+    exported file is readable by its owner only.
+  - purefb_keytabs - a prefix or a name that names the default server (``_array_server::prefix``)
+    addresses the keytabs of the plain prefix, and ``state=absent`` refuses a list of names
+    instead of reporting keytabs absent that still exist.
+  - purefb_keytabs - documented the ``server::prefix`` and ``realm::server::prefix`` forms of a
+    keytab prefix and name.

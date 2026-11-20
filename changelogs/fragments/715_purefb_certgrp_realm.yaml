@@ -1,0 +1,13 @@
+bugfixes:
+  - purefb_certgrp - a certificate from another scope than the group (named without the realm of
+    the group, from another realm, or a realm certificate for a group at array level) is refused
+    before any request, in check mode too. Before, the add failed on the array after check mode
+    had reported a change, and a removal reported no change while the member stayed in the group.
+  - purefb_certgrp - certificate names are compared the way the array reads them, without regard
+    to case or to white space around a name. A member written another way, such as the second
+    name of a list given as ``a, b``, is no longer reported as changed on every run and is
+    removed when ``state=absent`` names it.
+  - purefb_certgrp - a failed read of the certificate group fails the task with the array's
+    message instead of being taken for a group that does not exist.
+  - purefb_certgrp - check mode fails for a new group named into a realm that does not exist,
+    has been destroyed or is not open to the caller, as the real run does.

@@ -573,8 +573,9 @@ def create_cert(module, blade):
 
 def delete_cert(module, blade):
     changed = True
-    # the array matches names without regard to case
-    if module.params["name"].lower() == "global":
+    # the array matches names without regard to case and ignores white
+    # space around a name
+    if module.params["name"].strip().lower() == "global":
         module.fail_json(msg="Global certificate cannot be deleted")
     if not module.check_mode:
         res = blade.delete_certificates(names=[module.params["name"]])

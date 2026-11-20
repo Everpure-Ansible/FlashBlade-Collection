@@ -72,6 +72,7 @@ MOD = "plugins.modules.purefb_certs"
 MISSING = "Certificate does not exist."
 NO_REALM = "Realm does not exist."
 NOT_PERMITTED = "Operation not permitted."
+BLANK_NAME = "Missing or invalid parameter."
 ARRAY_TYPE_ONLY = (
     "Certificate signing request is only supported for array-type certificates."
 )
@@ -143,8 +144,8 @@ def _cert(name, certificate_type="array", **fields):
 def _blade(certs=(), realms=None, read_error=None, csr_error=None):
     """A FlashBlade that holds I(certs) and I(realms) (name: destroyed).
 
-    The array matches names without regard to case and answers a name it
-    does not have with an error.
+    The array matches names without regard to case, ignores white space
+    around a name and answers a name it does not have with an error.
     """
     blade = Mock()
     stored = dict((cert.name.lower(), cert) for cert in certs)
@@ -153,7 +154,10 @@ def _blade(certs=(), realms=None, read_error=None, csr_error=None):
     def get_certificates(names=None, **kwargs):
         if read_error is not None:
             return read_error
-        cert = stored.get(names[0].lower())
+        name = names[0].strip().lower()
+        if not name:
+            return _error_response(BLANK_NAME)
+        cert = stored.get(name)
         if cert is None:
             return _error_response(MISSING)
         return _valid_response([cert])
@@ -2242,6 +2246,21 @@ class TestCheckedRead:
         blade.get_realms.assert_not_called()
         opened.assert_not_called()
 
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    @pytest.mark.parametrize("name", ["", " "])
+    def test_blank_name_is_not_read_as_absent(self, name, state, check_mode):
+        """The array answers a blank name with an invalid parameter"""
+        module = _module(check_mode=check_mode, name=name, state=state)
+        blade = _blade([_cert("global")])
+
+        _run(module, blade)
+
+        assert _failure(module) == (
+            "Failed to read SSL certificate {0}. Error: {1}".format(name, BLANK_NAME)
+        )
+        _no_writes(blade)
+
     def test_error_without_a_message_is_not_read_as_absent(self):
         module = _module(state="absent")
         blade = _blade(read_error=_error_response(None, 500))
@@ -2386,6 +2405,30 @@ class TestBuiltInCertificate:
 
         assert _failure(module) == "Global certificate cannot be deleted"
         _no_writes(blade)
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize(
+        "name", ["global ", " global", "global\n", "GLOBAL\t", " Global \n"]
+    )
+    def test_white_space_around_the_name_is_refused(self, name, check_mode):
+        """A read ignores white space around a name, so it finds global"""
+        module = _module(check_mode=check_mode, name=name, state="absent")
+        blade = _blade([_cert("global")])
+
+        _run(module, blade)
+
+        assert _failure(module) == "Global certificate cannot be deleted"
+        blade.get_certificates.assert_called_once_with(names=[name])
+        _no_writes(blade)
+
+    def test_white_space_around_another_name_is_not_refused(self):
+        module = _module(name="cert\n", state="absent")
+        blade = _blade([_cert("global"), _cert("cert")])
+
+        _run(module, blade)
+
+        assert _changed(module) is True
+        blade.delete_certificates.assert_called_once_with(names=["cert\n"])
 
     def test_realm_certificate_called_global_is_deleted(self):
         module = _module(name="realm1::global", state="absent")

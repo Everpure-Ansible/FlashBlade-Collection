@@ -8,8 +8,8 @@ bugfixes:
     not exist, is outside the scope of the caller or has been destroyed, nor for a signing request
     from a certificate of type ``external``.
   - purefb_certs - the ``global`` certificate is refused for ``state=absent`` whatever the letter
-    case of the name, and a name with a ``*`` or a comma, which the array reads as a pattern or as
-    a list of names, is refused before anything is read.
+    case of the name and whatever white space surrounds it, and a name with a ``*`` or a comma,
+    which the array reads as a pattern or as a list of names, is refused before anything is read.
 minor_changes:
   - purefb_certs - documented the ``realm::certificate`` form of ``name`` for a certificate in a
     realm.

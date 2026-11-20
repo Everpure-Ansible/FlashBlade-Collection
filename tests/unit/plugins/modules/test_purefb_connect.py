@@ -306,6 +306,22 @@ class TestBreakConnection:
         )
         blade.delete_array_connections.assert_not_called()
 
+    def test_check_mode_reports_a_refused_read_like_the_real_run(self):
+        """The real run stops at a refused read of the array name, so check
+        mode makes the same read and must not promise the disconnect."""
+        module = _module(check_mode=True)
+        blade = _blade()
+        blade.get_arrays.side_effect = lambda **kwargs: _refused()
+
+        with pytest.raises(SystemExit):
+            break_connection(module, blade, _target())
+
+        assert _failure(module) == (
+            "Failed to read the array name. Error: Operation not permitted."
+        )
+        module.exit_json.assert_not_called()
+        assert _writes(blade) == []
+
     def test_refused_disconnect_is_reported(self):
         module = _module()
         blade = _blade()
@@ -399,6 +415,20 @@ class TestCheckConnected:
             "Failed to read the array name from 10.0.0.2. "
             "Error: Operation not permitted."
         )
+
+    def test_connection_formed_by_the_remote_needs_target_api(self, client):
+        """Without a token the array at target_url cannot be asked its name:
+        the failure names the option, and no login is tried."""
+        module = _module(state="absent", target_api=None)
+
+        with pytest.raises(SystemExit):
+            _check_connected(module, _blade([_target(management_address=None)]))
+
+        assert _failure(module) == (
+            "target_api is required to identify a connection that was "
+            "formed by the remote array"
+        )
+        client.assert_not_called()
 
 
 class TestCreateConnection:
@@ -770,6 +800,70 @@ class TestUpdateConnection:
 
         module.exit_json.assert_called_once_with(changed=False)
         module.fail_json.assert_not_called()
+
+    def test_stored_address_order_is_not_a_change(self, client):
+        """The array lists the replication addresses in its own order: a task
+        that names none must not send them back in another order."""
+        target = _target()
+        target.replication_addresses = ["10.0.1.9", "10.0.1.10"]
+        module = _module()
+        blade = _blade([target])
+        client.return_value = _remote()
+
+        with pytest.raises(SystemExit):
+            update_connection(module, blade)
+
+        assert _writes(blade) == []
+        module.exit_json.assert_called_once_with(changed=False)
+
+    def test_context_is_sent_with_the_local_requests(self, client):
+        module = _module(context="fleet-member", target_repl=["10.0.1.3"])
+        blade = _blade([_target()])
+        client.return_value = _remote()
+
+        with pytest.raises(SystemExit):
+            update_connection(module, blade)
+
+        blade.get_array_connections.assert_called_once_with(
+            context_names=["fleet-member"], filter="remote.name='peer-array'"
+        )
+        blade.get_bucket_replica_links.assert_called_once_with(
+            context_names=["fleet-member"]
+        )
+        assert blade.patch_array_connections.call_args[1]["context_names"] == [
+            "fleet-member"
+        ]
+
+    def test_change_is_worked_out_from_the_connection_of_the_context(self, client):
+        """The array that receives the request may be connected to the same
+        target as the fleet member named by context: the change is worked out
+        from the connection of the member, which is the one that is changed."""
+        own = _target()
+        own.replication_addresses = ["10.9.9.9"]
+        member = _target()
+        module = _module(context="fleet-member", encrypted=True)
+        blade = _blade()
+        blade.get_array_connections.side_effect = lambda **kwargs: _ok(
+            [member] if kwargs.get("context_names") == ["fleet-member"] else [own]
+        )
+        client.return_value = _remote()
+
+        with pytest.raises(SystemExit):
+            update_connection(module, blade)
+
+        blade.patch_array_connections.assert_called_once_with(
+            remote_names=["peer-array"],
+            array_connection={
+                "replication_addresses": ["10.0.1.2"],
+                "encrypted": True,
+                "throttle": {
+                    "default_limit": None,
+                    "window_limit": None,
+                    "window": {"start": None, "end": None},
+                },
+            },
+            context_names=["fleet-member"],
+        )
 
 
 def _run_main(module, blade):

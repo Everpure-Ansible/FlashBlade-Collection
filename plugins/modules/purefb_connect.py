@@ -45,6 +45,9 @@ options:
     - API token for target FlashBlade system
     - Creating a connection creates a connection key on the target FlashBlade
       with this token. No connection key is created in check mode.
+    - Required with C(state=present). With C(state=absent) it is needed only
+      when the array holds a connection that another array formed, because
+      such a connection is identified by the name of the array at I(target_url).
     type: str
   target_repl:
     description:
@@ -168,6 +171,13 @@ def _checked(module, res, what):
 
 def _remote_client(module):
     """Return a client for the array at I(target_url)"""
+    if not module.params["target_api"]:
+        # Only state=absent can come here: a connection that the other array
+        # formed is known by the name of that array, not by its address
+        module.fail_json(
+            msg="target_api is required to identify a connection that was "
+            "formed by the remote array"
+        )
     try:
         remote_system = Client(
             target=module.params["target_url"], api_token=module.params["target_api"]
@@ -236,15 +246,17 @@ def break_connection(module, blade, target_blade):
         module.fail_json(
             msg="Disconnect can only happen from the array that formed the connection"
         )
+    # Read in check mode too, so that it reports a refused read as the real
+    # run does
+    if (
+        LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
+        and module.params["context"]
+    ):
+        res = blade.get_arrays(context_names=[module.params["context"]])
+    else:
+        res = blade.get_arrays()
+    source_blade = list(_checked(module, res, "the array name").items)[0].name
     if not module.check_mode:
-        if (
-            LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-            and module.params["context"]
-        ):
-            res = blade.get_arrays(context_names=[module.params["context"]])
-        else:
-            res = blade.get_arrays()
-        source_blade = list(_checked(module, res, "the array name").items)[0].name
         if (
             LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
             and module.params["context"]
@@ -360,13 +372,19 @@ def update_connection(module, blade):
     changed = False
     api_version = get_rest_api_version(blade)
     remote_name = _remote_array_name(module, _remote_client(module))
-    connections = list(
-        _checked(
-            module,
-            blade.get_array_connections(filter="remote.name='" + remote_name + "'"),
-            "the array connections",
-        ).items
-    )
+    # Read the connection on the array that the lookup read and that the
+    # change is sent to
+    if (
+        LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
+        and module.params["context"]
+    ):
+        res = blade.get_array_connections(
+            context_names=[module.params["context"]],
+            filter="remote.name='" + remote_name + "'",
+        )
+    else:
+        res = blade.get_array_connections(filter="remote.name='" + remote_name + "'")
+    connections = list(_checked(module, res, "the array connections").items)
     if not connections:
         module.fail_json(
             msg="No connection to remote array {0} found".format(remote_name)
@@ -429,7 +447,7 @@ def update_connection(module, blade):
     if module.params["target_repl"]:
         target_repl = sorted(module.params["target_repl"])
     else:
-        target_repl = remote_connection.replication_addresses
+        target_repl = sorted(remote_connection.replication_addresses)
     if module.params["default_limit"]:
         default_limit = human_to_bytes(module.params["default_limit"])
         if default_limit == 0:

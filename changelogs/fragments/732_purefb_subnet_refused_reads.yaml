@@ -1,0 +1,13 @@
+bugfixes:
+  - purefb_subnet - the LAG is read only when a subnet is created, so a change, a delete or a task
+    with nothing to change no longer fails with ``LAG uplink does not exist.`` for an administrator
+    whose management access is limited to a realm.
+  - purefb_subnet - a read of the subnets or of the LAG that the array refuses or fails is reported
+    with the error of the array instead of being taken for a missing object or ending in a
+    traceback.
+  - purefb_subnet - a ``name`` of the form ``realm::name`` is refused before any request, so check
+    mode no longer predicts a create that the array refuses.
+  - purefb_subnet - an existing subnet named in another letter case is changed under the name the
+    array holds instead of failing with ``Prefix CIDR overlaps with existing subnet.``.
+  - purefb_subnet - a ``name`` that holds a comma, which the array reads as a list of names, is
+    refused.

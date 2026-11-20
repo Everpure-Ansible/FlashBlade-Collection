@@ -1,0 +1,14 @@
+bugfixes:
+  - purefb_s3acc - a quota request that the array refused while an account was created ended in a
+    traceback and left the account behind. ``quota``, ``default_quota`` and the hard limits are now
+    checked before anything is written, and a new account whose quotas the array still refuses is
+    deleted again.
+  - purefb_s3acc - check mode reported a change for an account in a realm that does not exist or is
+    destroyed, for a quota or hard limit the array refuses, and for the delete of an account that
+    still has users or buckets. It now fails as the real run does.
+  - purefb_s3acc - a read of the account, its users or its buckets that the array refuses now fails
+    with the error of the array instead of being taken for a missing account or an account without
+    users.
+  - purefb_s3acc - blanks around ``name`` or a comma-separated list of names got past the check for
+    users before an account is deleted. The blanks are now dropped and an empty name or a list of
+    names is refused.

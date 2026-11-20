@@ -1,0 +1,11 @@
+bugfixes:
+  - purefb_target - a replication network interface is required only to create a target. For an
+    administrator whose access is limited to a realm, who sees no such interface, a re-assert of
+    a target that is shared with the realm and ``state=absent`` no longer fail with
+    ``Replication network interface required to configure a target``.
+  - purefb_target - a read of the targets or of the network interfaces that the array refuses or
+    fails is reported with the error of the array instead of a traceback.
+  - purefb_target - an existing target is found whatever the letter case of ``name``.
+  - purefb_target - check mode fails like the real run for an address another target already has
+    and for a realm-qualified ``name``, which the module now refuses to create. The delete example
+    no longer passes ``target_api``, which is not an option.

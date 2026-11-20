@@ -1,0 +1,11 @@
+bugfixes:
+  - purefb_server - ``directory_service`` reported a change on every run and changed nothing,
+    because the directory services of a server are read-only once it is created. Nothing is sent
+    for the option any more. It is compared with the directory services of the server and a
+    difference fails, in check mode as well.
+  - purefb_server - a DNS configuration or local directory service named in another case than the
+    array stores was sent again on every run.
+  - purefb_server - a read of the server that fails is reported instead of being taken for a
+    missing server.
+  - purefb_server - when the array refuses a DNS configuration or a local directory service for a
+    server in a realm, the message now says what a server in that realm can use.

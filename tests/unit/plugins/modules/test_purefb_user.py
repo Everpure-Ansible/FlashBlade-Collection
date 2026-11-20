@@ -78,6 +78,7 @@ sys.modules[
 
 from plugins.modules.purefb_user import (
     parse_public_keys,
+    validate_name,
     validate_public_key,
     public_key_changed,
     create_local_user,
@@ -94,6 +95,7 @@ from plugins.modules.purefb_user import (
     new_admin_post,
     set_authorization_model,
     update_ad_user,
+    delete_local_user,
     main,
 )
 
@@ -321,6 +323,68 @@ class TestParsePublicKeys:
     def test_empty_and_none(self):
         assert parse_public_keys("") == []
         assert parse_public_keys(None) == []
+
+
+class TestValidateName:
+    """User accounts are array-level objects. A realm-qualified name is
+    refused with a message of its own, any other invalid name with the name
+    rule, both before the array is contacted."""
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "realm-a::svc",
+            "realm-a::qa-admin",
+            "outer::inner::svc",
+            "::svc",
+            "svc::",
+            "Realm-A::Svc",
+        ],
+    )
+    def test_realm_qualified_name_gets_the_realm_message(self, name):
+        module = _module(name=name)
+        with pytest.raises(SystemExit):
+            validate_name(module)
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "'{0}'".format(name) in msg
+        assert "array-level" in msg
+        assert "realm::name" in msg
+        assert "management_access_policies" in msg
+        assert "name must contain" not in msg
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "",
+            "Qa-Admin",
+            "qa_admin",
+            "qa.admin",
+            "qa:admin",
+            "qa admin",
+            "qa,admin",
+            "qa*",
+            "-qa",
+            "qa-",
+            "a" * 33,
+        ],
+    )
+    def test_other_invalid_name_gets_the_name_rule(self, name):
+        module = _module(name=name)
+        with pytest.raises(SystemExit):
+            validate_name(module)
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "name must contain a minimum of 1 and a maximum of 32" in msg
+        assert "array-level" not in msg
+
+    @pytest.mark.parametrize(
+        "name", ["a", "7", "qa-admin", "svc-2", "a-b-c", "realm-a-svc", "a" * 32]
+    )
+    def test_valid_name_passes(self, name):
+        module = _module(name=name)
+        validate_name(module)
+        module.fail_json.assert_not_called()
 
 
 class TestValidatePublicKey:
@@ -1248,6 +1312,183 @@ class TestAuthorizationModel:
         assert module.exit_json.call_args[1]["changed"] is False
 
 
+REALM_POLICY = "realm-a-admins"
+NOT_PERMITTED = "Operation not permitted."
+
+
+def _realm_account(policies=(REALM_POLICY,)):
+    """A service account as GET admins returns it when it holds no legacy
+    role: only management access policies, here one whose rules are all
+    scoped to a realm."""
+    return _user(role=None, policies=list(policies), admin_type="service-account")
+
+
+class TestRealmAdministrator:
+    """An account is confined to a realm by the policies it holds. To the
+    module such a policy is a policy name like any other; the account itself
+    is an array-level object."""
+
+    @patch("plugins.modules.purefb_user.ReferenceWritable")
+    @patch("plugins.modules.purefb_user.AdminPost")
+    def test_service_account_is_created_with_the_realm_policy(
+        self, mock_post, mock_ref
+    ):
+        module = _module(
+            name="realm-a-svc",
+            admin_type="service-account",
+            management_access_policies=[REALM_POLICY],
+        )
+        blade = Mock()
+        blade.post_admins.return_value.status_code = 200
+        with pytest.raises(SystemExit):
+            create_local_user(module, blade, None)
+        mock_ref.assert_called_once_with(name=REALM_POLICY)
+        assert mock_post.call_args[1] == {
+            "management_access_policies": [mock_ref.return_value],
+            "admin_type": "service-account",
+        }
+        blade.post_admins.assert_called_once_with(
+            names=["realm-a-svc"], admin=mock_post.return_value
+        )
+        assert _policy_calls(blade) == []
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    @pytest.mark.parametrize("requested", [REALM_POLICY, "Realm-A-Admins"])
+    def test_account_that_holds_the_realm_policy_is_unchanged(self, requested):
+        module = _module(
+            admin_type="service-account", management_access_policies=[requested]
+        )
+        blade = Mock()
+        with pytest.raises(SystemExit):
+            create_local_user(module, blade, _realm_account())
+        assert blade.mock_calls == []
+        module.fail_json.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    def test_widening_attaches_the_array_wide_policy_only(self):
+        module = _module(management_access_policies=[REALM_POLICY, "readonly"])
+        blade = Mock()
+        blade.post_management_access_policies_admins.return_value.status_code = 200
+        with pytest.raises(SystemExit):
+            create_local_user(module, blade, _realm_account())
+        assert _policy_calls(blade) == ["post_management_access_policies_admins"]
+        assert blade.post_management_access_policies_admins.call_args[1] == {
+            "member_names": ["qa-admin"],
+            "policy_names": ["readonly"],
+        }
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_narrowing_to_the_realm_policy_detaches_the_other_only(self):
+        module = _module(management_access_policies=[REALM_POLICY])
+        blade = Mock()
+        blade.delete_management_access_policies_admins.return_value.status_code = 200
+        with pytest.raises(SystemExit):
+            create_local_user(
+                module, blade, _realm_account(policies=("readonly", REALM_POLICY))
+            )
+        assert _policy_calls(blade) == ["delete_management_access_policies_admins"]
+        assert blade.delete_management_access_policies_admins.call_args[1] == {
+            "member_names": ["qa-admin"],
+            "policy_names": ["readonly"],
+        }
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_legacy_role_on_an_account_confined_to_a_realm_is_refused(self):
+        module = _module(role="readonly")
+        blade = Mock()
+        with pytest.raises(SystemExit):
+            create_local_user(module, blade, _realm_account())
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert REALM_POLICY in msg
+        assert "no legacy role" in msg
+        assert blade.mock_calls == []
+
+
+@patch("plugins.modules.purefb_user.get_error_message")
+class TestCallerConfinedToARealm:
+    """The array refuses these requests of an account that is confined to a
+    realm with a 400 "Operation not permitted."; the task fails with that
+    message and sends nothing further."""
+
+    def test_widening_its_own_policies_is_refused(self, mock_gem):
+        mock_gem.return_value = NOT_PERMITTED
+        module = _module(management_access_policies=[REALM_POLICY, "readonly"])
+        blade = Mock()
+        blade.post_management_access_policies_admins.return_value.status_code = 400
+        with pytest.raises(SystemExit):
+            create_local_user(module, blade, _realm_account())
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Failed to attach management access policies ['readonly']" in msg
+        assert NOT_PERMITTED in msg
+        blade.delete_management_access_policies_admins.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    def test_widening_its_own_policies_in_check_mode_sends_nothing(self, mock_gem):
+        module = _module(management_access_policies=[REALM_POLICY, "readonly"])
+        module.check_mode = True
+        blade = Mock()
+        with pytest.raises(SystemExit):
+            create_local_user(module, blade, _realm_account())
+        assert blade.mock_calls == []
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    @patch("plugins.modules.purefb_user.new_admin_post")
+    def test_creating_an_account_is_refused(self, mock_body, mock_gem):
+        mock_gem.return_value = NOT_PERMITTED
+        module = _module(
+            admin_type="service-account", management_access_policies=[REALM_POLICY]
+        )
+        blade = Mock()
+        blade.post_admins.return_value.status_code = 400
+        with pytest.raises(SystemExit):
+            create_local_user(module, blade, None)
+        module.fail_json.assert_called_once_with(
+            msg="Failed to create user qa-admin. Error: " + NOT_PERMITTED
+        )
+        blade.post_admins_api_tokens.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    def test_replacing_its_own_token_is_refused_and_no_token_is_created(self, mock_gem):
+        mock_gem.return_value = NOT_PERMITTED
+        module = _module(api=True)
+        blade = Mock()
+        blade.delete_admins_api_tokens.return_value.status_code = 400
+        user = _realm_account()
+        user.api_token = Mock()
+        user.api_token.created_at = 1700000000000
+        user.api_token.expires_at = None
+        with pytest.raises(SystemExit):
+            create_local_user(module, blade, user)
+        module.fail_json.assert_called_once_with(
+            msg="Failed to delete original API token. Error: " + NOT_PERMITTED
+        )
+        blade.post_admins_api_tokens.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    def test_deleting_itself_is_refused(self, mock_gem):
+        mock_gem.return_value = NOT_PERMITTED
+        module = _module(state="absent")
+        blade = Mock()
+        blade.delete_admins.return_value.status_code = 400
+        with pytest.raises(SystemExit):
+            delete_local_user(module, blade)
+        module.fail_json.assert_called_once_with(
+            msg="User Account qa-admin deletion failed. Error: " + NOT_PERMITTED
+        )
+        module.exit_json.assert_not_called()
+
+    def test_an_account_it_is_not_shown_reads_as_absent(self, mock_gem):
+        mock_gem.return_value = "Admin does not exist."
+        module = _module(name="other-admin")
+        blade = Mock()
+        blade.get_admins.return_value.status_code = 400
+        assert get_user(module, blade) is None
+        blade.get_admins.assert_called_once_with(names=["other-admin"])
+        module.fail_json.assert_not_called()
+
+
 class TestGetUser:
     def _blade(self, status_code, items=None):
         blade = Mock()
@@ -1518,4 +1759,187 @@ class TestMain:
             pass
         module.fail_json.assert_not_called()
         blade.delete_admins.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    def _assert_refused_before_connecting(self, module, blade, mock_get_system):
+        module.fail_json.assert_called_once()
+        mock_get_system.assert_not_called()
+        assert blade.mock_calls == []
+        module.exit_json.assert_not_called()
+        return module.fail_json.call_args[1]["msg"]
+
+    def test_realm_qualified_name_is_refused_before_connecting(
+        self, mock_ansible_module, mock_get_system, mock_api_version
+    ):
+        module, blade = self._run(
+            mock_ansible_module,
+            mock_get_system,
+            mock_api_version,
+            "2.30",
+            name="realm-a::svc",
+            admin_type="service-account",
+            management_access_policies=["realm-a-admins"],
+        )
+        try:
+            main()
+        except SystemExit:
+            pass
+        msg = self._assert_refused_before_connecting(module, blade, mock_get_system)
+        assert "'realm-a::svc'" in msg
+        assert "array-level" in msg
+        assert "management_access_policies" in msg
+
+    def test_realm_qualified_name_is_refused_in_check_mode(
+        self, mock_ansible_module, mock_get_system, mock_api_version
+    ):
+        module, blade = self._run(
+            mock_ansible_module,
+            mock_get_system,
+            mock_api_version,
+            "2.30",
+            name="realm-a::svc",
+            admin_type="service-account",
+            management_access_policies=["realm-a-admins"],
+        )
+        module.check_mode = True
+        try:
+            main()
+        except SystemExit:
+            pass
+        msg = self._assert_refused_before_connecting(module, blade, mock_get_system)
+        assert "array-level" in msg
+
+    def test_realm_qualified_name_absent_is_refused_before_connecting(
+        self, mock_ansible_module, mock_get_system, mock_api_version
+    ):
+        module, blade = self._run(
+            mock_ansible_module,
+            mock_get_system,
+            mock_api_version,
+            "2.30",
+            name="realm-a::svc",
+            state="absent",
+        )
+        try:
+            main()
+        except SystemExit:
+            pass
+        msg = self._assert_refused_before_connecting(module, blade, mock_get_system)
+        assert "array-level" in msg
+
+    def test_realm_qualified_remote_user_name_is_refused_before_connecting(
+        self, mock_ansible_module, mock_get_system, mock_api_version
+    ):
+        module, blade = self._run(
+            mock_ansible_module,
+            mock_get_system,
+            mock_api_version,
+            "2.30",
+            name="realm-a::ad-ops",
+            ad_user=True,
+            api=True,
+        )
+        try:
+            main()
+        except SystemExit:
+            pass
+        msg = self._assert_refused_before_connecting(module, blade, mock_get_system)
+        assert "array-level" in msg
+
+    def test_invalid_name_fails_before_connecting(
+        self, mock_ansible_module, mock_get_system, mock_api_version
+    ):
+        module, blade = self._run(
+            mock_ansible_module,
+            mock_get_system,
+            mock_api_version,
+            "2.30",
+            name="Qa_Admin",
+        )
+        try:
+            main()
+        except SystemExit:
+            pass
+        msg = self._assert_refused_before_connecting(module, blade, mock_get_system)
+        assert "name must contain a minimum of 1 and a maximum of 32" in msg
+        assert "array-level" not in msg
+
+    def test_name_is_checked_before_the_other_options(
+        self, mock_ansible_module, mock_get_system, mock_api_version
+    ):
+        module, blade = self._run(
+            mock_ansible_module,
+            mock_get_system,
+            mock_api_version,
+            "2.30",
+            name="realm-a::svc",
+            admin_type="service-account",
+            password="secret",
+        )
+        try:
+            main()
+        except SystemExit:
+            pass
+        msg = self._assert_refused_before_connecting(module, blade, mock_get_system)
+        assert "array-level" in msg
+
+    @patch("plugins.modules.purefb_user.get_error_message")
+    @patch("plugins.modules.purefb_user.ReferenceWritable")
+    @patch("plugins.modules.purefb_user.AdminPost")
+    def test_creates_a_realm_administrator_service_account(
+        self,
+        mock_post,
+        mock_ref,
+        mock_gem,
+        mock_ansible_module,
+        mock_get_system,
+        mock_api_version,
+    ):
+        mock_gem.return_value = "Admin does not exist."
+        module, blade = self._run(
+            mock_ansible_module,
+            mock_get_system,
+            mock_api_version,
+            "2.30",
+            name="realm-a-svc",
+            admin_type="service-account",
+            management_access_policies=["realm-a-admins"],
+        )
+        blade.get_admins.return_value.status_code = 400
+        blade.post_admins.return_value.status_code = 200
+        try:
+            main()
+        except SystemExit:
+            pass
+        module.fail_json.assert_not_called()
+        blade.get_admins.assert_called_once_with(names=["realm-a-svc"])
+        mock_ref.assert_called_once_with(name="realm-a-admins")
+        blade.post_admins.assert_called_once_with(
+            names=["realm-a-svc"], admin=mock_post.return_value
+        )
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_realm_administrator_service_account_rerun_is_unchanged(
+        self, mock_ansible_module, mock_get_system, mock_api_version
+    ):
+        module, blade = self._run(
+            mock_ansible_module,
+            mock_get_system,
+            mock_api_version,
+            "2.30",
+            name="realm-a-svc",
+            admin_type="service-account",
+            management_access_policies=["realm-a-admins"],
+        )
+        blade.get_admins.return_value.status_code = 200
+        blade.get_admins.return_value.items = [
+            _user(role=None, policies=["realm-a-admins"], admin_type="service-account")
+        ]
+        try:
+            main()
+        except SystemExit:
+            pass
+        module.fail_json.assert_not_called()
+        blade.post_admins.assert_not_called()
+        assert _policy_calls(blade) == []
         assert module.exit_json.call_args[1]["changed"] is False

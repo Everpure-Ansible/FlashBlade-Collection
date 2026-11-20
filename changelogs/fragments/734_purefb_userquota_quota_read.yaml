@@ -1,0 +1,6 @@
+bugfixes:
+  - purefb_userquota - a quota read that the array refuses now fails with the error of the array
+    instead of being taken for a user without a quota, which made ``state=absent`` report no
+    change and check mode report a create.
+  - purefb_userquota - ``name`` documents the ``realm::name`` form of a file system in a realm,
+    with an example.

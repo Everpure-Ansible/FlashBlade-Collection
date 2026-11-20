@@ -21,6 +21,11 @@ version_added: '1.0.0'
 short_description: Create or delete FlashBlade Object Store account users
 description:
 - Create or delete object store account users on a Pure Stoage FlashBlade.
+- A user of an object store account in a realm is managed by giving I(account)
+  as C(realm::account). The access keys of such a user are named
+  C(realm::<access key ID>) on the array.
+- A realm-scoped administrator must use the realm-qualified name; a bare name
+  is not placed in, or resolved to, the administrator's realm.
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
@@ -28,17 +33,22 @@ options:
     description:
     - Create or delete object store account user
     - Remove a specified access key for a user
+    - C(keystate) enables or disables the access key named by I(key_name), as
+      I(enable_key) says. The task fails when the user or the access key does
+      not exist.
     default: present
     choices: [ absent, present, remove_key, keystate ]
     type: str
   name:
     description:
     - The name of object store user
+    - A task names one user. A list of names is refused.
     type: str
     required: true
   account:
     description:
     - The name of object store account associated with user
+    - An account in a realm is named C(realm::account).
     type: str
     required: true
   access_key:
@@ -58,6 +68,13 @@ options:
     aliases: [ remove_key ]
     description:
     - Access key to be modified
+    - Required when I(state) is C(keystate) or C(remove_key).
+    - A task names one access key. A list of names is refused.
+    - The access key must belong to the user named by I(name) and I(account).
+      The task fails, and changes nothing, when it belongs to another user.
+    - The access key of a user of an account in a realm is named
+      C(realm::<access key ID>). An access key ID given without a realm prefix
+      is looked up in the realm of I(account).
     type: str
     version_added: "1.5.0"
   enable_key:
@@ -73,6 +90,12 @@ options:
       3.0.0 or later). The array validates the pair and rejects anything else
       with "The access key/secret key combination provided is invalid or
       unable to be imported"; the module then fails with that error.
+    - For a user of an account in a realm the key is imported as
+      C(realm::<access key ID>). An access key ID given without a realm prefix
+      is imported into the realm of I(account); a prefix that names another
+      realm is refused.
+    - An access key ID that already belongs to another user cannot be
+      imported.
     type: str
     version_added: "1.4.0"
   imported_secret:
@@ -87,6 +110,9 @@ options:
     - If not specified, the user is created with whatever policies the array
       assigns by default. Current Purity//FB releases assign none, so a user
       created without I(policy) has no access policies until some are added.
+    - For a user of an account in a realm, a policy of that account is named
+      C(realm::account/policy). The policies the array ships keep their names,
+      for example C(pure:policy/object-read).
     type: list
     elements: str
     version_added: "1.6.0"
@@ -160,9 +186,66 @@ EXAMPLES = r"""
     state: remove_key
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Create object store user foo (with access ID and key) in account bar of realm myrealm
+  everpure.flashblade.purefb_s3user:
+    name: foo
+    account: myrealm::bar
+    access_key: true
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+  register: realm_user
+  no_log: true
+
+- name: Disable the access key of user foo in account bar of realm myrealm
+  everpure.flashblade.purefb_s3user:
+    name: foo
+    account: myrealm::bar
+    key_name: "{{ realm_user.s3user_info.fb_s3user.access_key_id }}"
+    state: keystate
+    enable_key: false
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 """
 
 RETURN = r"""
+s3user_info:
+  description:
+  - Details of the access key the task generated.
+  - Empty when the task generated no access key, and in check mode.
+  returned: when I(state) is C(present)
+  type: dict
+  contains:
+    fb_s3user:
+      description: The access key generated for the user.
+      returned: when an access key is generated
+      type: dict
+      contains:
+        user:
+          description: Name of the user, as C(account/user).
+          type: str
+          sample: bar/foo
+        enabled:
+          description: Whether the access key is enabled.
+          type: bool
+          sample: true
+        access_key:
+          description: The secret access key. The array returns it only once.
+          type: str
+        access_id:
+          description:
+          - Name of the access key on the array, as I(key_name) takes it.
+          - For a user of an account in a realm it carries the realm prefix,
+            C(realm::<access key ID>).
+          type: str
+          sample: PSFBSAZRDHFKAMIEGIBLIEDDOFLHGEEEEFCBPBFCLJ
+        access_key_id:
+          description:
+          - The access key ID that authorizes S3 operations. It never carries
+            a realm prefix.
+          type: str
+          sample: PSFBSAZRDHFKAMIEGIBLIEDDOFLHGEEEEFCBPBFCLJ
+          version_added: '1.30.0'
 """
 
 
@@ -189,6 +272,159 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
 CONTEXT_API_VERSION = "2.17"
 
 
+def _context_kwargs(module, api_version):
+    """Return context_names kwargs when a fleet context applies."""
+    if (
+        LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
+        and module.params["context"]
+    ):
+        return {"context_names": [module.params["context"]]}
+    return {}
+
+
+def _realm_of(name):
+    """Return the realm prefix of a name, or an empty string outside a realm."""
+    return name.rpartition("::")[0] if name else ""
+
+
+def _same_name(first, second):
+    """Compare two names as the array does, without regard to letter case."""
+    return (first or "").lower() == (second or "").lower()
+
+
+def _user_name(module):
+    """Return the name of the user as the array holds it, account/user."""
+    return module.params["account"] + "/" + module.params["name"]
+
+
+def _owner(key):
+    """Return the name of the user an access key belongs to, or None."""
+    return getattr(getattr(key, "user", None), "name", None)
+
+
+def _one_name(module, option):
+    """Fail unless an option holds the name of exactly one object.
+
+    The array reads a comma as a separator of names. It answers a read of
+    such a list with every object on it and refuses to change more than
+    one of them in a request, so a list is refused before anything is read.
+    """
+    value = module.params[option]
+    if not value or not value.strip():
+        module.fail_json(msg="{0} must not be empty.".format(option))
+    if "," in value:
+        module.fail_json(
+            msg="{0} names more than one object ({1}). A task takes one name; "
+            "the array reads a comma as a separator of names.".format(option, value)
+        )
+
+
+def _qualify_key(module, option):
+    """Place the access key that an option names in the realm of the account.
+
+    An access key lives in the realm of its user. For a user of an account
+    named realm::account the array names the key realm::<access key ID>,
+    and the bare ID addresses another key: the one of that ID outside any
+    realm. A key given without a realm prefix therefore gets the prefix of
+    the account. A key whose prefix names another scope can never belong to
+    the user, and the array refuses to import one, so it is refused here
+    before anything is read or sent. The array matches names without regard
+    to case; the prefix is rewritten the way the account spells it.
+    """
+    _one_name(module, option)
+    key = module.params[option]
+    if not key.rpartition("::")[2].strip():
+        module.fail_json(msg="{0} must hold an access key ID.".format(option))
+    realm = _realm_of(module.params["account"])
+    if "::" not in key:
+        if realm:
+            module.params[option] = "{0}::{1}".format(realm, key)
+        return
+    if not realm:
+        module.fail_json(
+            msg="Access key {0} cannot belong to object store user {1}: the user "
+            "is not in a realm and its access keys are named without a realm "
+            "prefix.".format(key, _user_name(module))
+        )
+    if not _same_name(_realm_of(key), realm):
+        module.fail_json(
+            msg="Access key {0} cannot belong to object store user {1}: the user "
+            "is in realm {2} and its access keys are named {2}::<access key "
+            "ID>.".format(key, _user_name(module), realm)
+        )
+    module.params[option] = "{0}::{1}".format(realm, key.rpartition("::")[2])
+
+
+def _checked_item(module, res, what):
+    """Return the item a read by name answered, or None when there is none.
+
+    Only the array's "does not exist" answer reads as absent. Any other
+    failure fails the task with the array's message, so a refused or failed
+    read is never taken for a missing object.
+    """
+    if res.status_code == 200:
+        items = list(res.items)
+        return items[0] if items else None
+    error = get_error_message(res)
+    if "does not exist" in str(error).lower():
+        return None
+    module.fail_json(msg="Failed to read {0}. Error: {1}".format(what, error))
+
+
+def _get_key(module, blade, api_version, name):
+    """Return the access key called name, or None when there is none."""
+    res = blade.get_object_store_access_keys(
+        names=[name], **_context_kwargs(module, api_version)
+    )
+    return _checked_item(module, res, "access key {0}".format(name))
+
+
+def _list_keys(module, blade, api_version):
+    """Return every access key the array reports."""
+    res = blade.get_object_store_access_keys(**_context_kwargs(module, api_version))
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to list access keys. Error: {0}".format(get_error_message(res))
+        )
+    return list(res.items)
+
+
+def _get_own_key(module, blade, api_version):
+    """Return the access key that key_name names when it belongs to the user.
+
+    None when the array has no such key. A key of another user is never
+    acted on: the task fails before the check-mode branch, so check mode and
+    a real run agree.
+    """
+    key = _get_key(module, blade, api_version, module.params["key_name"])
+    if key is None:
+        return None
+    user = _user_name(module)
+    if not _same_name(_owner(key), user):
+        module.fail_json(
+            msg="Access key {0} belongs to object store user {1}, not to {2}. "
+            "Nothing was changed.".format(module.params["key_name"], _owner(key), user)
+        )
+    return key
+
+
+def _key_facts(module, user, key):
+    """Return the facts of an access key the array has just generated.
+
+    The name of an access key of a user in a realm carries the realm prefix;
+    the access key ID that authorizes S3 operations never does. Arrays that
+    do not report the ID have no realms, so the name is the ID there.
+    """
+    return {
+        "user": user,
+        "enabled": module.params["enable_key"],
+        "access_key": key.secret_access_key,
+        "access_id": key.name,
+        "access_key_id": getattr(key, "access_key_id", None)
+        or key.name.rpartition("::")[2],
+    }
+
+
 def get_s3acc(module, blade):
     """Return Object Store Account or None"""
     api_version = get_rest_api_version(blade)
@@ -201,9 +437,9 @@ def get_s3acc(module, blade):
         )
     else:
         res = blade.get_object_store_accounts(names=[module.params["account"]])
-    if res.status_code == 200:
-        return list(res.items)[0]
-    return None
+    return _checked_item(
+        module, res, "object store account {0}".format(module.params["account"])
+    )
 
 
 def get_s3user(module, blade):
@@ -219,9 +455,7 @@ def get_s3user(module, blade):
         )
     else:
         res = blade.get_object_store_users(names=[full_user])
-    if res.status_code == 200:
-        return list(res.items)[0]
-    return None
+    return _checked_item(module, res, "object store user {0}".format(full_user))
 
 
 def update_s3user(module, blade):
@@ -237,36 +471,17 @@ def update_s3user(module, blade):
             # Look the imported access key ID up directly before importing it:
             # re-importing an ID that already exists is an error on the array
             # and must be a no-op here when it already belongs to this user.
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-                and module.params["context"]
-            ):
-                key_res = blade.get_object_store_access_keys(
-                    names=[module.params["imported_key"]],
-                    context_names=[module.params["context"]],
-                )
-            else:
-                key_res = blade.get_object_store_access_keys(
-                    names=[module.params["imported_key"]]
-                )
-            if key_res.status_code == 200:
-                exists = True
-                existing_key = list(key_res.items)[0]
-                if getattr(getattr(existing_key, "user", None), "name", None) != user:
-                    module.warn("Imported key provided already belongs to another user")
-        if (
-            LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-            and module.params["context"]
-        ):
-            keys = list(
-                blade.get_object_store_access_keys(
-                    context_names=[module.params["context"]]
-                ).items
+            # main() has placed the name in the realm of the account, so a
+            # key of the same ID in another scope is not mistaken for it.
+            existing_key = _get_key(
+                module, blade, api_version, module.params["imported_key"]
             )
-        else:
-            keys = list(blade.get_object_store_access_keys().items)
-        for key in keys:
-            if key.user.name == user:
+            if existing_key is not None:
+                exists = True
+                if not _same_name(_owner(existing_key), user):
+                    module.warn("Imported key provided already belongs to another user")
+        for key in _list_keys(module, blade, api_version):
+            if _same_name(_owner(key), user):
                 key_count += 1
         if not exists:
             if key_count < 2:
@@ -317,12 +532,9 @@ def update_s3user(module, blade):
                                                 enabled=False
                                             ),
                                         )
-                                s3user_facts["fb_s3user"] = {
-                                    "user": user,
-                                    "enabled": module.params["enable_key"],
-                                    "access_key": result.secret_access_key,
-                                    "access_id": result.name,
-                                }
+                                s3user_facts["fb_s3user"] = _key_facts(
+                                    module, user, result
+                                )
                             else:
                                 module.fail_json(
                                     msg="Object Store User {0} access Key import failed. "
@@ -399,8 +611,22 @@ def create_s3user(module, blade):
     s3user_facts = {}
     changed = True
     api_version = get_rest_api_version(blade)
+    user = _user_name(module)
+    if module.params["imported_key"] and not module.params["access_key"]:
+        # A new user cannot own an access key that already exists, and the
+        # array refuses to import an access key ID a second time. Settled
+        # before the user is created, so check mode and a real run agree.
+        existing_key = _get_key(
+            module, blade, api_version, module.params["imported_key"]
+        )
+        if existing_key is not None:
+            module.fail_json(
+                msg="Access key {0} already belongs to object store user {1}. "
+                "It cannot be imported for {2}.".format(
+                    module.params["imported_key"], _owner(existing_key), user
+                )
+            )
     if not module.check_mode:
-        user = module.params["account"] + "/" + module.params["name"]
         if (
             LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
             and module.params["context"]
@@ -452,12 +678,7 @@ def create_s3user(module, blade):
                             names=[result.name],
                             object_store_access_key=ObjectStoreAccessKey(enabled=False),
                         )
-                s3user_facts["fb_s3user"] = {
-                    "user": user,
-                    "enabled": module.params["enable_key"],
-                    "access_key": result.secret_access_key,
-                    "access_id": result.name,
-                }
+                s3user_facts["fb_s3user"] = _key_facts(module, user, result)
             else:
                 delete_s3user(module, blade, True)
                 module.fail_json(
@@ -553,6 +774,11 @@ def create_s3user(module, blade):
                     res = blade.get_object_store_users_object_store_access_policies(
                         member_names=[username], policy_names=[policy]
                     )
+                if res.status_code != 200:
+                    module.fail_json(
+                        msg="Failed to read the access policies of object store "
+                        "user {0}. Error: {1}".format(username, get_error_message(res))
+                    )
                 if not list(res.items):
                     if (
                         LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
@@ -620,30 +846,13 @@ def remove_key(module, blade):
     """Remove Access Key from User"""
     changed = False
     api_version = get_rest_api_version(blade)
-    if (
-        LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-        and module.params["context"]
-    ):
-        res = blade.get_object_store_access_keys(
-            names=[module.params["key_name"]], context_names=[module.params["context"]]
-        )
-    else:
-        res = blade.get_object_store_access_keys(names=[module.params["key_name"]])
-    if res.status_code == 200:
+    key = _get_own_key(module, blade, api_version)
+    if key is not None:
         changed = True
         if not module.check_mode:
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-                and module.params["context"]
-            ):
-                res = blade.delete_object_store_access_keys(
-                    names=[module.params["key_name"]],
-                    context_names=[module.params["context"]],
-                )
-            else:
-                res = blade.delete_object_store_access_keys(
-                    names=[module.params["key_name"]]
-                )
+            res = blade.delete_object_store_access_keys(
+                names=[key.name], **_context_kwargs(module, api_version)
+            )
             if res.status_code != 200:
                 module.fail_json(
                     msg="Failed to delete access key {0}. "
@@ -658,46 +867,29 @@ def change_key(module, blade):
     """Change state of Access Key"""
     changed = False
     api_version = get_rest_api_version(blade)
-    if not module.check_mode:
-        if (
-            LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-            and module.params["context"]
-        ):
-            res = blade.get_object_store_access_keys(
-                names=[module.params["key_name"]],
-                context_names=[module.params["context"]],
+    key = _get_own_key(module, blade, api_version)
+    if key is None:
+        module.fail_json(
+            msg="Access key {0} does not exist. Object store user {1} has no "
+            "such access key.".format(module.params["key_name"], _user_name(module))
+        )
+    if bool(key.enabled) != module.params["enable_key"]:
+        changed = True
+        if not module.check_mode:
+            res = blade.patch_object_store_access_keys(
+                names=[key.name],
+                object_store_access_key=ObjectStoreAccessKey(
+                    enabled=module.params["enable_key"]
+                ),
+                **_context_kwargs(module, api_version)
             )
-        else:
-            res = blade.get_object_store_access_keys(names=[module.params["key_name"]])
-        if res.status_code == 200:
-            key = list(res.items)[0]
-            if key.enabled != module.params["enable_key"]:
-                changed = True
-                if (
-                    LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-                    and module.params["context"]
-                ):
-                    res = blade.patch_object_store_access_keys(
-                        names=[module.params["key_name"]],
-                        object_store_access_key=ObjectStoreAccessKey(
-                            enabled=module.params["enable_key"]
-                        ),
-                        context_names=[module.params["context"]],
+            if res.status_code != 200:
+                module.fail_json(
+                    msg="Failed to change state of access key {0}. "
+                    "Error: {1}".format(
+                        module.params["key_name"], get_error_message(res)
                     )
-                else:
-                    res = blade.patch_object_store_access_keys(
-                        names=[module.params["key_name"]],
-                        object_store_access_key=ObjectStoreAccessKey(
-                            enabled=module.params["enable_key"]
-                        ),
-                    )
-                if res.status_code != 200:
-                    module.fail_json(
-                        msg="Failed to change state of access key {0}. "
-                        "Error: {1}".format(
-                            module.params["key_name"], get_error_message(res)
-                        )
-                    )
+                )
     module.exit_json(changed=changed)
 
 
@@ -753,7 +945,10 @@ def main():
     )
 
     required_together = [["imported_key", "imported_secret"]]
-    required_if = [["state", "remove_key", ["key_name"]]]
+    required_if = [
+        ["state", "remove_key", ["key_name"]],
+        ["state", "keystate", ["key_name"]],
+    ]
 
     module = AnsibleModule(
         argument_spec,
@@ -766,6 +961,8 @@ def main():
         module.fail_json(msg="py-pure-client sdk is required for this module")
 
     state = module.params["state"]
+    for option in ("name", "account"):
+        _one_name(module, option)
     blade = get_system(module)
     api_version = get_rest_api_version(blade)
     if (
@@ -786,6 +983,16 @@ def main():
         module.warn("Changing account name to lowercase...")
         module.params["account"] = module.params["account"].lower()
 
+    # An access key is addressed in the realm of the account the task names.
+    if state in ("remove_key", "keystate"):
+        _qualify_key(module, "key_name")
+    elif (
+        state == "present"
+        and module.params["imported_key"]
+        and not module.params["access_key"]
+    ):
+        _qualify_key(module, "imported_key")
+
     s3acc = get_s3acc(module, blade)
     if not s3acc:
         module.fail_json(
@@ -804,7 +1011,14 @@ def main():
         create_s3user(module, blade)
     elif state == "remove_key" and s3user:
         remove_key(module, blade)
-    elif state == "keystate" and s3user:
+    elif state == "keystate":
+        if not s3user:
+            module.fail_json(
+                msg="Object Store User {0} does not exist. The state of access "
+                "key {1} cannot be set.".format(
+                    _user_name(module), module.params["key_name"]
+                )
+            )
         change_key(module, blade)
     else:
         module.exit_json(changed=False)

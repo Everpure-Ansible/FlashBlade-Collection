@@ -36,6 +36,12 @@ options:
   name:
     description:
     - Name of the local user inside the LDS.
+    - The name never takes a realm prefix; the realm is part of
+      I(local_directory_service).
+    - A task manages one user. A name that contains a comma is refused,
+      because the array reads a comma as the separator of a list of names.
+      The same holds for I(local_directory_service), I(new_name),
+      I(primary_group) and I(groups).
     type: str
     required: true
   state:
@@ -47,6 +53,12 @@ options:
   local_directory_service:
     description:
     - Name of the Local Directory Service that owns this user.
+    - For an LDS in a realm use the realm-qualified name C(realm::name).
+    - A realm-scoped administrator must use the realm-qualified name; a bare
+      name is not placed in, or resolved to, the administrator's realm.
+    - The module fails when the LDS does not exist or cannot be managed by
+      the user running the task. With I(state=absent) an LDS that does not
+      exist means that there is nothing to delete.
     - Attach LDSes to servers via M(everpure.flashblade.purefb_server).
     type: str
     required: true
@@ -54,6 +66,13 @@ options:
     description:
     - New name for the user. Uses the C(LocalUserPatch.name) field.
     - Rejected for built-in users.
+    - Idempotent when I(name) no longer exists and a user named I(new_name)
+      exists in the same LDS; the module then continues with that user. It
+      fails without changing anything when both names exist, or when I(name)
+      does not exist and I(new_name) is a built-in user.
+    - The array matches user names without regard to case and does not
+      rename a user to another spelling of its own name; such a request
+      changes nothing.
     type: str
   uid:
     description:
@@ -93,18 +112,25 @@ options:
     - Name of the local group that is the user's primary group.
     - Required when I(state=present) - the array will not create a user
       without one.
-    - The primary group must already exist in the same LDS.
+    - The primary group must already exist in the same LDS. It is named
+      without a realm prefix, also when the LDS is in a realm.
+    - The array accepts a new primary group for an existing user only when
+      the user is already a member of that group, so the module adds the
+      membership before it changes the primary group.
     type: str
   groups:
     description:
     - List of non-primary local group names the user should belong to.
+    - The groups must exist in the same LDS and are named without a realm
+      prefix. Group names are compared without regard to case.
     - When set, the module reconciles the user's group memberships against
       this list via C(/directory-services/local/users/members).
     - The primary group (either the current one or a newly requested one) is
       never removed via this list - the API disallows removing the primary
       group edge.
     - After a primary-group change the former primary remains a regular
-      member; if it is not listed here, a second run removes it.
+      member. When I(groups) is set and does not list it, that membership
+      is removed in the same run.
     type: list
     elements: str
   context:
@@ -138,6 +164,17 @@ EXAMPLES = r"""
     groups:
       - developers
       - infra
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Create local user 'bob' in the local directory service of a realm
+  everpure.flashblade.purefb_local_user:
+    name: bob
+    local_directory_service: myrealm::myserver_local
+    password: "s3cret!"
+    primary_group: staff
+    groups:
+      - developers
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
@@ -229,18 +266,121 @@ def _lds_filter(local_ds_name, extra=None):
     return expr
 
 
-def _get_user(module, blade, local_ds_name):
+def _check_names(module):
+    """Fail, before any request, on a name that is not the name of one object.
+
+    The array reads a comma as the separator of a list of names: a lookup of
+    such a name answers with several objects, and a PATCH or a DELETE of it
+    addresses each of them. A group name that is empty cannot be looked up.
+    The refusals apply to every state and in check mode as well.
+    """
+    names = [
+        ("local_directory_service", module.params["local_directory_service"]),
+        ("name", module.params["name"]),
+    ]
+    groups = []
+    if module.params["state"] == "present":
+        names.append(("new_name", module.params["new_name"]))
+        groups.append(("primary_group", module.params["primary_group"]))
+        groups.extend(("groups", group) for group in module.params["groups"] or [])
+    for option, value in names + groups:
+        if value and "," in value:
+            module.fail_json(
+                msg=(
+                    "{0} {1} is not valid: the array reads a comma as the "
+                    "separator of a list of names, so this would address "
+                    "more than one object. Give one name."
+                ).format(option, value)
+            )
+    for option, value in groups:
+        if value is not None and not str(value).strip():
+            module.fail_json(msg="{0} cannot hold an empty group name".format(option))
+
+
+def _is_absent(res):
+    """True when the array's answer to a read says that the object is not there.
+
+    Any other refusal (a missing permission, an internal error) is not the
+    same as "absent" and is reported by the caller.
+    """
+    message = str(get_error_message(res)).lower()
+    return "does not exist" in message or "was not found" in message
+
+
+def _get_local_ds(module, blade, local_ds_name):
+    """Return the Local Directory Service, or None when the array has none.
+
+    The array hides an LDS the caller cannot manage (for a realm-scoped
+    administrator: every LDS outside its realm) but still lists the users of
+    that LDS, so the LDS is read before any user is looked up.
+    """
+    res = blade.get_directory_services_local_directory_services(
+        names=[local_ds_name], **_context_kwargs(module)
+    )
+    if res.status_code == 200:
+        items = list(res.items)
+        return items[0] if items else None
+    if _is_absent(res):
+        return None
+    module.fail_json(
+        msg="Failed to read local directory service {0}. Error: {1}".format(
+            local_ds_name, get_error_message(res)
+        )
+    )
+
+
+def _get_user(module, blade, local_ds_name, name=None):
+    """Return the user ``name`` (default: the task's name) of this LDS, or None."""
+    name = name or module.params["name"]
     ctx = _context_kwargs(module)
     res = blade.get_directory_services_local_users(
-        names=[module.params["name"]],
+        names=[name],
         filter=_lds_filter(local_ds_name),
         **ctx,
     )
     if res.status_code == 200:
         items = list(res.items)
-        if items:
-            return items[0]
-    return None
+        if len(items) > 1:
+            # The task works on one user; never pick one of several.
+            module.fail_json(
+                msg=(
+                    "{0} matches {1} local users of local directory service "
+                    "{2}. Give the name of one user."
+                ).format(name, len(items), local_ds_name)
+            )
+        return items[0] if items else None
+    if _is_absent(res):
+        return None
+    module.fail_json(
+        msg="Failed to read local user {0}. Error: {1}".format(
+            name, get_error_message(res)
+        )
+    )
+
+
+def _require_groups(module, blade, local_ds_name, groups):
+    """Fail, in check mode too, when a group to be used is not in this LDS.
+
+    Only a definite "not found" from the array is a refusal; any other answer
+    is left to the request that follows.
+    """
+    for group in groups:
+        res = blade.get_directory_services_local_groups(
+            names=[group],
+            filter=_lds_filter(local_ds_name),
+            **_context_kwargs(module),
+        )
+        if res.status_code == 200:
+            missing = not list(res.items)
+        else:
+            missing = _is_absent(res)
+        if missing:
+            module.fail_json(
+                msg=(
+                    "Local group {0} does not exist in local directory service "
+                    "{1}. Group names are given without a realm prefix."
+                ).format(group, local_ds_name)
+            )
 
 
 def _get_current_groups(module, blade, local_ds_name):
@@ -308,6 +448,22 @@ def _remove_memberships(module, blade, local_ds_name, groups):
             )
 
 
+def _membership_plan(module, current, primary_groups):
+    """Return the groups to add and to remove so that ``current`` matches
+    module.params['groups'], leaving ``primary_groups`` alone.
+
+    The array matches group names without regard to case and returns the
+    stored spelling, so names are compared lower-cased: a group is added under
+    the name the task gives and removed under the name the array reports.
+    """
+    wanted = dict((g.lower(), g) for g in module.params["groups"] or [])
+    have = dict((g.lower(), g) for g in current)
+    skip = set(g.lower() for g in primary_groups if g)
+    add = sorted(wanted[k] for k in wanted if k not in have and k not in skip)
+    remove = sorted(have[k] for k in have if k not in wanted and k not in skip)
+    return add, remove
+
+
 def _reconcile_memberships(
     module, blade, local_ds_name, desired_primary_group, current_primary_group=None
 ):
@@ -317,19 +473,10 @@ def _reconcile_memberships(
     the API disallows deleting the primary-group edge, and until the PATCH has
     run the current primary is still in force.
     """
-    desired = set(module.params["groups"] or [])
     current = _get_current_groups(module, blade, local_ds_name)
-
-    exclude = set()
-    if desired_primary_group:
-        exclude.add(desired_primary_group)
-    if current_primary_group:
-        exclude.add(current_primary_group)
-    desired = desired - exclude
-    current_diff = current - exclude
-
-    add = desired - current_diff
-    remove = current_diff - desired
+    add, remove = _membership_plan(
+        module, current, (desired_primary_group, current_primary_group)
+    )
     changed = bool(add or remove)
     if changed and not module.check_mode:
         if add:
@@ -371,6 +518,14 @@ def create_user(module, blade, local_ds_name):
         module.fail_json(
             msg="'password' is required when creating an enabled local user"
         )
+    # The array refuses a user whose groups are not in the LDS; say so before
+    # anything is written, and in check mode.
+    wanted = dict(
+        (g.lower(), g)
+        for g in [module.params["primary_group"]] + (module.params["groups"] or [])
+        if g
+    )
+    _require_groups(module, blade, local_ds_name, sorted(wanted.values()))
     changed = True
     if not module.check_mode:
         body_kwargs = {}
@@ -418,7 +573,10 @@ def update_user(module, blade, local_ds_name, user):
     patch_kwargs = {}
     identity_changes = []
 
-    if module.params["new_name"] and module.params["new_name"] != module.params["name"]:
+    new_name = module.params["new_name"]
+    # The array matches names without regard to case and keeps the stored
+    # spelling: another spelling of the current name is not a rename.
+    if new_name and new_name.lower() != module.params["name"].lower():
         if built_in:
             module.fail_json(
                 msg="Refusing to rename built-in local user {0}".format(
@@ -426,18 +584,13 @@ def update_user(module, blade, local_ds_name, user):
                 )
             )
         # Refuse if target name already exists in this LDS.
-        name_conflict_check = blade.get_directory_services_local_users(
-            names=[module.params["new_name"]],
-            filter=_lds_filter(local_ds_name),
-            **ctx,
-        )
-        if name_conflict_check.status_code == 200 and list(name_conflict_check.items):
+        if _get_user(module, blade, local_ds_name, new_name) is not None:
             module.fail_json(
                 msg=(
                     "Cannot rename local user {0} to {1}: target name already exists"
-                ).format(module.params["name"], module.params["new_name"])
+                ).format(module.params["name"], new_name)
             )
-        patch_kwargs["name"] = module.params["new_name"]
+        patch_kwargs["name"] = new_name
         identity_changes.append("name")
 
     if module.params["email"] is not None and module.params["email"] != getattr(
@@ -468,8 +621,11 @@ def update_user(module, blade, local_ds_name, user):
         identity_changes.append("uid")
 
     desired_pg_name = module.params["primary_group"]
+    desired_pg_key = (desired_pg_name or "").lower()
+    current_pg_key = (current_pg_name or "").lower()
     pg_changed = False
-    if desired_pg_name != current_pg_name:
+    # Another spelling of the current primary group is not a change.
+    if desired_pg_key != current_pg_key:
         patch_kwargs["primary_group"] = ReferenceWritable(name=desired_pg_name)
         identity_changes.append("primary_group")
         pg_changed = True
@@ -499,40 +655,69 @@ def update_user(module, blade, local_ds_name, user):
             )
         )
 
-    membership_changed = False
-    # Order-of-ops guard: reconcile memberships BEFORE PATCHing primary_group
-    # to dodge the known array-side regression where PATCHing primary_group
-    # with stale membership edges present has returned 500 on some releases.
-    if module.params["groups"] is not None and pg_changed:
-        membership_changed = _reconcile_memberships(
-            module, blade, local_ds_name, desired_pg_name, current_pg_name
-        )
+    # Work out every membership change before anything is written, so that a
+    # group the LDS does not have stops the task in check mode as well.
+    groups_given = module.params["groups"] is not None
+    add, remove, drop_former_pg = [], [], False
+    if groups_given or pg_changed:
+        current_groups = _get_current_groups(module, blade, local_ds_name)
+        member_of = set(g.lower() for g in current_groups)
+        if groups_given:
+            add, remove = _membership_plan(
+                module, current_groups, (desired_pg_name, current_pg_name)
+            )
+        if pg_changed:
+            # The array accepts a primary group only when the user is already
+            # a member of it.
+            if desired_pg_key not in member_of:
+                add.append(desired_pg_name)
+            # Once the PATCH has run the former primary group is an ordinary
+            # membership, which goes when groups does not list it.
+            drop_former_pg = (
+                groups_given
+                and current_pg_key in member_of
+                and current_pg_key
+                not in set(g.lower() for g in module.params["groups"])
+            )
+        _require_groups(module, blade, local_ds_name, add)
+    membership_changed = bool(add or remove or drop_former_pg)
 
     patch_changed = bool(patch_kwargs)
-    if patch_changed and not module.check_mode:
-        res = blade.patch_directory_services_local_users(
-            names=[module.params["name"]],
-            local_directory_service_names=[local_ds_name],
-            local_user=LocalUserPatch(**patch_kwargs),
-            **ctx,
-        )
-        if res.status_code != 200:
-            module.fail_json(
-                msg="Failed to update local user {0}. Error: {1}".format(
-                    module.params["name"], get_error_message(res)
-                )
+    if not module.check_mode:
+        # Order-of-ops guard: reconcile memberships BEFORE PATCHing
+        # primary_group. The new primary group must already be a membership,
+        # and PATCHing primary_group with stale membership edges present has
+        # returned 500 on some releases.
+        if pg_changed:
+            if add:
+                _add_memberships(module, blade, local_ds_name, add)
+            if remove:
+                _remove_memberships(module, blade, local_ds_name, remove)
+        if patch_changed:
+            res = blade.patch_directory_services_local_users(
+                names=[module.params["name"]],
+                local_directory_service_names=[local_ds_name],
+                local_user=LocalUserPatch(**patch_kwargs),
+                **ctx,
             )
-
-    # If we didn't reconcile earlier (no primary-group change), reconcile now.
-    if module.params["groups"] is not None and not pg_changed:
-        # After a rename the user is known by new_name, and reconciliation
-        # uses module.params['name'] - but in check mode the rename was
-        # skipped, so the user still answers to the current name.
-        if patch_kwargs.get("name") and not module.check_mode:
-            module.params["name"] = patch_kwargs["name"]
-        membership_changed = _reconcile_memberships(
-            module, blade, local_ds_name, desired_pg_name, current_pg_name
-        )
+            if res.status_code != 200:
+                module.fail_json(
+                    msg="Failed to update local user {0}. Error: {1}".format(
+                        module.params["name"], get_error_message(res)
+                    )
+                )
+            # After a rename the user is known by new_name.
+            if patch_kwargs.get("name"):
+                module.params["name"] = patch_kwargs["name"]
+        if pg_changed:
+            if drop_former_pg:
+                _remove_memberships(module, blade, local_ds_name, [current_pg_name])
+        else:
+            # No primary-group change: memberships follow the PATCH.
+            if add:
+                _add_memberships(module, blade, local_ds_name, add)
+            if remove:
+                _remove_memberships(module, blade, local_ds_name, remove)
 
     module.exit_json(changed=patch_changed or membership_changed)
 
@@ -582,8 +767,49 @@ def main():
             module.params["context"] = list(blade.get_arrays().items)[0].name
 
     local_ds_name = module.params["local_directory_service"]
-    user = _get_user(module, blade, local_ds_name)
     state = module.params["state"]
+    _check_names(module)
+    local_ds = _get_local_ds(module, blade, local_ds_name)
+    user = _get_user(module, blade, local_ds_name)
+
+    if local_ds is None:
+        # Nothing can be written to an LDS the array does not show to this
+        # caller, so the task stops here, in check mode too. Only a delete of
+        # a user the array does not list either has nothing left to do.
+        if state == "absent" and not user:
+            module.exit_json(
+                changed=False,
+                msg=(
+                    "Local directory service {0} does not exist or cannot be "
+                    "managed by this user, so it has no local user {1} to "
+                    "delete. A local directory service in a realm is "
+                    "addressed as realm::name."
+                ).format(local_ds_name, module.params["name"]),
+            )
+        module.fail_json(
+            msg=(
+                "Local directory service {0} does not exist or cannot be "
+                "managed by this user. A local directory service in a realm "
+                "is addressed as realm::name."
+            ).format(local_ds_name)
+        )
+
+    new_name = module.params["new_name"]
+    if state == "present" and not user and new_name:
+        renamed = _get_user(module, blade, local_ds_name, new_name)
+        if renamed:
+            if getattr(renamed, "built_in", False):
+                # A rename never ends in a built-in user, so this one is not
+                # the user of the task.
+                module.fail_json(
+                    msg=(
+                        "Cannot rename local user {0} to {1}: {0} does not "
+                        "exist and {1} is a built-in user"
+                    ).format(module.params["name"], new_name)
+                )
+            # Already renamed: continue with the user that carries new_name.
+            user = renamed
+            module.params["name"] = new_name
 
     if state == "absent" and user:
         delete_user(module, blade, local_ds_name, user)

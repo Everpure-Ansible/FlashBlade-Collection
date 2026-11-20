@@ -560,3 +560,234 @@ class TestPoliciesAndDelete:
         _run_main(module, blade)
         blade.delete_file_system_replica_links.assert_not_called()
         module.exit_json.assert_called_once_with(changed=False)
+
+
+def _refused(status=403, message="Operation not permitted."):
+    """An SDK ErrorResponse: it carries errors and has no items attribute."""
+    res = Mock(spec=["status_code", "errors"])
+    res.status_code = status
+    error = Mock()
+    error.message = message
+    res.errors = [error]
+    return res
+
+
+def _first_error(res):
+    return res.errors[0].message
+
+
+REALM_HINT = (
+    "File system rzaudit::fs1 is in a realm; target_array takes a connected "
+    "array, a remote realm is not supported as the target"
+)
+NOT_VISIBLE = (
+    "no array connection is visible to this identity (array connections are "
+    "not visible to a realm-scoped administrator)"
+)
+
+
+class TestArrayConnectionsRead:
+    """A refused read of the array connections is reported, not raised"""
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_create_reports_refused_read(self, check_mode):
+        module = _module(_params(target_array="arrayB"), check_mode=check_mode)
+        blade = _blade()
+        blade.get_array_connections.return_value = _refused()
+        with patch(MODULE + ".get_error_message", side_effect=_first_error):
+            _run_main(module, blade)
+        assert _fail_msg(module) == (
+            "Failed to read the array connections. Error: Operation not permitted."
+        )
+        blade.post_file_system_replica_links.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    def test_management_address_lookup_reports_refused_read(self):
+        """get_local_rl falls back to the connections for a management address"""
+        module = _module(_params(target_array="10.0.0.3", state="absent"))
+        blade = _blade(links=[_link("arrayB")])
+        blade.get_array_connections.return_value = _refused()
+        with patch(MODULE + ".get_error_message", side_effect=_first_error):
+            with pytest.raises(SystemExit):
+                get_local_rl(module, blade)
+        assert _fail_msg(module) == (
+            "Failed to read the array connections. Error: Operation not permitted."
+        )
+
+    def test_absent_with_refused_read_deletes_nothing(self):
+        module = _module(_params(target_array="10.0.0.3", state="absent"))
+        blade = _blade(links=[_link("arrayB")])
+        blade.get_array_connections.return_value = _refused()
+        _run_main(module, blade)
+        assert "Failed to read the array connections" in _fail_msg(module)
+        blade.delete_file_system_replica_links.assert_not_called()
+        module.exit_json.assert_not_called()
+
+
+class TestNotConnectedMessage:
+    """The refusal says what the module looked for and what it cannot see"""
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_realm_administrator_sees_no_connection(self, check_mode):
+        """The array answers 200 with no items to a realm-scoped administrator"""
+        module = _module(
+            _params(name="rzaudit::fs1", target_array="arrayB"),
+            check_mode=check_mode,
+        )
+        blade = _blade(connections=[])
+        _run_main(module, blade)
+        assert _fail_msg(module) == (
+            "Target array arrayB is not connected: " + NOT_VISIBLE + ". " + REALM_HINT
+        )
+        blade.post_file_system_replica_links.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    def test_no_connection_array_level_file_system(self):
+        module = _module(_params(target_array="arrayB"))
+        blade = _blade(connections=[])
+        _run_main(module, blade)
+        assert _fail_msg(module) == (
+            "Target array arrayB is not connected: " + NOT_VISIBLE
+        )
+        blade.post_file_system_replica_links.assert_not_called()
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_realm_file_system_target_is_a_remote_realm(self, check_mode):
+        """target_array is resolved against the array connections only"""
+        module = _module(
+            _params(name="rzaudit::fs1", target_array="remote-realm"),
+            check_mode=check_mode,
+        )
+        blade = _blade(connections=[_connection("arrayB")])
+        _run_main(module, blade)
+        assert _fail_msg(module) == (
+            "Target array remote-realm is not connected. " + REALM_HINT
+        )
+        blade.post_file_system_replica_links.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    def test_realm_file_system_target_disconnected(self):
+        module = _module(_params(name="rzaudit::fs1", target_array="arrayB"))
+        blade = _blade(connections=[_connection(status="disconnected")])
+        _run_main(module, blade)
+        assert _fail_msg(module) == (
+            "Target array arrayB is not connected. " + REALM_HINT
+        )
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_array_level_message_is_unchanged(self, check_mode):
+        module = _module(_params(target_array="arrayZ"), check_mode=check_mode)
+        blade = _blade(connections=[_connection("arrayB")])
+        _run_main(module, blade)
+        assert _fail_msg(module) == "Target array arrayZ is not connected"
+        blade.post_file_system_replica_links.assert_not_called()
+
+
+class TestRealmNames:
+    """realm::name is passed to the array as given, for name and policy"""
+
+    @patch(MODULE + ".LocationReference")
+    @patch(MODULE + ".FileSystemReplicaLink")
+    def test_create_sends_qualified_names(self, mock_link_model, mock_location):
+        module = _module(
+            _params(name="rzaudit::fs1", target_array="arrayB", policy="rzaudit::daily")
+        )
+        blade = _blade(connections=[_connection()])
+        _run_main(module, blade)
+        blade.get_file_systems.assert_called_once_with(names=["rzaudit::fs1"])
+        blade.get_file_system_replica_links.assert_called_once_with(
+            local_file_system_names=["rzaudit::fs1"]
+        )
+        blade.get_policies.assert_called_once_with(names=["rzaudit::daily"])
+        mock_location.assert_called_once_with(name="rzaudit::daily")
+        kwargs = blade.post_file_system_replica_links.call_args.kwargs
+        assert kwargs["local_file_system_names"] == ["rzaudit::fs1"]
+        # target_fs defaults to name as given, realm included
+        assert kwargs["remote_file_system_names"] == ["rzaudit::fs1"]
+        assert kwargs["remote_names"] == ["arrayB"]
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_create_with_target_fs(self):
+        module = _module(
+            _params(name="rzaudit::fs1", target_array="arrayB", target_fs="fs1")
+        )
+        blade = _blade(connections=[_connection()])
+        _run_main(module, blade)
+        kwargs = blade.post_file_system_replica_links.call_args.kwargs
+        assert kwargs["local_file_system_names"] == ["rzaudit::fs1"]
+        assert kwargs["remote_file_system_names"] == ["fs1"]
+
+    def test_create_check_mode_sends_nothing(self):
+        module = _module(
+            _params(name="rzaudit::fs1", target_array="arrayB"), check_mode=True
+        )
+        blade = _blade(connections=[_connection()])
+        _run_main(module, blade)
+        blade.post_file_system_replica_links.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_missing_realm_file_system(self):
+        """The array answers a missing name of any scope with an error"""
+        module = _module(_params(name="rzaudit::fs1", target_array="arrayB"))
+        blade = _blade(connections=[_connection()])
+        blade.get_file_systems.return_value = _refused(
+            400, "File system does not exist."
+        )
+        blade.get_file_system_replica_links.return_value = _refused(
+            400, "File system does not exist."
+        )
+        _run_main(module, blade)
+        assert _fail_msg(module) == (
+            "Selected local filesystem rzaudit::fs1 does not exist."
+        )
+        blade.get_array_connections.assert_not_called()
+
+    def test_add_policy_to_link_with_a_remote_realm(self):
+        module = _module(_params(name="rzaudit::fs1", policy="rzaudit::daily"))
+        blade = _blade(links=[_link(remote="remote-realm")])
+        _run_main(module, blade)
+        blade.get_file_system_replica_links_policies.assert_called_once_with(
+            local_file_system_names=["rzaudit::fs1"],
+            policy_names=["rzaudit::daily"],
+            remote_names=["remote-realm"],
+        )
+        blade.post_file_system_replica_links_policies.assert_called_once_with(
+            policy_names=["rzaudit::daily"],
+            local_file_system_names=["rzaudit::fs1"],
+            remote_names=["remote-realm"],
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_add_policy_idempotent(self):
+        module = _module(_params(name="rzaudit::fs1", policy="rzaudit::daily"))
+        blade = _blade(links=[_link(remote="remote-realm")], policy_attached=True)
+        _run_main(module, blade)
+        blade.post_file_system_replica_links_policies.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+    def test_existing_link_is_selected_by_remote_name(self):
+        """An existing link is found by the name of its remote, array or realm"""
+        links = [_link("arrayB"), _link("remote-realm", remote_fs="fs1")]
+        module = _module(
+            _params(name="rzaudit::fs1", target_array="remote-realm", state="absent")
+        )
+        blade = _blade(links=links)
+        _run_main(module, blade)
+        blade.get_array_connections.assert_not_called()
+        blade.delete_file_system_replica_links.assert_called_once_with(
+            local_file_system_names=["rzaudit::fs1"],
+            remote_file_system_names=["fs1"],
+            remote_names=["remote-realm"],
+            cancel_in_progress_transfers=False,
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_absent_without_link_is_a_noop(self):
+        module = _module(
+            _params(name="rzaudit::fs1", target_array="arrayB", state="absent")
+        )
+        blade = _blade(connections=[])
+        _run_main(module, blade)
+        blade.get_array_connections.assert_not_called()
+        blade.delete_file_system_replica_links.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)

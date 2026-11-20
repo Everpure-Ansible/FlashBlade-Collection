@@ -23,11 +23,23 @@ version_added: '1.0.0'
 short_description:  Manage filesystem replica links between Everpure FlashBlades
 description:
     - This module manages filesystem replica links between Everpure FlashBlades.
+    - A replica link is created to a connected array, see I(target_array). A
+      remote realm cannot be given as the target, so the replication of a
+      file system in a realm to a remote realm cannot be set up with this
+      module.
+    - A file system or a snapshot policy in a realm is given by its full name
+      C(realm::name). A realm-scoped administrator must use the
+      realm-qualified name; a bare name is not resolved to the
+      administrator's realm.
+    - Array connections are not visible to a realm-scoped administrator, so
+      the module cannot create a replica link for such an administrator.
 author: Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
   name:
     description:
       - Local Filesystem Name.
+      - A file system in a realm is named C(realm::name). The same name
+        without the realm is a different file system at the array level.
     required: true
     type: str
   state:
@@ -43,6 +55,10 @@ options:
   target_array:
     description:
       - Remote array name to create replica on.
+      - To create a replica link this must be the name or the management
+        address of a connected array (see
+        M(everpure.flashblade.purefb_connect)). The name of a remote realm
+        is not accepted.
       - When the local filesystem replicates to several arrays (fan-out),
         this selects the replica link the module acts on.
     required: false
@@ -50,12 +66,14 @@ options:
   target_fs:
     description:
       - Name of target filesystem name
-      - If not supplied, will default to I(name).
+      - If not supplied, will default to I(name) as given, including the
+        realm of a C(realm::name) name.
     type: str
     required: false
   policy:
     description:
       - Name of filesystem snapshot policy to apply to the replica link.
+      - A snapshot policy in a realm is named C(realm::name).
       - Policies cannot be attached to C(partial-replica) links.
     required: false
     type: str
@@ -106,6 +124,11 @@ options:
     elements: str
     choices: [ "nfs", "smb" ]
     version_added: '1.30.0'
+notes:
+    - In check mode the module checks that the local file system and the
+      policy exist and that I(target_array) is a connected array. Whether the
+      array accepts the replica link, for example for a file system in a
+      realm, is only known when the request is sent.
 extends_documentation_fragment:
     - everpure.flashblade.everpure.fb
 """
@@ -250,10 +273,26 @@ def _rl_has_policy(module, blade, link):
     return bool(list(res.items))
 
 
-def _check_connected(module, blade):
+def _realm_of(name):
+    """Return the realm of a realm::name name, empty for an array-level name."""
+    return name.rpartition("::")[0]
+
+
+def _array_connections(module, blade):
+    """Return the array connections this identity can see."""
     res = blade.get_array_connections()
-    connected_blades = list(res.items)
-    for target in connected_blades:
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to read the array connections. Error: {0}".format(
+                get_error_message(res)
+            )
+        )
+    return list(res.items)
+
+
+def _connected_target(module, connections):
+    """Return the usable array connection target_array names, or None."""
+    for target in connections:
         if (
             target.remote.name == module.params["target_array"]
             or target.management_address == module.params["target_array"]
@@ -264,6 +303,33 @@ def _check_connected(module, blade):
         ]:
             return target
     return None
+
+
+def _check_connected(module, blade):
+    return _connected_target(module, _array_connections(module, blade))
+
+
+def _not_connected_message(module, connections):
+    """Say why target_array is not a connected array.
+
+    The array shows no array connection to a realm-scoped administrator, and
+    the module resolves target_array against the array connections only, so
+    a remote realm is never found.
+    """
+    msg = "Target array {0} is not connected".format(module.params["target_array"])
+    if not connections:
+        msg += (
+            ": no array connection is visible to this identity (array "
+            "connections are not visible to a realm-scoped administrator)"
+        )
+    if _realm_of(module.params["name"]):
+        msg += (
+            ". File system {0} is in a realm; target_array takes a connected "
+            "array, a remote realm is not supported as the target".format(
+                module.params["name"]
+            )
+        )
+    return msg
 
 
 def _remote_default_exports(exports):
@@ -285,13 +351,10 @@ def create_rl(module, blade):
         module.fail_json(msg="target_array is required to create a replica link.")
     # Validate the target connection before the check-mode exit so that a
     # check-mode run fails the same way the real run would.
-    remote_array = _check_connected(module, blade)
+    connections = _array_connections(module, blade)
+    remote_array = _connected_target(module, connections)
     if not remote_array:
-        module.fail_json(
-            msg="Target array {0} is not connected".format(
-                module.params["target_array"]
-            )
-        )
+        module.fail_json(msg=_not_connected_message(module, connections))
     if not module.check_mode:
         if not module.params["target_fs"]:
             module.params["target_fs"] = module.params["name"]

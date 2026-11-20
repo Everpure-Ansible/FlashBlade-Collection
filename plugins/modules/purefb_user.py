@@ -22,6 +22,15 @@ short_description: Create, modify or delete FlashBlade user accounts
 description:
 - Create, modify or delete local users and service accounts on a FlashBlade,
   and manage the API token, SSH key and authorization model of remote users.
+- User accounts are array-level objects and cannot be placed in a realm. An
+  account is confined to a realm by the management access policies it holds
+  (see I(management_access_policies)), not by its name.
+- An account that is confined to a realm is shown no account but its own, so
+  to it every other account looks absent. The array refuses its requests to
+  create an account, to delete itself, to change its own management access
+  policies and to replace its own API token. The task then fails with the
+  message of the array; check mode does not predict the refusal. Run this
+  module as an administrator with array-wide access.
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
@@ -35,6 +44,10 @@ options:
   name:
     description:
     - The name of the user account
+    - A name has 1 to 32 characters (lower-case letters, digits and C(-))
+      and begins and ends with a letter or digit.
+    - User accounts are array-level objects, so a realm-qualified name
+      (C(realm::name)) is refused.
     type: str
     required: true
   role:
@@ -44,6 +57,8 @@ options:
       I(management_access_policies) is given.
     - When omitted for an existing user the current role is left unchanged.
     - Mutually exclusive with I(management_access_policies).
+    - Each of the four roles applies to the whole array. Use
+      I(management_access_policies) to confine an account to a realm.
     - A user that holds several management access policies, or a custom one,
       has no legacy role. The requested role is then satisfied when it is one
       of the user's policies; the policy set is left alone and a warning names
@@ -139,6 +154,12 @@ options:
       regard to case. The policies of C(pureuser) cannot be changed. The
       list is not compared when I(password) is given without
       I(old_password) for an existing account (see I(password)).
+    - An account that holds only policies whose rules are all scoped to
+      realms is confined to those realms, with the role each rule grants
+      there. Such a policy is made with
+      M(everpure.flashblade.purefb_mgmt_policy), by a rule whose scope has
+      I(resource_type=realms). The policies themselves are array-level
+      objects, so they are named without a realm.
     - For a remote user (I(ad_user=true)) the list is applied only together
       with I(authorization_model=static) and may be empty. A remote user
       addressed without I(ad_user) is refused.
@@ -223,6 +244,26 @@ EXAMPLES = r"""
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
 
+- name: Create a management access policy that grants the admin role in one realm
+  everpure.flashblade.purefb_mgmt_policy:
+    name: realm-a-admins
+    rules:
+      - role: admin
+        scope:
+          name: realm-a
+          resource_type: realms
+    fb_url: 10.10.10.2
+    api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+
+- name: Create a realm administrator, a service account confined to that realm
+  everpure.flashblade.purefb_user:
+    name: realm-a-svc
+    admin_type: service-account
+    management_access_policies:
+      - realm-a-admins
+    fb_url: 10.10.10.2
+    api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+
 - name: Fix the policies of a remote user on the array
   everpure.flashblade.purefb_user:
     name: ad-ops
@@ -295,6 +336,15 @@ DYNAMIC = "dynamic"
 # Value the array reports for a stored public key when it masks it.
 PUBLIC_KEY_MASK = "****"
 MAX_PUBLIC_KEYS = 2
+# The names the module accepts for a user account.
+NAME_PATTERN = re.compile("^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$")
+REALM_NAME_MSG = (
+    "Invalid name '{0}': user accounts are array-level objects and their names "
+    "cannot be realm-qualified (realm::name). Use the unqualified account "
+    "name. To confine an account to a realm, give it only management access "
+    "policies whose rules are scoped to that realm "
+    "(management_access_policies)."
+)
 # One OpenSSH authorized_keys entry: "<type> <base64 key> [comment]"
 OPENSSH_KEY_LINE = re.compile(r"^(\S+)\s+([A-Za-z0-9+/=]+)(?:\s+.*)?$")
 
@@ -315,6 +365,24 @@ def parse_public_keys(text):
             return None
         keys.append((match.group(1), match.group(2)))
     return keys
+
+
+def validate_name(module):
+    """Fail before the array is contacted when the name cannot be an account's.
+
+    User accounts are array-level objects: none can be created in a realm,
+    so a realm-qualified name (``realm::name``) names nothing. It is refused
+    with a message that says how an account is confined to a realm; the
+    general name rule does not mention realms.
+    """
+    name = module.params["name"]
+    if "::" in name:
+        module.fail_json(msg=REALM_NAME_MSG.format(name))
+    if not NAME_PATTERN.match(name):
+        module.fail_json(
+            msg="name must contain a minimum of 1 and a maximum of 32 characters "
+            "(alphanumeric or `-`). All letters must be lowercase."
+        )
 
 
 def validate_public_key(module):
@@ -983,6 +1051,7 @@ def main():
         mutually_exclusive=[["role", "management_access_policies"]],
     )
 
+    validate_name(module)
     validate_public_key(module)
     validate_account_params(module)
     blade = get_system(module)
@@ -990,14 +1059,8 @@ def main():
     check_version_gates(module, api_version)
 
     state = module.params["state"]
-    pattern = re.compile("^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$")
     user = get_user(module, blade)
     local_user = getattr(user, "is_local", False)
-    if not pattern.match(module.params["name"]):
-        module.fail_json(
-            msg="name must contain a minimum of 1 and a maximum of 32 characters "
-            "(alphanumeric or `-`). All letters must be lowercase."
-        )
 
     if state == "present" and not local_user and module.params["ad_user"]:
         update_ad_user(module, blade, user)

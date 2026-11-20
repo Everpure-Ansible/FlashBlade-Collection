@@ -71,12 +71,32 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.purefb import 
     get_system,
     purefb_argument_spec,
 )
+from ansible_collections.everpure.flashblade.plugins.module_utils.common import (
+    get_error_message,
+)
+
+
+def _get_signature(module, blade):
+    """Return the signature of the EULA.
+
+    A read the array refuses or fails is reported with the message of the
+    array.
+    """
+    res = blade.get_arrays_eula()
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to read the EULA. Error: {0}".format(get_error_message(res))
+        )
+    items = list(res.items)
+    if not items:
+        module.fail_json(msg="The array returned no EULA.")
+    return items[0].signature
 
 
 def set_eula(module, blade):
     """Sign EULA"""
     changed = False
-    current_eula = list(blade.get_arrays_eula().items)[0].signature
+    current_eula = _get_signature(module, blade)
     if not current_eula.accepted:
         if (
             current_eula.company != module.params["company"]
@@ -93,7 +113,11 @@ def set_eula(module, blade):
                 eula_body = Eula(signature=signature)
                 rc = blade.patch_arrays_eula(eula=eula_body)
                 if rc.status_code != 200:
-                    module.fail_json(msg="Signing EULA failed")
+                    module.fail_json(
+                        msg="Signing EULA failed. Error: {0}".format(
+                            get_error_message(rc)
+                        )
+                    )
     module.exit_json(changed=changed)
 
 

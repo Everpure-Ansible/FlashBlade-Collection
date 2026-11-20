@@ -33,6 +33,10 @@ options:
   name:
     description:
     - Name of the S3 export policy.
+    - A policy in a realm is named C(realm::policy). The realm is part of
+      the name and is set when the policy is created.
+    - A realm-scoped administrator must use the realm-qualified name; a
+      bare name is not placed in, or resolved to, the administrator's realm.
     type: str
     required: true
   state:
@@ -49,7 +53,20 @@ options:
   rename:
     description:
     - New name for the S3 export policy.
-    - Only takes effect when the policy already exists.
+    - Only takes effect when the policy already exists. If I(name) no
+      longer exists but a policy with the new name exists in the same
+      realm, or outside of any realm for a policy that is not in one, the
+      rename is treated as already applied and that policy is managed
+      under its new name.
+    - A policy cannot be moved into or out of a realm with I(rename). For
+      a policy in a realm give the new name as C(realm::policy) with the
+      realm of I(name), or as a bare name, which is taken as a name in that
+      realm. A new name in another realm, or a realm on the new name of a
+      policy that is not in one, is refused.
+    - The rename is refused when another policy already has the new name.
+      The array matches names without regard to case, so a new name that
+      differs from the name of the policy only in case is refused as well.
+    - Ignored when I(state=absent).
     type: str
   rules:
     description:
@@ -136,6 +153,26 @@ EXAMPLES = r"""
     state: absent
     fb_url: 10.10.10.2
     api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
+
+- name: Create an S3 export policy in realm tenant1
+  everpure.flashblade.purefb_s3_export_policy:
+    name: tenant1::my_export_policy
+    rules:
+      - name: allow_all_buckets
+        actions:
+          - "pure:S3Access"
+        effect: allow
+        resources:
+          - "*"
+    fb_url: 10.10.10.2
+    api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
+
+- name: Rename a policy in realm tenant1 to tenant1::tenant_a_export_policy
+  everpure.flashblade.purefb_s3_export_policy:
+    name: tenant1::my_export_policy
+    rename: tenant_a_export_policy
+    fb_url: 10.10.10.2
+    api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
 """
 
 RETURN = r"""
@@ -174,6 +211,72 @@ def _context_kwargs(module):
     return {}
 
 
+def _realm(name):
+    """Return the realm of a realm::name name, empty for a name without one."""
+    if name and "::" in name:
+        return name.rpartition("::")[0]
+    return ""
+
+
+def _leaf(name):
+    """Return a name without its realm."""
+    if name and "::" in name:
+        return name.rpartition("::")[2]
+    return name or ""
+
+
+def _check_one_name(module, option):
+    """Fail when the value of option holds a comma.
+
+    The array reads a comma as a separator of names and answers a lookup of
+    such a value with every policy it names, the first of which would be
+    taken for the policy of the task. No policy name holds a comma.
+    """
+    value = module.params[option]
+    if value and "," in value:
+        module.fail_json(
+            msg=(
+                "{0} {1} holds a comma, which the array reads as a separator "
+                "of names. Give the name of one S3 export policy."
+            ).format(option, value)
+        )
+
+
+def _resolve_rename(module):
+    """Return the new name in the scope of the policy, or None without rename.
+
+    A policy is in a realm when it is named realm::policy, and a rename
+    cannot move it: the array refuses a new name whose realm is not the
+    realm of the policy ("Realm can't be changed with rename."), a bare new
+    name for a policy in a realm included. This is settled here, before any
+    read or write, so check mode agrees with a real run and the lookup for a
+    rename that an earlier run already applied can only find a policy in the
+    scope of name. A bare new name for a policy in a realm is taken as a
+    name in that realm. The array matches names without regard to case, so
+    the realms are compared that way.
+    """
+    rename = module.params["rename"]
+    if not rename:
+        return None
+    name = module.params["name"]
+    realm = _realm(name)
+    if "::" in rename and _realm(rename).lower() != realm.lower():
+        module.fail_json(
+            msg=(
+                "Cannot rename S3 export policy {0} to {1}: a rename cannot "
+                "move a policy into or out of a realm. Give the new name "
+                "without a realm{2}."
+            ).format(
+                name,
+                rename,
+                " or as {0}::<name>".format(realm) if realm else "",
+            )
+        )
+    if realm:
+        return "{0}::{1}".format(realm, _leaf(rename))
+    return rename
+
+
 def _normalize_rule(rule):
     """Normalize a desired-rule dict for order-insensitive comparison."""
     return {
@@ -195,12 +298,24 @@ def _normalize_existing_rule(rule_obj):
 
 
 def _get_policy_by_name(module, blade, name):
-    """Return the policy object called name, or None."""
+    """Return the policy object called name, or None.
+
+    A missing policy is itself an error answer ("S3 export policy does not
+    exist."), so only that answer reads as None. Any other failed read
+    fails the task with the message of the array, so that it is never taken
+    for a missing policy, which would lead to a create or to the lookup of
+    the new name of a rename.
+    """
     res = blade.get_s3_export_policies(names=[name], **_context_kwargs(module))
-    if res.status_code != 200:
+    if res.status_code == 200:
+        items = list(res.items)
+        return items[0] if items else None
+    error = get_error_message(res)
+    if "does not exist" in str(error).lower():
         return None
-    items = list(res.items)
-    return items[0] if items else None
+    module.fail_json(
+        msg="Failed to read S3 export policy {0}. Error: {1}".format(name, error)
+    )
 
 
 def _get_policy(module, blade):
@@ -214,7 +329,13 @@ def _get_policy_rules(module, blade):
         policy_names=[module.params["name"]], **_context_kwargs(module)
     )
     if res.status_code != 200:
-        return []
+        # an unread rule list is not an empty one: nothing may be added or
+        # left in place on the strength of it
+        module.fail_json(
+            msg="Failed to read the rules of S3 export policy {0}. Error: {1}".format(
+                module.params["name"], get_error_message(res)
+            )
+        )
     return list(res.items)
 
 
@@ -341,8 +462,8 @@ def create_policy(module, blade):
     module.exit_json(changed=changed)
 
 
-def update_policy(module, blade, policy):
-    """Update an existing S3 export policy."""
+def update_policy(module, blade, policy, new_name=None):
+    """Update an existing S3 export policy and rename it to new_name, if set."""
     changed = False
 
     if module.params["rules"] is not None:
@@ -359,10 +480,8 @@ def update_policy(module, blade, policy):
     ):
         patch_kwargs["enabled"] = module.params["enabled"]
 
-    if module.params["rename"] and module.params["rename"] != getattr(
-        policy, "name", None
-    ):
-        patch_kwargs["name"] = module.params["rename"]
+    if new_name:
+        patch_kwargs["name"] = new_name
 
     if patch_kwargs:
         changed = True
@@ -427,27 +546,72 @@ def main():
             module.params["context"] = list(blade.get_arrays().items)[0].name
 
     state = module.params["state"]
+    name = module.params["name"]
+    _check_one_name(module, "name")
+    # rename belongs to state=present only: with state=absent it is ignored,
+    # so a task that removes a policy never acts on the policy called rename
+    new_name = None
+    if state == "present":
+        _check_one_name(module, "rename")
+        new_name = _resolve_rename(module)
     policy = _get_policy(module, blade)
+    rename_to = None
 
-    if module.params["rename"] and policy is None:
+    if new_name and policy is None:
         # The rename may already have happened on an earlier run: if a policy
         # with the new name exists, manage it under that name and treat the
         # rename as done, so a repeated rename task is idempotent.
-        renamed = _get_policy_by_name(module, blade, module.params["rename"])
-        if renamed is None:
+        # _resolve_rename has put the new name in the realm of name, so a
+        # policy with that name in another scope is never picked up.
+        policy = _get_policy_by_name(module, blade, new_name)
+        if policy is None:
             module.fail_json(
-                msg="Cannot rename S3 export policy {0}: policy does not exist.".format(
-                    module.params["name"]
-                )
+                msg=(
+                    "Cannot rename S3 export policy {0}: policy does not "
+                    "exist, and neither does a policy named {1}."
+                ).format(name, new_name)
             )
-        module.params["name"] = module.params["rename"]
-        module.params["rename"] = None
-        policy = renamed
+        module.params["name"] = new_name
+        new_name = None
+
+    if policy is not None and isinstance(getattr(policy, "name", None), str):
+        # The array matches names without regard to case and returns the
+        # name as it is stored: from here on the policy goes by that name.
+        module.params["name"] = policy.name or module.params["name"]
+
+    if new_name and _leaf(new_name) != _leaf(module.params["name"]):
+        # Every refusal of the rename is decided here, before the rules are
+        # reconciled and in check mode too.
+        if _leaf(new_name).lower() == _leaf(module.params["name"]).lower():
+            # the array answers this with "Policy already exists."
+            module.fail_json(
+                msg=(
+                    "Cannot rename S3 export policy {0} to {1}: the new name "
+                    "differs from the name of the policy only in case. The "
+                    "array matches names without regard to case and does "
+                    "not rename a policy to its own name."
+                ).format(name, new_name)
+            )
+        if _get_policy_by_name(module, blade, new_name) is not None:
+            module.fail_json(
+                msg=(
+                    "Cannot rename S3 export policy {0} to {1}: an S3 export "
+                    "policy named {1} already exists."
+                ).format(name, new_name)
+            )
+        # The array compares the realm of the new name with the realm as it
+        # is stored, letter case included, so the new name takes the realm
+        # from the name the array returned.
+        rename_to = new_name
+        if _realm(module.params["name"]):
+            rename_to = "{0}::{1}".format(
+                _realm(module.params["name"]), _leaf(new_name)
+            )
 
     if state == "present" and policy is None:
         create_policy(module, blade)
     elif state == "present" and policy is not None:
-        update_policy(module, blade, policy)
+        update_policy(module, blade, policy, rename_to)
     elif state == "absent" and policy is not None:
         delete_policy(module, blade)
 

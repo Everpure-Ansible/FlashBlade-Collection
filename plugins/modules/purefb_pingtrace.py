@@ -89,6 +89,9 @@ options:
     - Used by ping and trace to specify where to run the operation.
     - Valid values are controllers and blades from hardware list.
     - If not specified defaults to all available controllers and selected blades
+    - When I(source) is also given, the component must be one that the
+      array can use that source on. A data interface, for example, is
+      accepted on a blade and refused on a controller.
     type: str
 extends_documentation_fragment:
 - everpure.flashblade.everpure.fb

@@ -131,6 +131,7 @@ TRACE_ONE = (
 )
 NO_SOURCE = "Need to be an existing subnet, IP or a network interface."
 NO_COMPONENT = "Hardware component is unavailable or does not exist."
+NO_USE = "Hardware component is not a valid choice with the current inputs."
 NOT_PERMITTED = "Operation not permitted."
 COMPONENT_NAME = re.compile(r"^CH\d+\.F[BM]\d+$")
 
@@ -163,12 +164,21 @@ def _module(check_mode=False, **overrides):
     return module
 
 
-def _item(component, details, destination=DEST):
-    """One result of a ping or a trace: the answer of one component."""
-    item = Mock(spec=["component_name", "destination", "details"])
+def _item(component, details, destination=DEST, source=None):
+    """One result of a ping or a trace: the answer of one component.
+
+    The array repeats the source of the request in each result and leaves
+    the field out when the request has none.
+    """
+    fields = ["component_name", "destination", "details"]
+    if source is not None:
+        fields.append("source")
+    item = Mock(spec=fields)
     item.component_name = component
     item.destination = destination
     item.details = details
+    if source is not None:
+        item.source = source
     return item
 
 
@@ -194,13 +204,17 @@ def _get_error_message(res):
     return res.errors[0].message
 
 
-def _blade(ping=None, trace=None):
+def _blade(ping=None, trace=None, source=None):
     blade = Mock()
     blade.get_network_interfaces_ping.return_value = (
-        ping if ping is not None else _response(_item("CH1.FM1", PING_ONE))
+        ping
+        if ping is not None
+        else _response(_item("CH1.FM1", PING_ONE, source=source))
     )
     blade.get_network_interfaces_trace.return_value = (
-        trace if trace is not None else _response(_item("CH1.FM1", TRACE_ONE))
+        trace
+        if trace is not None
+        else _response(_item("CH1.FM1", TRACE_ONE, source=source))
     )
     return blade
 
@@ -263,7 +277,7 @@ class TestRunPing:
 
     @pytest.mark.parametrize("source", SOURCES)
     def test_source_is_sent_as_given(self, source):
-        blade = _blade()
+        blade = _blade(source=source)
         module = _module(source=source)
         _call(run_ping, module, blade)
         kwargs = blade.get_network_interfaces_ping.call_args[1]
@@ -282,7 +296,7 @@ class TestRunPing:
 
     @pytest.mark.parametrize("source", SOURCES)
     def test_source_and_component(self, source):
-        blade = _blade()
+        blade = _blade(source=source)
         module = _module(source=source, component="CH1.FB1")
         _call(run_ping, module, blade)
         blade.get_network_interfaces_ping.assert_called_once_with(
@@ -318,9 +332,9 @@ class TestRunPing:
 
     def test_one_result_per_component(self):
         answer = _response(
-            _item("CH1.FB1", PING_ONE),
-            _item("CH1.FM1", PING_ONE),
-            _item("CH1.FM2", PING_ONE),
+            _item("CH1.FB1", PING_ONE, source="vir0"),
+            _item("CH1.FM1", PING_ONE, source="vir0"),
+            _item("CH1.FM2", PING_ONE, source="vir0"),
         )
         module = _module(source="vir0")
         _call(run_ping, module, _blade(ping=answer))
@@ -368,7 +382,7 @@ class TestRunTrace:
 
     @pytest.mark.parametrize("source", SOURCES)
     def test_source_is_sent_as_given(self, source):
-        blade = _blade()
+        blade = _blade(source=source)
         module = _module(action="trace", source=source)
         _call(run_trace, module, blade)
         kwargs = blade.get_network_interfaces_trace.call_args[1]
@@ -385,7 +399,7 @@ class TestRunTrace:
 
     @pytest.mark.parametrize("source", SOURCES)
     def test_source_and_component(self, source):
-        blade = _blade()
+        blade = _blade(source=source)
         module = _module(action="trace", source=source, component="CH1.FM1")
         _call(run_trace, module, blade)
         blade.get_network_interfaces_trace.assert_called_once_with(
@@ -475,6 +489,20 @@ class TestRefusedRequest:
         assert request.call_args[1]["component_name"] == component
         assert _failure(module) == prefix + NO_COMPONENT
 
+    # On a controller: a data interface by name and by address, a subnet that
+    # has only data interfaces and the support interface of the other controller
+    @pytest.mark.parametrize(
+        "source", ["data1", "10.10.10.20", "data-subnet", "fm2.admin0"]
+    )
+    def test_component_that_cannot_use_the_source(self, action, func, prefix, source):
+        blade = _blade(ping=_error(NO_USE), trace=_error(NO_USE))
+        module = _module(action=action, source=source, component="CH1.FM1")
+        _call(func, module, blade)
+        request = getattr(blade, "get_network_interfaces_" + action)
+        assert request.call_args[1]["source"] == source
+        assert request.call_args[1]["component_name"] == "CH1.FM1"
+        assert _failure(module) == prefix + NO_USE
+
     def test_administrator_without_access(self, action, func, prefix):
         blade = _blade(ping=_error(NOT_PERMITTED), trace=_error(NOT_PERMITTED))
         module = _module(action=action)
@@ -497,7 +525,7 @@ class TestMain:
 
     @pytest.mark.parametrize("check_mode", [False, True])
     def test_ping(self, check_mode):
-        blade = _blade()
+        blade = _blade(source="vir0")
         module = _module(check_mode=check_mode, source="vir0")
         _run(module, blade, api_version="2.6")
         blade.get_network_interfaces_ping.assert_called_once()
@@ -508,7 +536,7 @@ class TestMain:
 
     @pytest.mark.parametrize("check_mode", [False, True])
     def test_trace(self, check_mode):
-        blade = _blade()
+        blade = _blade(source="vir0")
         module = _module(check_mode=check_mode, action="trace", source="vir0")
         _run(module, blade)
         blade.get_network_interfaces_trace.assert_called_once()
@@ -546,6 +574,12 @@ class TestDocumentation:
         for form in ("IP address", "network interface", "subnet"):
             assert form in text
         assert "hostname is not accepted" in text
+
+    def test_component_names_the_rule_for_a_source(self):
+        option = yaml.safe_load(DOCUMENTATION)["options"]["component"]
+        text = " ".join(option["description"])
+        assert "I(source) is also given" in text
+        assert "accepted on a blade and refused on a controller" in text
 
     def test_documented_options_are_the_options_of_the_module(self):
         assert sorted(yaml.safe_load(DOCUMENTATION)["options"]) == OPTIONS

@@ -47,7 +47,10 @@ options:
         operation breakdowns (C(nfs_ops), C(s3_ops), C(http_ops)), replication
         performance (array-wide, per array connection and per target under
         C(replication)) and point-in-time per-object samples keyed by name
-        under C(filesystems) and C(buckets).
+        under C(filesystems) and C(buckets). The array gives these samples
+        for ten file systems or ten buckets per request, so an array that
+        holds more of them is asked once for every ten. Destroyed file
+        systems and buckets have no sample.
       - The C(filesystems) subset reports the space of every file system
         under the names the C(buckets) entries use, C(data_reduction) (the
         data reduction ratio), C(snapshot_space), C(total_physical_space),
@@ -171,6 +174,46 @@ options:
         C(storage_class_members) lists the local array itself when it is
         not in a fleet; C(realm_connections) and C(remote_realms) are
         empty when no realm is connected.
+      - An object in a realm is reported under its realm-qualified name,
+        C(realm::name), next to the array-level objects, and an array-level
+        object of the same name is an entry of its own. A file system is
+        keyed C(realm::filesystem), its snapshots
+        C(realm::filesystem.suffix), a bucket C(realm::bucket), its
+        policies C(realm::bucket/access-policy) and
+        C(realm::bucket/cors-policy), an account C(realm::account), its
+        roles and access policies C(realm::account/name), its export
+        C(realm::server::realm::account), and servers, policies,
+        certificates, legal holds and local directory services likewise.
+        The users of an account are listed inside its entry. A snapshot
+        of a file system in a realm reports the realm as its C(source)
+        and C(source_location), and the rules of a bucket access policy
+        name their bucket without the realm.
+      - File systems, object store accounts, account exports, virtual
+        hosts, certificates, DNS configurations and Active Directory
+        accounts report C(realms), the names of the realms the object
+        belongs to, as servers, legal holds and policies do. The list is
+        empty for an array-level object.
+      - The counters of the C(minimum) subset count what the credentials
+        in use can see. For an administrator of the array that includes
+        the objects in every realm; an administrator limited to a realm
+        gets the counts of that realm, which include the array-level
+        objects the array shows it, such as the built-in policies.
+      - The C(config) subset reports every directory service under its
+        full name in C(directory_services). The directory services of the
+        array keep their keys C(management_directory_service),
+        C(nfs_directory_service) and C(smb_directory_service); the one of
+        a server is named C(server_nfs), or C(realm::server_nfs) for a
+        server in a realm. On REST API 2.24 or later
+        C(local_directory_services) lists the local directory services
+        by name with their domain, server and realms, their C(users)
+        (UID, SID, whether enabled and built in, primary group and
+        groups) and their C(groups) (GID, SID, whether built in, and
+        members with their type). C(saml2_idps) lists every SAML2
+        identity provider by name; C(saml2sso) holds the first one the
+        array lists.
+      - A file system that is eradicated while the C(filesystems) subset
+        is gathered keeps the entry of its listing and is reported
+        without quotas.
       - The array refuses the reads the credentials in use are not allowed
         to make. An administrator whose access is limited to a realm is
         refused the array-wide reads (hardware, array space and
@@ -242,6 +285,19 @@ EXAMPLES = r"""
 - name: show which switch port each uplink is cabled to
   debug:
     msg: "{{ blade_info['purefb_info']['lldp_neighbors'] }}"
+
+- name: collect the file systems
+  everpure.flashblade.purefb_info:
+    gather_subset:
+      - filesystems
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+  register: blade_info
+- name: show the file systems of realm realm1
+  debug:
+    msg: >-
+      {{ blade_info['purefb_info']['filesystems'] | dict2items
+         | selectattr('key', 'match', '^realm1::') | items2dict }}
 """
 
 RETURN = r"""
@@ -409,6 +465,7 @@ NEIGHBOR_CAPABILITIES = (
 )
 MGMT_AUTH_API_VERSION = "2.22"
 WORKLOAD_API_VERSION = "2.23"
+LOCAL_DS_API_VERSION = "2.24"
 REALM_CONNECTION_API_VERSION = "2.25"
 MAP_ROLES_API_VERSION = "2.26"
 TGROUP_API_VERSION = "2.26"
@@ -683,6 +740,65 @@ def _listed(response):
     return len(response.items)
 
 
+class _ReadFailure(Exception):
+    """A read the array failed and the gather cannot do without
+
+    main() fails the module with the message it carries.
+    """
+
+
+def _served_items(response, what):
+    """Items of a read, ``what`` being what it reads
+
+    A read the array refused the identity in use holds none. Any other
+    failed read is reported with the message of the array; it is never
+    taken for an empty listing.
+    """
+    if not _read_failed(response):
+        return list(response.items)
+    if isinstance(response, _RefusedRead) or _read_refused(response):
+        return []
+    raise _ReadFailure(
+        "Failed to read {0}. Error: {1}".format(
+            what, "; ".join(_error_messages(response)) or response.status_code
+        )
+    )
+
+
+def _items_of_named(response, what):
+    """Items of a read that names one object, ``what`` being what it reads
+
+    The object can be removed between the listing that named it and this
+    read. The array then answers that it does not exist, and the read
+    holds no items.
+    """
+    if _read_failed(response) and _named_object_gone(response):
+        return []
+    return _served_items(response, what)
+
+
+def _name_realm(name):
+    """Realm a realm-qualified name places its object in; None otherwise"""
+    if isinstance(name, str) and "::" in name:
+        return name.split("::", 1)[0]
+    return None
+
+
+def _policy_realms(policy):
+    """Names of the realms of a policy
+
+    The array reports no realm for the object store access policies of an
+    account in a realm, nor for the access and cross-origin resource
+    sharing policies of a bucket in a realm. Their name carries the realm.
+    """
+    realms = _realm_names(policy)
+    if not realms:
+        realm = _name_realm(getattr(policy, "name", None))
+        if realm:
+            realms = [realm]
+    return realms
+
+
 def generate_directory_service_roles_dict(blade, api_version):
     """Return the directory service role mappings
 
@@ -733,6 +849,21 @@ def _reference_name(obj, field):
     return getattr(ref, "name", None) or None
 
 
+# Counters of the default subset with the policy types they count, as the
+# array names the types in its listing of every policy. The REST reference
+# names two of them differently.
+POLICY_COUNTERS = (
+    ("snapshot_policies", ("snapshot",)),
+    ("access_policies", ("object-store-access", "object-access")),
+    ("nfs_policies", ("nfs-export", "nfs")),
+    ("smb_share_policies", ("smb-share",)),
+    ("smb_client_policies", ("smb-client",)),
+    ("network_policies", ("network-access",)),
+    ("worm_policies", ("worm-data",)),
+    ("telemetry_metrics_policies", ("telemetry-metrics",)),
+)
+
+
 def generate_default_dict(blade):
     default_info = {}
     # NOTE(latent bug): this previously read list(blade.get_versions().items)[0]
@@ -764,30 +895,10 @@ def generate_default_dict(blade):
     default_info["policies"] = blade.get_policies_all().total_item_count
     # Count policies by type
     all_policies = list(blade.get_policies_all().items)
-    default_info["snapshot_policies"] = sum(
-        1 for p in all_policies if p.policy_type == "snapshot"
-    )
-    default_info["access_policies"] = sum(
-        1 for p in all_policies if p.policy_type == "access"
-    )
-    default_info["nfs_policies"] = sum(
-        1 for p in all_policies if p.policy_type == "nfs"
-    )
-    default_info["smb_share_policies"] = sum(
-        1 for p in all_policies if p.policy_type == "smb_share"
-    )
-    default_info["smb_client_policies"] = sum(
-        1 for p in all_policies if p.policy_type == "smb_client"
-    )
-    default_info["network_policies"] = sum(
-        1 for p in all_policies if p.policy_type == "network"
-    )
-    default_info["worm_policies"] = sum(
-        1 for p in all_policies if p.policy_type == "worm"
-    )
-    default_info["telemetry_metrics_policies"] = sum(
-        1 for p in all_policies if p.policy_type == "telemetry-metrics"
-    )
+    for counter, policy_types in POLICY_COUNTERS:
+        default_info[counter] = sum(
+            1 for p in all_policies if p.policy_type in policy_types
+        )
     default_info["certificate_groups"] = blade.get_certificate_groups().total_item_count
     default_info["fs_replicas"] = blade.get_file_system_replica_links().total_item_count
     default_info["remote_credentials"] = (
@@ -1018,6 +1129,28 @@ def _perf_first(response):
     return items[0] if items else None
 
 
+def _performance_rows(read, listing):
+    """Performance rows of every file system or every bucket
+
+    The array reports the performance of at most ten file systems, or ten
+    buckets, in one query. A query that names none is tried first; when
+    the array answers that it covers too many, ``listing`` gives the names
+    and the rows are read for ten of them at a time. The query that names
+    none leaves out what is destroyed, so do the names. A file system or
+    bucket removed since it was listed is skipped, and a failed read gives
+    no rows.
+    """
+    res = read()
+    if not _query_too_wide(res):
+        return _perf_items(res)
+    names = [
+        item.name
+        for item in _perf_items(listing())
+        if not getattr(item, "destroyed", False)
+    ]
+    return _listing_in_tens(read, "names", names, strict=False)
+
+
 def _replication_perf(sample):
     """Flatten a ResourcePerformanceReplication sample.
 
@@ -1046,6 +1179,8 @@ def generate_perf_breakdown_dict(blade):
 
     Every endpoint used here exists since REST 2.0, so there is no version
     gate. A failed GET leaves its key empty instead of failing the gather.
+    The per-object samples are read for ten file systems or buckets at a
+    time on an array that holds more than one query may cover.
     """
     breakdown = {
         "smb": _perf_fields(
@@ -1079,11 +1214,15 @@ def generate_perf_breakdown_dict(blade):
             )
     for target in _perf_items(blade.get_targets_performance_replication()):
         breakdown["replication"]["targets"][target.name] = _replication_perf(target)
-    for fsys in _perf_items(blade.get_file_systems_performance()):
+    for fsys in _performance_rows(
+        blade.get_file_systems_performance, blade.get_file_systems
+    ):
         breakdown["filesystems"][fsys.name] = _perf_fields(fsys, PERF_FIELDS)
-    for bucket in _perf_items(blade.get_buckets_performance()):
+    for bucket in _performance_rows(blade.get_buckets_performance, blade.get_buckets):
         breakdown["buckets"][bucket.name] = _perf_fields(bucket, PERF_FIELDS)
-    for bucket in _perf_items(blade.get_buckets_s3_specific_performance()):
+    for bucket in _performance_rows(
+        blade.get_buckets_s3_specific_performance, blade.get_buckets
+    ):
         breakdown["buckets"].setdefault(bucket.name, {})["s3"] = _perf_fields(
             bucket, S3_OPS_FIELDS
         )
@@ -1196,6 +1335,169 @@ def generate_quota_settings_dict(blade):
     return quota_settings
 
 
+def _directory_service_dict(ds_service):
+    """One directory service as the config subset reports it
+
+    The directory service of a server holds fewer settings than the ones
+    of the array; a setting the array did not report reads as null.
+    """
+    management = getattr(ds_service, "management", None)
+    nfs = getattr(ds_service, "nfs", None)
+    return {
+        "base_dn": getattr(ds_service, "base_dn", None),
+        "bind_user": getattr(ds_service, "bind_user", None),
+        "ca_certificate": getattr(
+            getattr(ds_service, "ca_certificate", None), "name", None
+        ),
+        "ca_certificate_group": getattr(
+            getattr(ds_service, "ca_certificate_group", None), "name", None
+        ),
+        "enabled": getattr(ds_service, "enabled", None),
+        "management": {
+            "user_login_attribute": getattr(management, "user_login_attribute", None),
+            "user_object_class": getattr(management, "user_object_class", None),
+        },
+        "nis_servers": getattr(nfs, "nis_servers", None),
+        "nis_domains": getattr(nfs, "nis_domains", None),
+        "services": getattr(ds_service, "services", None),
+        "join_ou": getattr(getattr(ds_service, "smb", None), "join_ou", None),
+        "uris": getattr(ds_service, "uris", None),
+    }
+
+
+def _saml2_idp_dict(provider):
+    """One SAML2 identity provider as the config subset reports it"""
+    idp = getattr(provider, "idp", None)
+    service = getattr(provider, "sp", None)
+    return {
+        "enabled": getattr(provider, "enabled", None),
+        "array_url": getattr(provider, "array_url", None),
+        "name": getattr(provider, "name", None),
+        "prn": getattr(provider, "prn", None),
+        "services": getattr(provider, "services", None),
+        "binding": getattr(provider, "binding", None),
+        "trust_other_saml_sps_in_fleet": getattr(
+            getattr(provider, "management", None),
+            "trust_other_saml_sps_in_fleet",
+            None,
+        ),
+        "idp": {
+            "url": getattr(idp, "url", None),
+            "entity_id": getattr(idp, "entity_id", None),
+            "encrypt_enabled": getattr(idp, "encrypt_assertion_enabled", None),
+            "sign_enabled": getattr(idp, "sign_request_enabled", None),
+            "metadata_url": getattr(idp, "metadata_url", None),
+            "metadata_url_ca_certificate": getattr(
+                getattr(idp, "metadata_url_ca_certificate", None), "name", None
+            ),
+            "metadata_url_ca_certificate_group": getattr(
+                getattr(idp, "metadata_url_ca_certificate_group", None),
+                "name",
+                None,
+            ),
+            "verification_certificate": getattr(
+                getattr(idp, "verification_certificate", None), "name", None
+            ),
+        },
+        "sp": {
+            "entity_id": getattr(service, "entity_id", None),
+            "assertion_consumer_url": getattr(service, "assertion_consumer_url", None),
+            "metadata_url": getattr(service, "metadata_url", None),
+            "decrypt_cred": getattr(
+                getattr(service, "decryption_credential", None), "name", None
+            ),
+            "sign_cred": getattr(
+                getattr(service, "signing_credential", None), "name", None
+            ),
+        },
+    }
+
+
+def generate_local_directory_services_dict(blade):
+    """Local directory services with their users and groups
+
+    Keyed by the name of the local directory service, ``realm::name`` for
+    one in a realm. Its users and groups are keyed by their own name, which
+    is unique inside one local directory service only, so every user, group
+    and membership is attributed by the id of the service it belongs to.
+    """
+    services = {}
+    names_by_id = {}
+    for service in _served_items(
+        blade.get_directory_services_local_directory_services(),
+        "the local directory services",
+    ):
+        services[service.name] = {
+            "domain": getattr(service, "domain", None),
+            "realms": _realm_names(service),
+            "server": _reference_name(service, "server"),
+            "users": {},
+            "groups": {},
+        }
+        if isinstance(getattr(service, "id", None), str):
+            names_by_id[service.id] = service.name
+
+    if not services:
+        return services
+
+    def owner(row):
+        reference = getattr(row, "local_directory_service", None)
+        return services.get(
+            names_by_id.get(
+                getattr(reference, "id", None), getattr(reference, "name", None)
+            )
+        )
+
+    for user in _served_items(
+        blade.get_directory_services_local_users(), "the local users"
+    ):
+        service = owner(user)
+        if service is not None:
+            service["users"][user.name] = {
+                "uid": getattr(user, "uid", None),
+                "sid": getattr(user, "sid", None),
+                "enabled": getattr(user, "enabled", None),
+                "built_in": getattr(user, "built_in", None),
+                "email": getattr(user, "email", None),
+                "primary_group": _reference_name(user, "primary_group"),
+                "groups": [],
+            }
+    for group in _served_items(
+        blade.get_directory_services_local_groups(), "the local groups"
+    ):
+        service = owner(group)
+        if service is not None:
+            service["groups"][group.name] = {
+                "gid": getattr(group, "gid", None),
+                "sid": getattr(group, "sid", None),
+                "built_in": getattr(group, "built_in", None),
+                "email": getattr(group, "email", None),
+                "members": [],
+            }
+    for row in _served_items(
+        blade.get_directory_services_local_groups_members(),
+        "the members of the local groups",
+    ):
+        service = owner(row)
+        if service is None:
+            continue
+        group_name = _reference_name(row, "group")
+        member = getattr(row, "member", None)
+        member_name = getattr(member, "name", None)
+        member_type = getattr(member, "resource_type", None)
+        if group_name in service["groups"]:
+            service["groups"][group_name]["members"].append(
+                {"name": member_name, "resource_type": member_type}
+            )
+        if (
+            isinstance(member_type, str)
+            and member_type.endswith("/users")
+            and member_name in service["users"]
+        ):
+            service["users"][member_name]["groups"].append(group_name)
+    return services
+
+
 def generate_config_dict(blade):
     config_info = {}
     api_version = get_rest_api_version(blade)
@@ -1212,6 +1514,7 @@ def generate_config_dict(blade):
             "ca_certificate_group": getattr(
                 getattr(config, "ca_certificate_group", None), "name", None
             ),
+            "realms": _realm_names(config),
         }
         if hasattr(config, "sources"):
             # sources is a list of references (at most one), not a reference
@@ -1237,26 +1540,16 @@ def generate_config_dict(blade):
             "enabled": config.enabled,
             "minimum_notification_severity": config.minimum_notification_severity,
         }
+    # Every directory service under its full name: the ones of the array
+    # and the ones of each server, a server in a realm included
+    # (realm::server_nfs). The three of the array keep their own keys.
+    config_info["directory_services"] = {}
     directory_services = list(blade.get_directory_services().items)
     for ds_service in directory_services:
+        entry = _directory_service_dict(ds_service)
+        config_info["directory_services"][ds_service.name] = entry
         if ds_service.name in {"management", "nfs", "smb"}:
-            key = f"{ds_service.name}_directory_service"
-            config_info[key] = {
-                "base_dn": ds_service.base_dn,
-                "bind_user": ds_service.bind_user,
-                "ca_certificate": ds_service.ca_certificate.name,
-                "ca_certificate_group": ds_service.ca_certificate_group.name,
-                "enabled": ds_service.enabled,
-                "management": {
-                    "user_login_attribute": ds_service.management.user_login_attribute,
-                    "user_object_class": ds_service.management.user_object_class,
-                },
-                "nis_servers": ds_service.nfs.nis_servers,
-                "nis_domains": ds_service.nfs.nis_domains,
-                "services": ds_service.services,
-                "join_ou": ds_service.smb.join_ou,
-                "uris": ds_service.uris,
-            }
+            config_info[f"{ds_service.name}_directory_service"] = entry
     # Forward backwards compatability. The management directory service is
     # not visible to an identity scoped to a realm.
     if "management_directory_service" in config_info:
@@ -1265,6 +1558,10 @@ def generate_config_dict(blade):
     config_info["directory_service_roles"] = generate_directory_service_roles_dict(
         blade, api_version
     )
+    if LooseVersion(LOCAL_DS_API_VERSION) <= LooseVersion(api_version):
+        config_info["local_directory_services"] = (
+            generate_local_directory_services_dict(blade)
+        )
     config_info["ntp"] = getattr(_first_item(blade.get_arrays()), "ntp_servers", None)
     certs = list(blade.get_certificates().items)
     config_info["ssl_certs"] = {}
@@ -1291,6 +1588,7 @@ def generate_config_dict(blade):
             "locality": getattr(cert, "locality", None),
             "organization": getattr(cert, "organization", None),
             "organizational_unit": getattr(cert, "organizational_unit", None),
+            "realms": _realm_names(cert),
             "state": getattr(cert, "state", None),
             "status": getattr(cert, "status", None),
             "subject_alternative_names": getattr(
@@ -1367,57 +1665,15 @@ def generate_config_dict(blade):
                 ),
             }
     if LooseVersion(SMTP_ENCRYPT_API_VERSION) <= LooseVersion(api_version):
+        # saml2sso holds the first provider the array lists; an array can
+        # hold more than one, so saml2_idps reports each under its name
         config_info["saml2sso"] = {}
+        config_info["saml2_idps"] = {}
         saml2 = list(blade.get_sso_saml2_idps().items)
         if saml2:
-            config_info["saml2sso"] = {
-                "enabled": saml2[0].enabled,
-                "array_url": saml2[0].array_url,
-                "name": saml2[0].name,
-                "prn": getattr(saml2[0], "prn", None),
-                "services": getattr(saml2[0], "services", None),
-                "binding": getattr(saml2[0], "binding", None),
-                "trust_other_saml_sps_in_fleet": getattr(
-                    getattr(saml2[0], "management", None),
-                    "trust_other_saml_sps_in_fleet",
-                    None,
-                ),
-                "idp": {
-                    "url": getattr(saml2[0].idp, "url", None),
-                    "entity_id": getattr(saml2[0].idp, "entity_id", None),
-                    "encrypt_enabled": saml2[0].idp.encrypt_assertion_enabled,
-                    "sign_enabled": saml2[0].idp.sign_request_enabled,
-                    "metadata_url": saml2[0].idp.metadata_url,
-                    "metadata_url_ca_certificate": getattr(
-                        getattr(saml2[0].idp, "metadata_url_ca_certificate", None),
-                        "name",
-                        None,
-                    ),
-                    "metadata_url_ca_certificate_group": getattr(
-                        getattr(
-                            saml2[0].idp, "metadata_url_ca_certificate_group", None
-                        ),
-                        "name",
-                        None,
-                    ),
-                    "verification_certificate": getattr(
-                        getattr(saml2[0].idp, "verification_certificate", None),
-                        "name",
-                        None,
-                    ),
-                },
-                "sp": {
-                    "entity_id": getattr(saml2[0].sp, "entity_id", None),
-                    "assertion_consumer_url": getattr(
-                        saml2[0].sp, "assertion_consumer_url", None
-                    ),
-                    "metadata_url": getattr(saml2[0].sp, "metadata_url", None),
-                    "decrypt_cred": getattr(
-                        saml2[0].sp.decryption_credential, "name", None
-                    ),
-                    "sign_cred": getattr(saml2[0].sp.signing_credential, "name", None),
-                },
-            }
+            config_info["saml2sso"] = _saml2_idp_dict(saml2[0])
+        for provider in saml2:
+            config_info["saml2_idps"][provider.name] = _saml2_idp_dict(provider)
     if LooseVersion(OIDC_API_VERSION) <= LooseVersion(api_version):
         config_info["oidc_idps"] = generate_oidc_idps_dict(blade)
     return config_info
@@ -2208,7 +2464,7 @@ def generate_all_policies_dict(blade):
             "is_local": getattr(policy, "is_local", None),
             "location": getattr(getattr(policy, "location", None), "name", None),
             "policy_type": policy.policy_type,
-            "realms": _realm_names(policy),
+            "realms": _policy_realms(policy),
         }
     if LooseVersion(POLICY_MEMBERS_API_VERSION) <= LooseVersion(
         get_rest_api_version(blade)
@@ -2386,6 +2642,7 @@ def generate_ad_dict(blade):
             "ca_certificate_group": getattr(
                 getattr(ad, "ca_certificate_group", None), "name", None
             ),
+            "realms": _realm_names(ad),
         }
 
     return ad_info
@@ -2405,7 +2662,7 @@ def generate_bucket_access_policies_dict(blade):
                     "description": getattr(policy, "description", None),
                     "enabled": policy.enabled,
                     "local": policy.is_local,
-                    "realms": _realm_names(policy),
+                    "realms": _policy_realms(policy),
                     "rules": [],
                 }
 
@@ -2438,7 +2695,7 @@ def generate_bucket_cross_object_policies_dict(blade):
             policies_info[policy.name] = {
                 "enabled": getattr(policy, "enabled", None),
                 "local": getattr(policy, "is_local", None),
-                "realms": _realm_names(policy),
+                "realms": _policy_realms(policy),
                 "rules": [],
             }
             rules = blade.get_buckets_cross_origin_resource_sharing_policies_rules(
@@ -2469,7 +2726,7 @@ def generate_object_store_access_policies_dict(blade):
             "description": policy.description,
             "enabled": policy.enabled,
             "local": policy.is_local,
-            "realms": _realm_names(policy),
+            "realms": _policy_realms(policy),
             "rules": [],
         }
 
@@ -2850,6 +3107,7 @@ def generate_object_store_account_exports_dict(blade):
             "account": getattr(getattr(export, "member", None), "name", None),
             "policy": getattr(getattr(export, "policy", None), "name", None),
             "server": getattr(getattr(export, "server", None), "name", None),
+            "realms": _realm_names(export),
         }
 
     return exports_info
@@ -2866,6 +3124,7 @@ def generate_object_store_virtual_hosts_dict(blade):
             # Before REST 2.20 the name is the hostname
             "hostname": getattr(vhost, "hostname", None) or vhost.name,
             "attached_servers": [getattr(srv, "name", None) for srv in attached],
+            "realms": _realm_names(vhost),
         }
 
     return vhosts_info
@@ -3001,6 +3260,7 @@ def generate_object_store_accounts_dict(blade, api_version):
             "quota_limit": getattr(account, "quota_limit", None),
             "hard_limit_enabled": getattr(account, "hard_limit_enabled", None),
             "total_provisioned": space.get("total_provisioned"),
+            "realms": _realm_names(account),
             "users": {},
             "bucket_defaults": {
                 "hard_limit_enabled": getattr(
@@ -3153,6 +3413,7 @@ def generate_fs_dict(blade, exports=None, api_version=None, worm_policies=None):
             "snapshot_enabled": fsystem.snapshot_directory_enabled,
             "provisioned": fsystem.provisioned,
             "destroyed": fsystem.destroyed,
+            "realms": _realm_names(fsystem),
             "nfs_rules": getattr(nfs, "rules", None),
             "nfs_v3": getattr(nfs, "v3_enabled", False),
             "nfs_v4_1": getattr(nfs, "v4_1_enabled", False),
@@ -3238,8 +3499,12 @@ def generate_fs_dict(blade, exports=None, api_version=None, worm_policies=None):
                         _policy_quota_entry(group, "group")
                     )
 
-        # Group quotas
-        for group_quota in blade.get_quotas_groups(file_system_names=[share]).items:
+        # Group and user quotas. A file system eradicated since the listing
+        # was taken has none left to read and is reported without them.
+        for group_quota in _items_of_named(
+            blade.get_quotas_groups(file_system_names=[share]),
+            "the group quotas of file system {0}".format(share),
+        ):
             group_name = group_quota.name.rsplit("/", 1)[1]
             fs_info[share]["group_quotas"][group_name] = {
                 "group_id": getattr(group_quota.group, "id", None),
@@ -3248,8 +3513,10 @@ def generate_fs_dict(blade, exports=None, api_version=None, worm_policies=None):
                 "usage": group_quota.usage,
             }
 
-        # User quotas
-        for user_quota in blade.get_quotas_users(file_system_names=[share]).items:
+        for user_quota in _items_of_named(
+            blade.get_quotas_users(file_system_names=[share]),
+            "the user quotas of file system {0}".format(share),
+        ):
             user_name = user_quota.name.rsplit("/", 1)[1]
             fs_info[share]["user_quotas"][user_name] = {
                 "user_id": getattr(user_quota.user, "id", None),
@@ -4384,6 +4651,16 @@ def main():
             % (",".join(valid_subsets), ",".join(subset))
         )
 
+    try:
+        info = _gather(blade, api_version, subset)
+    except _ReadFailure as failure:
+        module.fail_json(msg=str(failure))
+    else:
+        module.exit_json(changed=False, purefb_info=info)
+
+
+def _gather(blade, api_version, subset):
+    """The information of the subsets asked for"""
     info = {}
 
     if "minimum" in subset or "all" in subset:
@@ -4600,7 +4877,7 @@ def main():
         info["realm_connection_keys"] = generate_realm_connection_keys_dict(
             blade, info.get("realms", {})
         )
-    module.exit_json(changed=False, purefb_info=info)
+    return info
 
 
 if __name__ == "__main__":

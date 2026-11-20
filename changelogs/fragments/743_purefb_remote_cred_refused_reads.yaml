@@ -1,0 +1,12 @@
+bugfixes:
+  - purefb_remote_cred - a read that the array refuses or fails is reported with the error of the
+    array. Before, a failed read of the array connections or targets ended in a traceback and a
+    failed read of the credential was taken for a credential that does not exist.
+  - purefb_remote_cred - ``target`` is matched whatever its letter case, and a connected array
+    given by its management address is addressed by its name.
+  - purefb_remote_cred - the failure for a target that is not connected also says that the target
+    may not be visible to the user, and explains a realm prefix on ``target`` and a target that
+    is not shared with the realm of the credential.
+  - purefb_remote_cred - a ``name`` that holds a comma or ``*`` is refused. The array reads it as
+    a list of names or as a pattern and answers with several credentials, of which the module
+    compared the first. For a list of names check mode reported a change that the array refuses.

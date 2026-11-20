@@ -1,0 +1,4 @@
+bugfixes:
+  - purefb_apiclient - documentation says that API clients are array-level objects. A
+    realm-qualified ``name`` is refused, and an administrator limited to a realm cannot read or
+    change them.

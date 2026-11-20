@@ -134,13 +134,30 @@ def normalize_port(module, port):
     return [f"{parts[0]}.FM1.{parts[1]}", f"{parts[0]}.FM2.{parts[1]}"]
 
 
-def get_used_ports(blade):
+def _get_lags(module, blade, name=None):
+    """Return the LAGs of the array, or only the LAG called name
+
+    A named LAG that the array says does not exist gives an empty list. Any
+    other read the array refuses or fails is reported with the message of
+    the array.
+    """
+    if name is None:
+        res = blade.get_link_aggregation_groups()
+    else:
+        res = blade.get_link_aggregation_groups(names=[name])
+    if res.status_code != 200:
+        error = get_error_message(res)
+        if name is None:
+            module.fail_json(msg="Failed to read the LAGs. Error: {0}".format(error))
+        if "does not exist" in str(error).lower():
+            return []
+        module.fail_json(msg="Failed to read LAG {0}. Error: {1}".format(name, error))
+    return list(res.items)
+
+
+def get_used_ports(module, blade):
     """Return the names of all ports currently assigned to any LAG"""
-    return [
-        port.name
-        for lag in blade.get_link_aggregation_groups().items
-        for port in (lag.ports or [])
-    ]
+    return [port.name for lag in _get_lags(module, blade) for port in (lag.ports or [])]
 
 
 def delete_lag(module, blade):
@@ -157,19 +174,16 @@ def delete_lag(module, blade):
     module.exit_json(changed=changed)
 
 
-def update_lag(module, blade):
+def update_lag(module, blade, current_lag):
     """Update Link Aggregation Group"""
     changed = False
     lagfact = []
 
     # Get current LAG ports
-    current_lag = list(
-        blade.get_link_aggregation_groups(names=[module.params["name"]]).items
-    )[0]
     used_ports = [port.name for port in (current_lag.ports or [])]
 
     # Check if any requested port is already used in other LAGs
-    all_current_ports = get_used_ports(blade)
+    all_current_ports = get_used_ports(module, blade)
     for port in module.params["ports"]:
         for norm_port in normalize_port(module, port):
             if norm_port in all_current_ports and norm_port not in used_ports:
@@ -211,7 +225,7 @@ def create_lag(module, blade):
     """Create Link Aggregation Group"""
     changed = True
     lagfact = []
-    used_ports = get_used_ports(blade)
+    used_ports = get_used_ports(module, blade)
     new_ports = []
     for lag_port in module.params["ports"]:
         for norm_port in normalize_port(module, lag_port):
@@ -268,17 +282,15 @@ def main():
     blade = get_system(module)
     state = module.params["state"]
 
-    exists = bool(
-        blade.get_link_aggregation_groups(names=[module.params["name"]]).status_code
-        == 200
-    )
+    current_lags = _get_lags(module, blade, module.params["name"])
+    exists = bool(current_lags)
     if module.params["ports"]:
         # Remove duplicates
         module.params["ports"] = list(dict.fromkeys(module.params["ports"]))
     if not exists and state == "present":
         create_lag(module, blade)
     elif exists and state == "present":
-        update_lag(module, blade)
+        update_lag(module, blade, current_lags[0])
     elif exists and state == "absent":
         if module.params["name"].lower() == "uplink":
             module.fail_json(

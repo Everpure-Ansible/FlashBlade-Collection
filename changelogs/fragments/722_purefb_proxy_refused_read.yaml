@@ -1,0 +1,6 @@
+bugfixes:
+  - purefb_proxy - a read of the support settings that the array refuses or fails now fails with the
+    error of the array instead of a traceback, in check mode too. Purity//FB refuses this read to an
+    administrator whose management access is limited to a realm.
+  - purefb_proxy - ``state=present`` without ``host`` and ``port`` is now refused by the argument
+    check instead of ending in a traceback.

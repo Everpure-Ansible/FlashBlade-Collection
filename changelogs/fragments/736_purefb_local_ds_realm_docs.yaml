@@ -1,0 +1,11 @@
+bugfixes:
+  - purefb_local_ds - a ``name`` that contains a comma is now refused before any request. The
+    array reads a comma as the separator of a list of names, so such a task addressed several
+    local directory services at once and the check for an attached server before a delete
+    found none.
+  - purefb_local_ds - the warning for a domain change on a local directory service attached to
+    a server no longer says that the change is only permitted when detached. The array may
+    accept the change.
+  - purefb_local_ds - documentation states the ``realm::name`` form with an example, the rule
+    of the array for ``domain`` and the default when it is omitted. The examples no longer use
+    a domain, or a name without a domain, that the array refuses.

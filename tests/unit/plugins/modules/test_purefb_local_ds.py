@@ -7,6 +7,7 @@ from __future__ import absolute_import, division, print_function
 
 __metaclass__ = type
 
+import re
 import sys
 import multiprocessing
 import ctypes
@@ -70,7 +71,10 @@ sys.modules["ansible_collections.everpure.flashblade.plugins.module_utils.versio
     MagicMock()
 )
 
+import yaml
+
 from plugins.modules.purefb_local_ds import (
+    EXAMPLES,
     main,
     _get_lds,
     _find_attached_server,
@@ -388,7 +392,7 @@ class TestPurefbLocalDs:
         module = Mock()
         module.exit_json = Mock(side_effect=SystemExit)
         module.fail_json = Mock(side_effect=SystemExit)
-        module.params = _base_params(domain="corp.local")
+        module.params = _base_params(domain="corp-local")
         module.check_mode = False
         mock_ansible_module.return_value = module
 
@@ -422,7 +426,7 @@ class TestPurefbLocalDs:
             pass
 
         blade.patch_directory_services_local_directory_services.assert_called_once()
-        mock_lds.assert_called_once_with(domain="corp.local")
+        mock_lds.assert_called_once_with(domain="corp-local")
         assert module.exit_json.call_args[1]["changed"] is True
 
     @patch("plugins.modules.purefb_local_ds.LooseVersion")
@@ -842,3 +846,331 @@ class TestPurefbLocalDs:
 
         module.fail_json.assert_called_once()
         assert "py-pure-client" in module.fail_json.call_args[1]["msg"]
+
+
+# ---------------- realm names ----------------
+
+REALM_LDS = "realm1::tenant_local"
+REALM_SERVER = "realm1::tenant-srv"
+
+
+def _reference(name):
+    ref = Mock()
+    ref.name = name
+    return ref
+
+
+def _lds(name, domain, server=None):
+    """A local directory service as the array returns it"""
+    lds = Mock()
+    lds.name = name
+    lds.domain = domain
+    lds.server = _reference(server) if server else None
+    lds.realms = [_reference(name.rpartition("::")[0])] if "::" in name else []
+    return lds
+
+
+def _response(items=None, status_code=200):
+    res = Mock()
+    res.status_code = status_code
+    res.items = items if items is not None else []
+    return res
+
+
+@patch("plugins.modules.purefb_local_ds.LooseVersion")
+@patch("plugins.modules.purefb_local_ds.LocalDirectoryService")
+@patch("plugins.modules.purefb_local_ds.LocalDirectoryServicePost")
+@patch("plugins.modules.purefb_local_ds.get_system")
+@patch("plugins.modules.purefb_local_ds.AnsibleModule")
+@patch("plugins.modules.purefb_local_ds.HAS_PYPURECLIENT", True)
+def _run_main(
+    mock_ansible_module,
+    mock_get_system,
+    mock_post_model,
+    mock_patch_model,
+    mock_loose_version,
+    params=None,
+    existing=None,
+    servers=None,
+    check_mode=False,
+):
+    """Run main() against a mocked array; return module, client and models"""
+    mock_loose_version.return_value.__gt__ = Mock(return_value=False)
+    module = Mock()
+    module.exit_json = Mock(side_effect=SystemExit)
+    module.fail_json = Mock(side_effect=SystemExit)
+    module.params = params
+    module.check_mode = check_mode
+    mock_ansible_module.return_value = module
+
+    blade = Mock()
+    blade.get_versions.return_value.items = ["2.24"]
+    if not isinstance(existing, list):
+        existing = [existing] if existing else []
+    blade.get_directory_services_local_directory_services.return_value = _response(
+        existing
+    )
+    blade.get_servers.return_value = _response(servers or [])
+    blade.post_directory_services_local_directory_services.return_value = _response()
+    blade.patch_directory_services_local_directory_services.return_value = _response()
+    blade.delete_directory_services_local_directory_services.return_value = _response()
+    mock_get_system.return_value = blade
+
+    try:
+        main()
+    except SystemExit:
+        pass
+    return module, blade, mock_post_model, mock_patch_model
+
+
+class TestPurefbLocalDsRealm:
+    """A local directory service in a realm is addressed by its full name"""
+
+    def test_get_lds_reads_the_realm_name_as_given(self):
+        module = Mock()
+        module.params = {"name": REALM_LDS, "context": ""}
+        lds = _lds(REALM_LDS, "tenant1")
+        blade = Mock()
+        blade.get_directory_services_local_directory_services.return_value = _response(
+            [lds]
+        )
+
+        assert _get_lds(module, blade) is lds
+        blade.get_directory_services_local_directory_services.assert_called_once_with(
+            names=[REALM_LDS]
+        )
+
+    def test_find_attached_server_filters_on_the_full_name(self):
+        module = Mock()
+        module.params = {"name": REALM_LDS, "context": ""}
+        blade = Mock()
+        blade.get_servers.return_value = _response([_reference(REALM_SERVER)])
+
+        assert _find_attached_server(module, blade) == REALM_SERVER
+        blade.get_servers.assert_called_once_with(
+            filter="local_directory_service.name='realm1::tenant_local'"
+        )
+
+    def test_create_in_a_realm_sends_the_full_name(self):
+        module, blade, post_model, _patch_model = _run_main(
+            params=_base_params(name=REALM_LDS, domain="tenant1")
+        )
+
+        blade.get_directory_services_local_directory_services.assert_called_once_with(
+            names=[REALM_LDS]
+        )
+        post = blade.post_directory_services_local_directory_services
+        post.assert_called_once()
+        assert post.call_args[1]["names"] == [REALM_LDS]
+        post_model.assert_called_once_with(domain="tenant1")
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_create_in_a_realm_check_mode_sends_nothing(self):
+        module, blade, _post_model, _patch_model = _run_main(
+            params=_base_params(name=REALM_LDS, domain="tenant1"), check_mode=True
+        )
+
+        blade.post_directory_services_local_directory_services.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_domain_change_in_a_realm_sends_the_full_name(self):
+        module, blade, _post_model, patch_model = _run_main(
+            params=_base_params(name=REALM_LDS, domain="tenant2"),
+            existing=_lds(REALM_LDS, "tenant1"),
+        )
+
+        patch_call = blade.patch_directory_services_local_directory_services
+        patch_call.assert_called_once()
+        assert patch_call.call_args[1]["names"] == [REALM_LDS]
+        patch_model.assert_called_once_with(domain="tenant2")
+        module.warn.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_domain_change_in_a_realm_warns_when_attached(self):
+        module, blade, _post_model, _patch_model = _run_main(
+            params=_base_params(name=REALM_LDS, domain="tenant2"),
+            existing=_lds(REALM_LDS, "tenant1", server=REALM_SERVER),
+        )
+
+        module.warn.assert_called_once()
+        assert REALM_SERVER in module.warn.call_args[0][0]
+        blade.patch_directory_services_local_directory_services.assert_called_once()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_realm_lds_unchanged_when_the_domain_matches(self):
+        module, blade, _post_model, _patch_model = _run_main(
+            params=_base_params(name=REALM_LDS, domain="tenant1"),
+            existing=_lds(REALM_LDS, "tenant1"),
+        )
+
+        blade.patch_directory_services_local_directory_services.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    def test_realm_lds_unchanged_when_the_domain_is_omitted(self):
+        # the array defaulted the domain to the name without the realm
+        module, blade, _post_model, _patch_model = _run_main(
+            params=_base_params(name="realm1::tenant-local"),
+            existing=_lds("realm1::tenant-local", "tenant-local"),
+        )
+
+        blade.patch_directory_services_local_directory_services.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    def test_delete_in_a_realm_sends_the_full_name(self):
+        module, blade, _post_model, _patch_model = _run_main(
+            params=_base_params(name=REALM_LDS, state="absent"),
+            existing=_lds(REALM_LDS, "tenant1"),
+        )
+
+        blade.get_servers.assert_called_once_with(
+            filter="local_directory_service.name='realm1::tenant_local'"
+        )
+        blade.delete_directory_services_local_directory_services.assert_called_once_with(
+            names=[REALM_LDS]
+        )
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_delete_in_a_realm_refused_while_attached(self):
+        for check_mode in (False, True):
+            module, blade, _post_model, _patch_model = _run_main(
+                params=_base_params(name=REALM_LDS, state="absent"),
+                existing=_lds(REALM_LDS, "tenant1", server=REALM_SERVER),
+                servers=[_reference(REALM_SERVER)],
+                check_mode=check_mode,
+            )
+
+            module.fail_json.assert_called_once()
+            assert REALM_SERVER in module.fail_json.call_args[1]["msg"]
+            blade.delete_directory_services_local_directory_services.assert_not_called()
+
+    def test_bare_name_is_not_completed_with_a_realm(self):
+        # the array-level namesake of a realm LDS is a different object
+        module, blade, post_model, _patch_model = _run_main(
+            params=_base_params(name="tenant_local", domain="tenant1")
+        )
+
+        blade.get_directory_services_local_directory_services.assert_called_once_with(
+            names=["tenant_local"]
+        )
+        post = blade.post_directory_services_local_directory_services
+        assert post.call_args[1]["names"] == ["tenant_local"]
+        post_model.assert_called_once_with(domain="tenant1")
+        assert module.exit_json.call_args[1]["changed"] is True
+
+
+# ---------------- documented examples ----------------
+
+# The array accepts a domain of at most 15 characters, alphanumerics and
+# hyphens; without a domain it takes the first 15 characters of the name
+# (without the realm) and refuses the create when they are no valid domain.
+VALID_DOMAIN = re.compile(r"^[A-Za-z0-9-]{1,15}$")
+
+
+def _example_tasks():
+    """Arguments of every purefb_local_ds task in EXAMPLES, blocks included"""
+    tasks = []
+    pending = list(yaml.safe_load(EXAMPLES))
+    while pending:
+        task = pending.pop(0)
+        pending.extend(task.get("block", []))
+        if "everpure.flashblade.purefb_local_ds" in task:
+            tasks.append(task["everpure.flashblade.purefb_local_ds"])
+    return tasks
+
+
+class TestPurefbLocalDsExamples:
+    """The documented examples keep to what the array accepts"""
+
+    def test_example_domains_are_valid(self):
+        domains = [task["domain"] for task in _example_tasks() if "domain" in task]
+        assert domains
+        for domain in domains:
+            assert VALID_DOMAIN.match(domain), domain
+
+    def test_examples_without_a_domain_have_a_name_the_array_can_default(self):
+        names = [
+            task["name"]
+            for task in _example_tasks()
+            if "domain" not in task and task.get("state", "present") == "present"
+        ]
+        assert names
+        for name in names:
+            assert VALID_DOMAIN.match(name.rpartition("::")[2][:15]), name
+
+    def test_examples_show_the_realm_form(self):
+        realm_tasks = [task for task in _example_tasks() if "::" in task["name"]]
+        assert realm_tasks
+        for task in realm_tasks:
+            realm, sep, leaf = task["name"].rpartition("::")
+            assert realm and sep and leaf
+
+
+# ---------------- one name per task ----------------
+
+
+class TestPurefbLocalDsOneName:
+    """The array reads a comma in a name as the separator of a list"""
+
+    def _assert_refused(self, module, blade):
+        module.fail_json.assert_called_once()
+        assert "comma" in module.fail_json.call_args[1]["msg"]
+        module.exit_json.assert_not_called()
+        blade.get_directory_services_local_directory_services.assert_not_called()
+        blade.get_servers.assert_not_called()
+        blade.post_directory_services_local_directory_services.assert_not_called()
+        blade.patch_directory_services_local_directory_services.assert_not_called()
+        blade.delete_directory_services_local_directory_services.assert_not_called()
+
+    def test_delete_of_two_names_refused_before_any_request(self):
+        # the array answers the lookup with both; the server filter on the
+        # text "lds-a,lds-b" matches no server although lds-a is attached
+        for check_mode in (False, True):
+            module, blade, _post_model, _patch_model = _run_main(
+                params=_base_params(name="lds-a,lds-b", state="absent"),
+                existing=[_lds("lds-a", "lds-a", server="srv-a"), _lds("lds-b", "b")],
+                check_mode=check_mode,
+            )
+
+            self._assert_refused(module, blade)
+            assert "lds-a,lds-b" in module.fail_json.call_args[1]["msg"]
+
+    def test_domain_change_of_two_names_refused_before_any_request(self):
+        for check_mode in (False, True):
+            module, blade, _post_model, _patch_model = _run_main(
+                params=_base_params(name="lds-b,lds-a", domain="corp-local"),
+                existing=[_lds("lds-b", "b"), _lds("lds-a", "lds-a", server="srv-a")],
+                check_mode=check_mode,
+            )
+
+            self._assert_refused(module, blade)
+
+    def test_two_realm_names_refused_before_any_request(self):
+        name = "tenant_local,{0}".format(REALM_LDS)
+        for state in ("present", "absent"):
+            module, blade, _post_model, _patch_model = _run_main(
+                params=_base_params(name=name, state=state, domain="tenant1"),
+                existing=[
+                    _lds("tenant_local", "local"),
+                    _lds(REALM_LDS, "tenant1", server=REALM_SERVER),
+                ],
+            )
+
+            self._assert_refused(module, blade)
+
+    def test_comma_name_refused_when_nothing_exists(self):
+        module, blade, _post_model, _patch_model = _run_main(
+            params=_base_params(name="lds-a,lds-b", domain="corp-local")
+        )
+
+        self._assert_refused(module, blade)
+
+    def test_attached_domain_change_warning_does_not_say_refused(self):
+        module, _blade, _post_model, _patch_model = _run_main(
+            params=_base_params(name=REALM_LDS, domain="tenant2"),
+            existing=_lds(REALM_LDS, "tenant1", server=REALM_SERVER),
+        )
+
+        text = module.warn.call_args[0][0]
+        assert REALM_LDS in text and REALM_SERVER in text
+        assert "only permitted when detached" not in text
+        assert "may reject" in text

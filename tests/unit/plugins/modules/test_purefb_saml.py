@@ -70,6 +70,7 @@ sys.modules["ansible_collections.everpure.flashblade.plugins.module_utils.versio
     MagicMock()
 )
 
+import plugins.modules.purefb_saml as saml
 from plugins.modules.purefb_saml import (
     main,
     _check_option_versions,
@@ -83,6 +84,10 @@ MODULE = "plugins.modules.purefb_saml"
 IDP_NAME = "myidp"
 AUTO_SP_ENTITY = "https://fb.example.com/saml2/service-provider-metadata/myidp"
 PRN = "prn::iam:array-id/local::saml-provider/myidp"
+# what the array answers for a provider that is not configured, or that is not
+# shared with the realm of an administrator limited to a realm
+ABSENT = "SsoSaml2 configuration does not exist."
+REFUSED = "Operation not permitted."
 
 
 class _Version:
@@ -216,10 +221,27 @@ def _current_idp(
     return idp
 
 
-def _response(status_code, items=None):
-    res = Mock()
+def _error_message(res, default="Unknown error"):
+    """Stand-in for get_error_message: the first error message of a response"""
+    errors = getattr(res, "errors", None)
+    if errors:
+        return errors[0].message
+    return default
+
+
+def _response(status_code, items=None, error=None):
+    """A response shaped like the SDK's: items on 200, errors and no items otherwise"""
+    if status_code == 200:
+        res = Mock(spec=["status_code", "items"])
+        res.items = items or []
+    else:
+        res = Mock(spec=["status_code", "errors"])
+        res.errors = []
+        if error:
+            entry = Mock(spec=["message"])
+            entry.message = error
+            res.errors.append(entry)
     res.status_code = status_code
-    res.items = items or []
     return res
 
 
@@ -233,6 +255,8 @@ def _run(
     delete_status=200,
     get_side_effect=None,
     test_items=None,
+    test_response=None,
+    patch_error=None,
 ):
     """Run main() against a mocked module and blade; return (module, blade, models)"""
     module = Mock()
@@ -245,12 +269,14 @@ def _run(
     if get_side_effect is not None:
         blade.get_sso_saml2_idps.side_effect = get_side_effect
     elif current is None:
-        blade.get_sso_saml2_idps.return_value = _response(400)
+        blade.get_sso_saml2_idps.return_value = _response(400, error=ABSENT)
     else:
         blade.get_sso_saml2_idps.return_value = _response(200, [current])
-    blade.get_sso_saml2_idps_test.return_value = _response(200, test_items)
+    blade.get_sso_saml2_idps_test.return_value = test_response or _response(
+        200, test_items
+    )
     blade.post_sso_saml2_idps.return_value = _response(post_status)
-    blade.patch_sso_saml2_idps.return_value = _response(patch_status)
+    blade.patch_sso_saml2_idps.return_value = _response(patch_status, error=patch_error)
     blade.delete_sso_saml2_idps.return_value = _response(delete_status)
 
     models = {}
@@ -265,6 +291,7 @@ def _run(
     for name in ("Saml2Sso", "Saml2SsoPost", "Saml2SsoSp", "Saml2SsoIdp"):
         patchers.append(patch(MODULE + "." + name))
     patchers.append(patch(MODULE + ".Saml2SsoManagement"))
+    patchers.append(patch(MODULE + ".get_error_message", side_effect=_error_message))
     started = [p.start() for p in patchers]
     try:
         models["Saml2Sso"] = started[6]
@@ -460,7 +487,7 @@ class TestPurefbSamlCreate:
         created = _current_idp()
         module, blade, models = _run(
             params,
-            get_side_effect=[_response(400), _response(200, [created])],
+            get_side_effect=[_response(400, error=ABSENT), _response(200, [created])],
         )
 
         blade.post_sso_saml2_idps.assert_called_once()
@@ -929,3 +956,408 @@ class TestPurefbSamlDeleteAndTest:
                 "resource_name": IDP_NAME,
             }
         ]
+
+
+def _read(response):
+    """Call _get_idp against one GET answer; return (result, module)"""
+    module = Mock()
+    module.fail_json = Mock(side_effect=SystemExit)
+    blade = Mock()
+    blade.get_sso_saml2_idps.return_value = response
+    result = None
+    with patch(MODULE + ".get_error_message", side_effect=_error_message):
+        try:
+            result = saml._get_idp(module, blade, IDP_NAME)
+        except SystemExit:
+            pass
+    return result, module
+
+
+class TestPurefbSamlRead:
+    """Only the array's "does not exist" answer means the provider is absent"""
+
+    def test_get_idp_returns_the_provider(self):
+        current = _current_idp()
+        result, module = _read(_response(200, [current]))
+
+        assert result is current
+        module.fail_json.assert_not_called()
+
+    def test_get_idp_none_when_the_array_says_it_does_not_exist(self):
+        for message in (ABSENT, ABSENT.upper()):
+            result, module = _read(_response(400, error=message))
+
+            assert result is None
+            module.fail_json.assert_not_called()
+
+    def test_get_idp_none_on_empty_item_list(self):
+        result, module = _read(_response(200, []))
+
+        assert result is None
+        module.fail_json.assert_not_called()
+
+    def test_get_idp_fails_with_the_array_message(self):
+        custom_role = (
+            "Operation not permitted. Authorization for 'get' on "
+            "'purestorage.com/api/v2/sso/saml2/idps' is required."
+        )
+        for status, message in (
+            (400, REFUSED),
+            (400, custom_role),
+            (500, "Internal error"),
+        ):
+            result, module = _read(_response(status, error=message))
+
+            assert result is None
+            module.fail_json.assert_called_once_with(
+                msg="Failed to read SAML2 IdP myidp. Error: " + message
+            )
+
+    def test_get_idp_fails_when_the_array_gives_no_message(self):
+        result, module = _read(_response(503))
+
+        module.fail_json.assert_called_once_with(
+            msg="Failed to read SAML2 IdP myidp. Error: Unknown error"
+        )
+
+    def test_refused_read_is_not_a_create(self):
+        params = _base_params(array_url="https://fb.example.com")
+        for check_mode in (False, True):
+            module, blade, models = _run(
+                params,
+                check_mode=check_mode,
+                get_side_effect=[_response(400, error=REFUSED)],
+            )
+
+            _no_writes(blade)
+            module.exit_json.assert_not_called()
+            module.fail_json.assert_called_once_with(
+                msg="Failed to read SAML2 IdP myidp. Error: Operation not permitted."
+            )
+
+    def test_failed_read_is_not_absent_for_state_absent(self):
+        params = _base_params(state="absent")
+        module, blade, models = _run(
+            params, get_side_effect=[_response(500, error="Internal error")]
+        )
+
+        _no_writes(blade)
+        module.exit_json.assert_not_called()
+        module.fail_json.assert_called_once_with(
+            msg="Failed to read SAML2 IdP myidp. Error: Internal error"
+        )
+
+    def test_failed_read_is_reported_for_state_test(self):
+        params = _base_params(state="test")
+        module, blade, models = _run(
+            params, get_side_effect=[_response(400, error=REFUSED)]
+        )
+
+        blade.get_sso_saml2_idps_test.assert_not_called()
+        module.exit_json.assert_not_called()
+        module.fail_json.assert_called_once_with(
+            msg="Failed to read SAML2 IdP myidp. Error: Operation not permitted."
+        )
+
+    def test_failed_read_back_after_create_is_reported(self):
+        params = _base_params(array_url="https://fb.example.com")
+        module, blade, models = _run(
+            params,
+            get_side_effect=[
+                _response(400, error=ABSENT),
+                _response(500, error="Internal error"),
+            ],
+        )
+
+        blade.post_sso_saml2_idps.assert_called_once()
+        module.exit_json.assert_not_called()
+        module.fail_json.assert_called_once_with(
+            msg="Failed to read SAML2 IdP myidp. Error: Internal error"
+        )
+
+    def test_failed_read_back_after_update_is_reported(self):
+        params = _base_params(entity_id="https://idp.example.com/other")
+        module, blade, models = _run(
+            params,
+            get_side_effect=[
+                _response(200, [_current_idp()]),
+                _response(500, error="Internal error"),
+            ],
+        )
+
+        blade.patch_sso_saml2_idps.assert_called_once()
+        module.exit_json.assert_not_called()
+        module.fail_json.assert_called_once_with(
+            msg="Failed to read SAML2 IdP myidp. Error: Internal error"
+        )
+
+
+class TestPurefbSamlTestState:
+    """state=test: a refused test and a missing provider are failures"""
+
+    def test_refused_test_reports_the_array_message(self):
+        """An administrator limited to a realm reads a shared provider, but
+        the array refuses it the test and answers without items"""
+        params = _base_params(state="test")
+        module, blade, models = _run(
+            params,
+            current=_current_idp(),
+            test_response=_response(400, error=REFUSED),
+        )
+
+        blade.get_sso_saml2_idps_test.assert_called_once_with(names=[IDP_NAME])
+        module.exit_json.assert_not_called()
+        module.fail_json.assert_called_once_with(
+            msg="Failed to test SAML2 IdP myidp. Error: Operation not permitted."
+        )
+
+    def test_missing_provider_fails(self):
+        """Also what an administrator limited to a realm gets for a provider
+        that is not shared with its realm"""
+        params = _base_params(state="test")
+        for check_mode in (False, True):
+            module, blade, models = _run(params, check_mode=check_mode)
+
+            blade.get_sso_saml2_idps_test.assert_not_called()
+            module.exit_json.assert_not_called()
+            module.fail_json.assert_called_once_with(
+                msg="SAML2 IdP myidp does not exist"
+            )
+
+    def test_check_mode_runs_the_read_only_test(self):
+        params = _base_params(state="test")
+        module, blade, models = _run(params, current=_current_idp(), check_mode=True)
+
+        blade.get_sso_saml2_idps_test.assert_called_once_with(names=[IDP_NAME])
+        _no_writes(blade)
+        module.exit_json.assert_called_once_with(changed=False, test_response=[])
+
+
+REALM_IDP = "realm1::myidp"
+REALM_CERT = "realm1::idp-signing-cert"
+# references for which the array accepts a certificate in another letter case
+CERT_OPTIONS = ("x509_cert", "signing_credential", "decryption_credential")
+REFERENCE_OPTIONS = CERT_OPTIONS + (
+    "metadata_url_ca_certificate",
+    "metadata_url_ca_certificate_group",
+)
+
+
+class TestPurefbSamlRealm:
+    """Providers are array-level: a realm-qualified name never reaches the array"""
+
+    def test_realm_qualified_name_refused_in_every_state(self):
+        for state in ("present", "absent", "test"):
+            for check_mode in (False, True):
+                params = _base_params(
+                    name=REALM_IDP, state=state, array_url="https://fb.example.com"
+                )
+                module, blade, models = _run(params, check_mode=check_mode)
+
+                blade.get_sso_saml2_idps.assert_not_called()
+                blade.get_sso_saml2_idps_test.assert_not_called()
+                _no_writes(blade)
+                module.exit_json.assert_not_called()
+                msg = module.fail_json.call_args[1]["msg"]
+                assert "Invalid name 'realm1::myidp'" in msg
+                assert "realm-qualified" in msg
+                assert "sso/saml2/idps" in msg
+
+    def test_realm_qualified_reference_refused_on_create(self):
+        for option in REFERENCE_OPTIONS:
+            for check_mode in (False, True):
+                params = _base_params(
+                    array_url="https://fb.example.com", **{option: REALM_CERT}
+                )
+                module, blade, models = _run(params, check_mode=check_mode)
+
+                blade.get_sso_saml2_idps.assert_not_called()
+                _no_writes(blade)
+                module.exit_json.assert_not_called()
+                msg = module.fail_json.call_args[1]["msg"]
+                assert "Invalid {0} '{1}'".format(option, REALM_CERT) in msg
+                assert "array-level" in msg
+
+    def test_realm_qualified_reference_refused_on_update(self):
+        for option in REFERENCE_OPTIONS:
+            for check_mode in (False, True):
+                params = _base_params(**{option: REALM_CERT})
+                module, blade, models = _run(
+                    params, current=_current_idp(), check_mode=check_mode
+                )
+
+                _no_writes(blade)
+                module.exit_json.assert_not_called()
+                msg = module.fail_json.call_args[1]["msg"]
+                assert "Invalid {0} '{1}'".format(option, REALM_CERT) in msg
+
+    def test_references_are_not_read_for_absent(self):
+        params = _base_params(state="absent", x509_cert=REALM_CERT)
+        module, blade, models = _run(params, current=_current_idp())
+
+        blade.delete_sso_saml2_idps.assert_called_once_with(names=[IDP_NAME])
+        module.fail_json.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_array_level_names_pass(self):
+        module = Mock()
+        module.fail_json = Mock(side_effect=SystemExit)
+        module.params = _base_params(
+            x509_cert="idp-signing-cert",
+            signing_credential="sp-cert",
+            metadata_url_ca_certificate_group="ca-group",
+        )
+
+        saml._refuse_realm_names(module)
+
+        module.fail_json.assert_not_called()
+
+    def test_shared_provider_is_read_without_a_change(self):
+        """What an administrator limited to a realm gets for a provider that
+        is shared with its realm"""
+        params = _base_params()
+        module, blade, models = _run(params, current=_current_idp())
+
+        _no_writes(blade)
+        module.exit_json.assert_called_once_with(
+            changed=False, prn=PRN, sp_entity_id=AUTO_SP_ENTITY
+        )
+
+    def test_refused_update_reports_the_array_message(self):
+        params = _base_params(entity_id="https://idp.example.com/other")
+        module, blade, models = _run(
+            params, current=_current_idp(), patch_status=400, patch_error=REFUSED
+        )
+
+        module.exit_json.assert_not_called()
+        module.fail_json.assert_called_once_with(
+            msg="Failed to update SAML2 IdP myidp. Error: Operation not permitted."
+        )
+
+
+class TestPurefbSamlLetterCase:
+    """The array accepts the verification certificate and the service provider
+    credentials in another letter case and returns the stored spelling"""
+
+    @staticmethod
+    def _current():
+        current = _current_idp(
+            verification_certificate="idp-signing-cert",
+            metadata_url_ca_certificate="idp-signing-cert",
+        )
+        current.sp.signing_credential = _reference("idp-signing-cert")
+        current.sp.decryption_credential = _reference("idp-signing-cert")
+        return current
+
+    def test_same_name(self):
+        assert saml._same_name("IdP-Cert", "idp-cert") is True
+        assert saml._same_name("idp-cert", "idp-cert") is True
+        assert saml._same_name("idp-cert", "other") is False
+        assert saml._same_name(None, "idp-cert") is False
+        assert saml._same_name("idp-cert", None) is False
+
+    def test_certificate_in_another_case_is_not_a_change(self):
+        for option in CERT_OPTIONS:
+            for check_mode in (False, True):
+                params = _base_params(**{option: "IDP-Signing-Cert"})
+                module, blade, models = _run(
+                    params, current=self._current(), check_mode=check_mode
+                )
+
+                _no_writes(blade)
+                module.exit_json.assert_called_once_with(
+                    changed=False, prn=PRN, sp_entity_id=AUTO_SP_ENTITY
+                )
+
+    def test_stored_spelling_is_sent_with_another_change(self):
+        params = _base_params(
+            x509_cert="IDP-SIGNING-CERT", entity_id="https://idp.example.com/other"
+        )
+        module, blade, models = _run(params, current=self._current())
+
+        blade.patch_sso_saml2_idps.assert_called_once()
+        idp_kwargs = models["Saml2SsoIdp"].call_args[1]
+        assert idp_kwargs["verification_certificate"] == ("ref", "idp-signing-cert")
+        assert idp_kwargs["entity_id"] == "https://idp.example.com/other"
+
+    def test_another_certificate_is_a_change(self):
+        params = _base_params(x509_cert="other-cert")
+        module, blade, models = _run(params, current=self._current())
+
+        blade.patch_sso_saml2_idps.assert_called_once()
+        idp_kwargs = models["Saml2SsoIdp"].call_args[1]
+        assert idp_kwargs["verification_certificate"] == ("ref", "other-cert")
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_ca_references_are_matched_exactly(self):
+        """The array resolves the CA certificate and the CA certificate group
+        by their exact names, so another case is sent and the array decides"""
+        for option, value in (
+            ("metadata_url_ca_certificate", "IDP-SIGNING-CERT"),
+            ("metadata_url_ca_certificate_group", "CA-GROUP"),
+        ):
+            current = _current_idp(
+                metadata_url_ca_certificate=(
+                    "idp-signing-cert" if option.endswith("certificate") else None
+                ),
+                metadata_url_ca_certificate_group=(
+                    "ca-group" if option.endswith("group") else None
+                ),
+            )
+            params = _base_params(**{option: value})
+            module, blade, models = _run(params, current=current)
+
+            blade.patch_sso_saml2_idps.assert_called_once()
+            idp_kwargs = models["Saml2SsoIdp"].call_args[1]
+            assert idp_kwargs[option] == ("ref", value)
+
+
+class TestPurefbSamlNamePatterns:
+    """The array reads * in a name as a pattern and a comma as a separator of
+    names, so such a name never reaches the array"""
+
+    def test_pattern_or_list_refused_in_every_state(self):
+        for name in ("*", "my*", "*idp", "myidp,otheridp", "myidp,"):
+            for state in ("present", "absent", "test"):
+                for check_mode in (False, True):
+                    params = _base_params(
+                        name=name, state=state, array_url="https://fb.example.com"
+                    )
+                    # what the array answers: the providers that match
+                    module, blade, models = _run(
+                        params, current=_current_idp(), check_mode=check_mode
+                    )
+
+                    blade.get_sso_saml2_idps.assert_not_called()
+                    blade.get_sso_saml2_idps_test.assert_not_called()
+                    _no_writes(blade)
+                    module.exit_json.assert_not_called()
+                    msg = module.fail_json.call_args[1]["msg"]
+                    assert "Invalid name '{0}'".format(name) in msg
+                    assert "pattern" in msg
+                    assert "separator" in msg
+
+    def test_pattern_is_refused_before_the_realm_check(self):
+        params = _base_params(name="realm1::*", state="absent")
+        module, blade, models = _run(params, current=_current_idp())
+
+        blade.get_sso_saml2_idps.assert_not_called()
+        _no_writes(blade)
+        assert "pattern" in module.fail_json.call_args[1]["msg"]
+
+    def test_plain_names_pass(self):
+        for name in ("myidp", "My_IdP-2", "PureSSO"):
+            module = Mock()
+            module.fail_json = Mock(side_effect=SystemExit)
+            module.params = _base_params(name=name)
+
+            saml._refuse_name_patterns(module)
+
+            module.fail_json.assert_not_called()
+
+    def test_the_lookup_uses_the_exact_name(self):
+        params = _base_params(state="absent")
+        module, blade, models = _run(params, current=_current_idp())
+
+        blade.get_sso_saml2_idps.assert_called_once_with(names=[IDP_NAME])
+        blade.delete_sso_saml2_idps.assert_called_once_with(names=[IDP_NAME])

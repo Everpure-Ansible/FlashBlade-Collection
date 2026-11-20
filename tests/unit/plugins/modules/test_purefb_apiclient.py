@@ -12,6 +12,8 @@ import multiprocessing
 import ctypes
 from unittest.mock import Mock, patch, MagicMock
 
+import yaml
+
 # Mock multiprocessing context for Windows
 if sys.platform == "win32":
     original_get_context = multiprocessing.get_context
@@ -71,6 +73,8 @@ sys.modules["ansible_collections.everpure.flashblade.plugins.module_utils.versio
 )
 
 from plugins.modules.purefb_apiclient import (
+    DOCUMENTATION,
+    EXAMPLES,
     main,
     create_client,
     update_client,
@@ -81,6 +85,14 @@ from plugins.modules.purefb_apiclient import (
     MIN_ACCESS_POLICIES_API_VERSION,
 )
 
+FQCN = "everpure.flashblade.purefb_apiclient"
+# A management access policy whose rules are scoped to a realm. The policy
+# itself is an array-level object, named without a realm prefix.
+REALM_POLICY = "tenant1-admins"
+# Messages of the array, as Purity//FB 4.8.8 sends them
+NO_CLIENT = "API client does not exist."
+NO_POLICY = "Management access policy not exist."
+NOT_PERMITTED = "Operation not permitted."
 PUB_KEY = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A\n-----END PUBLIC KEY-----\n"
 
 
@@ -977,3 +989,323 @@ class TestPurefbApiclientGetClient:
             msg = module.fail_json.call_args[1]["msg"]
             assert "Failed to get API Client ansible-client" in msg
             assert "boom" in msg
+
+
+@patch("plugins.modules.purefb_apiclient.get_error_message", return_value="boom")
+@patch("plugins.modules.purefb_apiclient.ApiClient")
+@patch("plugins.modules.purefb_apiclient.ReferenceWritable", side_effect=_fake_ref)
+@patch("plugins.modules.purefb_apiclient.ApiClientsPost")
+@patch("plugins.modules.purefb_apiclient.LooseVersion")
+@patch("plugins.modules.purefb_apiclient.get_rest_api_version", return_value="2.30")
+@patch("plugins.modules.purefb_apiclient.get_system")
+@patch("plugins.modules.purefb_apiclient.AnsibleModule")
+@patch("plugins.modules.purefb_apiclient.HAS_PYPURECLIENT", True)
+class TestPurefbApiclientArrayLevel:
+    """API clients are array-level: realm names, realm-scoped policies and
+    the answers an administrator limited to a realm gets."""
+
+    _setup = staticmethod(TestPurefbApiclientMain._setup)
+
+    def test_main_refuses_realm_qualified_name_before_login(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_version,
+        mock_lv,
+        mock_post_model,
+        mock_ref,
+        mock_api_client,
+        mock_err,
+    ):
+        for name in ("tenant1::ansible-client", "tenant1::", "::ansible-client"):
+            for state in ("present", "absent"):
+                for check_mode in (False, True):
+                    module, blade = self._setup(
+                        mock_ansible_module,
+                        mock_get_system,
+                        mock_lv,
+                        name=name,
+                        state=state,
+                        access_policies=["readonly"],
+                        public_key=PUB_KEY,
+                    )
+                    module.check_mode = check_mode
+
+                    _run(main)
+
+                    module.fail_json.assert_called_once_with(
+                        msg="API Client name {0} does not conform to required "
+                        "naming convention".format(name)
+                    )
+                    module.exit_json.assert_not_called()
+        mock_get_system.assert_not_called()
+
+    def test_main_refused_read_fails_in_every_state(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_version,
+        mock_lv,
+        mock_post_model,
+        mock_ref,
+        mock_api_client,
+        mock_err,
+    ):
+        mock_err.return_value = NOT_PERMITTED
+        for params in (
+            {},
+            {"enabled": False},
+            {"access_policies": ["readonly"], "public_key": PUB_KEY},
+            {"state": "absent"},
+        ):
+            for check_mode in (False, True):
+                module, blade = self._setup(
+                    mock_ansible_module, mock_get_system, mock_lv, **params
+                )
+                module.check_mode = check_mode
+                blade.get_api_clients.return_value = _response(400)
+
+                _run(main)
+
+                module.fail_json.assert_called_once_with(
+                    msg="Failed to get API Client ansible-client. "
+                    "Error: Operation not permitted."
+                )
+                blade.post_api_clients.assert_not_called()
+                blade.patch_api_clients.assert_not_called()
+                blade.delete_api_clients.assert_not_called()
+                module.exit_json.assert_not_called()
+
+    def test_main_creates_with_policy_scoped_to_a_realm(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_version,
+        mock_lv,
+        mock_post_model,
+        mock_ref,
+        mock_api_client,
+        mock_err,
+    ):
+        for check_mode in (True, False):
+            module, blade = self._setup(
+                mock_ansible_module,
+                mock_get_system,
+                mock_lv,
+                access_policies=[REALM_POLICY],
+                public_key=PUB_KEY,
+            )
+            module.check_mode = check_mode
+            mock_err.return_value = NO_CLIENT
+            blade.get_api_clients.return_value = _response(400)
+            blade.post_api_clients.return_value = _response(200)
+            blade.patch_api_clients.return_value = _response(200)
+
+            _run(main)
+
+            module.exit_json.assert_called_once_with(changed=True)
+            if check_mode:
+                blade.post_api_clients.assert_not_called()
+        blade.post_api_clients.assert_called_once()
+        assert blade.post_api_clients.call_args[1]["names"] == ["ansible-client"]
+        assert mock_post_model.call_args[1]["access_policies"] == [
+            ("ref", REALM_POLICY)
+        ]
+
+    def test_main_existing_client_with_realm_scoped_policy_is_unchanged(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_version,
+        mock_lv,
+        mock_post_model,
+        mock_ref,
+        mock_api_client,
+        mock_err,
+    ):
+        for check_mode in (False, True):
+            module, blade = self._setup(
+                mock_ansible_module,
+                mock_get_system,
+                mock_lv,
+                access_policies=[REALM_POLICY],
+                public_key=PUB_KEY,
+            )
+            module.check_mode = check_mode
+            # The array reports no max_role for a client with a custom policy
+            blade.get_api_clients.return_value = _response(
+                200, [_client(policies=(REALM_POLICY,), max_role=None)]
+            )
+
+            _run(main)
+
+            module.warn.assert_not_called()
+            blade.post_api_clients.assert_not_called()
+            blade.patch_api_clients.assert_not_called()
+            module.exit_json.assert_called_once_with(changed=False)
+
+    def test_main_sends_realm_qualified_policy_name_as_given(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_version,
+        mock_lv,
+        mock_post_model,
+        mock_ref,
+        mock_api_client,
+        mock_err,
+    ):
+        module, blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_lv,
+            access_policies=["tenant1::" + REALM_POLICY],
+            public_key=PUB_KEY,
+        )
+        mock_err.side_effect = [NO_CLIENT, NO_POLICY]
+        blade.get_api_clients.return_value = _response(400)
+        blade.post_api_clients.return_value = _response(400)
+
+        _run(main)
+
+        assert mock_post_model.call_args[1]["access_policies"] == [
+            ("ref", "tenant1::" + REALM_POLICY)
+        ]
+        module.fail_json.assert_called_once_with(
+            msg="Failed to create API Client ansible-client. Error message: "
+            "Management access policy not exist."
+        )
+        blade.patch_api_clients.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    def test_main_realm_qualified_policy_name_never_matches_the_policy(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_version,
+        mock_lv,
+        mock_post_model,
+        mock_ref,
+        mock_api_client,
+        mock_err,
+    ):
+        module, blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_lv,
+            access_policies=["tenant1::" + REALM_POLICY],
+        )
+        blade.get_api_clients.return_value = _response(
+            200, [_client(policies=(REALM_POLICY,), max_role=None)]
+        )
+
+        _run(main)
+
+        module.warn.assert_called_once()
+        assert "access_policies cannot be changed" in module.warn.call_args[0][0]
+        blade.patch_api_clients.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+    def test_main_refuses_a_list_of_names_and_an_empty_name_before_login(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_version,
+        mock_lv,
+        mock_post_model,
+        mock_ref,
+        mock_api_client,
+        mock_err,
+    ):
+        # The array reads a comma as the separator of a list of names
+        for name in ("ansible-client,other-client", "", " "):
+            for state in ("present", "absent"):
+                module, blade = self._setup(
+                    mock_ansible_module,
+                    mock_get_system,
+                    mock_lv,
+                    name=name,
+                    state=state,
+                )
+                module.check_mode = True
+
+                _run(main)
+
+                module.fail_json.assert_called_once_with(
+                    msg="API Client name {0} does not conform to required "
+                    "naming convention".format(name)
+                )
+                module.exit_json.assert_not_called()
+        mock_get_system.assert_not_called()
+
+    def test_main_policy_name_in_another_letter_case_is_another_name(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_version,
+        mock_lv,
+        mock_post_model,
+        mock_ref,
+        mock_api_client,
+        mock_err,
+    ):
+        # The array refuses a policy name in another letter case when a client
+        # is created, so the comparison with an existing client is exact too.
+        module, blade = self._setup(
+            mock_ansible_module,
+            mock_get_system,
+            mock_lv,
+            access_policies=[REALM_POLICY.upper()],
+        )
+        blade.get_api_clients.return_value = _response(
+            200, [_client(policies=(REALM_POLICY,), max_role=None)]
+        )
+
+        _run(main)
+
+        module.warn.assert_called_once()
+        assert "access_policies cannot be changed" in module.warn.call_args[0][0]
+        blade.patch_api_clients.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+
+class TestPurefbApiclientDocumentation:
+    """The documentation says where API clients live and what a policy
+    scoped to a realm does not do."""
+
+    @staticmethod
+    def _text(lines):
+        return " ".join(" ".join(lines).split())
+
+    def test_description_says_api_clients_are_array_level(self):
+        text = self._text(yaml.safe_load(DOCUMENTATION)["description"])
+        assert "array-level objects" in text
+        assert "cannot be placed in a realm" in text
+        assert "limited to a realm may not read or change them" in text
+
+    def test_name_says_a_realm_prefix_is_refused(self):
+        option = yaml.safe_load(DOCUMENTATION)["options"]["name"]
+        text = self._text(option["description"])
+        assert "C(realm::name)" in text
+        assert "refused" in text
+
+    def test_access_policies_say_where_the_realm_scope_comes_from(self):
+        option = yaml.safe_load(DOCUMENTATION)["options"]["access_policies"]
+        text = self._text(option["description"])
+        assert "comes from the policies of the user named in it" in text
+        assert "does not confine the tokens of this API client" in text
+        assert "named without a realm prefix" in text
+
+    def test_examples_stay_at_array_level(self):
+        tasks = [task[FQCN] for task in yaml.safe_load(EXAMPLES)]
+        assert tasks
+        for args in tasks:
+            assert "::" not in args["name"]
+            for policy in args.get("access_policies", []):
+                assert "::" not in policy
+
+    def test_examples_use_documented_options(self):
+        documented = set(yaml.safe_load(DOCUMENTATION)["options"])
+        documented.update(["fb_url", "api_token"])
+        for task in yaml.safe_load(EXAMPLES):
+            assert set(task[FQCN]) <= documented

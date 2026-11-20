@@ -12,6 +12,8 @@ import multiprocessing
 import ctypes
 from unittest.mock import Mock, patch, MagicMock
 
+import pytest
+
 # Mock multiprocessing context for Windows
 if sys.platform == "win32":
     original_get_context = multiprocessing.get_context
@@ -79,8 +81,34 @@ from plugins.modules.purefb_phonehome import (
     EDGE_API_VERSION,
 )
 from plugins.module_utils.version import LooseVersion as RealLooseVersion
+from plugins.module_utils.common import get_error_message as real_get_error_message
+from plugins.modules import purefb_phonehome
 
 MODULE = "plugins.modules.purefb_phonehome"
+
+
+REFUSAL = "Operation not permitted."
+READ_REFUSED = "Failed to read the support settings. Error: " + REFUSAL
+TEST_REFUSED = "Phone Home test failed. Error: " + REFUSAL
+
+
+def _error_response(status_code=400, message=REFUSAL):
+    """The SDK answer to a refused or failed call: a status and errors, no items"""
+    res = Mock(spec=["status_code", "errors", "headers"])
+    res.status_code = status_code
+    res.errors = []
+    if message:
+        error = Mock(spec=["context", "message", "location_context"])
+        error.message = message
+        res.errors.append(error)
+    return res
+
+
+@pytest.fixture
+def real_error_message():
+    """Use the get_error_message of the collection instead of its mock"""
+    with patch(MODULE + ".get_error_message", real_get_error_message):
+        yield
 
 
 def _base_params(**overrides):
@@ -112,6 +140,7 @@ def _support(phonehome=True, edge_management=False, edge_agent_update=False):
 
 def _blade(support=None, patch_status=200):
     blade = Mock()
+    blade.get_support.return_value.status_code = 200
     blade.get_support.return_value.items = [support or _support()]
     blade.patch_support.return_value.status_code = patch_status
     return blade
@@ -502,6 +531,7 @@ class TestPurefbPhonehomeMain:
         component.destination = "phonehome.example"
         component.result_details = "timeout"
         component.test_type = "phonehome"
+        blade.get_support_test.return_value.status_code = 200
         blade.get_support_test.return_value.items = [component]
         mock_get_system.return_value = blade
 
@@ -555,3 +585,154 @@ class TestPurefbPhonehomeMain:
         module.fail_json.assert_called_once()
         assert "py-pure-client" in module.fail_json.call_args[1]["msg"]
         mock_get_system.assert_not_called()
+
+
+@pytest.mark.usefixtures("real_error_message")
+class TestPurefbPhonehomeRefusedReads:
+    """A read the array refuses or fails is reported with its message"""
+
+    def test_get_support_returns_the_settings(self):
+        module = _module()
+        support = _support(phonehome=False)
+        blade = _blade(support)
+
+        assert purefb_phonehome._get_support(module, blade) is support
+        module.fail_json.assert_not_called()
+
+    def test_get_support_refused(self):
+        """An administrator limited to a realm may not read the support settings"""
+        module = _module()
+        blade = _blade()
+        blade.get_support.return_value = _error_response()
+
+        with pytest.raises(SystemExit):
+            purefb_phonehome._get_support(module, blade)
+
+        module.fail_json.assert_called_once_with(msg=READ_REFUSED)
+
+    def test_get_support_failed_without_a_message(self):
+        """An error answer that carries no message"""
+        module = _module()
+        blade = _blade()
+        blade.get_support.return_value = _error_response(503, None)
+
+        with pytest.raises(SystemExit):
+            purefb_phonehome._get_support(module, blade)
+
+        module.fail_json.assert_called_once_with(
+            msg="Failed to read the support settings. Error: Unknown error"
+        )
+
+    def test_get_support_without_items(self):
+        module = _module()
+        blade = _blade()
+        blade.get_support.return_value.items = []
+
+        with pytest.raises(SystemExit):
+            purefb_phonehome._get_support(module, blade)
+
+        module.fail_json.assert_called_once_with(
+            msg="The array returned no support settings."
+        )
+
+    def test_test_ph_refused(self):
+        module = _module(state="test")
+        blade = _blade()
+        blade.get_support_test.return_value = _error_response()
+
+        with pytest.raises(SystemExit):
+            purefb_phonehome.test_ph(module, blade)
+
+        blade.get_support_test.assert_called_once_with(test_type="phonehome")
+        module.fail_json.assert_called_once_with(msg=TEST_REFUSED)
+        module.exit_json.assert_not_called()
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize(
+        "params",
+        [
+            {"state": "present"},
+            {"state": "absent"},
+            {"state": "present", "edge_management": True, "edge_agent_update": False},
+        ],
+        ids=["present", "absent", "edge_options"],
+    )
+    @patch(MODULE + ".LooseVersion", RealLooseVersion)
+    @patch(MODULE + ".get_rest_api_version", return_value="2.30")
+    @patch(MODULE + ".Support")
+    @patch(MODULE + ".get_system")
+    @patch(MODULE + ".AnsibleModule")
+    @patch(MODULE + ".HAS_PYPURECLIENT", True)
+    def test_main_refused_read(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_support_cls,
+        mock_ver,
+        params,
+        check_mode,
+    ):
+        module = _module(check_mode=check_mode, **params)
+        mock_ansible_module.return_value = module
+        blade = _blade()
+        blade.get_support.return_value = _error_response()
+        mock_get_system.return_value = blade
+
+        _run_main()
+
+        module.fail_json.assert_called_once_with(msg=READ_REFUSED)
+        mock_support_cls.assert_not_called()
+        blade.patch_support.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    @patch(MODULE + ".LooseVersion", RealLooseVersion)
+    @patch(MODULE + ".get_rest_api_version", return_value="2.30")
+    @patch(MODULE + ".Support")
+    @patch(MODULE + ".get_system")
+    @patch(MODULE + ".AnsibleModule")
+    @patch(MODULE + ".HAS_PYPURECLIENT", True)
+    def test_main_read_without_items(
+        self, mock_ansible_module, mock_get_system, mock_support_cls, mock_ver
+    ):
+        module = _module()
+        mock_ansible_module.return_value = module
+        blade = _blade()
+        blade.get_support.return_value.items = []
+        mock_get_system.return_value = blade
+
+        _run_main()
+
+        module.fail_json.assert_called_once_with(
+            msg="The array returned no support settings."
+        )
+        blade.patch_support.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @patch(MODULE + ".LooseVersion", RealLooseVersion)
+    @patch(MODULE + ".get_rest_api_version", return_value="2.30")
+    @patch(MODULE + ".Support")
+    @patch(MODULE + ".get_system")
+    @patch(MODULE + ".AnsibleModule")
+    @patch(MODULE + ".HAS_PYPURECLIENT", True)
+    def test_main_state_test_refused(
+        self,
+        mock_ansible_module,
+        mock_get_system,
+        mock_support_cls,
+        mock_ver,
+        check_mode,
+    ):
+        module = _module(check_mode=check_mode, state="test")
+        mock_ansible_module.return_value = module
+        blade = _blade()
+        blade.get_support_test.return_value = _error_response()
+        mock_get_system.return_value = blade
+
+        _run_main()
+
+        blade.get_support_test.assert_called_once_with(test_type="phonehome")
+        module.fail_json.assert_called_once_with(msg=TEST_REFUSED)
+        blade.get_support.assert_not_called()
+        blade.patch_support.assert_not_called()
+        module.exit_json.assert_not_called()

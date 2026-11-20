@@ -35,12 +35,19 @@ description:
   delete it. The delete is also refused when the virtual hosts, or the
   servers attached to them, cannot be read. Applies from Purity//FB 4.6.3
   (REST 2.20), where virtual hosts have attached servers.
+- A server is created in a realm by naming it C(realm::server). Its NFS
+  directory service and its local directory service are in the same realm,
+  and it needs I(dns) when it is created.
+- An administrator whose access is limited to a realm must use the
+  realm-qualified name. A name without a realm is not placed in, or resolved
+  to, the realm of the administrator.
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
   name:
     description:
     - Name of the server
+    - A server in a realm is named C(realm::server).
     type: str
     required: true
   state:
@@ -52,16 +59,35 @@ options:
   dns:
     description:
     - The DNS configuration to be used for this server
+    - A server in a realm needs a DNS configuration when it is created. It
+      uses a DNS configuration of its own realm, named C(realm::dns), or an
+      array-level DNS configuration that is shared with the realm through
+      M(everpure.flashblade.purefb_resource_access).
+    - A name without a realm always means the array-level DNS configuration,
+      also where the realm of the server has one of the same name. Write the
+      realm of a DNS configuration in the same case as in I(name); the array
+      does not accept it in another case.
     type: list
     elements: str
   directory_service:
     description:
-    - The directory service configuration to be used for this server
+    - The directory services of the server, to compare with what the array
+      reports.
+    - A server is created with one NFS directory service, named after the
+      server with the suffix C(_nfs), and the directory services of a server
+      cannot be changed through it. Nothing is sent for this option. The
+      module fails, in check mode as well, when the names given are not the
+      directory services of the server, or of the server about to be created.
+    - Names are compared without regard to case. For a server in a realm a
+      name without a realm is looked for in the realm of the server.
     type: list
     elements: str
   local_directory_service:
     description:
     - Name of an existing local directory service to associate with this server
+    - A server in a realm takes a local directory service of its own realm,
+      named C(realm::name). Write the realm in the same case as in I(name);
+      the array does not accept it in another case.
     - Set to an empty string (C("")) to clear a previously assigned local directory
       service. This only applies on update; on create an empty string is treated the
       same as omitting the parameter.
@@ -72,6 +98,8 @@ options:
     description:
     - Name of a local directory service for the array to create and associate
       with this server.
+    - For a server in a realm the name carries the realm of the server,
+      C(realm::name), written in the same case as in I(name).
     - Only applies when the server is created. On an existing server the module
       checks that this is the local directory service attached and fails otherwise,
       since the array cannot create and attach one after the fact. Create it with
@@ -84,6 +112,13 @@ options:
     - Only valid with REST 2.24 or higher
     type: str
     version_added: '1.30.0'
+notes:
+- Check mode reports the request the module would send. Whether the array
+  accepts a DNS configuration or a local directory service for the server,
+  or creates a server in a realm without I(dns), is only known when the
+  request is sent. Where the array refuses a reference that is named outside
+  the realm of the server, the module adds to its message what a server in
+  that realm can use.
 extends_documentation_fragment:
 - everpure.flashblade.everpure.fb
 """
@@ -100,6 +135,14 @@ EXAMPLES = r"""
   everpure.flashblade.purefb_server:
     name: myserver
     create_local_directory_service: myserver_local
+    fb_url: 10.10.10.2
+    api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
+
+- name: Add server in realm myrealm with a DNS configuration of that realm
+  everpure.flashblade.purefb_server:
+    name: myrealm::myserver
+    dns:
+      - myrealm::mydns
     fb_url: 10.10.10.2
     api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
 
@@ -167,6 +210,128 @@ def _field(obj, key, default=None):
 def _reference_keys(ref):
     """Return the name and ID of a server or of a server reference"""
     return _field(ref, "name"), _field(ref, "id")
+
+
+def _realm_of(name):
+    """Return the realm of a realm::name name, empty for an array-level name"""
+    return (name or "").rpartition("::")[0]
+
+
+def _names(refs):
+    """Return the names of the references a server holds"""
+    names = []
+    for ref in refs or []:
+        name = _field(ref, "name")
+        if name:
+            names.append(str(name))
+    return names
+
+
+def _same_names(first, second):
+    """Compare two lists of names as the array matches them, whatever the
+    case"""
+    return set(name.lower() for name in first) == set(name.lower() for name in second)
+
+
+def _get_servers(module, blade):
+    """Return the servers the name matches, none when there is no such server.
+
+    Only the answer that the server does not exist means it is absent. Any
+    other failed read is reported with the message of the array, so that no
+    server is created, or reported as deleted, on a read that was refused.
+    """
+    res = blade.get_servers(names=[module.params["name"]])
+    if res.status_code != 200:
+        error = get_error_message(res)
+        if "does not exist" not in str(error).lower():
+            module.fail_json(
+                msg="Failed to read server {0}. Error: {1}".format(
+                    module.params["name"], error
+                )
+            )
+        return []
+    return list(res.items)
+
+
+def _reference_error(res, server, dns=None, local_ds=None, new=False):
+    """Return the error of a refused request, with the realm rule for the
+    references of a server in a realm.
+
+    The array answers a reference that a server in a realm cannot use with a
+    message that does not mention the realm, for instance that the DNS
+    configuration does not exist. The rule is added where the server is in a
+    realm, the message is about that kind of reference and the request names
+    one outside the realm, or creates a server without a DNS configuration.
+    ``server`` is the name of the server as the task writes it. The array
+    matches the realm in the name of a server whatever its case, and accepts
+    the realm of a reference only as it is written in that name, so a
+    reference that names the realm in another case is outside it.
+    Nothing is refused here: an array-level DNS configuration that is shared
+    with the realm is a valid reference, named without a realm.
+    """
+    error = get_error_message(res)
+    realm = _realm_of(server)
+    if not realm:
+        return error
+    text = str(error).lower()
+    hint = ""
+    if "dns" in text and (
+        [name for name in dns or [] if _realm_of(name) != realm] or (new and not dns)
+    ):
+        hint += (
+            " A server in realm {0} can only use a DNS configuration of that "
+            "realm, named {0}::<name> with the realm written as in the name "
+            "of the server, or an array-level DNS configuration, named "
+            "without a realm, that is shared with the realm through "
+            "purefb_resource_access.".format(realm)
+        )
+    if "local directory service" in text and local_ds and _realm_of(local_ds) != realm:
+        hint += (
+            " A server in realm {0} can only use a local directory service "
+            "of that realm, named {0}::{1} with the realm written as in the "
+            "name of the server.".format(realm, local_ds.rpartition("::")[2])
+        )
+    return "{0}{1}".format(error, hint)
+
+
+def _check_directory_service(module, server, current, new=False):
+    """Fail unless directory_service names the directory services of the
+    server.
+
+    The directory services of a server are created with it and are
+    read-only afterwards: no request to create or change a server carries
+    them, so the option cannot change anything and nothing is sent for it.
+    It is compared with what the server has, or is created with, before any
+    write and in check mode as well. On a server in a realm a name without a
+    realm is compared in the realm of the server, where all its directory
+    services are.
+    """
+    wanted = module.params["directory_service"]
+    if wanted is None:
+        return
+    realm = _realm_of(server)
+    qualified = [
+        "{0}::{1}".format(realm, name) if realm and "::" not in name else name
+        for name in wanted
+    ]
+    if _same_names(qualified, current):
+        return
+    if new:
+        msg = "Server {0} is created with the directory service {1}, not {2}."
+    else:
+        msg = "The directory services of server {0} are {1}, not {2}."
+    msg += (
+        " The directory services of a server are created with it and cannot "
+        "be changed with purefb_server: leave directory_service out, or name "
+        "the directory services of the server."
+    )
+    module.fail_json(
+        msg=msg.format(
+            module.params["name"],
+            ", ".join(current) or "none",
+            ", ".join(wanted) or "none",
+        )
+    )
 
 
 def _virtual_hosts_of_server(module, blade, servers):
@@ -278,19 +443,24 @@ def delete_server(module, blade, api_version, servers):
     module.exit_json(changed=changed)
 
 
-def update_server(module, blade):
+def update_server(module, blade, server_info):
     """Update server object"""
     changed = False
-    server_info = list(blade.get_servers(names=[module.params["name"]]).items)[0]
+    # The array matches names whatever their case and returns them as they
+    # are stored: the directory services are compared in the realm of the
+    # stored name, and references are compared without regard to case. A
+    # refused reference is explained with the name of the task, which is
+    # what the array compares its realm with.
+    stored_name = _field(server_info, "name") or module.params["name"]
+    current_lds = _field(_field(server_info, "local_directory_service"), "name")
     if module.params["create_local_directory_service"]:
         # create_local_directory_service is a create-time parameter; the array
         # cannot create and attach an LDS to a server that already exists.
         # Accept a matching attachment as idempotent, otherwise fail rather
         # than silently hiding the drift.
-        current_lds = getattr(
-            getattr(server_info, "local_directory_service", None), "name", None
-        )
-        if current_lds != module.params["create_local_directory_service"]:
+        if (current_lds or "").lower() != module.params[
+            "create_local_directory_service"
+        ].lower():
             module.fail_json(
                 msg="Server {0} already exists and its local directory service "
                 "is {1}, not {2}. A local directory service can only be created "
@@ -301,12 +471,12 @@ def update_server(module, blade):
                     module.params["create_local_directory_service"],
                 )
             )
+    # Decided before any change is sent or reported
+    _check_directory_service(
+        module, stored_name, _names(_field(server_info, "directory_services"))
+    )
     if module.params["dns"] is not None:
-        dns_list = server_info.dns
-        current_dns = []
-        for dns in dns_list:
-            current_dns.append(getattr(dns, "name", None))
-        if set(module.params["dns"]) != set(current_dns):
+        if not _same_names(module.params["dns"], _names(_field(server_info, "dns"))):
             changed = True
             if not module.check_mode:
                 res = blade.patch_servers(
@@ -319,39 +489,19 @@ def update_server(module, blade):
                     module.fail_json(
                         msg="Failed to update DNS config for server {0}. Error: {1}".format(
                             module.params["name"],
-                            get_error_message(res),
-                        )
-                    )
-    if module.params["directory_service"] is not None:
-        ds_list = server_info.directory_services
-        current_ds = []
-        for ds in ds_list:
-            current_ds.append(getattr(ds, "name", None))
-        if set(module.params["directory_service"]) != set(current_ds):
-            changed = True
-            if not module.check_mode:
-                res = blade.patch_servers(
-                    names=[module.params["name"]],
-                    server=Server(
-                        directory_services=[
-                            Reference(name=ds)
-                            for ds in module.params["directory_service"]
-                        ]
-                    ),
-                )
-                if res.status_code != 200:
-                    module.fail_json(
-                        msg="Failed to update directory services for server {0}. Error: {1}".format(
-                            module.params["name"],
-                            get_error_message(res),
+                            _reference_error(
+                                res,
+                                module.params["name"],
+                                dns=module.params["dns"],
+                            ),
                         )
                     )
     if module.params["local_directory_service"] is not None:
-        current_lds = getattr(
-            getattr(server_info, "local_directory_service", None), "name", None
-        )
-        # normalise "" to None so clearing an already-unset field is a no-op
-        if (module.params["local_directory_service"] or None) != current_lds:
+        # "" clears the field, so clearing an already-unset field is a no-op
+        if (
+            module.params["local_directory_service"].lower()
+            != (current_lds or "").lower()
+        ):
             changed = True
             if not module.check_mode:
                 res = blade.patch_servers(
@@ -366,7 +516,11 @@ def update_server(module, blade):
                     module.fail_json(
                         msg="Failed to update local directory service for server {0}. Error: {1}".format(
                             module.params["name"],
-                            get_error_message(res),
+                            _reference_error(
+                                res,
+                                module.params["name"],
+                                local_ds=module.params["local_directory_service"],
+                            ),
                         )
                     )
     module.exit_json(changed=changed)
@@ -376,19 +530,19 @@ def add_server(module, blade):
     """Add server object"""
     changed = True
     final_dns = []
-    final_dserv = []
+    # The array creates the server with this one directory service, named in
+    # create_ds, so a task that expects another one is refused before the
+    # server is created
+    _check_directory_service(
+        module, module.params["name"], [module.params["name"] + "_nfs"], new=True
+    )
     if not module.check_mode:
         if module.params["dns"]:
             for dns in module.params["dns"]:
                 final_dns.append(Reference(name=dns))
-        if module.params["directory_service"]:
-            for dserv in module.params["directory_service"]:
-                final_dserv.append(Reference(name=dserv))
         server_kwargs = {}
         if final_dns:
             server_kwargs["dns"] = final_dns
-        if final_dserv:
-            server_kwargs["directory_services"] = final_dserv
         if module.params["local_directory_service"]:
             server_kwargs["local_directory_service"] = Reference(
                 name=module.params["local_directory_service"]
@@ -410,7 +564,14 @@ def add_server(module, blade):
             module.fail_json(
                 msg="Failed to add server {0}. Error: {1}".format(
                     module.params["name"],
-                    get_error_message(res),
+                    _reference_error(
+                        res,
+                        module.params["name"],
+                        dns=module.params["dns"],
+                        local_ds=module.params["local_directory_service"]
+                        or module.params["create_local_directory_service"],
+                        new=True,
+                    ),
                 )
             )
     module.exit_json(changed=changed)
@@ -467,15 +628,14 @@ def main():
         )
     state = module.params["state"]
 
-    res = blade.get_servers(names=[module.params["name"]])
-    exists = bool(res.status_code == 200)
+    servers = _get_servers(module, blade)
 
-    if not exists and state == "present":
+    if not servers and state == "present":
         add_server(module, blade)
-    elif exists and state == "present":
-        update_server(module, blade)
-    elif exists and state == "absent":
-        delete_server(module, blade, api_version, list(res.items))
+    elif servers and state == "present":
+        update_server(module, blade, servers[0])
+    elif servers and state == "absent":
+        delete_server(module, blade, api_version, servers)
 
     module.exit_json(changed=False)
 

@@ -1,0 +1,5 @@
+bugfixes:
+  - purefb_kmip - a read that the array refuses or cannot answer is no longer taken for a KMIP
+    object that does not exist. The task fails with the message of the array instead of reporting
+    ``state=absent`` as ok, a missing object for ``state=test`` or a create in check mode. A failed
+    read of the CA certificate, the certificate group or the connectivity test is reported as well.

@@ -1,0 +1,11 @@
+bugfixes:
+  - purefb_dns - names are compared without regard to case, as the array does. A ``name`` in
+    another case no longer tries to create a configuration that exists and is deleted by
+    ``state=absent``, and a ``source`` in another case is no longer reported as a change.
+  - purefb_dns - a configuration in a realm (``realm::name``) is refused before any request, in
+    check mode too, when it would be created without ``source`` or with the ``management``
+    service, when ``source`` is set to an empty string, or when ``source`` is not in the realm of
+    the configuration.
+  - purefb_dns - a ``source`` the array does not return is reported as not existing or not visible
+    to the identity, any other read error with the message of the array. The ``realm::name`` form
+    is documented.

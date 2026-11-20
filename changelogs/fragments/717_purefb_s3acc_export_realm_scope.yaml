@@ -1,0 +1,19 @@
+bugfixes:
+  - purefb_s3acc_export - with ``state=present`` an account and a server that are not in the same
+    realm, or not both outside of any realm, are refused before the export is looked up, in check
+    mode as well. Check mode reported a create that the array refuses.
+  - purefb_s3acc_export - check mode looks up the account, the server and the policy of a new
+    export, and the policy an existing export is re-pointed at, and fails for one the array does
+    not find, as a real run does.
+  - purefb_s3acc_export - the policy name is compared without regard to case, as the array matches
+    it. A policy given in another letter case was sent again and reported as a change on every run.
+  - purefb_s3acc_export - with ``state=present`` an empty name, and a name that holds a comma or an
+    asterisk, which the array reads as a list of names or as a pattern, are refused before the
+    export is looked up.
+  - purefb_s3acc_export - only the export of the named account on the named server is changed or
+    removed. An ``account`` or ``server`` that holds an asterisk or a quote selected the export of
+    another account or server.
+  - purefb_s3acc_export - blanks around a name are ignored. An account given with a blank at its
+    end was exported, and the next run failed.
+  - purefb_s3acc_export - documentation describes exports of an account in a realm and has an
+    example for one.

@@ -1,0 +1,16 @@
+bugfixes:
+  - purefb_network - an ``attached_server`` named without a realm on an interface in a realm is
+    now taken as a server of that realm, and server names are compared without regard to case.
+    Before, such a task reported a change on every run.
+  - purefb_network - a data interface in a realm without a server, a server outside the realm of
+    the interface, a server on an interface that stays ``egress-only``, a server that does not
+    exist and a new interface in a realm that does not exist are refused before any request.
+    Before, check mode reported a change that the array refuses.
+  - purefb_network - a ``name`` with a ``*`` or a comma, which the array reads as a pattern or as
+    a list of names, is refused. Only the interface that has the given name is changed or deleted.
+  - purefb_network - a read that the array refuses is reported with the error of the array
+    instead of being taken for an interface that does not exist.
+  - purefb_network - an interface named in another letter case than the array holds is now
+    changed and deleted. It is addressed by the name the array reports.
+  - purefb_network - documentation and examples name an interface in a realm as ``realm::name``
+    and say that its subnet is first shared with the realm.

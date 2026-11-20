@@ -1075,6 +1075,115 @@ class TestPurefbDnsLetterCase:
         _no_write(blade)
         assert module.exit_json.call_args[1]["changed"] is False
 
+    @pytest.mark.parametrize(
+        "param, stored, wanted",
+        [
+            ("ca_certificate", "cc46-cert", "CC46-CERT"),
+            ("ca_certificate_group", "cc46-grp", "Cc46-Grp"),
+            ("ca_certificate", RCERT, "REALM-1::CC46-CERT"),
+        ],
+    )
+    def test_ca_reference_is_sent_in_the_stored_spelling(self, param, stored, wanted):
+        """The array refuses the reference in another case: "... does not exist."."""
+        name = RDNS if "::" in stored else "cc46-dns"
+        source = RVIP if "::" in stored else None
+        module = _module(
+            name=name, domain="example.net", nameservers=[DOH], **{param: wanted}
+        )
+        blade = _array(
+            [_dns(name=name, nameservers=[DOH], source=source, **{param: stored})],
+            certificates=[stored],
+            groups=[stored],
+        )
+
+        _main(module, blade)
+
+        module.fail_json.assert_not_called()
+        body = blade.patch_dns.call_args[1]["dns"]
+        assert body["domain"] == "example.net"
+        assert body[param] == {"name": stored}
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_switch_to_a_group_named_in_another_case(self, check_mode):
+        module = _module(
+            check_mode=check_mode, nameservers=[DOH], ca_certificate_group="CC46-GRP"
+        )
+        blade = _array(
+            [_dns(nameservers=[DOH], ca_certificate="cc46-cert")],
+            certificates=["cc46-cert"],
+            groups=["cc46-grp"],
+        )
+
+        _main(module, blade)
+
+        blade.get_certificate_groups.assert_called_once_with(names=["CC46-GRP"])
+        if check_mode:
+            _no_write(blade)
+        else:
+            body = blade.patch_dns.call_args[1]["dns"]
+            assert body["ca_certificate_group"] == {"name": "cc46-grp"}
+            assert "ca_certificate" not in body
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_create_sends_the_ca_reference_in_the_stored_spelling(self):
+        module = _module(nameservers=[DOH], ca_certificate="CC46-Cert")
+        blade = _array([_dns(name="management")], certificates=["cc46-cert"])
+
+        _main(module, blade)
+
+        module.fail_json.assert_not_called()
+        assert blade.post_dns.call_args[1]["dns"]["ca_certificate"] == {
+            "name": "cc46-cert"
+        }
+
+    def test_ca_reference_is_sent_as_given_with_a_context(self):
+        """The certificate is read locally; its name belongs to the fleet member."""
+        module = _module(
+            nameservers=[DOH], ca_certificate="CC46-Cert", context="member-2"
+        )
+        blade = _array([_dns(name="management")], certificates=["cc46-cert"])
+
+        _main(module, blade)
+
+        module.fail_json.assert_not_called()
+        assert blade.post_dns.call_args[1]["context_names"] == ["member-2"]
+        assert blade.post_dns.call_args[1]["dns"]["ca_certificate"] == {
+            "name": "CC46-Cert"
+        }
+
+    def test_unchanged_ca_reference_with_a_context_keeps_the_stored_spelling(self):
+        """The current reference comes from the fleet member that holds it."""
+        module = _module(
+            domain="example.net",
+            nameservers=[DOH],
+            ca_certificate="CC46-CERT",
+            context="member-2",
+        )
+        blade = _array(
+            [_dns(nameservers=[DOH], ca_certificate="cc46-cert")],
+            certificates=["CC46-Cert"],
+        )
+
+        _main(module, blade)
+
+        module.fail_json.assert_not_called()
+        assert blade.patch_dns.call_args[1]["context_names"] == ["member-2"]
+        assert blade.patch_dns.call_args[1]["dns"]["ca_certificate"] == {
+            "name": "cc46-cert"
+        }
+
+    def test_ca_reference_is_kept_when_the_read_returns_no_item(self):
+        module = _module(nameservers=[DOH], ca_certificate="cc46-cert")
+        blade = _array([_dns(name="management")])
+        blade.get_certificates = Mock(return_value=_response())
+
+        _main(module, blade)
+
+        assert blade.post_dns.call_args[1]["dns"]["ca_certificate"] == {
+            "name": "cc46-cert"
+        }
+
 
 class TestPurefbDnsRealm:
     """A configuration named realm::name, and its references"""
@@ -1101,7 +1210,7 @@ class TestPurefbDnsRealm:
             "domain": "example.com",
             "nameservers": [DOH],
             "sources": [{"name": RVIP}],
-            "ca_certificate": {"name": "Realm-1::cc46-cert"},
+            "ca_certificate": {"name": RCERT},
         }
         assert module.exit_json.call_args[1]["changed"] is True
 

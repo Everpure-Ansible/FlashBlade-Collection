@@ -74,6 +74,8 @@ options:
     - Mutually exclusive with I(ca_certificate_group).
     - A configuration in a realm takes a certificate of the same realm,
       named C(realm::name).
+    - The array takes this reference only in the spelling it stored, so the
+      module sends the name as the array returns it, whatever the case given.
     - Requires REST API 2.25 (Purity//FB 4.8.0) or higher.
     type: str
     version_added: '1.30.0'
@@ -85,6 +87,8 @@ options:
     - Mutually exclusive with I(ca_certificate).
     - A configuration in a realm takes a certificate group of the same
       realm, named C(realm::name).
+    - The array takes this reference only in the spelling it stored, so the
+      module sends the name as the array returns it, whatever the case given.
     - Requires REST API 2.25 (Purity//FB 4.8.0) or higher.
     type: str
     version_added: '1.30.0'
@@ -97,8 +101,8 @@ options:
       array level. A configuration in a realm takes a network interface of
       that realm, named C(realm::name), normally the C(egress-only) interface
       of the realm.
-    - A configuration in a realm needs a source when it is created and
-      cannot give it up, so an empty string is refused for it.
+    - A configuration in a realm needs a source when it is created, and the
+      module does not clear it, so an empty string is refused for it.
     type: str
   service:
     description:
@@ -400,10 +404,16 @@ def _fail_reference(module, res, label, kind, name):
 
 
 def _check_certificate(module, blade, param):
-    """Fail unless the named certificate or certificate group can be read."""
+    """Fail unless the named certificate or certificate group can be read.
+
+    Returns the name as the array stores it. The array finds a certificate
+    or certificate group whatever the case of the name, but it takes the
+    reference on a DNS configuration only in the stored spelling and
+    answers "Certificate does not exist." for any other.
+    """
     name = module.params[param]
     if not name:
-        return
+        return name
     if param == "ca_certificate_group":
         res = blade.get_certificate_groups(names=[name])
         label = "Certificate group"
@@ -412,6 +422,10 @@ def _check_certificate(module, blade, param):
         label = "Certificate"
     if res.status_code != 200:
         _fail_reference(module, res, label, label.lower(), name)
+    for item in res.items:
+        if _same_name(getattr(item, "name", None), name):
+            return item.name
+    return name
 
 
 def _check_source(module, blade):
@@ -525,9 +539,12 @@ def update_multi_dns(module, blade):
     if ca_param:
         _fail_if_ca_without_https(module, ca_param, nameservers)
         wanted = module.params[ca_param]
-        if not _same_name(
-            wanted, _reference_name(current_dns, REFERENCE_PARAMS[ca_param])
-        ):
+        current_name = _reference_name(current_dns, REFERENCE_PARAMS[ca_param])
+        if _same_name(wanted, current_name):
+            # The same reference: carried in the spelling the configuration
+            # holds, the only one the array takes.
+            wanted = current_name
+        else:
             changed = True
         ca_reference = (REFERENCE_PARAMS[ca_param], wanted)
     elif _all_https(nameservers):
@@ -657,7 +674,12 @@ def main():
         if LooseVersion(NON_MGMT_DNS) <= LooseVersion(api_version):
             _check_realm_references(module)
         if ca_param:
-            _check_certificate(module, blade, ca_param)
+            stored_name = _check_certificate(module, blade, ca_param)
+            # The certificate is read on the array receiving the request.
+            # With a context the name belongs to the fleet member and is
+            # sent as given.
+            if not module.params["context"]:
+                module.params[ca_param] = stored_name
 
     if LooseVersion(NON_MGMT_DNS) <= LooseVersion(api_version):
         res = blade.get_dns(**_context_kwargs(module))

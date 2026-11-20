@@ -1310,3 +1310,54 @@ class TestPurefbSamlLetterCase:
             blade.patch_sso_saml2_idps.assert_called_once()
             idp_kwargs = models["Saml2SsoIdp"].call_args[1]
             assert idp_kwargs[option] == ("ref", value)
+
+
+class TestPurefbSamlNamePatterns:
+    """The array reads * in a name as a pattern and a comma as a separator of
+    names, so such a name never reaches the array"""
+
+    def test_pattern_or_list_refused_in_every_state(self):
+        for name in ("*", "my*", "*idp", "myidp,otheridp", "myidp,"):
+            for state in ("present", "absent", "test"):
+                for check_mode in (False, True):
+                    params = _base_params(
+                        name=name, state=state, array_url="https://fb.example.com"
+                    )
+                    # what the array answers: the providers that match
+                    module, blade, models = _run(
+                        params, current=_current_idp(), check_mode=check_mode
+                    )
+
+                    blade.get_sso_saml2_idps.assert_not_called()
+                    blade.get_sso_saml2_idps_test.assert_not_called()
+                    _no_writes(blade)
+                    module.exit_json.assert_not_called()
+                    msg = module.fail_json.call_args[1]["msg"]
+                    assert "Invalid name '{0}'".format(name) in msg
+                    assert "pattern" in msg
+                    assert "separator" in msg
+
+    def test_pattern_is_refused_before_the_realm_check(self):
+        params = _base_params(name="realm1::*", state="absent")
+        module, blade, models = _run(params, current=_current_idp())
+
+        blade.get_sso_saml2_idps.assert_not_called()
+        _no_writes(blade)
+        assert "pattern" in module.fail_json.call_args[1]["msg"]
+
+    def test_plain_names_pass(self):
+        for name in ("myidp", "My_IdP-2", "PureSSO"):
+            module = Mock()
+            module.fail_json = Mock(side_effect=SystemExit)
+            module.params = _base_params(name=name)
+
+            saml._refuse_name_patterns(module)
+
+            module.fail_json.assert_not_called()
+
+    def test_the_lookup_uses_the_exact_name(self):
+        params = _base_params(state="absent")
+        module, blade, models = _run(params, current=_current_idp())
+
+        blade.get_sso_saml2_idps.assert_called_once_with(names=[IDP_NAME])
+        blade.delete_sso_saml2_idps.assert_called_once_with(names=[IDP_NAME])

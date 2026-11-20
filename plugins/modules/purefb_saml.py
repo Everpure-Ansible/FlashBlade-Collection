@@ -32,8 +32,8 @@ description:
   so the module refuses a realm-qualified reference.
 - An administrator whose access is limited to a realm can read the providers
   shared with that realm. The array refuses that administrator
-  I(state=test) and every change, and answers for any other provider that it
-  does not exist.
+  I(state=test) and the creation or modification of a provider, and answers
+  for any other provider that it does not exist.
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
@@ -42,6 +42,8 @@ options:
     - Name of the SAML2 identity provider (IdP)
     - Providers are array-level objects, so the name cannot be
       realm-qualified (C(realm::name)).
+    - This is the name of one provider. A name with a C(*) or a comma, which
+      the array reads as a pattern and as a separator of names, is refused.
     type: str
     required: true
   state:
@@ -136,6 +138,7 @@ options:
       provider server when I(metadata_url) is fetched.
     - Mutually exclusive with I(metadata_url_ca_certificate_group), which is cleared
       when this is set.
+    - The array matches this name exactly, letter case included.
     - Requires REST 2.17 or higher.
     type: str
     version_added: '1.30.0'
@@ -146,6 +149,7 @@ options:
       The group must contain at least one certificate.
     - Mutually exclusive with I(metadata_url_ca_certificate), which is cleared when
       this is set.
+    - The array matches this name exactly, letter case included.
     - Requires REST 2.17 or higher.
     type: str
     version_added: '1.30.0'
@@ -307,6 +311,12 @@ REFERENCE_OPTIONS = (
     "metadata_url_ca_certificate",
     "metadata_url_ca_certificate_group",
 )
+NAME_PATTERN_MSG = (
+    "Invalid name '{0}': a task manages one SAML2 identity provider. The "
+    "array reads * in a name as a pattern and a comma as a separator of "
+    "names, so this name could match other providers than the one meant. "
+    "Use the exact name of one provider."
+)
 REALM_NAME_MSG = (
     "Invalid name '{0}': SAML2 identity providers are array-level objects and "
     "their names cannot be realm-qualified (realm::name). Use the unqualified "
@@ -331,6 +341,19 @@ def _check_option_versions(module, api_version):
                 msg="Option {0} requires FlashBlade REST version {1} or higher. "
                 "Array REST version is {2}".format(option, required, api_version)
             )
+
+
+def _refuse_name_patterns(module):
+    """Refuse a name the array reads as more than one provider, before any request
+
+    In a request the array reads * in a name as a pattern and a comma as a
+    separator of names. The lookup of such a name returns every provider that
+    matches: the first one would be taken for the provider of the task, and
+    a change, a delete or a test would be sent with that name.
+    """
+    name = module.params["name"]
+    if "*" in name or "," in name:
+        module.fail_json(msg=NAME_PATTERN_MSG.format(name))
 
 
 def _refuse_realm_names(module):
@@ -716,6 +739,7 @@ def main():
         module.fail_json(msg="py-pure-client sdk is required for this module")
 
     # refused before the array is contacted, in check mode too
+    _refuse_name_patterns(module)
     _refuse_realm_names(module)
 
     blade = get_system(module)

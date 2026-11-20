@@ -7,3 +7,6 @@ bugfixes:
     so check mode no longer predicts a change that the array refuses.
   - purefb_saml - ``x509_cert``, ``signing_credential`` and ``decryption_credential`` named in
     another letter case than the certificate are no longer reported as a change.
+  - purefb_saml - a ``name`` with a ``*`` or a comma is refused. The array reads them as a pattern
+    and as a separator of names, so such a name could reach other identity providers than the one
+    meant.

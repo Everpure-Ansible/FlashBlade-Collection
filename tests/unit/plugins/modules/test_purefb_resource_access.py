@@ -617,12 +617,10 @@ class TestResourceAccessNameCase:
 
     def test_revoke_under_another_case_deletes_the_access(self):
         blade = _blade(
-            accesses=[_access(ACCESS_ID, "Partner-2065", resource_type="subnets")]
+            accesses=[_access(ACCESS_ID, "Data-Net", resource_type="subnets")]
         )
         module = _run(
-            _params(
-                resource_type="subnets", resource_name="partner-2065", state="absent"
-            ),
+            _params(resource_type="subnets", resource_name="data-net", state="absent"),
             blade,
         )
 
@@ -835,7 +833,7 @@ NOT_VERIFIED = (
 )
 # One resource of each type the array shares with a realm
 SHAREABLE = [
-    ("subnets", "Partner-2065"),
+    ("subnets", "Data-Net"),
     ("dns", "dns1"),
     ("targets", "target1"),
     (OIDC, "okta"),
@@ -998,15 +996,13 @@ class TestResourceAccessCheckModePredictions:
 
     def test_subnet_named_in_another_case_is_a_warning(self):
         # not measured on an array: no failure is predicted for it
-        params = _params(resource_type="subnets", resource_name="partner-2065")
-        blade, module = _check(
-            params, {"realms": ["realm1"], "subnets": ["Partner-2065"]}
-        )
+        params = _params(resource_type="subnets", resource_name="data-net")
+        blade, module = _check(params, {"realms": ["realm1"], "subnets": ["Data-Net"]})
 
         module.warn.assert_called_once_with(
             NOT_VERIFIED.format(
-                "realms realm1 and subnets partner-2065",
-                "the array holds subnets partner-2065 as Partner-2065 and may"
+                "realms realm1 and subnets data-net",
+                "the array holds subnets data-net as Data-Net and may"
                 " not find it under another case.",
             )
         )

@@ -110,6 +110,7 @@ def _mapping(
 
 
 MISSING = "Directory service role does not exist."
+NOT_PERMITTED = "Operation not permitted."
 
 
 def _response(status=200, items=None, error="boom"):
@@ -166,11 +167,17 @@ def _module(params, check_mode=False):
 
 
 def _run(params, blade, api_version="2.30", check_mode=False, has_sdk=True):
-    """Run main() with the module plumbing patched; return the module mock"""
+    """Run main() with the module plumbing patched; return the module mock.
+
+    Its ``get_system`` attribute is the patched login, so a test can assert
+    that the array was never contacted.
+    """
     module = _module(params, check_mode)
     with patch(MODULE + ".AnsibleModule", return_value=module), patch(
         MODULE + ".get_system", return_value=blade
-    ), patch(MODULE + ".get_rest_api_version", return_value=api_version), patch(
+    ) as get_system, patch(
+        MODULE + ".get_rest_api_version", return_value=api_version
+    ), patch(
         MODULE + ".LooseVersion", RealLooseVersion
     ), patch(
         MODULE + ".get_error_message", side_effect=lambda res: res.error
@@ -181,6 +188,7 @@ def _run(params, blade, api_version="2.30", check_mode=False, has_sdk=True):
             main()
         except SystemExit:
             pass
+    module.get_system = get_system
     return module
 
 
@@ -699,3 +707,96 @@ class TestPurefbDsrole:
         msg = module.fail_json.call_args[1]["msg"]
         assert "Delete Directory Service Role array_admin failed" in msg
         assert "boom" in msg
+
+    # ---------------- main(): realms ----------------
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    def test_main_refuses_realm_qualified_name(self, state, check_mode):
+        """A realm-qualified mapping name is refused before any request"""
+        blade = _blade(mapping=None)
+        params = _base_params(name="realm1::cc44-map", state=state)
+        if state == "absent":
+            params["policies"] = None
+        module = _run(params, blade, check_mode=check_mode)
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "realm1::cc44-map" in msg
+        assert "mappings are array-level" in msg
+        assert "policies" in msg
+        module.exit_json.assert_not_called()
+        module.get_system.assert_not_called()
+        blade.get_directory_services_roles.assert_not_called()
+        _no_writes(blade)
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_main_refuses_realm_qualified_policy(self, check_mode):
+        """A realm-qualified policy name is refused before any request"""
+        blade = _blade(mapping=_mapping())
+        module = _run(
+            _base_params(policies=["readonly", "realm1::realm1-admin"]),
+            blade,
+            check_mode=check_mode,
+        )
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "realm1::realm1-admin" in msg
+        assert "policies are array-level" in msg
+        assert "without a realm prefix" in msg
+        module.exit_json.assert_not_called()
+        module.get_system.assert_not_called()
+        blade.get_directory_services_roles.assert_not_called()
+        _no_writes(blade)
+
+    def test_main_absent_does_not_read_policies(self):
+        """policies is not read for state=absent, so it is not refused there"""
+        blade = _blade(mapping=_mapping())
+        module = _run(
+            _base_params(state="absent", policies=["realm1::realm1-admin"]), blade
+        )
+        module.fail_json.assert_not_called()
+        blade.delete_directory_services_roles.assert_called_once_with(
+            names=["cc44-map"]
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_main_creates_mapping_granting_realm_scoped_policy(self):
+        """A policy scoped to a realm is granted under its unqualified name"""
+        blade = _blade(mapping=None)
+        with patch(MODULE + ".DirectoryServiceRolePost") as mock_post, patch(
+            MODULE + ".ReferenceWritable", side_effect=_fake_reference
+        ):
+            module = _run(
+                _base_params(name="realm1-admins", policies=["realm1-admin"]), blade
+            )
+        module.fail_json.assert_not_called()
+        module.get_system.assert_called_once()
+        blade.get_directory_services_roles.assert_called_once_with(
+            names=["realm1-admins"]
+        )
+        assert blade.post_directory_services_roles.call_args[1]["names"] == [
+            "realm1-admins"
+        ]
+        mock_post.assert_called_once_with(
+            group="cc44-grp",
+            group_base="ou=groups",
+            management_access_policies=[("ref", "realm1-admin")],
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    def test_main_refused_read_is_not_a_missing_mapping(self, state, check_mode):
+        """A read the array refuses, as it does for an administrator limited
+        to a realm, fails with the array's message in every state"""
+        blade = _blade()
+        blade.get_directory_services_roles.return_value = _response(
+            400, error=NOT_PERMITTED
+        )
+        module = _run(_base_params(state=state), blade, check_mode=check_mode)
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "Fetch Directory Service Role cc44-map failed" in msg
+        assert NOT_PERMITTED in msg
+        module.exit_json.assert_not_called()
+        _no_writes(blade)

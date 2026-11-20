@@ -79,6 +79,7 @@ from plugins.modules.purefb_smtp import main
 
 MOD = "plugins.modules.purefb_smtp"
 REFUSED = "Operation not permitted."
+RATE_LIMITED = "API rate limit exceeded"
 READ_FAILED = "Failed to read the SMTP configuration. Error: {0}"
 WRITE_FAILED = "Failed to set SMTP configuration. Error: {0}"
 NO_CONFIGURATION = "The array returned no SMTP configuration."
@@ -244,12 +245,14 @@ class TestPurefbSmtpRead:
         assert _failure(module) == READ_FAILED.format(REFUSED)
         blade.patch_smtp_servers.assert_not_called()
 
+    # The SDK builds one error from the message of a 403 or 429 answer; any
+    # other answer without an error list carries no errors.
     @pytest.mark.parametrize("check_mode", [False, True])
     @pytest.mark.parametrize(
         "message, status_code, reported",
         [
             (REFUSED, 403, REFUSED),
-            (None, 429, "Unknown error"),
+            (RATE_LIMITED, 429, RATE_LIMITED),
             (None, 500, "Unknown error"),
             ("Service unavailable.", 503, "Service unavailable."),
         ],

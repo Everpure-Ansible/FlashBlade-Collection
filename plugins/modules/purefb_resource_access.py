@@ -21,6 +21,15 @@ version_added: '1.28.0'
 short_description: Manage Resource Access on Everpure FlashBlades
 description:
     - Create or delete resource access on Everpure FlashBlades.
+    - A resource access shares an array-level resource with a realm, so that
+      the objects of the realm can use it. The resource stays at the array
+      level.
+    - A shared DNS configuration can also be changed from the realm. On
+      Purity//FB 4.8 an administrator whose management access is limited to
+      a realm can change a DNS configuration that is shared with that realm,
+      for example its nameservers, and a configuration shared with several
+      realms can be changed by the administrators of each of them. Share a
+      DNS configuration that serves only the realms it is shared with.
 author:
     - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
     - Leo Wahlandt (@valen98) <wahlandtleo@gmail.com>
@@ -33,8 +42,12 @@ options:
         with the REST API version, so it is not validated by this module.
       - For a realm scope, the array accepts the array-level resources that
         can be shared with a realm. Purity//FB 4.6 accepts C(subnets) and
-        C(dns). Purity//FB 4.8 also accepts C(sso/oidc/idps), an OIDC
-        identity provider managed with M(everpure.flashblade.purefb_oidc).
+        C(dns). Purity//FB 4.8 accepts C(subnets), C(dns), C(targets) (a
+        remote S3 target managed with
+        M(everpure.flashblade.purefb_target)), C(sso/oidc/idps) (an OIDC
+        identity provider managed with M(everpure.flashblade.purefb_oidc))
+        and C(sso/saml2/idps) (a SAML2 identity provider managed with
+        M(everpure.flashblade.purefb_saml)).
       - Purity//FB 4.8 keeps OIDC identity providers at the array level. A
         provider has to be shared with a realm before the trust policies of
         the object store roles in that realm can name it, and the array
@@ -53,9 +66,10 @@ options:
         under the name C(realm::provider).
       - Names are unique on the array whatever their case, and an existing
         resource access is found whatever the case of I(resource_name) and
-        I(scope_name). To create one, give the name as the array holds it.
-        Purity//FB 4.8 does not find an OIDC identity provider under a name
-        in another case when a resource access is created.
+        I(scope_name). To create one, give both names as the array holds
+        them. Purity//FB 4.8 does not find a realm, a DNS configuration, a
+        target or an OIDC identity provider under a name in another case
+        when a resource access is created.
     type: str
     required: true
   state:
@@ -75,14 +89,28 @@ options:
   scope_name:
     description:
       - The name of the scope, that should be using the resource.
+      - For a realm scope, the name of the realm as the array holds it.
       - You can not rename a resource access.
       - Resource access are immutable. You have to delete it and then create a new one.
     type: str
     required: true
 notes:
-- Check mode reports the request the module would send. Whether the array
-  accepts the resource type, the resource name or a revoke is only known
-  when the request is sent.
+- Check mode sends no request that changes the array. For a new resource
+  access with a realm scope it reads the realm and, for the resource types
+  named under I(resource_type), the resource, and fails as the create
+  request would when the array does not hold one of them under the name
+  given. What these reads do not settle is reported with a warning and the
+  change is predicted, because only the array decides it. This applies to a
+  resource type or scope type other than the ones named here, a destroyed
+  realm, a subnet named in another case, a resource that belongs to a realm,
+  a read the array refuses and a read that does not return the name given,
+  as for a name with a comma in it.
+- Whether the array accepts a revoke is only known when the request is
+  sent, and so is whether an administrator who may read the resource
+  accesses may also change them.
+- The array refuses to destroy a realm while a resource access names it.
+  Revoke the resource accesses of a realm before the realm is destroyed
+  with M(everpure.flashblade.purefb_realm).
 - The module reads the resource accesses to find out whether one exists.
   Purity//FB 4.8 refuses that read with C(Operation not permitted) for an
   administrator whose management access is limited to a realm. With
@@ -103,10 +131,19 @@ EXAMPLES = r"""
     fb_url: 10.10.10.2
     api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
 
-- name: Share the management DNS configuration with realm realm_foo
+- name: Share the data DNS configuration dns_foo with realm realm_foo
   everpure.flashblade.purefb_resource_access:
     resource_type: dns
-    resource_name: management
+    resource_name: dns_foo
+    scope_type: realms
+    scope_name: realm_foo
+    fb_url: 10.10.10.2
+    api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+
+- name: Share remote S3 target target_foo with realm realm_foo
+  everpure.flashblade.purefb_resource_access:
+    resource_type: targets
+    resource_name: target_foo
     scope_type: realms
     scope_name: realm_foo
     fb_url: 10.10.10.2
@@ -116,6 +153,15 @@ EXAMPLES = r"""
   everpure.flashblade.purefb_resource_access:
     resource_type: sso/oidc/idps
     resource_name: okta
+    scope_type: realms
+    scope_name: realm_foo
+    fb_url: 10.10.10.2
+    api_token: T-9f276a18-50ab-446e-8a0c-666a3529a1b6
+
+- name: Share SAML2 identity provider saml_foo with realm realm_foo
+  everpure.flashblade.purefb_resource_access:
+    resource_type: sso/saml2/idps
+    resource_name: saml_foo
     scope_type: realms
     scope_name: realm_foo
     fb_url: 10.10.10.2
@@ -160,6 +206,20 @@ REALM_PREFIX_HINT = (
     "An array-level resource is shared under its own name, without a realm prefix."
 )
 
+# The resources Purity//FB 4.8 shares with a realm, by REST collection name,
+# each with the read that finds one by its name
+REALM_SHAREABLE = {
+    "subnets": "get_subnets",
+    "dns": "get_dns",
+    "targets": "get_targets",
+    "sso/oidc/idps": "get_sso_oidc_idps",
+    "sso/saml2/idps": "get_sso_saml2_idps",
+}
+
+# Purity//FB 4.8 reads these by name whatever the case, but was seen to
+# refuse a new resource access that names one in another case than it holds
+EXACT_NAME_ON_CREATE = ("realms", "dns", "targets", "sso/oidc/idps")
+
 
 def _access_text(module):
     """Name both ends of the resource access for a message"""
@@ -179,6 +239,129 @@ def _realm_prefix_hint(module):
     ):
         return REALM_PREFIX_HINT
     return ""
+
+
+def _with_realm_prefix_hint(module, msg):
+    """Add the hint for a realm-qualified resource name to a failure message"""
+    hint = _realm_prefix_hint(module)
+    if hint:
+        if not msg.endswith("."):
+            msg += "."
+        msg = "{0} {1}".format(msg, hint)
+    return msg
+
+
+def _create_would_fail(module, reason):
+    """Fail a check mode run for a create the array would refuse"""
+    module.fail_json(
+        msg=_with_realm_prefix_hint(
+            module,
+            "Create resource access between {0} would fail. {1}".format(
+                _access_text(module), reason
+            ),
+        )
+    )
+
+
+def _not_verified(module, reason):
+    """Warn that check mode predicts a create it could not verify"""
+    if not reason.endswith("."):
+        reason += "."
+    module.warn(
+        "Check mode did not verify the resource access between {0}: {1} The"
+        " array decides when the request is sent.".format(_access_text(module), reason)
+    )
+
+
+def _read_by_name(module, blade, method, resource_type, name):
+    """Read one end of a new resource access for check mode
+
+    Returns the object the array holds under the name, whatever its case,
+    or None when the read does not settle whether there is one. The array
+    answers a create that names a missing realm or resource with the error
+    of this read, so only that answer fails the task.
+    """
+    res = getattr(blade, method)(names=[name])
+    if res.status_code == 200:
+        # Names are unique on the array whatever their case. A name with a
+        # comma in it is read as several names, so the answer can hold other
+        # objects than the one asked for: none of them is taken for it.
+        for item in list(res.items):
+            if (getattr(item, "name", None) or "").lower() == name.lower():
+                return item
+        _not_verified(
+            module, "the array returned no {0} {1}".format(resource_type, name)
+        )
+        return None
+    error = get_error_message(res)
+    if "does not exist" in error.lower():
+        _create_would_fail(module, "Error: {0}".format(error))
+        return None
+    _not_verified(
+        module,
+        "the read of {0} {1} failed. Error: {2}".format(resource_type, name, error),
+    )
+    return None
+
+
+def _check_name_as_held(module, resource_type, given, found):
+    """Compare a name of a new resource access with the name the array holds"""
+    held = getattr(found, "name", None)
+    if not held or held == given:
+        return
+    if resource_type in EXACT_NAME_ON_CREATE:
+        _create_would_fail(
+            module,
+            "The array holds {0} {1} as {2} and creates a resource access only"
+            " under the name as it holds it.".format(resource_type, given, held),
+        )
+        return
+    _not_verified(
+        module,
+        "the array holds {0} {1} as {2} and may not find it under another"
+        " case".format(resource_type, given, held),
+    )
+
+
+def _predict_create(module, blade):
+    """Tell in check mode whether the array would accept a new resource access
+
+    The array finds the realm and the resource of a new resource access by
+    name and refuses the request when it holds no such realm or resource.
+    The same reads are made here, so that check mode fails where the create
+    request would. Everything they do not settle is left to the array and
+    reported with a warning: no request the array might accept is refused.
+    """
+    resource_type = module.params["resource_type"]
+    resource_name = module.params["resource_name"]
+    scope_name = module.params["scope_name"]
+    if module.params["scope_type"] != "realms":
+        _not_verified(module, "the module can only check a scope of type realms")
+        return
+    realm = _read_by_name(module, blade, "get_realms", "realms", scope_name)
+    if realm is not None:
+        _check_name_as_held(module, "realms", scope_name, realm)
+        if getattr(realm, "destroyed", False):
+            _not_verified(module, "realm {0} is destroyed".format(scope_name))
+    if resource_type not in REALM_SHAREABLE:
+        _not_verified(
+            module,
+            "the module can only check a resource of type {0}".format(
+                ", ".join(sorted(REALM_SHAREABLE))
+            ),
+        )
+        return
+    resource = _read_by_name(
+        module, blade, REALM_SHAREABLE[resource_type], resource_type, resource_name
+    )
+    if resource is not None:
+        _check_name_as_held(module, resource_type, resource_name, resource)
+        if "::" in resource_name:
+            _not_verified(
+                module,
+                "{0} {1} belongs to a realm, and the array is only known to"
+                " share array-level resources".format(resource_type, resource_name),
+            )
 
 
 def get_resource_access(module, blade):
@@ -220,7 +403,9 @@ def get_resource_access(module, blade):
 def create_resource_access(module, blade):
     """Create a new resource_access"""
     changed = True
-    if not module.check_mode:
+    if module.check_mode:
+        _predict_create(module, blade)
+    else:
         resource = ResourceAccessPost(
             resource={
                 "name": module.params["resource_name"],
@@ -236,12 +421,7 @@ def create_resource_access(module, blade):
             msg = "Create resource access between {0} failed. Error: {1}".format(
                 _access_text(module), get_error_message(res)
             )
-            hint = _realm_prefix_hint(module)
-            if hint:
-                if not msg.endswith("."):
-                    msg += "."
-                msg = "{0} {1}".format(msg, hint)
-            module.fail_json(msg=msg)
+            module.fail_json(msg=_with_realm_prefix_hint(module, msg))
     module.exit_json(changed=changed)
 
 

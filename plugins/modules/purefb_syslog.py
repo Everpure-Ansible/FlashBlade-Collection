@@ -29,11 +29,16 @@ options:
   name:
     description:
     - Unique identifier for the syslog server address
+    - The array matches the name without regard to letter case and ignores
+      white space around it, and so does the module.
+    - This is the name of one syslog server. A name that holds a comma, which
+      the array reads as a list of names, is refused.
     type: str
     required: true
   state:
     description:
     - Create update, delete or test syslog servers configuration
+    - C(test) fails if I(name) is not a configured syslog server.
     default: present
     type: str
     choices: [ absent, present, test ]
@@ -112,15 +117,53 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
 SYSLOG_SERVICES_API = "2.14"
 
 
-def delete_syslog(module, blade):
+def _refuse_name_list(module):
+    """Refuse a name that the array does not read as the name of one server.
+
+    In a request the array reads a comma as a separator of names, so such a
+    name is a list of syslog servers, or one server named with a stray
+    comma. This module manages the one server that has the name given, so
+    the name is refused before any request.
+    """
+    name = module.params["name"]
+    if "," in name:
+        module.fail_json(
+            msg="name must be the name of one syslog server: in {0} the array "
+            "reads a comma as a separator of names.".format(name)
+        )
+
+
+def _get_syslog_server(module, blade):
+    """Return the syslog server I(name), or None if it is not configured.
+
+    The servers are listed and matched by name as the array matches names:
+    without regard to case and ignoring white space around the name. A read
+    the array refuses or fails is reported with the message of the array: it
+    says nothing about the server.
+    """
+    res = blade.get_syslog_servers()
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to list syslog servers. Error: {0}".format(
+                get_error_message(res)
+            )
+        )
+    wanted = module.params["name"].strip().lower()
+    for server in list(res.items):
+        if (server.name or "").strip().lower() == wanted:
+            return server
+    return None
+
+
+def delete_syslog(module, blade, name):
     """Delete Syslog Server"""
     changed = True
     if not module.check_mode:
-        res = blade.delete_syslog_servers(names=[module.params["name"]])
+        res = blade.delete_syslog_servers(names=[name])
         if res.status_code != 200:
             module.fail_json(
                 msg="Failed to remove syslog server {0}. Error: {1}".format(
-                    module.params["name"], get_error_message(res)
+                    name, get_error_message(res)
                 )
             )
 
@@ -168,7 +211,7 @@ def add_syslog(module, blade):
     module.exit_json(changed=changed)
 
 
-def update_syslog(module, blade):
+def update_syslog(module, blade, syslog_config):
     """Update Syslog Server"""
     changed = False
     api_version = get_rest_api_version(blade)
@@ -176,9 +219,6 @@ def update_syslog(module, blade):
         module.exit_json(
             msg="Purity//FB needs upgrading to support modification of existing syslog server"
         )
-    syslog_config = list(blade.get_syslog_servers(names=[module.params["name"]]).items)[
-        0
-    ]
     noport_address = module.params["protocol"] + "://" + module.params["address"]
 
     if module.params["port"]:
@@ -195,19 +235,19 @@ def update_syslog(module, blade):
         new_services = module.params["services"]
     if changed and not module.check_mode:
         res = blade.patch_syslog_servers(
-            names=[module.params["name"]],
+            names=[syslog_config.name],
             syslog_server=SyslogServerPatch(uri=new_uri, services=new_services),
         )
         if res.status_code != 200:
             module.fail_json(
                 msg="Updating syslog server {0} failed. Error: {1}".format(
-                    module.params["name"], get_error_message(res)
+                    syslog_config.name, get_error_message(res)
                 )
             )
     module.exit_json(changed=changed)
 
 
-def test_syslog(module, blade):
+def test_syslog(module, blade, name):
     """Test syslog configuration"""
     test_response = []
     # The syslog test endpoint takes no names filter, so the array tests
@@ -216,11 +256,11 @@ def test_syslog(module, blade):
     if res.status_code != 200:
         module.fail_json(
             msg="Failed to test syslog server {0}. Error: {1}".format(
-                module.params["name"], get_error_message(res)
+                name, get_error_message(res)
             )
         )
     for component in list(res.items):
-        if getattr(component.resource, "name", None) != module.params["name"]:
+        if getattr(component.resource, "name", None) != name:
             continue
         if component.enabled:
             enabled = "true"
@@ -272,19 +312,26 @@ def main():
         argument_spec, required_if=required_if, supports_check_mode=True
     )
 
+    _refuse_name_list(module)
+
     blade = get_system(module)
 
-    res = blade.get_syslog_servers(names=[module.params["name"]])
-    exists = bool(res.status_code == 200)
+    state = module.params["state"]
+    server = _get_syslog_server(module, blade)
+    exists = server is not None
 
-    if module.params["state"] == "absent" and exists:
-        delete_syslog(module, blade)
-    elif module.params["state"] == "present" and exists:
-        update_syslog(module, blade)
-    elif module.params["state"] == "present" and not exists:
+    if state == "absent" and exists:
+        delete_syslog(module, blade, server.name)
+    elif state == "present" and exists:
+        update_syslog(module, blade, server)
+    elif state == "present":
         add_syslog(module, blade)
-    elif module.params["state"] == "test" and exists:
-        test_syslog(module, blade)
+    elif state == "test" and exists:
+        test_syslog(module, blade, server.name)
+    elif state == "test":
+        module.fail_json(
+            msg="Syslog server {0} is not configured".format(module.params["name"])
+        )
 
     module.exit_json(changed=False)
 

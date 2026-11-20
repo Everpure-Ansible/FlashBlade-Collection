@@ -97,6 +97,7 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.version import
     LooseVersion,
 )
 from ansible_collections.everpure.flashblade.plugins.module_utils.common import (
+    get_error_message,
     get_rest_api_version,
 )
 
@@ -105,6 +106,24 @@ MAC_API_VERSION = "2.16"
 CONNECTOR_API_VERSION = "2.17"
 SENSOR_API_VERSION = "2.18"
 LANES_PER_PORT_API_VERSION = "2.20"
+
+
+def _read_items(module, res, what):
+    """Return the items of a read, or fail with the answer of the array."""
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to read {0}. Error: {1}".format(what, get_error_message(res))
+        )
+    return list(res.items)
+
+
+def _get_components(module, blade, hw_type):
+    """Return the hardware components of one type."""
+    return _read_items(
+        module,
+        blade.get_hardware(filter="type='{0}'".format(hw_type)),
+        "the hardware inventory",
+    )
 
 
 def _sensor_readings(component):
@@ -140,16 +159,14 @@ def _common_fields(component, api_version):
     return fields
 
 
-def generate_connectors_dict(blade, api_version):
+def generate_connectors_dict(module, blade, api_version):
     """Return the network connector configuration keyed by connector name."""
     if LooseVersion(CONNECTOR_API_VERSION) <= LooseVersion(api_version):
         res = blade.get_network_interfaces_connectors()
     else:
         res = blade.get_hardware_connectors()
     connectors = {}
-    if res.status_code != 200:
-        return connectors
-    for connector in list(res.items):
+    for connector in _read_items(module, res, "the network connectors"):
         connectors[connector.name] = {
             "connector_type": connector.connector_type,
             "lane_speed": connector.lane_speed,
@@ -162,7 +179,7 @@ def generate_connectors_dict(blade, api_version):
     return connectors
 
 
-def generate_hardware_dict(blade):
+def generate_hardware_dict(module, blade):
     api_version = get_rest_api_version(blade)
     hw_info = {
         "modules": {},
@@ -177,7 +194,7 @@ def generate_hardware_dict(blade):
         "switch": {},
         "connectors": {},
     }
-    components = list(blade.get_hardware(filter="type='fm'").items)
+    components = _get_components(module, blade, "fm")
     for component in components:
         component_name = component.name
         hw_info["modules"][component_name] = {
@@ -190,7 +207,7 @@ def generate_hardware_dict(blade):
         hw_info["modules"][component_name].update(
             _common_fields(component, api_version)
         )
-    components = list(blade.get_hardware(filter="type='eth'").items)
+    components = _get_components(module, blade, "eth")
     for component in components:
         component_name = component.name
         hw_info["ethernet"][component_name] = {
@@ -203,7 +220,7 @@ def generate_hardware_dict(blade):
         hw_info["ethernet"][component_name].update(
             _common_fields(component, api_version)
         )
-    components = list(blade.get_hardware(filter="type='mgmt_port'").items)
+    components = _get_components(module, blade, "mgmt_port")
     for component in components:
         component_name = component.name
         hw_info["mgmt_ports"][component_name] = {
@@ -216,7 +233,7 @@ def generate_hardware_dict(blade):
         hw_info["mgmt_ports"][component_name].update(
             _common_fields(component, api_version)
         )
-    components = list(blade.get_hardware(filter="type='fan'").items)
+    components = _get_components(module, blade, "fan")
     for component in components:
         component_name = component.name
         hw_info["fans"][component_name] = {
@@ -225,7 +242,7 @@ def generate_hardware_dict(blade):
             "identify": component.identify_enabled,
         }
         hw_info["fans"][component_name].update(_common_fields(component, api_version))
-    components = list(blade.get_hardware(filter="type='fb'").items)
+    components = _get_components(module, blade, "fb")
     for component in components:
         component_name = component.name
         hw_info["blades"][component_name] = {
@@ -237,7 +254,7 @@ def generate_hardware_dict(blade):
             "identify": component.identify_enabled,
         }
         hw_info["blades"][component_name].update(_common_fields(component, api_version))
-    components = list(blade.get_hardware(filter="type='pwr'").items)
+    components = _get_components(module, blade, "pwr")
     for component in components:
         component_name = component.name
         hw_info["power"][component_name] = {
@@ -247,7 +264,7 @@ def generate_hardware_dict(blade):
             "model": component.model,
         }
         hw_info["power"][component_name].update(_common_fields(component, api_version))
-    components = list(blade.get_hardware(filter="type='xfm'").items)
+    components = _get_components(module, blade, "xfm")
     for component in components:
         component_name = component.name
         hw_info["switch"][component_name] = {
@@ -257,7 +274,7 @@ def generate_hardware_dict(blade):
             "model": component.model,
         }
         hw_info["switch"][component_name].update(_common_fields(component, api_version))
-    components = list(blade.get_hardware(filter="type='ch'").items)
+    components = _get_components(module, blade, "ch")
     for component in components:
         component_name = component.name
         hw_info["chassis"][component_name] = {
@@ -270,7 +287,7 @@ def generate_hardware_dict(blade):
         hw_info["chassis"][component_name].update(
             _common_fields(component, api_version)
         )
-    components = list(blade.get_hardware(filter="type='bay'").items)
+    components = _get_components(module, blade, "bay")
     for component in components:
         component_name = component.name
         hw_info["bays"][component_name] = {
@@ -282,7 +299,7 @@ def generate_hardware_dict(blade):
             "identify": component.identify_enabled,
         }
         hw_info["bays"][component_name].update(_common_fields(component, api_version))
-    hw_info["connectors"] = generate_connectors_dict(blade, api_version)
+    hw_info["connectors"] = generate_connectors_dict(module, blade, api_version)
 
     return hw_info
 
@@ -292,7 +309,7 @@ def main():
 
     module = AnsibleModule(argument_spec, supports_check_mode=True)
     blade = get_system(module)
-    module.exit_json(changed=False, purefb_info=generate_hardware_dict(blade))
+    module.exit_json(changed=False, purefb_info=generate_hardware_dict(module, blade))
 
 
 if __name__ == "__main__":

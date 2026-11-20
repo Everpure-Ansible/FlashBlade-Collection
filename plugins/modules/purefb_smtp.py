@@ -81,10 +81,29 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
 SMTP_ENCRYPT_API_VERSION = "2.15"
 
 
+def _get_smtp(module, blade):
+    """Return the SMTP configuration of the array.
+
+    A read the array refuses or fails is reported with the message of the
+    array.
+    """
+    res = blade.get_smtp_servers(names=["management"])
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to read the SMTP configuration. Error: {0}".format(
+                get_error_message(res)
+            )
+        )
+    items = list(res.items)
+    if not items:
+        module.fail_json(msg="The array returned no SMTP configuration.")
+    return items[0]
+
+
 def set_smtp(module, blade):
     """Configure SMTP settings"""
     changed = False
-    current_smtp = list(blade.get_smtp_servers(names=["management"]).items)[0]
+    current_smtp = _get_smtp(module, blade)
     # The array reports an unset relay host or encryption mode as null; the
     # module takes "" for "unset", so compare both sides normalised to "".
     relay_host = getattr(current_smtp, "relay_host", None) or ""

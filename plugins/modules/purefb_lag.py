@@ -27,6 +27,8 @@ options:
   name:
     description:
     - Name of the Link Aggregation Group
+    - This is the name of one LAG. A name that holds a comma, which the
+      array reads as a list of names, is refused.
     type: str
     default: uplink
   state:
@@ -114,6 +116,8 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
     get_error_message,
 )
 
+PRECONFIGURED_LAG = "uplink"
+
 
 def normalize_port(module, port):
     """Return the CHx.FMy.ETHz port names a requested port expands to
@@ -134,13 +138,54 @@ def normalize_port(module, port):
     return [f"{parts[0]}.FM1.{parts[1]}", f"{parts[0]}.FM2.{parts[1]}"]
 
 
-def get_used_ports(blade):
+def _single_name(module):
+    """Refuse a name that the array does not read as the name of one LAG
+
+    In a request the array reads a comma as a separator of names, so such a
+    name reaches several LAGs at once while only one of them is compared.
+    This module manages the one LAG that has the name given, so the name is
+    refused before anything is read.
+    """
+    name = module.params["name"]
+    if name and "," in name:
+        module.fail_json(
+            msg="name must be the name of one Link Aggregation Group: in {0} "
+            "the array reads a comma as a separator of names.".format(name)
+        )
+
+
+def _is_preconfigured(name):
+    """Tell whether name is the name of the preconfigured LAG
+
+    The array ignores white space around a name, so it is ignored here.
+    """
+    return str(name).strip().lower() == PRECONFIGURED_LAG
+
+
+def _get_lags(module, blade, name=None):
+    """Return the LAGs of the array, or only the LAG called name
+
+    A named LAG that the array says does not exist gives an empty list. Any
+    other read the array refuses or fails is reported with the message of
+    the array.
+    """
+    if name is None:
+        res = blade.get_link_aggregation_groups()
+    else:
+        res = blade.get_link_aggregation_groups(names=[name])
+    if res.status_code != 200:
+        error = get_error_message(res)
+        if name is None:
+            module.fail_json(msg="Failed to read the LAGs. Error: {0}".format(error))
+        if "does not exist" in str(error).lower():
+            return []
+        module.fail_json(msg="Failed to read LAG {0}. Error: {1}".format(name, error))
+    return list(res.items)
+
+
+def get_used_ports(module, blade):
     """Return the names of all ports currently assigned to any LAG"""
-    return [
-        port.name
-        for lag in blade.get_link_aggregation_groups().items
-        for port in (lag.ports or [])
-    ]
+    return [port.name for lag in _get_lags(module, blade) for port in (lag.ports or [])]
 
 
 def delete_lag(module, blade):
@@ -157,19 +202,16 @@ def delete_lag(module, blade):
     module.exit_json(changed=changed)
 
 
-def update_lag(module, blade):
+def update_lag(module, blade, current_lag):
     """Update Link Aggregation Group"""
     changed = False
     lagfact = []
 
     # Get current LAG ports
-    current_lag = list(
-        blade.get_link_aggregation_groups(names=[module.params["name"]]).items
-    )[0]
     used_ports = [port.name for port in (current_lag.ports or [])]
 
     # Check if any requested port is already used in other LAGs
-    all_current_ports = get_used_ports(blade)
+    all_current_ports = get_used_ports(module, blade)
     for port in module.params["ports"]:
         for norm_port in normalize_port(module, port):
             if norm_port in all_current_ports and norm_port not in used_ports:
@@ -211,7 +253,7 @@ def create_lag(module, blade):
     """Create Link Aggregation Group"""
     changed = True
     lagfact = []
-    used_ports = get_used_ports(blade)
+    used_ports = get_used_ports(module, blade)
     new_ports = []
     for lag_port in module.params["ports"]:
         for norm_port in normalize_port(module, lag_port):
@@ -265,22 +307,25 @@ def main():
     if not HAS_PYPURECLIENT:
         module.fail_json(msg="py-pure-client sdk is required for this module")
 
+    # Whatever the state, the task names one LAG.
+    _single_name(module)
     blade = get_system(module)
     state = module.params["state"]
 
-    exists = bool(
-        blade.get_link_aggregation_groups(names=[module.params["name"]]).status_code
-        == 200
-    )
+    current_lags = _get_lags(module, blade, module.params["name"])
+    exists = bool(current_lags)
     if module.params["ports"]:
         # Remove duplicates
         module.params["ports"] = list(dict.fromkeys(module.params["ports"]))
     if not exists and state == "present":
         create_lag(module, blade)
     elif exists and state == "present":
-        update_lag(module, blade)
+        update_lag(module, blade, current_lags[0])
     elif exists and state == "absent":
-        if module.params["name"].lower() == "uplink":
+        # The LAG the array returned decides, as well as the name given
+        if _is_preconfigured(module.params["name"]) or any(
+            _is_preconfigured(lag.name) for lag in current_lags
+        ):
             module.fail_json(
                 msg="Preconfigured Link Aggregation Group cannot be deleted"
             )

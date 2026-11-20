@@ -12,6 +12,9 @@ import multiprocessing
 import ctypes
 from unittest.mock import Mock, patch, MagicMock
 
+import pytest
+import yaml
+
 # Mock multiprocessing context for Windows
 if sys.platform == "win32":
     original_get_context = multiprocessing.get_context
@@ -71,6 +74,8 @@ sys.modules["ansible_collections.everpure.flashblade.plugins.module_utils.versio
 )
 
 from plugins.modules.purefb_mgmt_auth_policy import (
+    DOCUMENTATION,
+    EXAMPLES,
     main,
     _ctx,
     _validate_methods,
@@ -85,6 +90,27 @@ from plugins.modules.purefb_mgmt_auth_policy import (
     create_policy,
     update_policy,
     delete_policy,
+)
+
+MOD = "plugins.modules.purefb_mgmt_auth_policy"
+FQCN = "everpure.flashblade.purefb_mgmt_auth_policy"
+REALM_POLICY = "realm1::ssh-mfa"
+REALM_ADMIN = "realm1::alice"
+# Answers of the array, as Purity//FB 4.8.8 sends them
+NO_POLICY = "Management authentication policy does not exist."
+NAME_RULE = (
+    "Management Authentication Policy name must be between 1 and 63 "
+    "characters (alphanumeric, '_' and '-') in length and begin and end "
+    "with a letter or number. The name must include at least one letter."
+)
+NO_ADMIN = "Admin does not exist."
+NOT_PERMITTED = "Operation not permitted."
+WRITES = (
+    "post_management_authentication_policies",
+    "patch_management_authentication_policies",
+    "delete_management_authentication_policies",
+    "post_management_authentication_policies_members",
+    "delete_management_authentication_policies_members",
 )
 
 
@@ -142,6 +168,45 @@ def _ok_response(items=None):
     response.status_code = 200
     response.items = items if items is not None else []
     return response
+
+
+def _refused(message, status_code=400):
+    """Error answer of the array: one message and, like the SDK's
+    ErrorResponse, no items."""
+    response = Mock(spec=["status_code", "errors"])
+    response.status_code = status_code
+    error = Mock()
+    error.message = message
+    response.errors = [error]
+    return response
+
+
+def _first_message(response):
+    """Stand-in for get_error_message (module_utils is mocked here)."""
+    return response.errors[0].message
+
+
+def _run_main(module, blade, api_version="2.30"):
+    """Run main() with the given module and client mocks."""
+    patches = (
+        patch(MOD + ".AnsibleModule", return_value=module),
+        patch(MOD + ".get_system", return_value=blade),
+        patch(MOD + ".get_rest_api_version", return_value=api_version),
+        patch(
+            MOD + ".LooseVersion",
+            side_effect=lambda v: tuple(int(p) for p in v.split(".")),
+        ),
+        patch(MOD + ".get_error_message", side_effect=_first_message),
+    )
+    for item in patches:
+        item.start()
+    try:
+        main()
+    except SystemExit:
+        pass
+    finally:
+        for item in patches:
+            item.stop()
 
 
 def _members_side_effect(policy_members, member_policy_map):
@@ -1112,3 +1177,200 @@ class TestPurefbMgmtAuthPolicy:
         except SystemExit:
             pass
         mock_module.exit_json.assert_called_once_with(changed=False)
+
+    # ==== realms: policies and admins are array-level objects ====
+
+    def test_documentation_says_policies_are_array_level(self):
+        """The description says that a policy cannot be placed in a realm
+        and who can manage policies"""
+        doc = yaml.safe_load(DOCUMENTATION)
+        text = " ".join(doc["description"])
+        assert "array-level objects" in text
+        assert "cannot be placed in a realm" in text
+        assert "limited to a realm" in text
+        assert "array-wide access" in text
+
+    def test_documentation_name_has_no_realm_form(self):
+        """The name option says that the array refuses realm::name"""
+        doc = yaml.safe_load(DOCUMENTATION)
+        text = " ".join(doc["options"]["name"]["description"])
+        assert "refuses a realm-qualified name" in text
+        assert "C(realm::name)" in text
+
+    def test_documentation_member_names_have_no_realm_prefix(self):
+        """The member name says that an admin is named without a realm"""
+        doc = yaml.safe_load(DOCUMENTATION)
+        member = doc["options"]["members"]["suboptions"]["name"]
+        text = " ".join(member["description"])
+        assert "without a realm prefix" in text
+        assert "management access policies" in text
+        assert "C(realm::name)" in text
+
+    def test_examples_use_no_realm_qualified_name(self):
+        """No example shows a name the array refuses"""
+        tasks = yaml.safe_load(EXAMPLES)
+        assert tasks
+        for task in tasks:
+            args = task[FQCN]
+            assert "::" not in args["name"]
+            for member in args.get("members") or []:
+                assert "::" not in member["name"]
+
+    def test_realm_qualified_name_goes_to_the_array_as_given(self):
+        """A realm-qualified name is neither stripped nor completed: the
+        array is asked for that very name and its name rule refuses the
+        create, which is reported with the message of the array"""
+        module = _mock_module(
+            name=REALM_POLICY, ssh_allowed_methods=["password", "key"]
+        )
+        blade = Mock()
+        blade.get_management_authentication_policies.return_value = _refused(NO_POLICY)
+        blade.post_management_authentication_policies.return_value = _refused(NAME_RULE)
+        _run_main(module, blade)
+        blade.get_management_authentication_policies.assert_called_once_with(
+            names=[REALM_POLICY]
+        )
+        post = blade.post_management_authentication_policies
+        post.assert_called_once()
+        assert post.call_args[1]["names"] == [REALM_POLICY]
+        module.fail_json.assert_called_once_with(
+            msg="Failed to create policy {0}. Error: {1}".format(
+                REALM_POLICY, NAME_RULE
+            )
+        )
+        module.exit_json.assert_not_called()
+        blade.get_management_authentication_policies_members.assert_not_called()
+        blade.post_management_authentication_policies_members.assert_not_called()
+
+    def test_realm_qualified_name_absent_is_unchanged(self):
+        """state=absent on a realm-qualified name: the array knows no such
+        policy, so nothing is deleted and nothing changes"""
+        module = _mock_module(name=REALM_POLICY, state="absent")
+        blade = Mock()
+        blade.get_management_authentication_policies.return_value = _refused(NO_POLICY)
+        _run_main(module, blade)
+        blade.get_management_authentication_policies.assert_called_once_with(
+            names=[REALM_POLICY]
+        )
+        module.exit_json.assert_called_once_with(changed=False)
+        module.fail_json.assert_not_called()
+        blade.get_management_authentication_policies_members.assert_not_called()
+        for write in WRITES:
+            getattr(blade, write).assert_not_called()
+
+    @pytest.mark.parametrize(
+        "name, state, check_mode",
+        [
+            ("ssh-mfa", "present", False),
+            ("ssh-mfa", "present", True),
+            ("ssh-mfa", "absent", False),
+            ("ssh-mfa", "absent", True),
+            (REALM_POLICY, "present", False),
+            (REALM_POLICY, "present", True),
+            (REALM_POLICY, "absent", False),
+            (REALM_POLICY, "absent", True),
+        ],
+    )
+    def test_refused_read_fails_with_the_answer_of_the_array(
+        self, name, state, check_mode
+    ):
+        """An administrator whose access is limited to a realm is refused
+        the read of a policy. The task fails with the message of the array
+        in every state and mode, never reads that as an absent policy and
+        writes nothing"""
+        module = _mock_module(
+            name=name,
+            state=state,
+            ssh_allowed_methods=["key"],
+            members=[{"name": "alice", "type": "admin"}],
+        )
+        module.check_mode = check_mode
+        blade = Mock()
+        blade.get_management_authentication_policies.return_value = _refused(
+            NOT_PERMITTED
+        )
+        _run_main(module, blade)
+        blade.get_management_authentication_policies.assert_called_once_with(
+            names=[name]
+        )
+        module.fail_json.assert_called_once_with(
+            msg="Failed to read policy {0}. Error: {1}".format(name, NOT_PERMITTED)
+        )
+        module.exit_json.assert_not_called()
+        blade.get_admins.assert_not_called()
+        blade.get_management_authentication_policies_members.assert_not_called()
+        for write in WRITES:
+            getattr(blade, write).assert_not_called()
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_member_with_realm_prefix_matches_no_admin(self, check_mode):
+        """Admins are array-level objects: a realm-qualified member name is
+        looked up as given, the array knows no such admin and the task
+        fails before any write, in check mode too"""
+        module = _mock_module(members=[{"name": REALM_ADMIN, "type": "admin"}])
+        module.check_mode = check_mode
+        blade = Mock()
+        blade.get_management_authentication_policies_members.side_effect = (
+            _members_side_effect([], {})
+        )
+        blade.get_admins.return_value = _refused(NO_ADMIN)
+        with patch(MOD + ".get_error_message", side_effect=_first_message):
+            try:
+                reconcile_members(module, blade, {})
+            except SystemExit:
+                pass
+        blade.get_admins.assert_called_once_with(names=[REALM_ADMIN])
+        module.fail_json.assert_called_once_with(
+            msg=(
+                "Member admin {0} does not exist or could not be verified. "
+                "Error: {1}"
+            ).format(REALM_ADMIN, NO_ADMIN)
+        )
+        for write in WRITES:
+            getattr(blade, write).assert_not_called()
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_admin_limited_to_a_realm_is_a_member_by_plain_name(self, check_mode):
+        """The scope of an admin's management access policies plays no
+        part: the admin is read and attached under its plain name"""
+        module = _mock_module(members=[{"name": "realm1-admin", "type": "admin"}])
+        module.check_mode = check_mode
+        blade = Mock()
+        admin = Mock()
+        admin.name = "realm1-admin"
+        realm_policy = Mock()
+        realm_policy.name = "realm1-admins"
+        admin.management_access_policies = [realm_policy]
+        blade.get_admins.return_value = _ok_response([admin])
+        blade.get_management_authentication_policies_members.side_effect = (
+            _members_side_effect([], {})
+        )
+        post = blade.post_management_authentication_policies_members
+        post.return_value = _ok_response()
+        assert reconcile_members(module, blade, {}) is True
+        blade.get_admins.assert_called_once_with(names=["realm1-admin"])
+        module.fail_json.assert_not_called()
+        if check_mode:
+            post.assert_not_called()
+        else:
+            post.assert_called_once_with(
+                policy_names=["ssh-mfa"],
+                member_names=["realm1-admin"],
+                member_types=["admins"],
+            )
+
+    def test_attached_realm_admin_is_unchanged_on_rerun(self):
+        """An attached admin whose access is limited to a realm reads back
+        under its plain name, so a second run changes nothing"""
+        module = _mock_module(members=[{"name": "realm1-admin", "type": "admin"}])
+        blade = Mock()
+        blade.get_management_authentication_policies_members.side_effect = (
+            _members_side_effect(
+                [_member_item("ssh-mfa", "admins", "realm1-admin")],
+                {"realm1-admin": "ssh-mfa"},
+            )
+        )
+        assert reconcile_members(module, blade, {}) is False
+        blade.get_admins.assert_not_called()
+        for write in WRITES:
+            getattr(blade, write).assert_not_called()

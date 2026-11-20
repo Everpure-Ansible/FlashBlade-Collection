@@ -28,6 +28,10 @@ description:
   policy is attached to.
 - A member can be attached to at most one management authentication policy
   at a time; the array does not move members between policies implicitly.
+- Management authentication policies are array-level objects and cannot be
+  placed in a realm. An administrator whose access is limited to a realm
+  may not read or change them; run this module as an administrator with
+  array-wide access.
 author:
 - Pure Storage Ansible Team (@avk) <pure-ansible-team@everpuredata.com>
 notes:
@@ -49,6 +53,7 @@ options:
   name:
     description:
     - Name of the management authentication policy.
+    - The array refuses a realm-qualified name (C(realm::name)).
     type: str
     required: true
   state:
@@ -104,6 +109,9 @@ options:
         description:
         - Name of the member (a local admin name, or the FlashBlade array
           name for I(type=array)).
+        - An admin is named without a realm prefix, whatever the scope of
+          its management access policies. Admins are array-level objects,
+          so a realm-qualified name (C(realm::name)) matches no admin.
         type: str
         required: true
       type:

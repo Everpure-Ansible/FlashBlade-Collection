@@ -1,0 +1,13 @@
+bugfixes:
+  - purefb_bucket - a task acted on a bucket of the same name outside the realm of ``account``, or
+    in another account. ``name`` and ``account`` must now be in the same realm, and the task fails
+    with nothing changed when the bucket belongs to another account.
+  - purefb_bucket - a create the array refuses fails with the array's message; it no longer tries
+    to destroy a bucket of that name and no longer ends in a traceback. A read the array refuses is
+    reported instead of being taken for a missing bucket or account.
+  - purefb_bucket - a bucket created without ``quota`` or ``hard_limit`` takes the bucket defaults
+    of its object store account instead of the account's own quota and hard limit, and ``quota``
+    set to ``0`` creates an unlimited bucket.
+  - purefb_bucket - a ``name`` that is a comma-separated list of names is refused before the array
+    is contacted. The array changes one bucket name at a time, so check mode predicted a change
+    that the task could not make.

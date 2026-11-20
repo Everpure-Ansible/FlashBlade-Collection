@@ -1,0 +1,8 @@
+bugfixes:
+  - purefb_bucket_access - a bucket access policy rule on a bucket in a realm (``realm::bucket``)
+    is now recognised once it exists. The array stores the rule resources without the realm, so
+    the task failed on the run that created the rule and on every later run.
+  - purefb_bucket_access - a bucket name given in another letter case than the array stores no
+    longer prevents a bucket access policy rule from being created or recognised.
+  - purefb_bucket_access - a failed read of the bucket is reported with the array's message
+    unless the bucket is missing or destroyed.

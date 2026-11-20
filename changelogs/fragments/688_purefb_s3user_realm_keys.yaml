@@ -1,0 +1,20 @@
+bugfixes:
+  - purefb_s3user - ``state=keystate`` and ``state=remove_key`` now refuse an access key that
+    belongs to another user instead of disabling or deleting it.
+  - purefb_s3user - for a user of an account in a realm, an access key ID given without the realm
+    prefix in ``key_name`` or ``imported_key`` is now resolved in the realm of ``account``. A key
+    name of another realm is refused.
+  - purefb_s3user - ``state=keystate`` now reports its change in check mode, requires ``key_name``
+    and fails when the user or the access key does not exist.
+  - purefb_s3user - a new user that imports an access key ID held by another user now fails before
+    the user is created, in check mode too.
+  - purefb_s3user - a read that the array refuses (account, user, access keys, access policies of
+    the user) now fails with the error of the array instead of being taken for a missing object or
+    ending in a traceback. User names are compared without regard to case when access keys are
+    counted.
+  - purefb_s3user - a comma-separated list in ``name``, ``account``, ``key_name`` or
+    ``imported_key`` and an empty ``name``, ``account`` or ``key_name`` are now refused before
+    any object is read, in check mode too. The array changes one user or access key per request.
+minor_changes:
+  - purefb_s3user - ``s3user_info`` now also returns ``access_key_id``, the access key ID without
+    the realm prefix that ``access_id`` carries for a user in a realm.

@@ -23,6 +23,9 @@ description:
 - Create, enable, disable and delete FlashBlade API Clients.
 - The management access policies of an API client are fixed when the client
   is created. Delete and recreate the client to change them.
+- API clients are array-level objects and cannot be placed in a realm. An
+  administrator whose access is limited to a realm may not read or change
+  them; run this module as an administrator with array-wide access.
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 notes:
@@ -34,6 +37,8 @@ options:
   name:
     description:
     - Name of the API Client
+    - The name takes no realm prefix. A realm-qualified name
+      (C(realm::name)) is refused.
     type: str
     required: true
   state:
@@ -48,6 +53,14 @@ options:
       this API client.
     - The bearer of an access token may perform actions within the intersection
       of these policies and those of the array user named in the token.
+    - The realm scope of a token comes from the policies of the user named
+      in it. A policy whose rules are scoped to a realm is accepted
+      here, but it does not confine the tokens of this API client to that
+      realm. On Purity//FB 4.8.8 a token issued to a user whose own policies
+      are array-wide still reads objects outside the realm. To confine a
+      token to a realm, give the user named in it only policies whose rules
+      are scoped to that realm.
+    - Policies are array-level objects and are named without a realm prefix.
     - The built-in policies are C(readonly), C(ops_admin), C(storage_admin) and
       C(array_admin). Custom policies are managed by
       M(everpure.flashblade.purefb_mgmt_policy).

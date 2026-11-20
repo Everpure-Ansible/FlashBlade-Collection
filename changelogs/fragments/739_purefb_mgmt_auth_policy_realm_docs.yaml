@@ -1,0 +1,5 @@
+bugfixes:
+  - purefb_mgmt_auth_policy - documentation says that management authentication policies and
+    their members are array-level objects. The array refuses a realm-qualified policy name, an
+    admin is named without a realm prefix, and an administrator limited to a realm cannot read
+    or change the policies.

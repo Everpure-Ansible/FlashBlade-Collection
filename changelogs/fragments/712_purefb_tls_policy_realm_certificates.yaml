@@ -1,0 +1,20 @@
+bugfixes:
+  - purefb_tls_policy - the failure of a create without ``appliance_certificate`` and the option
+    text no longer advise ``global`` for a policy in a realm, which the array refuses. They name a
+    certificate of that realm, written ``realm::certificate``.
+  - purefb_tls_policy - a certificate or certificate group outside the realm of the policy,
+    ``global`` on a policy in a realm included, and a new policy in a realm that does not exist or
+    is destroyed are refused before anything is written. Before, check mode reported a change
+    that the array refuses.
+  - purefb_tls_policy - a ``name`` with a ``*`` or a comma, which the array reads as a pattern or
+    as a list of names, is refused. Only the policy that has the given name is changed or deleted.
+  - purefb_tls_policy - a certificate, certificate group or network interface written in another
+    letter case than the array stores is no longer sent as a change on every run.
+  - purefb_tls_policy - a policy in a realm named in another letter case than the array stores
+    could not be created, or given another certificate or certificate group, because the array
+    compares their realm with the realm prefix as it is written. Requests now carry the name as
+    the array stores it.
+  - purefb_tls_policy - a read that the array refuses is reported with the error of the array
+    instead of being taken for a missing policy or a policy without interfaces.
+  - purefb_tls_policy - documentation and one example name a policy in a realm, its certificates
+    and its network interfaces as ``realm::name``.

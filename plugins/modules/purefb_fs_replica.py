@@ -40,6 +40,9 @@ options:
       - Local Filesystem Name.
       - A file system in a realm is named C(realm::name). The same name
         without the realm is a different file system at the array level.
+      - This is the name of one file system. A I(name), I(target_array),
+        I(target_fs) or I(policy) that holds a C(*) or a comma, which the
+        array reads as a pattern or as a list of names, is refused.
     required: true
     type: str
   state:
@@ -59,6 +62,7 @@ options:
         address of a connected array (see
         M(everpure.flashblade.purefb_connect)). The name of a remote realm
         is not accepted.
+      - The name of the array is not case sensitive.
       - When the local filesystem replicates to several arrays (fan-out),
         this selects the replica link the module acts on.
     required: false
@@ -219,16 +223,73 @@ DELETE_RL_API_VERSION = "2.10"
 LINK_TYPE_API_VERSION = "2.17"
 REMOTE_EXPORTS_API_VERSION = "2.25"
 PARTIAL_REPLICA = "partial-replica"
+CONNECTED = ("connected", "connecting", "partially_connected")
+
+
+def _realm_of(name):
+    """Return the realm of a realm::name name, empty for an array-level name."""
+    return name.rpartition("::")[0]
+
+
+def _same_name(first, second):
+    """Return True when the array reads both names as the same name.
+
+    The array matches names without regard to case. A name the array did
+    not return is the same as no name.
+    """
+    return (first or "").lower() == (second or "").lower()
+
+
+def _check_names(module):
+    """Take name, target_array, target_fs and policy as one name each.
+
+    In a look-up the array reads * in a name as a pattern and a comma as a
+    separator of names, and answers with every object that matches, so a
+    task with such a name would go on with the first of several file
+    systems, replica links or policies. It is refused before anything is
+    read. The array ignores blanks around a name; they are removed here
+    because target_array is compared in the module.
+    """
+    options = ("name", "target_array", "target_fs", "policy")
+    for option in options:
+        if module.params[option]:
+            module.params[option] = module.params[option].strip()
+    if not module.params["name"]:
+        module.fail_json(msg="name is empty; it takes the name of one file system.")
+    for option in options:
+        value = module.params[option]
+        if value and ("*" in value or "," in value):
+            module.fail_json(
+                msg="{0} {1} is not one name: the array reads * as a pattern "
+                "and a comma as a separator of names.".format(option, value)
+            )
+
+
+def _items(module, res, what, absent_ok=False):
+    """Return the items a read answered with.
+
+    A read that does not answer 200 fails the task with the array's message,
+    so a refused read is never a traceback and never taken for a missing
+    object. With absent_ok the array's "does not exist" is an empty list:
+    only that answer means absent.
+    """
+    if res.status_code == 200:
+        return list(res.items)
+    error = get_error_message(res)
+    if not (absent_ok and "does not exist" in str(error).lower()):
+        module.fail_json(msg="Failed to read {0}. Error: {1}".format(what, error))
+    return []
 
 
 def get_local_fs(module, blade):
     """Return Filesystem or None"""
-    res = blade.get_file_systems(names=[module.params["name"]])
-    if res.status_code == 200:
-        items = list(res.items)
-        if items:
-            return items[0]
-    return None
+    items = _items(
+        module,
+        blade.get_file_systems(names=[module.params["name"]]),
+        "file system {0}".format(module.params["name"]),
+        absent_ok=True,
+    )
+    return items[0] if items else None
 
 
 def get_local_rl(module, blade):
@@ -238,25 +299,27 @@ def get_local_rl(module, blade):
     is given, only the link to that array counts; otherwise the first link
     is used, as before.
     """
-    res = blade.get_file_system_replica_links(
-        local_file_system_names=[module.params["name"]]
+    links = _items(
+        module,
+        blade.get_file_system_replica_links(
+            local_file_system_names=[module.params["name"]]
+        ),
+        "the replica links of file system {0}".format(module.params["name"]),
+        absent_ok=True,
     )
-    if res.status_code != 200:
-        return None
-    links = list(res.items)
     if not links:
         return None
     target = module.params["target_array"]
     if not target:
         return links[0]
     for link in links:
-        if link.remote.name == target:
+        if _same_name(link.remote.name, target):
             return link
     # target_array may be the management address rather than the array name
     remote_array = _check_connected(module, blade)
     if remote_array:
         for link in links:
-            if link.remote.name == remote_array.remote.name:
+            if _same_name(link.remote.name, remote_array.remote.name):
                 return link
     return None
 
@@ -268,39 +331,48 @@ def _rl_has_policy(module, blade, link):
         policy_names=[module.params["policy"]],
         remote_names=[link.remote.name],
     )
-    if res.status_code != 200:
-        return False
-    return bool(list(res.items))
+    return bool(
+        _items(
+            module,
+            res,
+            "the policies of the replica link from {0} to {1}".format(
+                module.params["name"], link.remote.name
+            ),
+            absent_ok=True,
+        )
+    )
 
 
-def _realm_of(name):
-    """Return the realm of a realm::name name, empty for an array-level name."""
-    return name.rpartition("::")[0]
+def _check_policy(module, blade):
+    """Fail unless policy is the name of a snapshot policy the array has."""
+    policy = module.params["policy"]
+    if not _items(
+        module,
+        blade.get_policies(names=[policy]),
+        "policy {0}".format(policy),
+        absent_ok=True,
+    ):
+        module.fail_json(msg="Selected policy {0} does not exist.".format(policy))
 
 
 def _array_connections(module, blade):
     """Return the array connections this identity can see."""
-    res = blade.get_array_connections()
-    if res.status_code != 200:
-        module.fail_json(
-            msg="Failed to read the array connections. Error: {0}".format(
-                get_error_message(res)
-            )
-        )
-    return list(res.items)
+    return _items(module, blade.get_array_connections(), "the array connections")
 
 
 def _connected_target(module, connections):
-    """Return the usable array connection target_array names, or None."""
+    """Return the usable array connection target_array names, or None.
+
+    The connection carries the name the array has for the remote array, so
+    a target given in another letter case, or by its management address, is
+    addressed by that name.
+    """
+    wanted = module.params["target_array"]
     for target in connections:
         if (
-            target.remote.name == module.params["target_array"]
-            or target.management_address == module.params["target_array"]
-        ) and target.status in [
-            "connected",
-            "connecting",
-            "partially_connected",
-        ]:
+            _same_name(target.remote.name, wanted)
+            or _same_name(target.management_address, wanted)
+        ) and target.status in CONNECTED:
             return target
     return None
 
@@ -496,6 +568,7 @@ def main():
     if not HAS_PYPURECLIENT:
         module.fail_json(msg="py-pure-client sdk is required for this module")
 
+    _check_names(module)
     state = module.params["state"]
     policy = module.params["policy"]
     link_type = module.params["link_type"]
@@ -528,15 +601,13 @@ def main():
     if link_type == PARTIAL_REPLICA and policy:
         module.fail_json(msg="Policies cannot be attached to partial-replica links")
 
-    local_fs = get_local_fs(module, blade)
-    local_replica_link = get_local_rl(module, blade)
-
-    if not local_fs:
+    if not get_local_fs(module, blade):
         module.fail_json(
             msg="Selected local filesystem {0} does not exist.".format(
                 module.params["name"]
             )
         )
+    local_replica_link = get_local_rl(module, blade)
 
     existing_type = None
     if local_replica_link:
@@ -561,9 +632,7 @@ def main():
     if policy:
         # Replica link policies are snapshot policies; validate against the
         # policies collection, not against links the policy is attached to.
-        res = blade.get_policies(names=[policy])
-        if res.status_code != 200:
-            module.fail_json(msg="Selected policy {0} does not exist.".format(policy))
+        _check_policy(module, blade)
 
     if replicate_now:
         if not local_replica_link:

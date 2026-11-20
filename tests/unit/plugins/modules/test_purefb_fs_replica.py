@@ -138,7 +138,7 @@ def _blade(fs_exists=True, links=None, connections=None, policy_attached=False):
     blade.get_file_systems.return_value = _response(items=[Mock()] if fs_exists else [])
     blade.get_file_system_replica_links.return_value = _response(items=links or [])
     blade.get_array_connections.return_value = _response(items=connections or [])
-    blade.get_policies.return_value = _response()
+    blade.get_policies.return_value = _response(items=[Mock()])
     blade.get_file_system_replica_links_policies.return_value = _response(
         items=[Mock()] if policy_attached else []
     )
@@ -153,6 +153,14 @@ def _blade(fs_exists=True, links=None, connections=None, policy_attached=False):
     return blade
 
 
+def _error_text(res, default="Unknown error"):
+    """What get_error_message returns: the first message of an error response."""
+    errors = getattr(res, "errors", None)
+    if isinstance(errors, list) and errors:
+        return errors[0].message
+    return default
+
+
 def _run_main(module, blade, api_version="2.30"):
     """Run main() with the module, SDK client and REST version patched in."""
     with patch(MODULE + ".AnsibleModule", return_value=module), patch(
@@ -161,6 +169,8 @@ def _run_main(module, blade, api_version="2.30"):
         MODULE + ".LooseVersion", RealLooseVersion
     ), patch(
         MODULE + ".HAS_PYPURECLIENT", True
+    ), patch(
+        MODULE + ".get_error_message", side_effect=_error_text
     ):
         with pytest.raises(SystemExit):
             main()
@@ -208,11 +218,24 @@ class TestGetLocalRl:
         blade = _blade(links=[_link("arrayB")])
         assert get_local_rl(module, blade) is None
 
-    def test_returns_none_on_api_error(self):
+    def test_returns_none_when_the_file_system_does_not_exist(self):
+        """The array answers a missing file system with an error, not a list"""
         module = _module(_params())
         blade = _blade()
-        blade.get_file_system_replica_links.return_value = _response(status=400)
-        assert get_local_rl(module, blade) is None
+        blade.get_file_system_replica_links.return_value = _refused(
+            400, "File system does not exist."
+        )
+        with patch(MODULE + ".get_error_message", side_effect=_error_text):
+            assert get_local_rl(module, blade) is None
+        module.fail_json.assert_not_called()
+
+    def test_finds_the_link_in_another_letter_case(self):
+        """The array matches the name of the remote array in any letter case"""
+        links = [_link("arrayB"), _link("arrayC")]
+        module = _module(_params(target_array="ARRAYC"))
+        blade = _blade(links=links)
+        assert get_local_rl(module, blade) is links[1]
+        blade.get_array_connections.assert_not_called()
 
 
 class TestCreate:
@@ -515,9 +538,10 @@ class TestPoliciesAndDelete:
     def test_add_policy_unknown_policy(self):
         module = _module(_params(policy="nope"))
         blade = _blade(links=[_link()])
-        blade.get_policies.return_value = _response(status=400)
+        blade.get_policies.return_value = _refused(400, "Policy does not exist.")
         _run_main(module, blade)
-        assert "does not exist" in _fail_msg(module)
+        assert _fail_msg(module) == "Selected policy nope does not exist."
+        blade.post_file_system_replica_links_policies.assert_not_called()
 
     def test_remove_policy(self):
         module = _module(_params(policy="daily", state="absent"))
@@ -791,3 +815,194 @@ class TestRealmNames:
         blade.get_array_connections.assert_not_called()
         blade.delete_file_system_replica_links.assert_not_called()
         module.exit_json.assert_called_once_with(changed=False)
+
+
+class TestTargetArrayLetterCase:
+    """The array matches the name of a connected array in any letter case"""
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    def test_create_uses_the_name_the_array_has(self, check_mode):
+        module = _module(_params(target_array="ARRAYB"), check_mode=check_mode)
+        blade = _blade(connections=[_connection("arrayB")])
+        _run_main(module, blade)
+        module.fail_json.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+        if check_mode:
+            blade.post_file_system_replica_links.assert_not_called()
+        else:
+            kwargs = blade.post_file_system_replica_links.call_args.kwargs
+            assert kwargs["remote_names"] == ["arrayB"]
+
+    def test_existing_link_is_not_created_again(self):
+        module = _module(_params(target_array="ARRAYB"))
+        blade = _blade(links=[_link("arrayB")], connections=[_connection("arrayB")])
+        _run_main(module, blade)
+        blade.get_array_connections.assert_not_called()
+        blade.post_file_system_replica_links.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+    def test_delete_selects_the_link(self):
+        links = [_link("arrayB"), _link("arrayC", remote_fs="fs1-c")]
+        module = _module(_params(state="absent", target_array="ArrayC"))
+        blade = _blade(links=links)
+        _run_main(module, blade)
+        blade.delete_file_system_replica_links.assert_called_once_with(
+            local_file_system_names=["fs1"],
+            remote_file_system_names=["fs1-c"],
+            remote_names=["arrayC"],
+            cancel_in_progress_transfers=False,
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_another_array_is_still_not_connected(self):
+        module = _module(_params(target_array="ARRAYZ"))
+        blade = _blade(connections=[_connection("arrayB")])
+        _run_main(module, blade)
+        assert _fail_msg(module) == "Target array ARRAYZ is not connected"
+        blade.post_file_system_replica_links.assert_not_called()
+
+
+ONE_NAME = "{0} {1} is not one name: the array reads * as a pattern and a comma as a separator of names."
+
+
+class TestOneNamePerOption:
+    """A pattern or a list is refused before anything is read"""
+
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    @pytest.mark.parametrize(
+        "option,value",
+        [
+            ("name", "fs*"),
+            ("name", "fs1,fs2"),
+            ("name", "rzaudit::*"),
+            ("target_array", "array*"),
+            ("target_array", "arrayB,arrayC"),
+            ("target_fs", "fs1,fs2"),
+            ("policy", "dai*"),
+            ("policy", "daily,weekly"),
+        ],
+    )
+    def test_pattern_or_list_is_refused(self, option, value, state):
+        params = _params(target_array="arrayB", state=state)
+        params[option] = value
+        module = _module(params, check_mode=True)
+        blade = _blade(links=[_link()], connections=[_connection()])
+        _run_main(module, blade)
+        assert _fail_msg(module) == ONE_NAME.format(option, value)
+        assert blade.mock_calls == []
+        module.exit_json.assert_not_called()
+
+    @pytest.mark.parametrize("name", ["", "   "])
+    def test_empty_name_is_refused(self, name):
+        module = _module(_params(name=name, target_array="arrayB"))
+        blade = _blade(connections=[_connection()])
+        _run_main(module, blade)
+        assert _fail_msg(module) == (
+            "name is empty; it takes the name of one file system."
+        )
+        assert blade.mock_calls == []
+
+    def test_blanks_around_names_are_dropped(self):
+        """The array ignores blanks around a name; target_array is compared here"""
+        module = _module(
+            _params(
+                name=" fs1 ",
+                target_array=" arrayB ",
+                target_fs=" fs1-dr ",
+                policy=" daily ",
+            )
+        )
+        blade = _blade(connections=[_connection()])
+        _run_main(module, blade)
+        blade.get_file_systems.assert_called_once_with(names=["fs1"])
+        blade.get_policies.assert_called_once_with(names=["daily"])
+        kwargs = blade.post_file_system_replica_links.call_args.kwargs
+        assert kwargs["local_file_system_names"] == ["fs1"]
+        assert kwargs["remote_file_system_names"] == ["fs1-dr"]
+        assert kwargs["remote_names"] == ["arrayB"]
+        module.exit_json.assert_called_once_with(changed=True)
+
+
+class TestRefusedReads:
+    """Only "does not exist" means absent; any other answer is reported"""
+
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    def test_file_system_read(self, state):
+        module = _module(_params(target_array="arrayB", state=state))
+        blade = _blade(links=[_link()], connections=[_connection()])
+        blade.get_file_systems.return_value = _refused()
+        _run_main(module, blade)
+        assert _fail_msg(module) == (
+            "Failed to read file system fs1. Error: Operation not permitted."
+        )
+        blade.get_file_system_replica_links.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    def test_missing_file_system_reads_no_link(self):
+        module = _module(_params(target_array="arrayB"))
+        blade = _blade(connections=[_connection()])
+        blade.get_file_systems.return_value = _refused(
+            400, "File system does not exist."
+        )
+        _run_main(module, blade)
+        assert _fail_msg(module) == "Selected local filesystem fs1 does not exist."
+        blade.get_file_system_replica_links.assert_not_called()
+
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    def test_replica_link_read(self, state):
+        module = _module(_params(target_array="arrayB", state=state))
+        blade = _blade(connections=[_connection()])
+        blade.get_file_system_replica_links.return_value = _refused()
+        _run_main(module, blade)
+        assert _fail_msg(module) == (
+            "Failed to read the replica links of file system fs1. "
+            "Error: Operation not permitted."
+        )
+        blade.post_file_system_replica_links.assert_not_called()
+        blade.delete_file_system_replica_links.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    def test_link_policy_read(self, state):
+        module = _module(_params(policy="daily", state=state))
+        blade = _blade(links=[_link()], policy_attached=True)
+        blade.get_file_system_replica_links_policies.return_value = _refused()
+        _run_main(module, blade)
+        assert _fail_msg(module) == (
+            "Failed to read the policies of the replica link from fs1 to arrayB. "
+            "Error: Operation not permitted."
+        )
+        blade.post_file_system_replica_links_policies.assert_not_called()
+        blade.delete_file_system_replica_links_policies.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    def test_link_policy_that_does_not_exist_is_not_attached(self):
+        module = _module(_params(policy="daily", state="absent"))
+        blade = _blade(links=[_link()])
+        blade.get_file_system_replica_links_policies.return_value = _refused(
+            400, "Policy does not exist."
+        )
+        _run_main(module, blade)
+        module.fail_json.assert_not_called()
+        blade.delete_file_system_replica_links_policies.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=False)
+
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    def test_policy_read(self, state):
+        module = _module(_params(policy="daily", state=state))
+        blade = _blade(links=[_link()], policy_attached=True)
+        blade.get_policies.return_value = _refused()
+        _run_main(module, blade)
+        assert _fail_msg(module) == (
+            "Failed to read policy daily. Error: Operation not permitted."
+        )
+        blade.post_file_system_replica_links_policies.assert_not_called()
+        blade.delete_file_system_replica_links_policies.assert_not_called()
+
+    def test_policy_answered_without_items_does_not_exist(self):
+        module = _module(_params(policy="daily"))
+        blade = _blade(links=[_link()])
+        blade.get_policies.return_value = _response()
+        _run_main(module, blade)
+        assert _fail_msg(module) == "Selected policy daily does not exist."
+        blade.post_file_system_replica_links_policies.assert_not_called()

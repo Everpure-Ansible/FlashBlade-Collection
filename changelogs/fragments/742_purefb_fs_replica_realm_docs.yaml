@@ -1,7 +1,15 @@
 bugfixes:
-  - purefb_fs_replica - a refused read of the array connections is reported with the message of
-    the array instead of a traceback.
+  - purefb_fs_replica - a read the array refuses is reported with the message of the array. A
+    refused read of the array connections ended in a traceback, and any other refused read was
+    taken to mean that the file system, the replica link or the policy does not exist.
   - purefb_fs_replica - the refusal of a target that is not a connected array says when no array
     connection is visible to the identity, as for a realm-scoped administrator, and that a remote
     realm is not supported as the target of a file system in a realm. The ``realm::name`` form of
     ``name`` and ``policy`` and the supported targets are documented.
+  - purefb_fs_replica - a ``target_array`` written in another letter case than the array has for
+    the connected array was reported as not connected, and an existing replica link to it was not
+    found. The name is now matched as the array matches it.
+  - purefb_fs_replica - a ``name``, ``target_array``, ``target_fs`` or ``policy`` that holds ``*``
+    or a comma is refused, and so is an empty ``name``. The array reads them as a pattern and as
+    a list of names in a look-up, so such a task went on with the first of several file systems,
+    replica links or policies. Blanks around these names are ignored, as the array ignores them.

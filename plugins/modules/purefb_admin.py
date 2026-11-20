@@ -73,6 +73,25 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
 )
 
 
+def _get_settings(module, blade):
+    """Return the Global Admin settings.
+
+    A read the array refuses or fails is reported with the message of the
+    array.
+    """
+    res = blade.get_admins_settings()
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to read Global Admin settings. Error: {0}".format(
+                get_error_message(res)
+            )
+        )
+    items = list(res.items)
+    if not items:
+        module.fail_json(msg="The array returned no Global Admin settings.")
+    return items[0]
+
+
 def main():
     argument_spec = purefb_argument_spec()
     argument_spec.update(
@@ -101,7 +120,7 @@ def main():
     changed = False
     # Settings that are omitted keep their current value; the array reports
     # a disabled lockout rule as an absent (null) field.
-    current_settings = list(blade.get_admins_settings().items)[0]
+    current_settings = _get_settings(module, blade)
     lockout = getattr(current_settings, "lockout_duration", None)
     max_login = getattr(current_settings, "max_login_attempts", None)
     min_password = getattr(current_settings, "min_password_length", None)

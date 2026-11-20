@@ -91,14 +91,20 @@ def _ref(name):
 
 
 def _mapping(
-    group="cc44-grp", group_base="OU=groups", policies=("readonly",), legacy=False
+    group="cc44-grp",
+    group_base="OU=groups",
+    policies=("readonly",),
+    legacy=False,
+    name=None,
 ):
     """A directory service role mapping as the array reports it.
 
     ``legacy`` mimics an array below REST 2.19, which reports no
-    management_access_policies, only the legacy role.
+    management_access_policies, only the legacy role. ``name`` is the
+    spelling the array stores; None stands for the spelling of the task.
     """
     mapping = Mock()
+    mapping.name = name
     mapping.group = group
     mapping.group_base = group_base
     if legacy:
@@ -708,6 +714,203 @@ class TestPurefbDsrole:
         assert "Delete Directory Service Role array_admin failed" in msg
         assert "boom" in msg
 
+    def test_main_delete_builtin_other_case_clears_group(self):
+        """A built-in mapping named in another letter case is cleared like
+        the built-in mapping it is, not deleted"""
+        blade = _blade(
+            mapping=_mapping(
+                group="readonly-users",
+                group_base="OU=RBAC-Groups",
+                policies=("readonly",),
+                name="readonly",
+            )
+        )
+        with patch(MODULE + ".DirectoryServiceRole") as mock_role:
+            module = _run(
+                _base_params(
+                    name="ReadOnly",
+                    policies=None,
+                    state="absent",
+                    group=None,
+                    group_base=None,
+                ),
+                blade,
+            )
+        blade.get_directory_services_roles.assert_called_once_with(names=["ReadOnly"])
+        mock_role.assert_called_once_with(group_base="", group="")
+        assert blade.patch_directory_services_roles.call_args[1]["names"] == [
+            "readonly"
+        ]
+        blade.delete_directory_services_roles.assert_not_called()
+        module.exit_json.assert_called_once_with(changed=True)
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_main_delete_builtin_other_case_already_clear(self, check_mode):
+        """absent on a cleared built-in mapping named in another letter case
+        is a no-op, in check mode too"""
+        blade = _blade(
+            mapping=_mapping(
+                group="", group_base="", policies=("readonly",), name="readonly"
+            )
+        )
+        module = _run(
+            _base_params(
+                name="READONLY",
+                policies=None,
+                state="absent",
+                group=None,
+                group_base=None,
+            ),
+            blade,
+            check_mode=check_mode,
+        )
+        module.exit_json.assert_called_once_with(changed=False)
+        _no_writes(blade)
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_main_delete_uses_stored_spelling(self, check_mode):
+        """A mapping found under another letter case is deleted under the
+        name the array reports: the array answers a delete under any other
+        spelling with success and deletes nothing"""
+        blade = _blade(mapping=_mapping(name="cc44-map"))
+        module = _run(
+            _base_params(name="CC44-Map", state="absent", policies=None),
+            blade,
+            check_mode=check_mode,
+        )
+        blade.get_directory_services_roles.assert_called_once_with(names=["CC44-Map"])
+        if check_mode:
+            _no_writes(blade)
+        else:
+            blade.delete_directory_services_roles.assert_called_once_with(
+                names=["cc44-map"]
+            )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_main_update_uses_stored_spelling(self):
+        """Changes to a mapping found under another letter case are sent
+        under the name the array reports"""
+        blade = _blade(
+            mapping=_mapping(policies=("readonly", "storage_admin"), name="cc44-map")
+        )
+        with patch(MODULE + ".DirectoryServiceRole"):
+            module = _run(
+                _base_params(
+                    name="CC44-Map", group="other", policies=["readonly", "ops_admin"]
+                ),
+                blade,
+            )
+        assert blade.patch_directory_services_roles.call_args[1]["names"] == [
+            "cc44-map"
+        ]
+        blade.post_management_access_policies_directory_services_roles.assert_called_once_with(
+            member_names=["cc44-map"], policy_names=["ops_admin"]
+        )
+        blade.delete_management_access_policies_directory_services_roles.assert_called_once_with(
+            member_names=["cc44-map"], policy_names=["storage_admin"]
+        )
+        module.exit_json.assert_called_once_with(changed=True)
+
+    def test_main_update_other_case_idempotent(self):
+        """A mapping named in another letter case with nothing to change is
+        left alone"""
+        blade = _blade(mapping=_mapping(name="cc44-map"))
+        module = _run(_base_params(name="CC44-MAP"), blade)
+        module.exit_json.assert_called_once_with(changed=False)
+        _no_writes(blade)
+
+    # ---------------- main(): empty names and lists of names ----------------
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    @pytest.mark.parametrize("name", ["", None])
+    def test_main_refuses_empty_name_without_role(self, name, state, check_mode):
+        """An empty name with no role to stand in for it is refused before
+        any request"""
+        blade = _blade(mapping=None)
+        params = _base_params(name=name, state=state)
+        if state == "absent":
+            params["policies"] = None
+        module = _run(params, blade, check_mode=check_mode)
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "name is empty" in msg
+        assert "role" in msg
+        module.exit_json.assert_not_called()
+        module.get_system.assert_not_called()
+        blade.get_directory_services_roles.assert_not_called()
+        _no_writes(blade)
+
+    def test_main_empty_name_defaults_to_role(self):
+        """An empty name still addresses the built-in mapping of role"""
+        blade = _blade(
+            mapping=_mapping(
+                group="readonly-users",
+                group_base="OU=RBAC-Groups",
+                policies=("readonly",),
+            )
+        )
+        module = _run(
+            _base_params(
+                name="", role="readonly", policies=None, group=None, group_base=None
+            ),
+            blade,
+        )
+        module.fail_json.assert_not_called()
+        blade.get_directory_services_roles.assert_called_once_with(names=["readonly"])
+        module.exit_json.assert_called_once_with(changed=False)
+        _no_writes(blade)
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    def test_main_refuses_list_of_names(self, state, check_mode):
+        """A name the array reads as two mappings is refused before any
+        request, so no second mapping is read, changed or deleted"""
+        # The array answers such a lookup with every mapping named in it.
+        blade = _blade(mapping=_mapping())
+        blade.get_directory_services_roles.return_value = _response(
+            200, [_mapping(), _mapping(group="cc44-other")]
+        )
+        params = _base_params(name="cc44-map,cc44-other", state=state)
+        if state == "absent":
+            params["policies"] = None
+        module = _run(params, blade, check_mode=check_mode)
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "cc44-map,cc44-other" in msg
+        assert "more than one mapping" in msg
+        module.exit_json.assert_not_called()
+        module.get_system.assert_not_called()
+        blade.get_directory_services_roles.assert_not_called()
+        _no_writes(blade)
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_main_refuses_list_in_policies_entry(self, check_mode):
+        """An entry of policies the array reads as two policies is refused
+        before any request"""
+        blade = _blade(mapping=_mapping())
+        module = _run(
+            _base_params(policies=["readonly,storage_admin"]),
+            blade,
+            check_mode=check_mode,
+        )
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert "readonly,storage_admin" in msg
+        assert "entry of its own" in msg
+        module.exit_json.assert_not_called()
+        module.get_system.assert_not_called()
+        blade.get_directory_services_roles.assert_not_called()
+        _no_writes(blade)
+
+    def test_main_name_list_is_refused_before_realm_name(self):
+        """A list of realm-qualified names gets the message about the list"""
+        blade = _blade(mapping=None)
+        module = _run(_base_params(name="realm1::a,realm1::b"), blade)
+        module.fail_json.assert_called_once()
+        assert "more than one mapping" in module.fail_json.call_args[1]["msg"]
+        module.get_system.assert_not_called()
+
     # ---------------- main(): realms ----------------
 
     @pytest.mark.parametrize("check_mode", [False, True])
@@ -748,12 +951,13 @@ class TestPurefbDsrole:
         blade.get_directory_services_roles.assert_not_called()
         _no_writes(blade)
 
-    def test_main_absent_does_not_read_policies(self):
+    @pytest.mark.parametrize(
+        "policy", ["realm1::realm1-admin", "readonly,storage_admin"]
+    )
+    def test_main_absent_does_not_read_policies(self, policy):
         """policies is not read for state=absent, so it is not refused there"""
         blade = _blade(mapping=_mapping())
-        module = _run(
-            _base_params(state="absent", policies=["realm1::realm1-admin"]), blade
-        )
+        module = _run(_base_params(state="absent", policies=[policy]), blade)
         module.fail_json.assert_not_called()
         blade.delete_directory_services_roles.assert_called_once_with(
             names=["cc44-map"]

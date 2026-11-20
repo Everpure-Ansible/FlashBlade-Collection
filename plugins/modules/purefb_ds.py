@@ -27,6 +27,17 @@ description:
   will always cause a change, even if the password given isn't different from
   the current, unless I(force_bind_password) is C(false). The array never
   reports the password, so the module cannot compare it.
+- Every server has its own NFS directory service, selected with
+  I(nfs_server). For a server in a realm give the server as
+  C(realm::server). The C(management) directory service and the NFS
+  directory service of the default server are array-level and are not
+  available to a realm-scoped administrator.
+- The module configures directory services that exist on the array. The
+  array-level ones always exist, and the NFS directory service of a server
+  is created and deleted with the server. A directory service that does not
+  exist, or that the user is not allowed to see, fails the task when
+  I(state) is C(present) or C(test) and is reported as unchanged when
+  I(state) is C(absent).
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
@@ -39,6 +50,9 @@ options:
   dstype:
     description:
     - The type of directory service to work on
+    - C(management) is the array-level directory service for the
+      management of the array. C(nfs) is the NFS directory service of the
+      server named in I(nfs_server).
     choices: [ management, nfs, smb ]
     type: str
     required: true
@@ -106,8 +120,18 @@ options:
     type: str
   nfs_server:
     description:
-     - Name of the internal server
-     - Only required if I(nfs) is the I(dstype)
+    - Name of the server whose NFS directory service is managed. The array
+      names that directory service C(<server>_nfs).
+    - For a server in a realm use C(realm::server); the directory service
+      managed is C(realm::server_nfs).
+    - A realm-scoped administrator must use the realm-qualified name; a bare
+      name is not placed in, or resolved to, the administrator's realm.
+    - If not set or empty, or set to C(_array_server), the NFS directory
+      service of the default server is managed, which is the array-level
+      C(nfs).
+    - The value is the name of one server. A value that holds a comma is
+      refused, because the array reads it as a list of names.
+    - Only used when I(dstype) is C(nfs).
     type: str
     version_added: 1.23.0
 extends_documentation_fragment:
@@ -134,7 +158,7 @@ EXAMPLES = r"""
 
 - name: Enable existing SMB directory service
   everpure.flashblade.purefb_ds:
-    dstypr: smb
+    dstype: smb
     enable: true
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
@@ -161,6 +185,18 @@ EXAMPLES = r"""
   everpure.flashblade.purefb_ds:
     dstype: nfs
     nfs_server: acme1
+    enable: true
+    nis_domain: "acme.com"
+    nis_servers:
+      - "1.1.1.1"
+      - "2.2.2.2"
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Create NFS directory service (NIS based) - server in a realm
+  everpure.flashblade.purefb_ds:
+    dstype: nfs
+    nfs_server: realm1::acme1
     enable: true
     nis_domain: "acme.com"
     nis_servers:
@@ -197,6 +233,7 @@ RETURN = r"""
 
 
 NO_SMB_VERSION = "2.16"
+DEFAULT_SERVER = "_array_server"
 
 HAS_PYPURECLIENT = True
 try:
@@ -219,71 +256,134 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
 )
 
 
+def _ds_name(module):
+    """Return the name of the directory service the task addresses.
+
+    The array-level services are named after their type. Every server has
+    its own NFS directory service, C(<server>_nfs), which carries the realm
+    of the server (C(realm::server_nfs)). The NFS directory service of the
+    default server is the array-level C(nfs). The array matches names
+    without regard to letter case.
+    """
+    nfs_server = module.params["nfs_server"]
+    if (
+        module.params["dstype"] == "nfs"
+        and nfs_server
+        and nfs_server.lower() != DEFAULT_SERVER
+    ):
+        return nfs_server + "_nfs"
+    return module.params["dstype"]
+
+
+def _get_ds(module, blade, ds_name):
+    """Return the directory service called C(ds_name), or None.
+
+    Only the answer "does not exist" reads as None. Any other failure of the
+    read fails the task with the message of the array.
+    """
+    res = blade.get_directory_services(names=[ds_name])
+    if res.status_code == 200:
+        items = list(res.items)
+        return items[0] if items else None
+    error = get_error_message(res)
+    if error and "does not exist" in str(error).lower():
+        return None
+    module.fail_json(
+        msg="Failed to read Directory Service {0}. Error: {1}".format(ds_name, error)
+    )
+
+
+def _fail_missing(module, ds_name):
+    """Fail for a directory service the array does not show to the caller.
+
+    The array gives the same answer for a server that does not exist and for
+    a directory service outside the scope of a realm-scoped administrator,
+    so the message covers both.
+    """
+    if ds_name == module.params["dstype"]:
+        msg = (
+            "Directory Service {0} does not exist for this user. It is an "
+            "array-level directory service, which a realm-scoped "
+            "administrator cannot manage."
+        ).format(ds_name)
+        if module.params["dstype"] == "nfs":
+            msg += (
+                " For the NFS directory service of a server in a realm set "
+                "nfs_server to realm::server."
+            )
+    else:
+        msg = (
+            "Directory Service {0} does not exist. It is created with server "
+            "{1}: check that the server exists. A server in a realm is named "
+            "realm::server, and a realm-scoped administrator must use that "
+            "form."
+        ).format(ds_name, module.params["nfs_server"])
+    module.fail_json(msg=msg)
+
+
 def delete_ds(module, blade):
     """Delete Directory Service"""
     changed = True
-    ds_name = module.params["dstype"]
-    if not module.check_mode:
-        if module.params["nfs_server"] and module.params["dstype"] == "nfs":
-            if module.params["nfs_server"] != "_array_server":
-                ds_name = module.params["nfs_server"] + "_nfs"
-        res = blade.get_directory_services(names=[ds_name])
+    ds_name = _ds_name(module)
+    res = blade.get_directory_services(names=[ds_name])
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Fetch {0} Directory Service failed. Error: {1}".format(
+                module.params["dstype"], get_error_message(res)
+            )
+        )
+    dirserv = list(res.items)[0]
+    dir_service = DirectoryService()  # Initialize for pylint
+    if module.params["dstype"] == "management":
+        if dirserv.uris:
+            dir_service = DirectoryService(
+                uris=[""],
+                base_dn="",
+                bind_user="",
+                bind_password="",
+                enabled=False,
+            )
+        else:
+            changed = False
+    elif module.params["dstype"] == "smb":
+        if dirserv.uris:
+            smb_attrs = {"join_ou": ""}
+            dir_service = DirectoryService(
+                uris=[""],
+                base_dn="",
+                bind_user="",
+                bind_password="",
+                smb=smb_attrs,
+                enabled=False,
+            )
+        else:
+            changed = False
+    elif module.params["dstype"] == "nfs":
+        if dirserv.uris:
+            dir_service = DirectoryService(
+                uris=[""],
+                base_dn="",
+                bind_user="",
+                bind_password="",
+                enabled=False,
+            )
+        elif getattr(dirserv.nfs, "nis_domains", None):
+            nfs_attrs = {"nis_domains": [], "nis_servers": []}
+            dir_service = DirectoryService(nfs=nfs_attrs, enabled=False)
+        else:
+            changed = False
+    # Whether there is anything to clear is known from the read, so check
+    # mode reports what the real run would do and only the write is skipped.
+    if changed and not module.check_mode:
+        res = blade.patch_directory_services(
+            names=[ds_name], directory_service=dir_service
+        )
         if res.status_code != 200:
             module.fail_json(
-                msg="Fetch {0} Directory Service failed. Error: {1}".format(
-                    module.params["dstype"], get_error_message(res)
+                msg="Delete Directory Service {0} failed. Error: {1}".format(
+                    ds_name, get_error_message(res)
                 )
             )
-        dirserv = list(res.items)[0]
-        dir_service = DirectoryService()  # Initialize for pylint
-        if module.params["dstype"] == "management":
-            if dirserv.uris:
-                dir_service = DirectoryService(
-                    uris=[""],
-                    base_dn="",
-                    bind_user="",
-                    bind_password="",
-                    enabled=False,
-                )
-            else:
-                changed = False
-        elif module.params["dstype"] == "smb":
-            if dirserv.uris:
-                smb_attrs = {"join_ou": ""}
-                dir_service = DirectoryService(
-                    uris=[""],
-                    base_dn="",
-                    bind_user="",
-                    bind_password="",
-                    smb=smb_attrs,
-                    enabled=False,
-                )
-            else:
-                changed = False
-        elif module.params["dstype"] == "nfs":
-            if dirserv.uris:
-                dir_service = DirectoryService(
-                    uris=[""],
-                    base_dn="",
-                    bind_user="",
-                    bind_password="",
-                    enabled=False,
-                )
-            elif getattr(dirserv.nfs, "nis_domains", None):
-                nfs_attrs = {"nis_domains": [], "nis_servers": []}
-                dir_service = DirectoryService(nfs=nfs_attrs, enabled=False)
-            else:
-                changed = False
-        if changed:
-            res = blade.patch_directory_services(
-                names=[ds_name], directory_service=dir_service
-            )
-            if res.status_code != 200:
-                module.fail_json(
-                    msg="Delete Directory Service {0} failed. Error: {1}".format(
-                        ds_name, get_error_message(res)
-                    )
-                )
     module.exit_json(changed=changed)
 
 
@@ -293,10 +393,7 @@ def update_ds(module, blade):
     changed = False
     password_required = False
     attr = {}
-    ds_name = module.params["dstype"]
-    if module.params["nfs_server"] and module.params["dstype"] == "nfs":
-        if module.params["nfs_server"] != "_array_server":
-            ds_name = module.params["nfs_server"] + "_nfs"
+    ds_name = _ds_name(module)
     res = blade.get_directory_services(names=[ds_name])
     if res.status_code != 200:
         module.fail_json(
@@ -442,12 +539,16 @@ def create_ds(module, blade):
 
 def test_ds(module, blade):
     """Test directory services configuration"""
-    test_server = module.params["dstype"]
-    if module.params["dstype"] == "nfs" and module.params["nfs_server"]:
-        if module.params["nfs_server"] != "_array_server":
-            test_server = module.params["nfs_server"] + "_nfs"
+    test_server = _ds_name(module)
     test_response = []
-    response = list(blade.get_directory_services_test(names=[test_server]).items)
+    res = blade.get_directory_services_test(names=[test_server])
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to test Directory Service {0}. Error: {1}".format(
+                test_server, get_error_message(res)
+            )
+        )
+    response = list(res.items)
     for component in response:
         if component.enabled:
             enabled = "true"
@@ -513,6 +614,17 @@ def main():
     if not HAS_PYPURECLIENT:
         module.fail_json(msg="py-pure-client sdk is required for this module")
 
+    nfs_server = module.params["nfs_server"]
+    if module.params["dstype"] == "nfs" and nfs_server and "," in nfs_server:
+        # The array reads a name that holds a comma as a list of names, so
+        # the read and the change would address more than one directory
+        # service, the array-level ones included.
+        module.fail_json(
+            msg="nfs_server must be the name of one server and {0} holds a "
+            "comma. The array reads such a name as a list of names, so the "
+            "task would address more than one directory service.".format(nfs_server)
+        )
+
     state = module.params["state"]
     blade = get_system(module)
     api_version = get_rest_api_version(blade)
@@ -522,21 +634,25 @@ def main():
     ):
         module.warn("Directory Service for SMB no longer supported by FlashBlade")
         module.exit_json(changed=False)
-    ds_name = module.params["dstype"]
-    if module.params["nfs_server"] and module.params["dstype"] == "nfs":
-        if module.params["nfs_server"] != "_array_server":
-            ds_name = module.params["nfs_server"] + "_nfs"
-    res = blade.get_directory_services(names=[ds_name])
+    ds_name = _ds_name(module)
+    dirserv = _get_ds(module, blade, ds_name)
     ds_configured = False
-    if res.status_code == 200:
-        dirserv = list(res.items)[0]
+    if dirserv is not None:
         # The built-in service objects always exist, so every state=present
         # request is a comparison against the current values in update_ds;
         # an LDAP-based nfs service must not be mistaken for an empty one
         # just because it has no NIS servers.
         ds_configured = True
+    elif state == "absent":
+        # Nothing to clear. The array gives this answer for a server that
+        # does not exist and for a service the user is not allowed to see.
+        module.exit_json(
+            changed=False, msg="Directory Service {0} does not exist".format(ds_name)
+        )
     else:
-        module.exit_json(msg="Directory Service {0} does not exist".format(ds_name))
+        # Setting or testing a service that is not there is an error, in
+        # check mode as well.
+        _fail_missing(module, ds_name)
     ldap_uri = False
     set_ldap = False
     for uri in dirserv.uris or []:

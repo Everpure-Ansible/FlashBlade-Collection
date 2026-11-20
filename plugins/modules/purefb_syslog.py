@@ -34,6 +34,7 @@ options:
   state:
     description:
     - Create update, delete or test syslog servers configuration
+    - C(test) fails if I(name) is not a configured syslog server.
     default: present
     type: str
     choices: [ absent, present, test ]
@@ -112,15 +113,36 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
 SYSLOG_SERVICES_API = "2.14"
 
 
-def delete_syslog(module, blade):
+def _get_syslog_server(module, blade):
+    """Return the syslog server I(name), or None if it is not configured.
+
+    The servers are listed and matched by name without regard to case, as
+    the array matches names. A read the array refuses or fails is reported
+    with the message of the array: it says nothing about the server.
+    """
+    res = blade.get_syslog_servers()
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to list syslog servers. Error: {0}".format(
+                get_error_message(res)
+            )
+        )
+    wanted = module.params["name"].lower()
+    for server in list(res.items):
+        if (server.name or "").lower() == wanted:
+            return server
+    return None
+
+
+def delete_syslog(module, blade, name):
     """Delete Syslog Server"""
     changed = True
     if not module.check_mode:
-        res = blade.delete_syslog_servers(names=[module.params["name"]])
+        res = blade.delete_syslog_servers(names=[name])
         if res.status_code != 200:
             module.fail_json(
                 msg="Failed to remove syslog server {0}. Error: {1}".format(
-                    module.params["name"], get_error_message(res)
+                    name, get_error_message(res)
                 )
             )
 
@@ -168,7 +190,7 @@ def add_syslog(module, blade):
     module.exit_json(changed=changed)
 
 
-def update_syslog(module, blade):
+def update_syslog(module, blade, syslog_config):
     """Update Syslog Server"""
     changed = False
     api_version = get_rest_api_version(blade)
@@ -176,9 +198,6 @@ def update_syslog(module, blade):
         module.exit_json(
             msg="Purity//FB needs upgrading to support modification of existing syslog server"
         )
-    syslog_config = list(blade.get_syslog_servers(names=[module.params["name"]]).items)[
-        0
-    ]
     noport_address = module.params["protocol"] + "://" + module.params["address"]
 
     if module.params["port"]:
@@ -195,19 +214,19 @@ def update_syslog(module, blade):
         new_services = module.params["services"]
     if changed and not module.check_mode:
         res = blade.patch_syslog_servers(
-            names=[module.params["name"]],
+            names=[syslog_config.name],
             syslog_server=SyslogServerPatch(uri=new_uri, services=new_services),
         )
         if res.status_code != 200:
             module.fail_json(
                 msg="Updating syslog server {0} failed. Error: {1}".format(
-                    module.params["name"], get_error_message(res)
+                    syslog_config.name, get_error_message(res)
                 )
             )
     module.exit_json(changed=changed)
 
 
-def test_syslog(module, blade):
+def test_syslog(module, blade, name):
     """Test syslog configuration"""
     test_response = []
     # The syslog test endpoint takes no names filter, so the array tests
@@ -216,11 +235,11 @@ def test_syslog(module, blade):
     if res.status_code != 200:
         module.fail_json(
             msg="Failed to test syslog server {0}. Error: {1}".format(
-                module.params["name"], get_error_message(res)
+                name, get_error_message(res)
             )
         )
     for component in list(res.items):
-        if getattr(component.resource, "name", None) != module.params["name"]:
+        if getattr(component.resource, "name", None) != name:
             continue
         if component.enabled:
             enabled = "true"
@@ -274,17 +293,22 @@ def main():
 
     blade = get_system(module)
 
-    res = blade.get_syslog_servers(names=[module.params["name"]])
-    exists = bool(res.status_code == 200)
+    state = module.params["state"]
+    server = _get_syslog_server(module, blade)
+    exists = server is not None
 
-    if module.params["state"] == "absent" and exists:
-        delete_syslog(module, blade)
-    elif module.params["state"] == "present" and exists:
-        update_syslog(module, blade)
-    elif module.params["state"] == "present" and not exists:
+    if state == "absent" and exists:
+        delete_syslog(module, blade, server.name)
+    elif state == "present" and exists:
+        update_syslog(module, blade, server)
+    elif state == "present":
         add_syslog(module, blade)
-    elif module.params["state"] == "test" and exists:
-        test_syslog(module, blade)
+    elif state == "test" and exists:
+        test_syslog(module, blade, server.name)
+    elif state == "test":
+        module.fail_json(
+            msg="Syslog server {0} is not configured".format(module.params["name"])
+        )
 
     module.exit_json(changed=False)
 

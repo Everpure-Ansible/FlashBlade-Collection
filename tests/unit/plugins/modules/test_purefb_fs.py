@@ -10,6 +10,7 @@ __metaclass__ = type
 import sys
 import multiprocessing
 import ctypes
+from contextlib import ExitStack
 from unittest.mock import Mock, patch, MagicMock
 
 import pytest
@@ -99,6 +100,14 @@ from plugins.modules.purefb_fs import (
     _resolve_name,
 )
 from plugins.module_utils.version import LooseVersion as RealLooseVersion
+
+
+def _array_message(res, default="Unknown error"):
+    """What module_utils.common.get_error_message returns for a response."""
+    errors = getattr(res, "errors", None)
+    if isinstance(errors, list) and errors:
+        return errors[0].message
+    return default
 
 
 class TestPurefbFs:
@@ -624,27 +633,28 @@ class TestPurefbFs:
         assert call_kwargs["context_names"] == ["member-array"]
 
     @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.0"),
+    )
     def test_create_fs_check_mode(self):
         """Test creating filesystem in check mode"""
         # Setup mocks
         mock_module = Mock()
         mock_module.check_mode = True
-        mock_module.params = {
-            "name": "test-fs",
-            "size": "1T",
-        }
+        params = self.get_default_params()
+        params.update({"name": "test-fs", "size": "1T"})
+        mock_module.params = params
 
         mock_blade = Mock()
-        # Mock API version even in check mode (it's called before check_mode check)
-        mock_version = Mock()
-        mock_version.version = "2.0"
-        mock_blade.get_versions.return_value.items = [mock_version]
 
         # Call function
         create_fs(mock_module, mock_blade)
 
         # Verify - should not call API in check mode
         mock_blade.post_file_systems.assert_not_called()
+        mock_module.fail_json.assert_not_called()
         mock_module.exit_json.assert_called_with(changed=True)
 
     @patch("plugins.modules.purefb_fs.FileSystemPatch")
@@ -1334,7 +1344,9 @@ class TestPurefbFs:
 
         # Mock policy not yet attached
         mock_policy_fs_response = Mock()
-        mock_policy_fs_response.status_code = 400
+        mock_policy_fs_response.status_code = 200
+        mock_policy_fs_response.total_item_count = 0
+        mock_policy_fs_response.items = []
         mock_blade.get_policies_file_systems.return_value = mock_policy_fs_response
 
         # Mock successful policy attachment
@@ -2970,6 +2982,7 @@ class TestPurefbFs:
         mock_blade.post_policies_file_systems.assert_called_once()
         mock_module.exit_json.assert_called_with(changed=True)
 
+    @patch("plugins.modules.purefb_fs.get_error_message", _array_message)
     @patch("plugins.modules.purefb_fs.get_filesystem")
     @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
     @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
@@ -2994,24 +3007,12 @@ class TestPurefbFs:
         mock_module.params = params
 
         mock_blade = Mock()
-        mock_version = Mock()
-        mock_version.version = "2.0"
-        mock_blade.get_versions.return_value.items = [mock_version]
 
-        # Mock successful filesystem creation
-        mock_create_response = Mock()
-        mock_create_response.status_code = 200
-        mock_blade.post_file_systems.return_value = mock_create_response
-
-        # Mock failed policy check
+        # The policy does not exist
         mock_policy_response = Mock()
         mock_policy_response.status_code = 400
+        mock_policy_response.errors = [Mock(message="Policy does not exist.")]
         mock_blade.get_policies.return_value = mock_policy_response
-
-        # Mock delete for cleanup
-        mock_delete_response = Mock()
-        mock_delete_response.status_code = 200
-        mock_blade.delete_file_systems.return_value = mock_delete_response
 
         mock_get_filesystem.return_value = None
 
@@ -3021,10 +3022,15 @@ class TestPurefbFs:
         except Exception as e:
             assert str(e) == "fail_json"
 
-        # Verify - should have tried to delete the filesystem
-        mock_blade.post_file_systems.assert_called_once()
+        # Verify - the policy is read first, so nothing was created and
+        # nothing has to be removed again
         mock_blade.get_policies.assert_called_once()
-        mock_module.fail_json.assert_called_once()
+        mock_module.fail_json.assert_called_once_with(
+            msg="Policy invalid-policy doesn't exist."
+        )
+        mock_blade.post_file_systems.assert_not_called()
+        mock_blade.patch_file_systems.assert_not_called()
+        mock_blade.delete_file_systems.assert_not_called()
 
     @patch("plugins.modules.purefb_fs.get_filesystem")
     @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
@@ -3765,6 +3771,7 @@ class TestPurefbFs:
         mock_blade.post_file_systems.assert_called_once()
         mock_module.exit_json.assert_called_with(changed=True)
 
+    @patch("plugins.modules.purefb_fs.get_error_message", _array_message)
     @patch("plugins.modules.purefb_fs.get_filesystem")
     @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
     @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
@@ -3823,6 +3830,7 @@ class TestPurefbFs:
         # Mock policy doesn't exist
         mock_policy_response = Mock()
         mock_policy_response.status_code = 400
+        mock_policy_response.errors = [Mock(message="Policy does not exist.")]
         mock_blade.get_policies.return_value = mock_policy_response
 
         # Call function - should fail
@@ -3833,7 +3841,9 @@ class TestPurefbFs:
 
         # Verify
         mock_blade.get_policies.assert_called()
-        mock_module.fail_json.assert_called()
+        mock_module.fail_json.assert_called_once()
+        assert "doesn't exist" in mock_module.fail_json.call_args[1]["msg"]
+        mock_blade.post_policies_file_systems.assert_not_called()
 
     @patch("plugins.modules.purefb_fs.get_filesystem")
     @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
@@ -3897,7 +3907,9 @@ class TestPurefbFs:
 
         # Mock filesystem is not in policy
         mock_member_response = Mock()
-        mock_member_response.status_code = 400
+        mock_member_response.status_code = 200
+        mock_member_response.total_item_count = 0
+        mock_member_response.items = []
         mock_blade.get_policies_file_systems.return_value = mock_member_response
 
         # Mock failed attach
@@ -4574,6 +4586,7 @@ class TestPurefbFs:
         # Verify cleanup was attempted (patch_file_systems called to destroy)
         mock_blade.patch_file_systems.assert_called()
 
+    @patch("plugins.modules.purefb_fs.get_error_message", _array_message)
     @patch("plugins.modules.purefb_fs.get_filesystem")
     @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
     @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
@@ -4581,59 +4594,46 @@ class TestPurefbFs:
         "plugins.modules.purefb_fs.get_rest_api_version",
         Mock(return_value="2.0"),
     )
-    def test_create_fs_policy_check_failure_cleanup(self, mock_get_filesystem):
-        """Test that filesystem is cleaned up when policy check fails during creation"""
+    def test_create_fs_policy_check_failure_creates_nothing(self, mock_get_filesystem):
+        """A refused policy read fails the task with the array message
+        before the filesystem is created, so there is nothing to clean up"""
         mock_module = Mock()
         mock_module.check_mode = False
+        mock_module.fail_json.side_effect = Exception("fail_json")
         params = self.get_default_params()
         params.update(
             {
                 "name": "test-fs",
                 "size": "1T",
-                "policy": "nonexistent-policy",
+                "policy": "some-policy",
             }
         )
         mock_module.params = params
 
         mock_blade = Mock()
-        mock_version = Mock()
-        mock_version.version = "2.0"
-        mock_version.__eq__ = lambda self, other: self.version == other
-        mock_blade.get_versions.return_value.items = [mock_version]
-
         mock_get_filesystem.return_value = None
-
-        # Mock successful filesystem creation
-        mock_create_response = Mock()
-        mock_create_response.status_code = 200
-        mock_blade.post_file_systems.return_value = mock_create_response
 
         # Mock policy check failure (get_policies returns 400)
         mock_policy_response = Mock()
         mock_policy_response.status_code = 400
-        mock_policy_response.errors = [Mock(message="Policy not found")]
+        mock_policy_response.errors = [Mock(message="Operation not permitted.")]
         mock_blade.get_policies.return_value = mock_policy_response
 
-        # Mock cleanup operations
-        mock_cleanup_response = Mock()
-        mock_cleanup_response.status_code = 200
-        mock_blade.patch_file_systems.return_value = mock_cleanup_response
-        mock_blade.delete_file_systems.return_value = mock_cleanup_response
-
         # Call function
-        create_fs(mock_module, mock_blade)
+        try:
+            create_fs(mock_module, mock_blade)
+        except Exception as e:
+            assert str(e) == "fail_json"
 
-        # Verify error was raised with correct message
-        mock_module.fail_json.assert_called()
+        mock_module.fail_json.assert_called_once()
         call_args = mock_module.fail_json.call_args[1]
-        # The error message should contain "doesn't exist" when get_policies fails
-        assert (
-            "doesn't exist" in call_args["msg"]
-            or "Failed to apply policy" in call_args["msg"]
-        )
+        assert "Operation not permitted." in call_args["msg"]
+        assert "some-policy" in call_args["msg"]
 
-        # Verify cleanup was attempted
-        mock_blade.patch_file_systems.assert_called()
+        # Nothing was created, so nothing is cleaned up
+        mock_blade.post_file_systems.assert_not_called()
+        mock_blade.patch_file_systems.assert_not_called()
+        mock_blade.delete_file_systems.assert_not_called()
 
     @patch("plugins.modules.purefb_fs.get_filesystem")
     @patch("plugins.modules.purefb_fs.HAS_PYPURECLIENT", True)
@@ -4959,6 +4959,7 @@ class TestPurefbFs:
         mock_module.params["state"] = "present"
 
         mock_blade = Mock()
+        mock_blade.get_realms.return_value = self._realm_response()
         # Mock API version 2.19+
         versions = []
         for ver in ["2.19", "2.20"]:
@@ -4974,12 +4975,14 @@ class TestPurefbFs:
         mock_fs_response = Mock()
         mock_fs_response.status_code = 200
         mock_blade.post_file_systems.return_value = mock_fs_response
+        mock_blade.patch_file_systems.return_value = mock_fs_response
 
         mock_get_system.return_value = mock_blade
 
         # Call function (realm validation already done in main())
         create_fs(mock_module, mock_blade)
 
+        mock_module.fail_json.assert_not_called()
         # Verify filesystem was created with qualified name
         assert mock_blade.post_file_systems.called
         call_args = mock_blade.post_file_systems.call_args
@@ -5009,6 +5012,11 @@ class TestPurefbFs:
 
     @patch("plugins.modules.purefb_fs.get_filesystem")
     @patch("plugins.modules.purefb_fs.get_system")
+    @patch("plugins.modules.purefb_fs.LooseVersion", RealLooseVersion)
+    @patch(
+        "plugins.modules.purefb_fs.get_rest_api_version",
+        Mock(return_value="2.19"),
+    )
     def test_create_fs_with_realm_check_mode(
         self, mock_get_system, mock_get_filesystem
     ):
@@ -5026,14 +5034,7 @@ class TestPurefbFs:
         mock_module.check_mode = True
 
         mock_blade = Mock()
-        # Mock API version 2.19+
-        versions = []
-        for ver in ["2.19"]:
-            mock_ver = Mock()
-            mock_ver.version = ver
-            mock_ver.__eq__ = lambda self, other: self.version == other
-            versions.append(mock_ver)
-        mock_blade.get_versions.return_value.items = versions
+        mock_blade.get_realms.return_value = self._realm_response()
 
         mock_get_filesystem.return_value = None
         mock_get_system.return_value = mock_blade
@@ -5041,8 +5042,10 @@ class TestPurefbFs:
         # Call function
         create_fs(mock_module, mock_blade)
 
-        # In check mode, no API calls should be made
+        # In check mode the realm is read, and nothing is written
+        mock_blade.get_realms.assert_called_once_with(names=["production-realm"])
         mock_blade.post_file_systems.assert_not_called()
+        mock_module.fail_json.assert_not_called()
 
         # exit_json should be called with changed=True
         mock_module.exit_json.assert_called_once()
@@ -5303,7 +5306,7 @@ class TestPurefbFs:
         mock_module = self._worm_create_module(
             worm_policy="worm-pol", eradication_mode="retention-based"
         )
-        mock_blade = Mock()
+        mock_blade = self._worm_blade()
         mock_get_filesystem.return_value = None
         ok = Mock()
         ok.status_code = 200
@@ -5368,7 +5371,7 @@ class TestPurefbFs:
         """The array only creates a WORM filesystem in retention-based
         eradication mode, so worm_policy alone sends that mode."""
         mock_module = self._worm_create_module(worm_policy="worm-pol")
-        mock_blade = Mock()
+        mock_blade = self._worm_blade()
         mock_get_filesystem.return_value = None
         ok = Mock()
         ok.status_code = 200
@@ -5391,13 +5394,15 @@ class TestPurefbFs:
         Mock(return_value="2.15"),
     )
     def test_create_fs_worm_policy_check_mode_creates_nothing(self):
-        """Check mode reports the create without POSTing anything."""
+        """Check mode reads the policy and reports the create without
+        POSTing anything."""
         mock_module = self._worm_create_module(worm_policy="worm-pol")
         mock_module.check_mode = True
-        mock_blade = Mock()
+        mock_blade = self._worm_blade()
 
         create_fs(mock_module, mock_blade)
 
+        mock_blade.get_worm_data_policies.assert_called_once_with(names=["worm-pol"])
         mock_blade.post_file_systems.assert_not_called()
         mock_blade.get_realms.assert_not_called()
         mock_module.exit_json.assert_called_with(changed=True)
@@ -5412,7 +5417,7 @@ class TestPurefbFs:
     def test_create_fs_worm_policy_with_context(self, mock_get_filesystem):
         """policy_names and context_names travel together on the POST."""
         mock_module = self._worm_create_module(worm_policy="worm-pol", context="fb1")
-        mock_blade = Mock()
+        mock_blade = self._worm_blade()
         mock_get_filesystem.return_value = None
         ok = Mock()
         ok.status_code = 200
@@ -5437,7 +5442,7 @@ class TestPurefbFs:
         """A rejected POST (for example an unknown WORM policy) fails the
         task with the array message; nothing exists to clean up."""
         mock_module = self._worm_create_module(worm_policy="missing-pol")
-        mock_blade = Mock()
+        mock_blade = self._worm_blade()
         mock_get_filesystem.return_value = None
         bad = Mock()
         bad.status_code = 400
@@ -5448,6 +5453,7 @@ class TestPurefbFs:
         except Exception as exc:
             assert str(exc) == "fail_json"
 
+        mock_blade.post_file_systems.assert_called_once()
         mock_module.fail_json.assert_called_once()
         assert "boom" in mock_module.fail_json.call_args[1]["msg"]
         mock_blade.delete_file_systems.assert_not_called()
@@ -5475,6 +5481,7 @@ class TestPurefbFs:
         ok = Mock()
         ok.status_code = 200
         mock_blade.post_file_systems.return_value = ok
+        mock_blade.get_worm_data_policies.return_value = ok
         with patch(
             "plugins.modules.purefb_fs.get_rest_api_version",
             Mock(return_value=version),
@@ -5568,6 +5575,7 @@ class TestPurefbFs:
         eradication_config."""
         fsys = self._existing_fs()
         fsys.name = "test-fs"
+        fsys.id = "fs-id-1"
         fsys.eradication_config = Mock()
         fsys.eradication_config.eradication_mode = eradication_mode
         return fsys
@@ -5586,7 +5594,7 @@ class TestPurefbFs:
         _check_create_only_options(mock_module, mock_blade, self._worm_fs(), "2.15")
 
         mock_blade.get_file_systems_worm_data_policies.assert_called_once_with(
-            member_names=["test-fs"]
+            member_ids=["fs-id-1"]
         )
         mock_blade.get_file_systems.assert_not_called()
         mock_module.fail_json.assert_not_called()
@@ -5646,7 +5654,7 @@ class TestPurefbFs:
             assert str(exc) == "fail_json"
 
         mock_blade.get_file_systems_worm_data_policies.assert_called_once_with(
-            member_names=["test-fs"], context_names=["fb1"]
+            member_ids=["fs-id-1"], context_names=["fb1"]
         )
         mock_module.fail_json.assert_called_once()
         assert "boom" in mock_module.fail_json.call_args[1]["msg"]
@@ -5761,7 +5769,7 @@ class TestPurefbFs:
         mock_module.fail_json.assert_not_called()
         assert mock_get_filesystem.call_count == 1
         mock_blade.get_file_systems_worm_data_policies.assert_called_once_with(
-            member_names=["test-fs"]
+            member_ids=["fs-id-1"]
         )
         mock_modify.assert_called_once_with(mock_module, mock_blade)
 
@@ -6298,6 +6306,7 @@ class TestPurefbFs:
             found[self.REALM_FS] = self._existing_fs(name=self.REALM_FS, **in_realm)
         return found
 
+    @patch("plugins.modules.purefb_fs.get_error_message", _array_message)
     @patch("plugins.modules.purefb_fs.FileSystemPatch")
     @patch("plugins.modules.purefb_fs.get_filesystem")
     @patch("plugins.modules.purefb_fs.get_system")
@@ -6317,12 +6326,14 @@ class TestPurefbFs:
         mock_get_filesystem,
         mock_fs_patch,
         check_mode=False,
+        prepare=None,
     ):
         """Run main() against an array holding the filesystems in ``found``
         (name -> mock filesystem). exit_json and fail_json end the run as
         they do in Ansible. Returns (module, blade, lookups, fs_patch):
         ``lookups`` lists every filesystem name the module read, in order,
-        and ``fs_patch`` is the patched FileSystemPatch class.
+        and ``fs_patch`` is the patched FileSystemPatch class. ``prepare``
+        is called with the blade before the run, to change its answers.
         """
         mock_module = Mock()
         mock_module.check_mode = check_mode
@@ -6336,7 +6347,7 @@ class TestPurefbFs:
         ok.status_code = 200
         for write in ("post_file_systems", "patch_file_systems", "delete_file_systems"):
             getattr(mock_blade, write).return_value = ok
-        mock_blade.get_realms.return_value = ok
+        mock_blade.get_realms.return_value = self._realm_response()
         lookups = []
 
         def by_name(module, blade):
@@ -6353,6 +6364,8 @@ class TestPurefbFs:
 
         mock_get_filesystem.side_effect = by_name
         mock_blade.get_file_systems.side_effect = by_filter
+        if prepare:
+            prepare(mock_blade)
         try:
             main()
         except SystemExit:
@@ -6420,7 +6433,8 @@ class TestPurefbFs:
         """Both names exist. The request matches the namesake outside the
         realm (2G, snapshot directory and hard limit on) but not the realm
         filesystem (1G, both off): the realm filesystem is the one read,
-        and the PATCH carries its own flags, not the namesake's.
+        and the PATCH carries the new size only, none of the namesake's
+        flags.
         """
         found = self._namesakes(
             array_level={
@@ -6438,9 +6452,7 @@ class TestPurefbFs:
         mock_blade.patch_file_systems.assert_called_once()
         assert self._written_names(mock_blade) == [self.REALM_FS]
         kwargs = mock_fs_patch.call_args.kwargs
-        assert kwargs["provisioned"] == 2 * self.GIB
-        assert kwargs["snapshot_directory_enabled"] is False
-        assert kwargs["hard_limit_enabled"] is False
+        assert kwargs == {"provisioned": 2 * self.GIB}
         mock_module.exit_json.assert_called_once_with(changed=True)
 
     def test_main_realm_short_name_matching_the_realm_fs_is_noop(self):
@@ -6571,8 +6583,7 @@ class TestPurefbFs:
         assert lookups and set(lookups) == {"prod-fs"}
         assert self._written_names(mock_blade) == ["prod-fs"]
         kwargs = mock_fs_patch.call_args.kwargs
-        assert kwargs["provisioned"] == self.GIB
-        assert kwargs["hard_limit_enabled"] is True
+        assert kwargs == {"provisioned": self.GIB}
         mock_module.exit_json.assert_called_once_with(changed=True)
 
     def test_main_short_name_without_realm_when_only_the_realm_fs_exists(self):
@@ -6694,3 +6705,1113 @@ class TestPurefbFs:
             assert set(lookups) == {self.REALM_FS}
             assert self._written_names(mock_blade) == []
             mock_module.exit_json.assert_called_once_with(changed=True)
+
+    # ==== check mode, policies and WORM in a realm, legacy options, demote ====
+
+    WRITES = (
+        "post_file_systems",
+        "patch_file_systems",
+        "delete_file_systems",
+        "post_policies_file_systems",
+        "delete_policies_file_systems",
+    )
+
+    def _ok(self, *items):
+        """A 200 answer listing ``items``."""
+        res = Mock()
+        res.status_code = 200
+        res.items = list(items)
+        res.total_item_count = len(items)
+        return res
+
+    def _refused(self, message):
+        """A 400 answer carrying the message of the array."""
+        res = Mock()
+        res.status_code = 400
+        res.errors = [Mock(message=message)]
+        return res
+
+    def _realm_response(self, name="production-realm", destroyed=False):
+        """GET realms answer for one realm."""
+        realm = Mock()
+        realm.name = name
+        realm.destroyed = destroyed
+        return self._ok(realm)
+
+    def _worm_blade(self):
+        """Blade on which the WORM data policy of a create task exists."""
+        mock_blade = Mock()
+        mock_blade.get_worm_data_policies.return_value = self._ok(Mock())
+        return mock_blade
+
+    def _fu_params(self, **overrides):
+        """Default params plus the two create-only WORM options."""
+        params = self.get_default_params()
+        params.update({"worm_policy": None, "eradication_mode": None})
+        params.update(overrides)
+        return params
+
+    def _writes(self, mock_blade):
+        """The write requests that were sent, in order."""
+        return [call[0] for call in mock_blade.mock_calls if call[0] in self.WRITES]
+
+    def _run_fu(
+        self, func, params, fs=None, check_mode=False, api="2.30", prepare=None
+    ):
+        """Run create_fs or modify_fs as main() calls them, on an array
+        where the policies of the task exist, nothing is attached and every
+        write answers 200. ``prepare`` changes those answers. exit_json and
+        fail_json end the run as they do in Ansible. Returns the module,
+        the blade and the patched model classes by name.
+        """
+        mock_module = Mock()
+        mock_module.check_mode = check_mode
+        mock_module.params = params
+        mock_module.exit_json.side_effect = SystemExit(0)
+        mock_module.fail_json.side_effect = SystemExit(1)
+        mock_blade = Mock()
+        for write in self.WRITES:
+            getattr(mock_blade, write).return_value = self._ok()
+        mock_blade.get_policies.return_value = self._ok(Mock())
+        mock_blade.get_policies_file_systems.return_value = self._ok()
+        mock_blade.get_worm_data_policies.return_value = self._ok(Mock())
+        mock_blade.get_file_system_replica_links.return_value = self._ok()
+        mock_blade.get_realms.return_value = self._realm_response()
+        if fs is not None:
+            mock_blade.get_file_systems.return_value = self._ok(fs)
+        if prepare:
+            prepare(mock_blade)
+        models = {}
+        target = "plugins.modules.purefb_fs."
+        with ExitStack() as stack:
+            enter = stack.enter_context
+            enter(patch(target + "LooseVersion", RealLooseVersion))
+            enter(patch(target + "get_rest_api_version", Mock(return_value=api)))
+            enter(patch(target + "get_error_message", _array_message))
+            enter(patch(target + "get_filesystem", Mock(return_value=fs)))
+            for model in (
+                "FileSystemPatch",
+                "NfsPatch",
+                "MultiProtocol",
+                "Smb",
+                "Http",
+            ):
+                models[model] = enter(patch(target + model))
+            try:
+                func(mock_module, mock_blade)
+            except SystemExit:
+                pass
+        return mock_module, mock_blade, models
+
+    def _modify(self, fs, check_mode=False, prepare=None, **overrides):
+        """Run modify_fs on ``fs`` with the default params plus overrides."""
+        params = self._fu_params(name=fs.name, **overrides)
+        return self._run_fu(modify_fs, params, fs, check_mode, prepare=prepare)
+
+    def _create(self, check_mode=False, prepare=None, api="2.30", **overrides):
+        """Run create_fs for a 1G filesystem that needs no PATCH afterwards."""
+        params = self._fu_params(size="1G", group_ownership=None, **overrides)
+        return self._run_fu(create_fs, params, None, check_mode, api, prepare)
+
+    # ---- snapshot policy membership ----
+
+    SCOPES = (("rz::fs1", "rz::snap"), ("fs1", "snap"))
+
+    def test_attach_policy_check_mode_sends_nothing(self):
+        """Check mode reports the attach and sends neither the membership
+        nor a PATCH, for a filesystem in a realm and for one outside."""
+        for name, policy in self.SCOPES:
+            mock_module, mock_blade, models = self._modify(
+                self._existing_fs(name=name), check_mode=True, policy=policy
+            )
+
+            mock_blade.get_policies_file_systems.assert_called_once_with(
+                policy_names=[policy], member_names=[name]
+            )
+            assert self._writes(mock_blade) == []
+            mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_detach_policy_check_mode_sends_nothing(self):
+        """Check mode reports the detach and leaves the membership alone."""
+
+        def attached(mock_blade):
+            mock_blade.get_policies_file_systems.return_value = self._ok(Mock())
+
+        for name, policy in self.SCOPES:
+            mock_module, mock_blade, models = self._modify(
+                self._existing_fs(name=name),
+                check_mode=True,
+                prepare=attached,
+                policy=policy,
+                policy_state="absent",
+            )
+
+            assert self._writes(mock_blade) == []
+            mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_attach_policy_sends_the_membership_only(self):
+        """The attach is one POST policies/file-systems with the names as
+        given; no PATCH of the filesystem rides along."""
+        for name, policy in self.SCOPES:
+            mock_module, mock_blade, models = self._modify(
+                self._existing_fs(name=name), policy=policy
+            )
+
+            assert self._writes(mock_blade) == ["post_policies_file_systems"]
+            mock_blade.post_policies_file_systems.assert_called_once_with(
+                policy_names=[policy], member_names=[name]
+            )
+            mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_detach_policy_sends_the_membership_only(self):
+        def attached(mock_blade):
+            mock_blade.get_policies_file_systems.return_value = self._ok(Mock())
+
+        for name, policy in self.SCOPES:
+            mock_module, mock_blade, models = self._modify(
+                self._existing_fs(name=name),
+                prepare=attached,
+                policy=policy,
+                policy_state="absent",
+            )
+
+            assert self._writes(mock_blade) == ["delete_policies_file_systems"]
+            mock_blade.delete_policies_file_systems.assert_called_once_with(
+                policy_names=[policy], member_names=[name]
+            )
+            mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_attach_policy_already_attached_is_noop(self):
+        def attached(mock_blade):
+            mock_blade.get_policies_file_systems.return_value = self._ok(Mock())
+
+        for check_mode in (False, True):
+            for name, policy in self.SCOPES:
+                mock_module, mock_blade, models = self._modify(
+                    self._existing_fs(name=name),
+                    check_mode=check_mode,
+                    prepare=attached,
+                    policy=policy,
+                )
+
+                assert self._writes(mock_blade) == []
+                mock_module.exit_json.assert_called_once_with(changed=False)
+
+    def test_attach_policy_carries_the_fleet_context(self):
+        mock_module, mock_blade, models = self._modify(
+            self._existing_fs(name="fs1"), policy="snap", context="fb1"
+        )
+
+        mock_blade.get_policies.assert_called_once_with(
+            names=["snap"], context_names=["fb1"]
+        )
+        mock_blade.get_policies_file_systems.assert_called_once_with(
+            policy_names=["snap"], member_names=["fs1"], context_names=["fb1"]
+        )
+        mock_blade.post_policies_file_systems.assert_called_once_with(
+            policy_names=["snap"], member_names=["fs1"], context_names=["fb1"]
+        )
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_attach_policy_of_another_scope_fails_before_any_request(self):
+        """The array attaches a policy only inside its own realm. The task
+        fails before the policy is read, in check mode as well."""
+        for name, policy, needle in (
+            ("rz::fs1", "snap", "rz::<policy>"),
+            ("rz::fs1", "other::snap", "rz::<policy>"),
+            ("fs1", "rz::snap", "array-level"),
+        ):
+            for check_mode in (False, True):
+                mock_module, mock_blade, models = self._modify(
+                    self._existing_fs(name=name), check_mode=check_mode, policy=policy
+                )
+
+                mock_module.fail_json.assert_called_once()
+                msg = mock_module.fail_json.call_args.kwargs["msg"]
+                assert "policy " + policy in msg
+                assert name in msg
+                assert needle in msg
+                mock_blade.get_policies.assert_not_called()
+                assert self._writes(mock_blade) == []
+                mock_module.exit_json.assert_not_called()
+
+    def test_attach_policy_realm_is_compared_without_regard_to_case(self):
+        mock_module, mock_blade, models = self._modify(
+            self._existing_fs(name="Rz::fs1"), policy="rz::snap"
+        )
+
+        mock_module.fail_json.assert_not_called()
+        assert self._writes(mock_blade) == ["post_policies_file_systems"]
+
+    def test_detach_policy_of_another_scope_is_noop(self):
+        """Such a membership cannot exist, so there is nothing to detach."""
+        mock_module, mock_blade, models = self._modify(
+            self._existing_fs(name="rz::fs1"), policy="snap", policy_state="absent"
+        )
+
+        mock_module.fail_json.assert_not_called()
+        assert self._writes(mock_blade) == []
+        mock_module.exit_json.assert_called_once_with(changed=False)
+
+    def test_detach_missing_policy_is_noop(self):
+        def missing(mock_blade):
+            mock_blade.get_policies.return_value = self._refused(
+                "Policy does not exist."
+            )
+
+        mock_module, mock_blade, models = self._modify(
+            self._existing_fs(name="fs1"),
+            prepare=missing,
+            policy="snap",
+            policy_state="absent",
+        )
+
+        mock_module.fail_json.assert_not_called()
+        mock_blade.get_policies_file_systems.assert_not_called()
+        assert self._writes(mock_blade) == []
+        mock_module.exit_json.assert_called_once_with(changed=False)
+
+    def test_detach_policy_read_refused_fails_with_the_array_message(self):
+        """Only "does not exist" means that there is nothing to detach."""
+
+        def refused(mock_blade):
+            mock_blade.get_policies.return_value = self._refused(
+                "Operation not permitted."
+            )
+
+        mock_module, mock_blade, models = self._modify(
+            self._existing_fs(name="fs1"),
+            prepare=refused,
+            policy="snap",
+            policy_state="absent",
+        )
+
+        mock_module.fail_json.assert_called_once()
+        msg = mock_module.fail_json.call_args.kwargs["msg"]
+        assert "Operation not permitted." in msg
+        assert self._writes(mock_blade) == []
+        mock_module.exit_json.assert_not_called()
+
+    def test_attach_missing_policy_fails_in_check_mode(self):
+        def missing(mock_blade):
+            mock_blade.get_policies.return_value = self._refused(
+                "Policy does not exist."
+            )
+
+        for check_mode in (False, True):
+            mock_module, mock_blade, models = self._modify(
+                self._existing_fs(name="fs1"),
+                check_mode=check_mode,
+                prepare=missing,
+                policy="snap",
+            )
+
+            mock_module.fail_json.assert_called_once_with(
+                msg="Policy snap doesn't exist."
+            )
+            assert self._writes(mock_blade) == []
+
+    def test_attach_policy_read_refused_reports_the_array_message(self):
+        def refused(mock_blade):
+            mock_blade.get_policies.return_value = self._refused(
+                "Operation not permitted."
+            )
+
+        mock_module, mock_blade, models = self._modify(
+            self._existing_fs(name="fs1"), prepare=refused, policy="snap"
+        )
+
+        mock_module.fail_json.assert_called_once()
+        msg = mock_module.fail_json.call_args.kwargs["msg"]
+        assert "Operation not permitted." in msg
+        assert "doesn't exist" not in msg
+        assert self._writes(mock_blade) == []
+
+    def test_membership_read_refused_fails_with_the_array_message(self):
+        """A refused membership read is not "not attached": nothing is
+        attached or detached on the strength of it."""
+
+        def refused(mock_blade):
+            mock_blade.get_policies_file_systems.return_value = self._refused(
+                "Operation not permitted."
+            )
+
+        for policy_state in ("present", "absent"):
+            mock_module, mock_blade, models = self._modify(
+                self._existing_fs(name="fs1"),
+                prepare=refused,
+                policy="snap",
+                policy_state=policy_state,
+            )
+
+            mock_module.fail_json.assert_called_once()
+            msg = mock_module.fail_json.call_args.kwargs["msg"]
+            assert "Operation not permitted." in msg
+            assert self._writes(mock_blade) == []
+            mock_module.exit_json.assert_not_called()
+
+    def test_policy_is_attached_only_after_the_other_checks_passed(self):
+        """A task that fails one of its checks has not attached the policy."""
+        mock_module, mock_blade, models = self._modify(
+            self._existing_fs(name="fs1"), policy="snap", promote=False
+        )
+
+        mock_module.fail_json.assert_called_once()
+        assert "discard_snaps" in mock_module.fail_json.call_args.kwargs["msg"]
+        assert self._writes(mock_blade) == []
+
+    # ---- snapshot policy of a destroyed filesystem ----
+
+    DESTROYED_MESSAGE = (
+        "Name belongs to a file system that has been destroyed and is "
+        "pending eradication."
+    )
+
+    def _destroyed_member(self, member):
+        """Answers of the array for a destroyed filesystem.
+
+        Its snapshot policy membership is not listed and cannot be changed
+        while it is destroyed. Once the filesystem is recovered the
+        membership it had (``member``) is listed again.
+        """
+
+        def prepare(mock_blade):
+            state = {"destroyed": True}
+
+            def recover(**kwargs):
+                state["destroyed"] = False
+                return self._ok()
+
+            def members(**kwargs):
+                if state["destroyed"] or not member:
+                    return self._ok()
+                return self._ok(Mock())
+
+            def change(**kwargs):
+                if state["destroyed"]:
+                    return self._refused(self.DESTROYED_MESSAGE)
+                return self._ok()
+
+            mock_blade.patch_file_systems.side_effect = recover
+            mock_blade.get_policies_file_systems.side_effect = members
+            mock_blade.post_policies_file_systems.side_effect = change
+            mock_blade.delete_policies_file_systems.side_effect = change
+
+        return prepare
+
+    def test_destroyed_filesystem_is_recovered_before_the_attach(self):
+        """The array refuses to attach a policy to a destroyed filesystem,
+        so the recovery is sent first and the membership afterwards."""
+        for name, policy in self.SCOPES:
+            mock_module, mock_blade, models = self._modify(
+                self._existing_fs(name=name, destroyed=True),
+                prepare=self._destroyed_member(False),
+                policy=policy,
+            )
+
+            mock_module.fail_json.assert_not_called()
+            assert self._writes(mock_blade) == [
+                "patch_file_systems",
+                "post_policies_file_systems",
+            ]
+            models["FileSystemPatch"].assert_called_once_with(destroyed=False)
+            mock_blade.post_policies_file_systems.assert_called_once_with(
+                policy_names=[policy], member_names=[name]
+            )
+            mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_destroyed_filesystem_is_recovered_before_the_detach(self):
+        """The membership of a destroyed filesystem is only listed again
+        after the recovery, so one run recovers and detaches."""
+        for name, policy in self.SCOPES:
+            mock_module, mock_blade, models = self._modify(
+                self._existing_fs(name=name, destroyed=True),
+                prepare=self._destroyed_member(True),
+                policy=policy,
+                policy_state="absent",
+            )
+
+            mock_module.fail_json.assert_not_called()
+            assert self._writes(mock_blade) == [
+                "patch_file_systems",
+                "delete_policies_file_systems",
+            ]
+            mock_blade.delete_policies_file_systems.assert_called_once_with(
+                policy_names=[policy], member_names=[name]
+            )
+            mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_destroyed_filesystem_keeps_the_policy_it_had(self):
+        """A recovered filesystem that is still a member of the policy is
+        not attached a second time."""
+        mock_module, mock_blade, models = self._modify(
+            self._existing_fs(name="rz::fs1", destroyed=True),
+            prepare=self._destroyed_member(True),
+            policy="rz::snap",
+        )
+
+        mock_module.fail_json.assert_not_called()
+        assert self._writes(mock_blade) == ["patch_file_systems"]
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_destroyed_filesystem_with_policy_check_mode_sends_nothing(self):
+        """Check mode reports the recovery and sends nothing."""
+        for policy_state, member in (("present", False), ("absent", True)):
+            mock_module, mock_blade, models = self._modify(
+                self._existing_fs(name="rz::fs1", destroyed=True),
+                check_mode=True,
+                prepare=self._destroyed_member(member),
+                policy="rz::snap",
+                policy_state=policy_state,
+            )
+
+            mock_module.fail_json.assert_not_called()
+            assert self._writes(mock_blade) == []
+            mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_destroyed_filesystem_with_a_policy_of_another_scope_is_not_recovered(
+        self,
+    ):
+        """The checks of the policy run before the recovery is sent."""
+        mock_module, mock_blade, models = self._modify(
+            self._existing_fs(name="rz::fs1", destroyed=True),
+            prepare=self._destroyed_member(False),
+            policy="snap",
+        )
+
+        mock_module.fail_json.assert_called_once()
+        assert self._writes(mock_blade) == []
+
+    # ---- WORM data policy of an existing filesystem ----
+
+    def _worm_endpoint(self, *memberships):
+        """GET file-systems/worm-data-policies as the array answers it.
+
+        ``memberships`` are (filesystem id, filesystem name, policy name).
+        The array lists a member without its realm, matches member_names
+        against that bare name, and matches member_ids exactly.
+        """
+
+        def answer(**kwargs):
+            items = []
+            for fs_id, fs_name, policy in memberships:
+                bare = fs_name.rpartition("::")[2]
+                if "member_ids" in kwargs and fs_id not in kwargs["member_ids"]:
+                    continue
+                if "member_names" in kwargs and bare not in kwargs["member_names"]:
+                    continue
+                item = Mock()
+                item.member = Mock()
+                item.member.id = fs_id
+                item.member.name = bare
+                item.policy = Mock()
+                item.policy.name = policy
+                items.append(item)
+            return self._ok(*items)
+
+        return answer
+
+    def _worm_check(self, fs, worm_policy, memberships, context=""):
+        """Run the create-only check for ``fs`` declared with ``worm_policy``."""
+        mock_module = Mock()
+        mock_module.params = self._fu_params(
+            name=fs.name, worm_policy=worm_policy, context=context
+        )
+        mock_module.fail_json.side_effect = SystemExit(1)
+        mock_blade = Mock()
+        mock_blade.get_file_systems_worm_data_policies.side_effect = (
+            self._worm_endpoint(*memberships)
+        )
+        target = "plugins.modules.purefb_fs."
+        with patch(target + "LooseVersion", RealLooseVersion), patch(
+            target + "get_error_message", _array_message
+        ):
+            try:
+                _check_create_only_options(mock_module, mock_blade, fs, "2.30")
+            except SystemExit:
+                pass
+        return mock_module, mock_blade
+
+    REALM_WORM = ("id-realm", "rz::fs1", "rz::worm")
+    ARRAY_WORM = ("id-array", "fs1", "worm")
+
+    def test_worm_policy_of_a_realm_filesystem_is_found_by_id(self):
+        """Replaying the create task of a WORM filesystem in a realm is a
+        no-op: the membership is read by the id of the filesystem, as the
+        array lists the member without its realm."""
+        fs = self._existing_fs(name="rz::fs1", id="id-realm")
+        mock_module, mock_blade = self._worm_check(fs, "rz::worm", [self.REALM_WORM])
+
+        mock_blade.get_file_systems_worm_data_policies.assert_called_once_with(
+            member_ids=["id-realm"]
+        )
+        mock_module.fail_json.assert_not_called()
+
+    def test_worm_policy_of_a_namesake_is_not_taken_for_the_filesystem(self):
+        """A filesystem without a WORM data policy is not accepted because
+        a filesystem of the same name in a realm has one."""
+        fs = self._existing_fs(name="fs1", id="id-array")
+        mock_module, mock_blade = self._worm_check(fs, "rz::worm", [self.REALM_WORM])
+
+        mock_module.fail_json.assert_called_once()
+        msg = mock_module.fail_json.call_args.kwargs["msg"]
+        assert "Filesystem fs1 has WORM data policy none." in msg
+
+    def test_worm_policy_mismatch_names_the_policy_of_the_filesystem(self):
+        """Both namesakes are WORM filesystems: each one is compared with
+        its own policy only."""
+        memberships = [self.ARRAY_WORM, self.REALM_WORM]
+        array_fs = self._existing_fs(name="fs1", id="id-array")
+        realm_fs = self._existing_fs(name="rz::fs1", id="id-realm")
+
+        for fs, policy in ((array_fs, "worm"), (realm_fs, "rz::worm")):
+            mock_module, mock_blade = self._worm_check(fs, policy, memberships)
+            mock_module.fail_json.assert_not_called()
+
+        mock_module, mock_blade = self._worm_check(array_fs, "rz::worm", memberships)
+        mock_module.fail_json.assert_called_once()
+        msg = mock_module.fail_json.call_args.kwargs["msg"]
+        assert "Filesystem fs1 has WORM data policy worm." in msg
+
+        mock_module, mock_blade = self._worm_check(realm_fs, "worm", memberships)
+        mock_module.fail_json.assert_called_once()
+        msg = mock_module.fail_json.call_args.kwargs["msg"]
+        assert "Filesystem rz::fs1 has WORM data policy rz::worm." in msg
+
+    def test_worm_policy_name_is_compared_without_regard_to_case(self):
+        fs = self._existing_fs(name="rz::fs1", id="id-realm")
+        mock_module, mock_blade = self._worm_check(
+            fs, "RZ::worm", [("id-realm", "rz::fs1", "rz::Worm")]
+        )
+
+        mock_module.fail_json.assert_not_called()
+
+    def test_worm_policy_lookup_by_id_carries_the_fleet_context(self):
+        fs = self._existing_fs(name="rz::fs1", id="id-realm")
+        mock_module, mock_blade = self._worm_check(
+            fs, "rz::worm", [self.REALM_WORM], context="fb1"
+        )
+
+        mock_blade.get_file_systems_worm_data_policies.assert_called_once_with(
+            member_ids=["id-realm"], context_names=["fb1"]
+        )
+        mock_module.fail_json.assert_not_called()
+
+    # ---- export_policy, share_policy and client_policy in a realm ----
+
+    LEGACY = ("export_policy", "share_policy", "client_policy")
+
+    def test_main_legacy_policy_options_are_refused_for_a_realm_filesystem(self):
+        """The array does not take the three options on a filesystem in a
+        realm. The task fails before the array is contacted, for both ways
+        of naming the filesystem, new or existing, and in check mode."""
+        for option in self.LEGACY:
+            for found in ({}, self._namesakes(array_level={}, in_realm={})):
+                for check_mode in (False, True):
+                    by_option = self._realm_params(smb=True, **{option: "pol1"})
+                    by_name = self._fu_params(
+                        name=self.REALM_FS, smb=True, **{option: "pol1"}
+                    )
+                    for params in (by_option, by_name):
+                        mock_module, mock_blade, lookups, mock_fs_patch = (
+                            self._run_main_on(params, found, check_mode=check_mode)
+                        )
+
+                        mock_module.fail_json.assert_called_once()
+                        msg = mock_module.fail_json.call_args.kwargs["msg"]
+                        assert msg.startswith(option + " cannot be set")
+                        assert self.REALM_FS in msg
+                        assert "purefb_export" in msg
+                        assert lookups == []
+                        assert mock_blade.mock_calls == []
+                        mock_module.exit_json.assert_not_called()
+
+    def test_main_legacy_policy_options_all_named_in_the_refusal(self):
+        params = self._realm_params(
+            export_policy="pol1", share_policy="pol2", client_policy="pol3"
+        )
+        mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(params, {})
+
+        msg = mock_module.fail_json.call_args.kwargs["msg"]
+        assert msg.startswith("export_policy, share_policy, client_policy cannot")
+
+    def test_main_legacy_policy_option_still_applies_outside_a_realm(self):
+        found = self._namesakes(array_level={}, in_realm={})
+        params = self._fu_params(name="prod-fs", export_policy="pol1")
+        mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(
+            params, found
+        )
+
+        mock_module.fail_json.assert_not_called()
+        assert self._written_names(mock_blade) == ["prod-fs"]
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_main_legacy_policy_options_do_not_block_a_delete(self):
+        found = self._namesakes(in_realm={})
+        params = self._realm_params(state="absent", export_policy="pol1")
+        mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(
+            params, found
+        )
+
+        mock_module.fail_json.assert_not_called()
+        assert self._written_names(mock_blade) == [self.REALM_FS]
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_main_empty_legacy_policy_option_is_not_refused(self):
+        found = self._namesakes(in_realm={})
+        params = self._realm_params(share_policy="", client_policy="")
+        mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(
+            params, found
+        )
+
+        mock_module.fail_json.assert_not_called()
+        assert self._written_names(mock_blade) == []
+        mock_module.exit_json.assert_called_once_with(changed=False)
+
+    def test_main_contradicting_realm_is_refused_for_an_eradicate(self):
+        found = {"other-realm::prod-fs": self._existing_fs(destroyed=True)}
+        for check_mode in (False, True):
+            params = self._realm_params(
+                name="other-realm::prod-fs", state="absent", eradicate=True
+            )
+            mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(
+                params, found, check_mode=check_mode
+            )
+
+            mock_module.fail_json.assert_called_once()
+            assert lookups == []
+            assert mock_blade.mock_calls == []
+
+    # ---- create: what the array would refuse is checked first ----
+
+    def test_create_in_unknown_realm_fails_before_the_post(self):
+        def unknown(mock_blade):
+            mock_blade.get_realms.return_value = self._refused("Realm does not exist.")
+
+        for check_mode in (True, False):
+            mock_module, mock_blade, models = self._create(
+                check_mode, unknown, name="nope::fs1"
+            )
+
+            mock_blade.get_realms.assert_called_once_with(names=["nope"])
+            mock_module.fail_json.assert_called_once_with(
+                msg="Realm 'nope' does not exist"
+            )
+            assert self._writes(mock_blade) == []
+            mock_module.exit_json.assert_not_called()
+
+    def test_create_in_destroyed_realm_fails_before_the_post(self):
+        def destroyed(mock_blade):
+            mock_blade.get_realms.return_value = self._realm_response(
+                "gone", destroyed=True
+            )
+
+        for check_mode in (True, False):
+            mock_module, mock_blade, models = self._create(
+                check_mode, destroyed, name="gone::fs1"
+            )
+
+            mock_module.fail_json.assert_called_once()
+            msg = mock_module.fail_json.call_args.kwargs["msg"]
+            assert msg.startswith("Realm 'gone' is destroyed.")
+            assert self._writes(mock_blade) == []
+            mock_module.exit_json.assert_not_called()
+
+    def test_create_in_realm_the_user_cannot_see_fails_before_the_post(self):
+        """A realm-scoped administrator gets an empty list for another
+        realm."""
+
+        def hidden(mock_blade):
+            mock_blade.get_realms.return_value = self._ok()
+
+        mock_module, mock_blade, models = self._create(True, hidden, name="other::fs1")
+
+        mock_module.fail_json.assert_called_once_with(
+            msg="Realm 'other' does not exist"
+        )
+        assert self._writes(mock_blade) == []
+
+    def test_create_realm_read_refused_reports_the_array_message(self):
+        def refused(mock_blade):
+            mock_blade.get_realms.return_value = self._refused(
+                "Operation not permitted."
+            )
+
+        mock_module, mock_blade, models = self._create(False, refused, name="rz::fs1")
+
+        mock_module.fail_json.assert_called_once()
+        msg = mock_module.fail_json.call_args.kwargs["msg"]
+        assert "Operation not permitted." in msg
+        assert "does not exist" not in msg
+        assert self._writes(mock_blade) == []
+
+    def test_create_in_realm_below_rest_2_19_fails_in_check_mode(self):
+        for check_mode in (True, False):
+            mock_module, mock_blade, models = self._create(
+                check_mode, api="2.18", name="rz::fs1"
+            )
+
+            mock_module.fail_json.assert_called_once()
+            assert "2.19" in mock_module.fail_json.call_args.kwargs["msg"]
+            mock_blade.get_realms.assert_not_called()
+            assert self._writes(mock_blade) == []
+
+    def test_create_in_realm_check_mode_reads_the_realm_and_writes_nothing(self):
+        mock_module, mock_blade, models = self._create(
+            True, name="production-realm::fs1"
+        )
+
+        mock_blade.get_realms.assert_called_once_with(names=["production-realm"])
+        mock_module.fail_json.assert_not_called()
+        assert self._writes(mock_blade) == []
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_create_outside_a_realm_reads_no_realm(self):
+        mock_module, mock_blade, models = self._create(True, name="fs1")
+
+        mock_blade.get_realms.assert_not_called()
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_create_in_realm_with_policies_of_the_realm(self):
+        mock_module, mock_blade, models = self._create(
+            name="rz::fs1", policy="rz::snap", worm_policy="rz::worm"
+        )
+
+        mock_module.fail_json.assert_not_called()
+        mock_blade.get_worm_data_policies.assert_called_once_with(names=["rz::worm"])
+        mock_blade.get_policies.assert_called_once_with(names=["rz::snap"])
+        assert self._writes(mock_blade) == [
+            "post_file_systems",
+            "post_policies_file_systems",
+        ]
+        kwargs = mock_blade.post_file_systems.call_args.kwargs
+        assert kwargs["names"] == ["rz::fs1"]
+        assert kwargs["policy_names"] == ["rz::worm"]
+        assert kwargs["default_exports"] == ["''"]
+        mock_blade.post_policies_file_systems.assert_called_once_with(
+            policy_names=["rz::snap"], member_names=["rz::fs1"]
+        )
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_create_with_missing_policy_creates_nothing(self):
+        """The policy is read before the POST, so there is no filesystem
+        to remove again, and check mode fails like the real run."""
+
+        def missing(mock_blade):
+            mock_blade.get_policies.return_value = self._refused(
+                "Policy does not exist."
+            )
+
+        for check_mode in (True, False):
+            mock_module, mock_blade, models = self._create(
+                check_mode, missing, name="fs1", policy="snap"
+            )
+
+            mock_module.fail_json.assert_called_once_with(
+                msg="Policy snap doesn't exist."
+            )
+            assert self._writes(mock_blade) == []
+            mock_module.exit_json.assert_not_called()
+
+    def test_create_with_policy_of_another_scope_creates_nothing(self):
+        for name, option, policy in (
+            ("rz::fs1", "policy", "snap"),
+            ("fs1", "policy", "rz::snap"),
+            ("rz::fs1", "worm_policy", "worm"),
+            ("fs1", "worm_policy", "rz::worm"),
+            ("rz::fs1", "worm_policy", "other::worm"),
+        ):
+            for check_mode in (True, False):
+                mock_module, mock_blade, models = self._create(
+                    check_mode, name=name, **{option: policy}
+                )
+
+                mock_module.fail_json.assert_called_once()
+                msg = mock_module.fail_json.call_args.kwargs["msg"]
+                assert msg.startswith("Cannot attach {0} {1} ".format(option, policy))
+                assert name in msg
+                mock_blade.get_policies.assert_not_called()
+                mock_blade.get_worm_data_policies.assert_not_called()
+                assert self._writes(mock_blade) == []
+                mock_module.exit_json.assert_not_called()
+
+    def test_create_with_missing_worm_policy_creates_nothing(self):
+        def missing(mock_blade):
+            mock_blade.get_worm_data_policies.return_value = self._refused(
+                "Worm data policy does not exist."
+            )
+
+        for check_mode in (True, False):
+            mock_module, mock_blade, models = self._create(
+                check_mode, missing, name="fs1", worm_policy="worm"
+            )
+
+            mock_module.fail_json.assert_called_once_with(
+                msg="WORM data policy worm doesn't exist."
+            )
+            assert self._writes(mock_blade) == []
+
+    def test_create_worm_policy_read_refused_reports_the_array_message(self):
+        def refused(mock_blade):
+            mock_blade.get_worm_data_policies.return_value = self._refused(
+                "Operation not permitted."
+            )
+
+        mock_module, mock_blade, models = self._create(
+            False, refused, name="fs1", worm_policy="worm"
+        )
+
+        msg = mock_module.fail_json.call_args.kwargs["msg"]
+        assert "Operation not permitted." in msg
+        assert self._writes(mock_blade) == []
+
+    def test_create_policy_reads_carry_the_fleet_context(self):
+        mock_module, mock_blade, models = self._create(
+            True, name="fs1", policy="snap", worm_policy="worm", context="fb1"
+        )
+
+        mock_blade.get_worm_data_policies.assert_called_once_with(
+            names=["worm"], context_names=["fb1"]
+        )
+        mock_blade.get_policies.assert_called_once_with(
+            names=["snap"], context_names=["fb1"]
+        )
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_create_option_checks_run_in_check_mode(self):
+        for overrides, needle in (
+            (
+                {"access_control": "nfs", "nfsv3": False, "nfsv4": False},
+                "Cannot set access_control to nfs",
+            ),
+            ({"access_control": "smb"}, "when SMB is not enabled"),
+            ({"access_control": "mode-bits"}, "ACL Safeguarding"),
+        ):
+            mock_module, mock_blade, models = self._create(
+                True, name="fs1", **overrides
+            )
+
+            mock_module.fail_json.assert_called_once()
+            assert needle in mock_module.fail_json.call_args.kwargs["msg"]
+            mock_module.exit_json.assert_not_called()
+
+    def test_main_check_mode_create_in_unknown_realm_fails(self):
+        def unknown(mock_blade):
+            mock_blade.get_realms.return_value = self._refused("Realm does not exist.")
+
+        mock_module, mock_blade, lookups, mock_fs_patch = self._run_main_on(
+            self._realm_params(size="1G"), {}, check_mode=True, prepare=unknown
+        )
+
+        mock_module.fail_json.assert_called_once_with(
+            msg="Realm 'production-realm' does not exist"
+        )
+        assert self._written_names(mock_blade) == []
+        mock_module.exit_json.assert_not_called()
+
+    # ---- the PATCH carries what changes; demote ----
+
+    def test_demote_sends_the_promotion_state_only(self):
+        """A writable, promoted filesystem is demoted with a PATCH that
+        does not carry writable: the array refuses writable in a request
+        that demotes the filesystem."""
+        mock_module, mock_blade, models = self._modify(
+            self._existing_fs(name="fs1"), promote=False, discard_snaps=True
+        )
+
+        models["FileSystemPatch"].assert_called_once_with(
+            requested_promotion_state="demoted"
+        )
+        mock_blade.patch_file_systems.assert_called_once_with(
+            names=["fs1"],
+            file_system=models["FileSystemPatch"].return_value,
+            discard_non_snapshotted_data=True,
+            ignore_usage=False,
+        )
+        mock_blade.get_file_system_replica_links.assert_not_called()
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_demote_check_mode_sends_nothing(self):
+        mock_module, mock_blade, models = self._modify(
+            self._existing_fs(name="fs1"),
+            check_mode=True,
+            promote=False,
+            discard_snaps=True,
+        )
+
+        assert self._writes(mock_blade) == []
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_demote_without_discard_snaps_fails_before_any_write(self):
+        """The array only demotes with discard_non_snapshotted_data, so the
+        task fails in check mode as it would for real."""
+        for check_mode in (True, False):
+            mock_module, mock_blade, models = self._modify(
+                self._existing_fs(name="rz::fs1"), check_mode=check_mode, promote=False
+            )
+
+            mock_module.fail_json.assert_called_once()
+            msg = mock_module.fail_json.call_args.kwargs["msg"]
+            assert "rz::fs1" in msg
+            assert "discard_snaps=true" in msg
+            assert self._writes(mock_blade) == []
+            mock_module.exit_json.assert_not_called()
+
+    def test_demote_and_read_only_in_one_task(self):
+        mock_module, mock_blade, models = self._modify(
+            self._existing_fs(name="fs1"),
+            promote=False,
+            writable=False,
+            discard_snaps=True,
+        )
+
+        models["FileSystemPatch"].assert_called_once_with(
+            writable=False, requested_promotion_state="demoted"
+        )
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_demote_already_requested_is_noop(self):
+        fs = self._existing_fs(name="fs1", requested_promotion_state="demoted")
+        mock_module, mock_blade, models = self._modify(fs, promote=False)
+
+        mock_module.fail_json.assert_not_called()
+        assert self._writes(mock_blade) == []
+        mock_module.exit_json.assert_called_once_with(changed=False)
+
+    def test_demoted_filesystem_demote_is_noop(self):
+        fs = self._existing_fs(
+            name="fs1",
+            promotion_status="demoted",
+            requested_promotion_state="demoted",
+            writable=False,
+        )
+        mock_module, mock_blade, models = self._modify(fs, promote=False)
+
+        mock_module.fail_json.assert_not_called()
+        assert self._writes(mock_blade) == []
+        mock_module.exit_json.assert_called_once_with(changed=False)
+
+    def test_promote_sends_the_promotion_state_only(self):
+        fs = self._existing_fs(
+            name="fs1",
+            promotion_status="demoted",
+            requested_promotion_state="demoted",
+            writable=False,
+        )
+        mock_module, mock_blade, models = self._modify(fs, promote=True)
+
+        models["FileSystemPatch"].assert_called_once_with(
+            requested_promotion_state="promoted"
+        )
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_promote_already_requested_is_noop(self):
+        fs = self._existing_fs(name="fs1", promotion_status="demoted", writable=False)
+        mock_module, mock_blade, models = self._modify(fs, promote=True)
+
+        assert self._writes(mock_blade) == []
+        mock_module.exit_json.assert_called_once_with(changed=False)
+
+    def test_patch_carries_only_what_changes(self):
+        mock_module, mock_blade, models = self._modify(
+            self._existing_fs(name="rz::fs1"), size="2G"
+        )
+
+        models["FileSystemPatch"].assert_called_once_with(provisioned=2 * self.GIB)
+        mock_blade.patch_file_systems.assert_called_once_with(
+            names=["rz::fs1"],
+            file_system=models["FileSystemPatch"].return_value,
+            discard_non_snapshotted_data=False,
+            ignore_usage=False,
+        )
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_patch_nested_attributes_carry_only_what_changes(self):
+        mock_module, mock_blade, models = self._modify(
+            self._existing_fs(name="fs1"),
+            nfsv3=False,
+            http=True,
+            access_control="nfs",
+        )
+
+        models["NfsPatch"].assert_called_once_with(v3_enabled=False)
+        models["Http"].assert_called_once_with(enabled=True)
+        models["MultiProtocol"].assert_called_once_with(access_control_style="nfs")
+        models["Smb"].assert_not_called()
+        models["FileSystemPatch"].assert_called_once_with(
+            nfs=models["NfsPatch"].return_value,
+            http=models["Http"].return_value,
+            multi_protocol=models["MultiProtocol"].return_value,
+        )
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_patch_carries_the_fleet_context(self):
+        mock_module, mock_blade, models = self._modify(
+            self._existing_fs(name="fs1"), size="2G", context="fb1"
+        )
+
+        mock_blade.patch_file_systems.assert_called_once_with(
+            names=["fs1"],
+            file_system=models["FileSystemPatch"].return_value,
+            discard_non_snapshotted_data=False,
+            ignore_usage=False,
+            context_names=["fb1"],
+        )
+
+    def test_unchanged_filesystem_sends_nothing(self):
+        for check_mode in (False, True):
+            mock_module, mock_blade, models = self._modify(
+                self._existing_fs(name="rz::fs1"), check_mode=check_mode
+            )
+
+            assert self._writes(mock_blade) == []
+            mock_module.exit_json.assert_called_once_with(changed=False)
+
+    def test_recover_sends_the_recovery_only(self):
+        mock_module, mock_blade, models = self._modify(
+            self._existing_fs(name="fs1", destroyed=True)
+        )
+
+        models["FileSystemPatch"].assert_called_once_with(destroyed=False)
+        mock_blade.patch_file_systems.assert_called_once_with(
+            names=["fs1"], file_system=models["FileSystemPatch"].return_value
+        )
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_recover_and_resize_sends_two_patches(self):
+        mock_module, mock_blade, models = self._modify(
+            self._existing_fs(name="fs1", destroyed=True), size="2G"
+        )
+
+        assert [call.kwargs for call in models["FileSystemPatch"].call_args_list] == [
+            {"destroyed": False},
+            {"provisioned": 2 * self.GIB},
+        ]
+        assert self._writes(mock_blade) == ["patch_file_systems"] * 2
+        mock_module.exit_json.assert_called_once_with(changed=True)
+
+    def test_recover_failure_reports_the_array_message(self):
+        def refused(mock_blade):
+            mock_blade.patch_file_systems.return_value = self._refused(
+                "File system cannot be recovered."
+            )
+
+        mock_module, mock_blade, models = self._modify(
+            self._existing_fs(name="fs1", destroyed=True), prepare=refused
+        )
+
+        mock_module.fail_json.assert_called_once()
+        msg = mock_module.fail_json.call_args.kwargs["msg"]
+        assert "deleted status" in msg
+        assert "File system cannot be recovered." in msg
+
+    def test_patch_body_and_realm_helpers(self):
+        from plugins.modules.purefb_fs import _patch_body, _realm_of
+
+        assert _realm_of("rz::fs1") == "rz"
+        assert _realm_of("fs1") == ""
+        before = {"provisioned": 1, "writable": True, "destroyed": False}
+        assert _patch_body(before, dict(before)) == {}
+        assert _patch_body(before, dict(before, provisioned=2, destroyed=True)) == {
+            "provisioned": 2
+        }

@@ -8,6 +8,7 @@ from __future__ import absolute_import, division, print_function
 __metaclass__ = type
 
 import sys
+import fnmatch
 import multiprocessing
 import ctypes
 from unittest.mock import Mock, patch, MagicMock, call
@@ -70,6 +71,7 @@ sys.modules["ansible_collections.everpure.flashblade.plugins.module_utils.versio
     MagicMock()
 )
 
+from plugins.module_utils.version import LooseVersion as RealLooseVersion
 from plugins.modules.purefb_tls_policy import (
     main,
     _get_policy,
@@ -117,18 +119,42 @@ class TestPurefbTlsPolicy:
 
         assert _get_policy(mock_module, mock_blade) is None
 
-    def test_get_policy_returns_none_on_error(self):
-        """Test _get_policy returns None when status is non-200"""
+    @patch("plugins.modules.purefb_tls_policy.get_error_message")
+    def test_get_policy_returns_none_when_array_says_missing(self, mock_get_error):
+        """Test _get_policy returns None for the array's "does not exist" answer"""
+        mock_get_error.return_value = "TLS Policy does not exist."
         mock_module = Mock()
         mock_module.params = {"name": "tls1"}
+        mock_module.fail_json = Mock(side_effect=SystemExit)
 
         mock_blade = Mock()
-        mock_response = Mock()
+        mock_response = Mock(spec=["status_code", "errors"])
         mock_response.status_code = 400
-        mock_response.items = []
         mock_blade.get_tls_policies.return_value = mock_response
 
         assert _get_policy(mock_module, mock_blade) is None
+        mock_module.fail_json.assert_not_called()
+
+    @patch("plugins.modules.purefb_tls_policy.get_error_message")
+    def test_get_policy_fails_on_any_other_error(self, mock_get_error):
+        """Test _get_policy reports an answer that does not say the policy is missing"""
+        mock_get_error.return_value = "Operation not permitted."
+        mock_module = Mock()
+        mock_module.params = {"name": "tls1"}
+        mock_module.fail_json = Mock(side_effect=SystemExit)
+
+        mock_blade = Mock()
+        mock_response = Mock(spec=["status_code", "errors"])
+        mock_response.status_code = 400
+        mock_blade.get_tls_policies.return_value = mock_response
+
+        try:
+            _get_policy(mock_module, mock_blade)
+        except SystemExit:
+            pass
+        mock_module.fail_json.assert_called_once_with(
+            msg="Failed to read TLS policy tls1. Error: Operation not permitted."
+        )
 
     def test_get_attached_interfaces_returns_sorted_names(self):
         """Test _get_attached_interfaces returns member names sorted"""
@@ -154,18 +180,27 @@ class TestPurefbTlsPolicy:
             policy_names=["tls1"]
         )
 
-    def test_get_attached_interfaces_returns_empty_on_error(self):
-        """Test _get_attached_interfaces returns [] when status is non-200"""
+    @patch("plugins.modules.purefb_tls_policy.get_error_message")
+    def test_get_attached_interfaces_fails_on_error(self, mock_get_error):
+        """Test _get_attached_interfaces reports a list the array does not return"""
+        mock_get_error.return_value = "Operation not permitted."
         mock_module = Mock()
         mock_module.params = {"name": "tls1"}
+        mock_module.fail_json = Mock(side_effect=SystemExit)
 
         mock_blade = Mock()
-        mock_response = Mock()
+        mock_response = Mock(spec=["status_code", "errors"])
         mock_response.status_code = 400
-        mock_response.items = []
         mock_blade.get_tls_policies_network_interfaces.return_value = mock_response
 
-        assert _get_attached_interfaces(mock_module, mock_blade) == []
+        try:
+            _get_attached_interfaces(mock_module, mock_blade)
+        except SystemExit:
+            pass
+        mock_module.fail_json.assert_called_once_with(
+            msg="Failed to list the network interfaces of TLS policy tls1. "
+            "Error: Operation not permitted."
+        )
 
     # ---------------- _reconcile_interfaces tests ----------------
 
@@ -1745,3 +1780,1136 @@ class TestPurefbTlsPolicy:
         mock_module.fail_json.assert_called_once()
         msg = mock_module.fail_json.call_args[1]["msg"]
         assert "appliance_certificate is required" in msg
+
+
+# ---------------- realm names, scope checks, letter case and checked reads ----------------
+
+MOD = "plugins.modules.purefb_tls_policy"
+WRITES = (
+    "post_tls_policies",
+    "patch_tls_policies",
+    "delete_tls_policies",
+    "post_tls_policies_network_interfaces",
+    "delete_tls_policies_network_interfaces",
+)
+
+
+def _params(**overrides):
+    params = {
+        "name": "tls1",
+        "state": "present",
+        "enabled": None,
+        "appliance_certificate": None,
+        "client_certificates_required": None,
+        "trusted_client_certificate_authority": None,
+        "verify_client_certificate_trust": None,
+        "min_tls_version": None,
+        "enabled_tls_ciphers": None,
+        "disabled_tls_ciphers": None,
+        "network_interfaces": None,
+    }
+    params.update(overrides)
+    return params
+
+
+def _key(name):
+    """The array matches names without regard to letter case and outer blanks."""
+    return name.strip().lower()
+
+
+def _named(name):
+    item = Mock()
+    item.name = name
+    return item
+
+
+def _policy(name, certificate="global", trusted_ca=None, **fields):
+    """A TLS policy as GET /tls-policies returns it.
+
+    An unset trusted CA comes back as an empty reference, whose name is None.
+    """
+    policy = Mock()
+    policy.name = name
+    policy.enabled = fields.get("enabled", True)
+    policy.min_tls_version = fields.get("min_tls_version", "default")
+    policy.enabled_tls_ciphers = fields.get("enabled_tls_ciphers", ["default"])
+    policy.disabled_tls_ciphers = fields.get("disabled_tls_ciphers", [])
+    policy.appliance_certificate = _named(certificate)
+    policy.trusted_client_certificate_authority = _named(trusted_ca)
+    policy.client_certificates_required = fields.get(
+        "client_certificates_required", False
+    )
+    policy.verify_client_certificate_trust = fields.get(
+        "verify_client_certificate_trust", False
+    )
+    return policy
+
+
+def _member(policy_name, interface_name):
+    """A policy member as GET /tls-policies/network-interfaces returns it."""
+    item = Mock()
+    item.policy = _named(policy_name)
+    item.member = _named(interface_name)
+    return item
+
+
+def _answer(items=None, error=None):
+    """A 200 answer with items, or an error answer, which has no items."""
+    if error is None:
+        res = Mock()
+        res.status_code = 200
+        res.items = list(items or [])
+        return res
+    res = Mock(spec=["status_code", "errors"])
+    res.status_code = 400
+    err = Mock()
+    err.message = error
+    res.errors = [err]
+    return res
+
+
+def _error_message(res, default="Unknown error"):
+    errors = getattr(res, "errors", None)
+    return errors[0].message if errors else default
+
+
+def _body(**kwargs):
+    """Stand-in for the SDK models, so that request bodies are comparable."""
+    return dict(kwargs)
+
+
+def _wire_names(names):
+    """Names as a request carries them: a comma separates two names."""
+    return [part for name in names for part in name.split(",")]
+
+
+def _array(policies=(), attached=(), interfaces=(), realms=("realm1",), destroyed=()):
+    """A small stateful stand-in for the array.
+
+    It answers as Purity//FB 4.8.8 does: names match without regard to letter
+    case, * in a name is a pattern, a missing policy answers 400 "TLS Policy
+    does not exist." (its member list "Policy does not exist."), a missing
+    interface "Network does not exist." and a missing realm "Realm does not
+    exist.". attached holds (policy name, interface name) pairs. POST, PATCH
+    and DELETE change that state, so a second run reads it back.
+
+    A realm is returned in the spelling the array stores (realms, destroyed).
+    A certificate reference is found without regard to letter case, but its
+    realm is compared with the realm prefix as it is written in the policy
+    name of the request: another spelling answers 400 "Realms for Certificate
+    (...) and TLS Policy (...) don't match".
+    """
+    blade = Mock()
+    blade.policies = {_key(policy.name): policy for policy in policies}
+    blade.attached = [tuple(pair) for pair in attached]
+    stored_interfaces = {_key(name): name for name in interfaces}
+    stored_realms = {_key(realm): realm for realm in tuple(realms) + tuple(destroyed)}
+
+    def realm_mismatch(policy_name, body):
+        written = policy_name.rpartition("::")[0].strip()
+        for field, kind in (
+            ("appliance_certificate", "Certificate"),
+            ("trusted_client_certificate_authority", "Certificate group"),
+        ):
+            reference = (body.get(field) or {}).get("name")
+            if not reference:
+                continue
+            prefix, sep, leaf = reference.strip().rpartition("::")
+            realm = stored_realms.get(_key(prefix), prefix)
+            if realm != written:
+                return _answer(
+                    error="Realms for {0} ({1}{2}{3}) and TLS Policy ({4}) don't "
+                    "match".format(kind, realm, sep, leaf, policy_name)
+                )
+        return None
+
+    def get_tls_policies(names=None):
+        found = []
+        for name in _wire_names(names):
+            if "*" in name:
+                hits = [
+                    policy
+                    for key, policy in sorted(blade.policies.items())
+                    if fnmatch.fnmatchcase(key, _key(name))
+                ]
+                if not hits:
+                    return _answer(error="TLS Policy was not found.")
+                found.extend(hits)
+            elif _key(name) in blade.policies:
+                found.append(blade.policies[_key(name)])
+            else:
+                return _answer(error="TLS Policy does not exist.")
+        return _answer(found)
+
+    def get_members(policy_names=None, member_names=None):
+        if policy_names is not None:
+            if [name for name in policy_names if _key(name) not in blade.policies]:
+                return _answer(error="Policy does not exist.")
+            wanted = [_key(name) for name in policy_names]
+            pairs = [pair for pair in blade.attached if _key(pair[0]) in wanted]
+        else:
+            wanted = [_key(name) for name in member_names]
+            pairs = [pair for pair in blade.attached if _key(pair[1]) in wanted]
+        return _answer([_member(*pair) for pair in pairs])
+
+    def get_network_interfaces(names=None):
+        if [name for name in names if _key(name) not in stored_interfaces]:
+            return _answer(error="Network does not exist.")
+        return _answer([_named(stored_interfaces[_key(name)]) for name in names])
+
+    def get_realms(names=None):
+        found = []
+        for name in names:
+            if _key(name) not in stored_realms:
+                return _answer(error="Realm does not exist.")
+            item = _named(stored_realms[_key(name)])
+            item.destroyed = _key(name) in [_key(realm) for realm in destroyed]
+            found.append(item)
+        return _answer(found)
+
+    def post_tls_policies(names=None, policy=None):
+        refusal = realm_mismatch(names[0], policy)
+        if refusal:
+            return refusal
+        fields = dict(policy)
+        certificate = fields.pop("appliance_certificate")["name"]
+        trusted_ca = fields.pop("trusted_client_certificate_authority", {}).get("name")
+        blade.policies[_key(names[0])] = _policy(
+            names[0].strip(), certificate, trusted_ca, **fields
+        )
+        return _answer()
+
+    def patch_tls_policies(names=None, policy=None):
+        for name in _wire_names(names):
+            refusal = realm_mismatch(name, policy)
+            if refusal:
+                return refusal
+        for name in _wire_names(names):
+            stored = blade.policies[_key(name)]
+            for field, value in policy.items():
+                if field in (
+                    "appliance_certificate",
+                    "trusted_client_certificate_authority",
+                ):
+                    setattr(stored, field, _named(value["name"] or None))
+                else:
+                    setattr(stored, field, value)
+        return _answer()
+
+    def delete_tls_policies(names=None):
+        for name in _wire_names(names):
+            del blade.policies[_key(name)]
+        return _answer()
+
+    def post_members(policy_names=None, member_names=None):
+        blade.attached.append(
+            (
+                blade.policies[_key(policy_names[0])].name,
+                stored_interfaces[_key(member_names[0])],
+            )
+        )
+        return _answer()
+
+    def delete_members(policy_names=None, member_names=None):
+        gone = (_key(policy_names[0]), _key(member_names[0]))
+        blade.attached = [
+            pair for pair in blade.attached if (_key(pair[0]), _key(pair[1])) != gone
+        ]
+        return _answer()
+
+    blade.get_tls_policies = Mock(side_effect=get_tls_policies)
+    blade.get_tls_policies_network_interfaces = Mock(side_effect=get_members)
+    blade.get_network_interfaces = Mock(side_effect=get_network_interfaces)
+    blade.get_realms = Mock(side_effect=get_realms)
+    blade.post_tls_policies = Mock(side_effect=post_tls_policies)
+    blade.patch_tls_policies = Mock(side_effect=patch_tls_policies)
+    blade.delete_tls_policies = Mock(side_effect=delete_tls_policies)
+    blade.post_tls_policies_network_interfaces = Mock(side_effect=post_members)
+    blade.delete_tls_policies_network_interfaces = Mock(side_effect=delete_members)
+    return blade
+
+
+def _writes(blade):
+    """The write requests the module sent, in the order of WRITES."""
+    return [name for name in WRITES if getattr(blade, name).called]
+
+
+def _run(blade, check_mode=False, api_version="2.30", **overrides):
+    """Run main() against blade and return ("exit" or "fail", its keywords)."""
+    module = Mock()
+    module.params = _params(**overrides)
+    module.check_mode = check_mode
+    module.exit_json = Mock(side_effect=SystemExit)
+    module.fail_json = Mock(side_effect=SystemExit)
+    with patch(MOD + ".AnsibleModule", return_value=module), patch(
+        MOD + ".HAS_PYPURECLIENT", True
+    ), patch(MOD + ".get_system", return_value=blade), patch(
+        MOD + ".get_rest_api_version", return_value=api_version
+    ), patch(
+        MOD + ".LooseVersion", RealLooseVersion
+    ), patch(
+        MOD + ".get_error_message", _error_message
+    ), patch(
+        MOD + ".TlsPolicy", side_effect=_body
+    ), patch(
+        MOD + ".TlsPolicyPost", side_effect=_body
+    ), patch(
+        MOD + ".ReferenceWritable", side_effect=_body
+    ):
+        try:
+            main()
+        except SystemExit:
+            pass
+    if module.fail_json.called:
+        return "fail", module.fail_json.call_args[1]
+    return "exit", module.exit_json.call_args[1]
+
+
+class TestPurefbTlsPolicyOneName:
+    """A name the array reads as a pattern or as several names is refused"""
+
+    def test_pattern_name_is_refused_before_any_read(self):
+        blade = _array(policies=[_policy("tls1"), _policy("tls2")])
+        for check_mode in (True, False):
+            outcome, result = _run(
+                blade, check_mode=check_mode, name="tls*", state="absent"
+            )
+            assert outcome == "fail"
+            assert "name of one TLS policy" in result["msg"]
+            assert "tls*" in result["msg"]
+        blade.get_tls_policies.assert_not_called()
+        assert _writes(blade) == []
+        assert sorted(blade.policies) == ["tls1", "tls2"]
+
+    def test_two_names_in_one_are_refused(self):
+        blade = _array(policies=[_policy("tls1"), _policy("tls2")])
+        outcome, result = _run(blade, name="tls1,tls2", enabled=False)
+        assert outcome == "fail"
+        assert "comma" in result["msg"]
+        blade.get_tls_policies.assert_not_called()
+        assert _writes(blade) == []
+        assert blade.policies["tls1"].enabled is True
+        assert blade.policies["tls2"].enabled is True
+
+    def test_pattern_in_the_realm_part_is_refused(self):
+        blade = _array(policies=[_policy("realm1::data-tls", "realm1::tls-cert")])
+        outcome, result = _run(blade, name="*::data-tls", state="absent")
+        assert outcome == "fail"
+        assert _writes(blade) == []
+
+    def test_answer_with_another_name_is_not_adopted(self):
+        blade = _array(policies=[_policy("tls1")])
+        blade.get_tls_policies = Mock(return_value=_answer([_policy("tls2")]))
+        outcome, result = _run(blade, name="tls1", enabled=False)
+        assert outcome == "fail"
+        assert "tls2" in result["msg"]
+        assert "does not have that name" in result["msg"]
+        assert _writes(blade) == []
+
+
+class TestPurefbTlsPolicyReferenceScope:
+    """A policy and the certificates it names are in one scope"""
+
+    def test_global_on_a_new_realm_policy_is_refused(self):
+        for check_mode in (True, False):
+            blade = _array()
+            outcome, result = _run(
+                blade,
+                check_mode=check_mode,
+                name="realm1::data-tls",
+                appliance_certificate="global",
+            )
+            assert outcome == "fail"
+            assert "appliance_certificate global cannot be used" in result["msg"]
+            assert "built-in certificate of the array" in result["msg"]
+            assert "realm1::<name>" in result["msg"]
+            blade.get_tls_policies.assert_not_called()
+            assert _writes(blade) == []
+
+    def test_global_on_an_existing_realm_policy_is_refused(self):
+        for check_mode in (True, False):
+            blade = _array(policies=[_policy("realm1::data-tls", "realm1::tls-cert")])
+            outcome, result = _run(
+                blade,
+                check_mode=check_mode,
+                name="realm1::data-tls",
+                appliance_certificate="global",
+                min_tls_version="1.3",
+            )
+            assert outcome == "fail"
+            assert "built-in certificate of the array" in result["msg"]
+            assert _writes(blade) == []
+            assert blade.policies["realm1::data-tls"].min_tls_version == "default"
+
+    def test_global_in_another_letter_case_is_refused_for_a_realm_policy(self):
+        blade = _array()
+        outcome, result = _run(
+            blade, name="realm1::data-tls", appliance_certificate="GLOBAL"
+        )
+        assert outcome == "fail"
+        assert "built-in certificate of the array" in result["msg"]
+
+    def test_bare_certificate_on_a_realm_policy_is_refused(self):
+        for check_mode in (True, False):
+            blade = _array(policies=[_policy("realm1::data-tls", "realm1::tls-cert")])
+            outcome, result = _run(
+                blade,
+                check_mode=check_mode,
+                name="realm1::data-tls",
+                appliance_certificate="tls-cert",
+            )
+            assert outcome == "fail"
+            assert "tls-cert is an array-level name" in result["msg"]
+            assert "Name a certificate of that realm" in result["msg"]
+            assert _writes(blade) == []
+
+    def test_certificate_of_another_realm_is_refused(self):
+        blade = _array(policies=[_policy("realm1::data-tls", "realm1::tls-cert")])
+        outcome, result = _run(
+            blade,
+            check_mode=True,
+            name="realm1::data-tls",
+            appliance_certificate="realm2::tls-cert",
+        )
+        assert outcome == "fail"
+        assert "realm2::tls-cert is in realm realm2" in result["msg"]
+        assert "realm1::<name>" in result["msg"]
+        assert _writes(blade) == []
+
+    def test_realm_certificate_on_an_array_level_policy_is_refused(self):
+        for check_mode in (True, False):
+            blade = _array(policies=[_policy("data-tls", "tls-cert")])
+            outcome, result = _run(
+                blade,
+                check_mode=check_mode,
+                name="data-tls",
+                appliance_certificate="realm1::tls-cert",
+            )
+            assert outcome == "fail"
+            assert "realm1::tls-cert is in realm realm1" in result["msg"]
+            assert "data-tls is an array-level policy" in result["msg"]
+            assert "realm1::<policy>" in result["msg"]
+            assert _writes(blade) == []
+
+    def test_realm_ca_group_on_an_array_level_policy_is_refused(self):
+        blade = _array(policies=[_policy("data-tls", "tls-cert")])
+        outcome, result = _run(
+            blade,
+            check_mode=True,
+            name="data-tls",
+            trusted_client_certificate_authority="realm1::ca-group",
+        )
+        assert outcome == "fail"
+        assert result["msg"].startswith(
+            "trusted_client_certificate_authority realm1::ca-group cannot be used"
+        )
+        assert _writes(blade) == []
+
+    def test_bare_ca_on_a_realm_policy_is_refused(self):
+        blade = _array(policies=[_policy("realm1::data-tls", "realm1::tls-cert")])
+        outcome, result = _run(
+            blade,
+            name="realm1::data-tls",
+            trusted_client_certificate_authority="ca-group",
+            verify_client_certificate_trust=True,
+        )
+        assert outcome == "fail"
+        assert "ca-group is an array-level name" in result["msg"]
+        assert "certificate or certificate group of that realm" in result["msg"]
+        assert _writes(blade) == []
+        assert (
+            blade.policies["realm1::data-tls"].verify_client_certificate_trust is False
+        )
+
+    def test_bare_policy_with_a_realm_certificate_is_refused_on_create(self):
+        blade = _array()
+        outcome, result = _run(
+            blade, check_mode=True, name="data-tls", appliance_certificate="realm1::c"
+        )
+        assert outcome == "fail"
+        assert "realm1::<policy>" in result["msg"]
+        blade.get_tls_policies.assert_not_called()
+
+    def test_realm_prefix_in_another_letter_case_is_the_same_realm(self):
+        """The scope check passes; the create names the realm as the array stores it"""
+        blade = _array()
+        task = dict(
+            name="Realm1::data-tls",
+            appliance_certificate="REALM1::tls-cert",
+            trusted_client_certificate_authority="realm1::ca-group",
+        )
+        outcome, result = _run(blade, check_mode=True, **task)
+        assert (outcome, result["changed"]) == ("exit", True)
+        assert _writes(blade) == []
+        outcome, result = _run(blade, **task)
+        assert (outcome, result["changed"]) == ("exit", True)
+        blade.post_tls_policies.assert_called_once_with(
+            names=["realm1::data-tls"],
+            policy={
+                "appliance_certificate": {"name": "REALM1::tls-cert"},
+                "trusted_client_certificate_authority": {"name": "realm1::ca-group"},
+            },
+        )
+        outcome, result = _run(blade, **task)
+        assert (outcome, result["changed"]) == ("exit", False)
+        assert _writes(blade) == ["post_tls_policies"]
+
+    def test_clearing_the_trusted_ca_of_a_realm_policy_is_allowed(self):
+        blade = _array(
+            policies=[
+                _policy("realm1::data-tls", "realm1::tls-cert", "realm1::ca-group")
+            ]
+        )
+        outcome, result = _run(
+            blade, name="realm1::data-tls", trusted_client_certificate_authority=""
+        )
+        assert (outcome, result["changed"]) == ("exit", True)
+        blade.patch_tls_policies.assert_called_once_with(
+            names=["realm1::data-tls"],
+            policy={"trusted_client_certificate_authority": {"name": ""}},
+        )
+        outcome, result = _run(
+            blade, name="realm1::data-tls", trusted_client_certificate_authority=""
+        )
+        assert (outcome, result["changed"]) == ("exit", False)
+        blade.patch_tls_policies.assert_called_once()
+
+    def test_scope_is_not_checked_for_absent(self):
+        blade = _array(policies=[_policy("realm1::data-tls", "realm1::tls-cert")])
+        outcome, result = _run(
+            blade,
+            name="realm1::data-tls",
+            state="absent",
+            appliance_certificate="global",
+        )
+        assert (outcome, result["changed"]) == ("exit", True)
+        assert blade.policies == {}
+
+
+class TestPurefbTlsPolicyCreateWithoutCertificate:
+    """The create failure names a certificate the policy can use"""
+
+    def test_realm_policy_is_pointed_to_a_certificate_of_its_realm(self):
+        for check_mode in (True, False):
+            blade = _array()
+            outcome, result = _run(
+                blade,
+                check_mode=check_mode,
+                name="realm1::data-tls",
+                min_tls_version="1.2",
+            )
+            assert outcome == "fail"
+            assert "appliance_certificate is required" in result["msg"]
+            assert "realm1::<certificate>" in result["msg"]
+            assert "cannot be used by a TLS policy in a realm" in result["msg"]
+            assert "can use 'global'" not in result["msg"]
+            assert _writes(blade) == []
+
+    def test_array_level_policy_keeps_the_global_hint(self):
+        blade = _array()
+        outcome, result = _run(blade, name="data-tls", min_tls_version="1.2")
+        assert outcome == "fail"
+        assert "TLS policy data-tls was not found" in result["msg"]
+        assert "appliance_certificate is required" in result["msg"]
+        assert "an array-level policy can use 'global'" in result["msg"]
+        assert "<realm>::<policy>" in result["msg"]
+        blade.get_realms.assert_not_called()
+        assert _writes(blade) == []
+
+    def test_bare_leaf_of_a_realm_policy_names_the_realm_form(self):
+        """A realm-scoped administrator is told "does not exist" for a bare name"""
+        blade = _array(policies=[_policy("realm1::data-tls", "realm1::tls-cert")])
+        outcome, result = _run(blade, name="data-tls", min_tls_version="1.3")
+        assert outcome == "fail"
+        assert "was not found" in result["msg"]
+        assert "realm-scoped administrator must use that form" in result["msg"]
+        assert _writes(blade) == []
+        assert blade.policies["realm1::data-tls"].min_tls_version == "default"
+
+
+class TestPurefbTlsPolicyRealmOfANewPolicy:
+    """A create in a realm that cannot take the policy fails in both modes"""
+
+    def test_unknown_realm_fails_before_the_create(self):
+        for check_mode in (True, False):
+            blade = _array(realms=("realm1",))
+            outcome, result = _run(
+                blade,
+                check_mode=check_mode,
+                name="nosuch::data-tls",
+                appliance_certificate="nosuch::tls-cert",
+            )
+            assert outcome == "fail"
+            assert "cannot be created in realm nosuch" in result["msg"]
+            assert "Realm does not exist." in result["msg"]
+            blade.get_realms.assert_called_once_with(names=["nosuch"])
+            assert _writes(blade) == []
+
+    def test_destroyed_realm_fails_before_the_create(self):
+        for check_mode in (True, False):
+            blade = _array(realms=("realm1",), destroyed=("realm9",))
+            outcome, result = _run(
+                blade,
+                check_mode=check_mode,
+                name="realm9::data-tls",
+                appliance_certificate="realm9::tls-cert",
+            )
+            assert outcome == "fail"
+            assert "Realm has been destroyed." in result["msg"]
+            assert _writes(blade) == []
+
+    def test_unknown_realm_outranks_the_missing_certificate(self):
+        blade = _array(realms=())
+        outcome, result = _run(blade, name="nosuch::data-tls", min_tls_version="1.3")
+        assert outcome == "fail"
+        assert "Realm does not exist." in result["msg"]
+        assert "appliance_certificate" not in result["msg"]
+
+    def test_realm_lookup_that_is_not_answered_is_left_to_the_create(self):
+        blade = _array()
+        blade.get_realms = Mock(return_value=_answer(error="Operation not permitted."))
+        outcome, result = _run(
+            blade, name="realm1::data-tls", appliance_certificate="realm1::tls-cert"
+        )
+        assert (outcome, result["changed"]) == ("exit", True)
+        blade.post_tls_policies.assert_called_once()
+
+    def test_realm_the_identity_does_not_see_is_left_to_the_create(self):
+        """A realm-scoped administrator reads another realm as 200 without items"""
+        blade = _array(realms=("realm1", "realm2"))
+        blade.get_realms = Mock(return_value=_answer([]))
+        outcome, result = _run(
+            blade,
+            check_mode=True,
+            name="realm2::data-tls",
+            appliance_certificate="realm2::tls-cert",
+        )
+        assert (outcome, result["changed"]) == ("exit", True)
+        outcome, result = _run(blade, name="realm2::data-tls", min_tls_version="1.3")
+        assert outcome == "fail"
+        assert "realm2::<certificate>" in result["msg"]
+        assert "can use 'global'" not in result["msg"]
+        assert _writes(blade) == []
+
+    def test_realm_is_not_read_below_rest_2_19(self):
+        blade = _array(realms=())
+        outcome, result = _run(
+            blade,
+            api_version="2.18",
+            name="realm1::data-tls",
+            appliance_certificate="realm1::tls-cert",
+        )
+        assert (outcome, result["changed"]) == ("exit", True)
+        blade.get_realms.assert_not_called()
+        blade.post_tls_policies.assert_called_once()
+
+    def test_new_policy_takes_the_realm_prefix_as_the_array_stores_it(self):
+        """The array refuses RZ1::data-tls with a certificate of realm rz1"""
+        for certificate in ("rz1::tls-cert", "RZ1::tls-cert"):
+            blade = _array(realms=("rz1",))
+            task = dict(name="RZ1::data-tls", appliance_certificate=certificate)
+            outcome, result = _run(blade, check_mode=True, **task)
+            assert (outcome, result["changed"]) == ("exit", True)
+            assert _writes(blade) == []
+            outcome, result = _run(blade, **task)
+            assert (outcome, result["changed"]) == ("exit", True)
+            blade.get_realms.assert_called_with(names=["RZ1"])
+            blade.post_tls_policies.assert_called_once_with(
+                names=["rz1::data-tls"],
+                policy={"appliance_certificate": {"name": certificate}},
+            )
+            assert sorted(blade.policies) == ["rz1::data-tls"]
+            outcome, result = _run(blade, **task)
+            assert (outcome, result["changed"]) == ("exit", False)
+            blade.post_tls_policies.assert_called_once()
+
+    def test_realm_prefix_is_sent_as_given_when_the_realm_is_not_read(self):
+        blade = _array(realms=())
+        outcome, result = _run(
+            blade,
+            api_version="2.18",
+            name="Realm1::data-tls",
+            appliance_certificate="Realm1::tls-cert",
+        )
+        assert (outcome, result["changed"]) == ("exit", True)
+        blade.post_tls_policies.assert_called_once_with(
+            names=["Realm1::data-tls"],
+            policy={"appliance_certificate": {"name": "Realm1::tls-cert"}},
+        )
+
+        blade = _array(realms=())
+        blade.get_realms = Mock(return_value=_answer(error="Operation not permitted."))
+        outcome, result = _run(
+            blade, name="Realm1::data-tls", appliance_certificate="Realm1::tls-cert"
+        )
+        assert (outcome, result["changed"]) == ("exit", True)
+        blade.post_tls_policies.assert_called_once_with(
+            names=["Realm1::data-tls"],
+            policy={"appliance_certificate": {"name": "Realm1::tls-cert"}},
+        )
+
+    def test_array_level_create_reads_no_realm(self):
+        blade = _array(realms=())
+        outcome, result = _run(blade, name="data-tls", appliance_certificate="global")
+        assert (outcome, result["changed"]) == ("exit", True)
+        blade.get_realms.assert_not_called()
+        blade.post_tls_policies.assert_called_once_with(
+            names=["data-tls"], policy={"appliance_certificate": {"name": "global"}}
+        )
+
+    def test_existing_realm_policy_reads_no_realm(self):
+        blade = _array(
+            policies=[_policy("realm1::data-tls", "realm1::tls-cert")], realms=()
+        )
+        outcome, result = _run(blade, name="realm1::data-tls", min_tls_version="1.3")
+        assert (outcome, result["changed"]) == ("exit", True)
+        blade.get_realms.assert_not_called()
+
+
+class TestPurefbTlsPolicyRealmLifecycle:
+    """A policy in a realm next to an array-level policy of the same leaf name"""
+
+    def _twins(self):
+        return _array(
+            policies=[
+                _policy("data-tls", "tls-cert"),
+                _policy("realm1::data-tls", "realm1::tls-cert"),
+            ]
+        )
+
+    def test_create_sends_the_names_as_given_and_is_idempotent(self):
+        blade = _array(policies=[_policy("data-tls", "tls-cert")])
+        task = dict(
+            name="realm1::data-tls",
+            appliance_certificate="realm1::tls-cert",
+            trusted_client_certificate_authority="realm1::ca-group",
+            verify_client_certificate_trust=True,
+            min_tls_version="1.2",
+        )
+        outcome, result = _run(blade, check_mode=True, **task)
+        assert (outcome, result["changed"]) == ("exit", True)
+        assert _writes(blade) == []
+
+        outcome, result = _run(blade, **task)
+        assert (outcome, result["changed"]) == ("exit", True)
+        blade.post_tls_policies.assert_called_once_with(
+            names=["realm1::data-tls"],
+            policy={
+                "appliance_certificate": {"name": "realm1::tls-cert"},
+                "trusted_client_certificate_authority": {"name": "realm1::ca-group"},
+                "verify_client_certificate_trust": True,
+                "min_tls_version": "1.2",
+            },
+        )
+
+        outcome, result = _run(blade, **task)
+        assert (outcome, result["changed"]) == ("exit", False)
+        assert _writes(blade) == ["post_tls_policies"]
+        assert blade.policies["data-tls"].appliance_certificate.name == "tls-cert"
+
+    def test_current_realm_certificate_sends_no_patch(self):
+        blade = self._twins()
+        outcome, result = _run(
+            blade, name="realm1::data-tls", appliance_certificate="realm1::tls-cert"
+        )
+        assert (outcome, result["changed"]) == ("exit", False)
+        assert _writes(blade) == []
+
+    def test_certificate_in_another_letter_case_is_not_a_change(self):
+        for wanted in ("realm1::TLS-CERT", "REALM1::tls-cert"):
+            blade = self._twins()
+            for check_mode in (True, False):
+                outcome, result = _run(
+                    blade,
+                    check_mode=check_mode,
+                    name="realm1::data-tls",
+                    appliance_certificate=wanted,
+                )
+                assert (outcome, result["changed"]) == ("exit", False)
+            assert _writes(blade) == []
+
+    def test_trusted_ca_in_another_letter_case_is_not_a_change(self):
+        blade = _array(
+            policies=[
+                _policy("realm1::data-tls", "realm1::tls-cert", "realm1::ca-group")
+            ]
+        )
+        outcome, result = _run(
+            blade,
+            name="realm1::data-tls",
+            trusted_client_certificate_authority="realm1::CA-Group",
+        )
+        assert (outcome, result["changed"]) == ("exit", False)
+        assert _writes(blade) == []
+
+    def test_another_certificate_of_the_realm_is_patched_once(self):
+        blade = self._twins()
+        task = dict(name="realm1::data-tls", appliance_certificate="realm1::tls-cert2")
+        outcome, result = _run(blade, check_mode=True, **task)
+        assert (outcome, result["changed"]) == ("exit", True)
+        assert _writes(blade) == []
+        outcome, result = _run(blade, **task)
+        assert (outcome, result["changed"]) == ("exit", True)
+        blade.patch_tls_policies.assert_called_once_with(
+            names=["realm1::data-tls"],
+            policy={"appliance_certificate": {"name": "realm1::tls-cert2"}},
+        )
+        outcome, result = _run(blade, **task)
+        assert (outcome, result["changed"]) == ("exit", False)
+        blade.patch_tls_policies.assert_called_once()
+        assert blade.policies["data-tls"].appliance_certificate.name == "tls-cert"
+
+    def test_array_level_namesake_is_changed_alone(self):
+        blade = self._twins()
+        outcome, result = _run(
+            blade, name="data-tls", appliance_certificate="global", enabled=False
+        )
+        assert (outcome, result["changed"]) == ("exit", True)
+        blade.patch_tls_policies.assert_called_once_with(
+            names=["data-tls"],
+            policy={"enabled": False, "appliance_certificate": {"name": "global"}},
+        )
+        realm_policy = blade.policies["realm1::data-tls"]
+        assert realm_policy.enabled is True
+        assert realm_policy.appliance_certificate.name == "realm1::tls-cert"
+
+    def test_policy_name_in_another_letter_case_is_the_same_policy(self):
+        blade = self._twins()
+        outcome, result = _run(blade, name="REALM1::Data-TLS", min_tls_version="1.3")
+        assert (outcome, result["changed"]) == ("exit", True)
+        blade.post_tls_policies.assert_not_called()
+        assert blade.policies["realm1::data-tls"].min_tls_version == "1.3"
+        outcome, result = _run(blade, name="REALM1::Data-TLS", min_tls_version="1.3")
+        assert (outcome, result["changed"]) == ("exit", False)
+
+    def test_policy_in_another_letter_case_takes_another_certificate(self):
+        """The request names the policy as the array stores it
+
+        The array answers a certificate change sent under REALM1::Data-TLS
+        with "Realms for Certificate (...) and TLS Policy (...) don't match".
+        """
+        blade = self._twins()
+        task = dict(name="REALM1::Data-TLS", appliance_certificate="realm1::tls-cert2")
+        outcome, result = _run(blade, check_mode=True, **task)
+        assert (outcome, result["changed"]) == ("exit", True)
+        assert _writes(blade) == []
+        outcome, result = _run(blade, **task)
+        assert (outcome, result["changed"]) == ("exit", True)
+        blade.patch_tls_policies.assert_called_once_with(
+            names=["realm1::data-tls"],
+            policy={"appliance_certificate": {"name": "realm1::tls-cert2"}},
+        )
+        outcome, result = _run(blade, **task)
+        assert (outcome, result["changed"]) == ("exit", False)
+        blade.patch_tls_policies.assert_called_once()
+        assert blade.policies["data-tls"].appliance_certificate.name == "tls-cert"
+
+    def test_policy_in_another_letter_case_takes_a_ca_group(self):
+        blade = self._twins()
+        task = dict(
+            name="Realm1::DATA-TLS",
+            trusted_client_certificate_authority="REALM1::ca-group",
+            verify_client_certificate_trust=True,
+        )
+        outcome, result = _run(blade, **task)
+        assert (outcome, result["changed"]) == ("exit", True)
+        blade.patch_tls_policies.assert_called_once_with(
+            names=["realm1::data-tls"],
+            policy={
+                "verify_client_certificate_trust": True,
+                "trusted_client_certificate_authority": {"name": "REALM1::ca-group"},
+            },
+        )
+        outcome, result = _run(blade, **task)
+        assert (outcome, result["changed"]) == ("exit", False)
+        blade.patch_tls_policies.assert_called_once()
+
+    def test_array_level_policy_in_another_letter_case_is_named_as_stored(self):
+        blade = self._twins()
+        outcome, result = _run(blade, name="DATA-TLS", appliance_certificate="global")
+        assert (outcome, result["changed"]) == ("exit", True)
+        blade.patch_tls_policies.assert_called_once_with(
+            names=["data-tls"], policy={"appliance_certificate": {"name": "global"}}
+        )
+        realm_policy = blade.policies["realm1::data-tls"]
+        assert realm_policy.appliance_certificate.name == "realm1::tls-cert"
+
+    def test_delete_in_another_letter_case_names_the_stored_policy(self):
+        blade = self._twins()
+        outcome, result = _run(blade, name="REALM1::DATA-TLS", state="absent")
+        assert (outcome, result["changed"]) == ("exit", True)
+        blade.get_tls_policies_network_interfaces.assert_called_once_with(
+            policy_names=["realm1::data-tls"]
+        )
+        blade.delete_tls_policies.assert_called_once_with(names=["realm1::data-tls"])
+        assert sorted(blade.policies) == ["data-tls"]
+
+    def test_delete_twice_leaves_the_namesake(self):
+        blade = self._twins()
+        task = dict(name="realm1::data-tls", state="absent")
+        outcome, result = _run(blade, check_mode=True, **task)
+        assert (outcome, result["changed"]) == ("exit", True)
+        assert _writes(blade) == []
+        outcome, result = _run(blade, **task)
+        assert (outcome, result["changed"]) == ("exit", True)
+        blade.delete_tls_policies.assert_called_once_with(names=["realm1::data-tls"])
+        outcome, result = _run(blade, **task)
+        assert (outcome, result["changed"]) == ("exit", False)
+        blade.delete_tls_policies.assert_called_once()
+        assert sorted(blade.policies) == ["data-tls"]
+
+
+class TestPurefbTlsPolicyRealmInterfaces:
+    """Interface attachments of a policy in a realm"""
+
+    def _blade(self, attached=()):
+        return _array(
+            policies=[
+                _policy("data-tls", "tls-cert"),
+                _policy("realm1::data-tls", "realm1::tls-cert"),
+            ],
+            attached=[("data-tls", "vip1")] + list(attached),
+            interfaces=["vip1", "realm1::vip1", "realm1::vip2"],
+        )
+
+    def test_attach_a_realm_interface_once(self):
+        blade = self._blade()
+        task = dict(name="realm1::data-tls", network_interfaces=["realm1::vip1"])
+        outcome, result = _run(blade, check_mode=True, **task)
+        assert (outcome, result["changed"]) == ("exit", True)
+        assert _writes(blade) == []
+        outcome, result = _run(blade, **task)
+        assert (outcome, result["changed"]) == ("exit", True)
+        blade.post_tls_policies_network_interfaces.assert_called_once_with(
+            policy_names=["realm1::data-tls"], member_names=["realm1::vip1"]
+        )
+        outcome, result = _run(blade, **task)
+        assert (outcome, result["changed"]) == ("exit", False)
+        assert _writes(blade) == ["post_tls_policies_network_interfaces"]
+        assert ("data-tls", "vip1") in blade.attached
+
+    def test_attached_interface_in_another_letter_case_is_left_alone(self):
+        blade = self._blade(attached=[("realm1::data-tls", "realm1::vip1")])
+        for check_mode in (True, False):
+            outcome, result = _run(
+                blade,
+                check_mode=check_mode,
+                name="realm1::data-tls",
+                network_interfaces=["REALM1::VIP1"],
+            )
+            assert (outcome, result["changed"]) == ("exit", False)
+        assert _writes(blade) == []
+        assert ("realm1::data-tls", "realm1::vip1") in blade.attached
+
+    def test_replace_the_interface_of_a_realm_policy(self):
+        blade = self._blade(attached=[("realm1::data-tls", "realm1::vip1")])
+        outcome, result = _run(
+            blade, name="realm1::data-tls", network_interfaces=["realm1::vip2"]
+        )
+        assert (outcome, result["changed"]) == ("exit", True)
+        blade.post_tls_policies_network_interfaces.assert_called_once_with(
+            policy_names=["realm1::data-tls"], member_names=["realm1::vip2"]
+        )
+        blade.delete_tls_policies_network_interfaces.assert_called_once_with(
+            policy_names=["realm1::data-tls"], member_names=["realm1::vip1"]
+        )
+        assert sorted(blade.attached) == [
+            ("data-tls", "vip1"),
+            ("realm1::data-tls", "realm1::vip2"),
+        ]
+
+    def test_empty_list_detaches_the_realm_policy_only(self):
+        blade = self._blade(attached=[("realm1::data-tls", "realm1::vip1")])
+        task = dict(name="realm1::data-tls", network_interfaces=[])
+        outcome, result = _run(blade, **task)
+        assert (outcome, result["changed"]) == ("exit", True)
+        blade.delete_tls_policies_network_interfaces.assert_called_once_with(
+            policy_names=["realm1::data-tls"], member_names=["realm1::vip1"]
+        )
+        outcome, result = _run(blade, **task)
+        assert (outcome, result["changed"]) == ("exit", False)
+        assert blade.attached == [("data-tls", "vip1")]
+
+    def test_interface_of_another_policy_of_the_realm_is_a_conflict(self):
+        blade = self._blade(attached=[("realm1::other-tls", "realm1::vip2")])
+        outcome, result = _run(
+            blade,
+            check_mode=True,
+            name="realm1::data-tls",
+            network_interfaces=["realm1::vip2"],
+        )
+        assert outcome == "fail"
+        assert "realm1::vip2=>realm1::other-tls" in result["msg"]
+        assert _writes(blade) == []
+
+    def test_own_policy_in_another_letter_case_is_no_conflict(self):
+        module = Mock()
+        module.params = {"name": "REALM1::Data-TLS"}
+        module.fail_json = Mock(side_effect=SystemExit)
+        blade = self._blade(attached=[("realm1::data-tls", "realm1::vip1")])
+        _validate_attachable(module, blade, ["Realm1::VIP1"])
+        module.fail_json.assert_not_called()
+
+    def test_validate_attachable_returns_the_stored_names_once(self):
+        module = Mock()
+        module.params = {"name": "realm1::data-tls"}
+        module.fail_json = Mock(side_effect=SystemExit)
+        blade = self._blade()
+        assert _validate_attachable(module, blade, []) == []
+        assert _validate_attachable(
+            module, blade, ["REALM1::VIP2", "realm1::vip1", "Realm1::Vip2"]
+        ) == ["realm1::vip2", "realm1::vip1"]
+        module.fail_json.assert_not_called()
+
+    def test_interface_in_another_letter_case_is_attached_by_its_stored_name(self):
+        blade = self._blade()
+        task = dict(name="REALM1::DATA-TLS", network_interfaces=["REALM1::VIP2"])
+        outcome, result = _run(blade, check_mode=True, **task)
+        assert (outcome, result["changed"]) == ("exit", True)
+        assert _writes(blade) == []
+        outcome, result = _run(blade, **task)
+        assert (outcome, result["changed"]) == ("exit", True)
+        blade.post_tls_policies_network_interfaces.assert_called_once_with(
+            policy_names=["realm1::data-tls"], member_names=["realm1::vip2"]
+        )
+        outcome, result = _run(blade, **task)
+        assert (outcome, result["changed"]) == ("exit", False)
+        blade.post_tls_policies_network_interfaces.assert_called_once()
+        assert ("data-tls", "vip1") in blade.attached
+
+    def test_interface_named_twice_is_attached_once(self):
+        blade = self._blade()
+        outcome, result = _run(
+            blade,
+            name="realm1::data-tls",
+            network_interfaces=["realm1::vip2", "REALM1::VIP2"],
+        )
+        assert (outcome, result["changed"]) == ("exit", True)
+        blade.post_tls_policies_network_interfaces.assert_called_once_with(
+            policy_names=["realm1::data-tls"], member_names=["realm1::vip2"]
+        )
+
+    def test_new_policy_attaches_interfaces_by_their_stored_names(self):
+        blade = self._blade()
+        outcome, result = _run(
+            blade,
+            name="Realm1::new-tls",
+            appliance_certificate="realm1::tls-cert",
+            network_interfaces=["Realm1::VIP2"],
+        )
+        assert (outcome, result["changed"]) == ("exit", True)
+        blade.post_tls_policies.assert_called_once_with(
+            names=["realm1::new-tls"],
+            policy={"appliance_certificate": {"name": "realm1::tls-cert"}},
+        )
+        blade.post_tls_policies_network_interfaces.assert_called_once_with(
+            policy_names=["realm1::new-tls"], member_names=["realm1::vip2"]
+        )
+
+    def test_delete_detaches_the_realm_interface_of_the_policy_only(self):
+        blade = self._blade(attached=[("realm1::data-tls", "realm1::vip1")])
+        outcome, result = _run(blade, name="realm1::data-tls", state="absent")
+        assert (outcome, result["changed"]) == ("exit", True)
+        assert _writes(blade) == [
+            "delete_tls_policies",
+            "delete_tls_policies_network_interfaces",
+        ]
+        assert blade.attached == [("data-tls", "vip1")]
+        assert sorted(blade.policies) == ["data-tls"]
+
+
+class TestPurefbTlsPolicyCheckedReads:
+    """A read the array refuses is reported, never taken as absent or empty"""
+
+    def _refuse(self, blade, method):
+        setattr(
+            blade,
+            method,
+            Mock(return_value=_answer(error="Operation not permitted.")),
+        )
+
+    def test_refused_policy_read_fails_present(self):
+        for check_mode in (True, False):
+            blade = _array()
+            self._refuse(blade, "get_tls_policies")
+            outcome, result = _run(
+                blade,
+                check_mode=check_mode,
+                name="realm1::data-tls",
+                appliance_certificate="realm1::tls-cert",
+            )
+            assert outcome == "fail"
+            assert result["msg"] == (
+                "Failed to read TLS policy realm1::data-tls. Error: "
+                "Operation not permitted."
+            )
+            assert _writes(blade) == []
+
+    def test_refused_policy_read_fails_absent(self):
+        for check_mode in (True, False):
+            blade = _array(policies=[_policy("data-tls", "tls-cert")])
+            self._refuse(blade, "get_tls_policies")
+            outcome, result = _run(
+                blade, check_mode=check_mode, name="data-tls", state="absent"
+            )
+            assert outcome == "fail"
+            assert "Operation not permitted." in result["msg"]
+            assert _writes(blade) == []
+
+    def test_missing_policy_is_absent(self):
+        blade = _array()
+        outcome, result = _run(blade, name="realm1::data-tls", state="absent")
+        assert (outcome, result["changed"]) == ("exit", False)
+        assert _writes(blade) == []
+
+    def test_refused_member_list_fails_the_reconcile(self):
+        for check_mode in (True, False):
+            blade = _array(policies=[_policy("realm1::data-tls", "realm1::tls-cert")])
+            self._refuse(blade, "get_tls_policies_network_interfaces")
+            outcome, result = _run(
+                blade,
+                check_mode=check_mode,
+                name="realm1::data-tls",
+                network_interfaces=[],
+            )
+            assert outcome == "fail"
+            assert result["msg"] == (
+                "Failed to list the network interfaces of TLS policy "
+                "realm1::data-tls. Error: Operation not permitted."
+            )
+            assert _writes(blade) == []
+
+    def test_refused_member_list_fails_the_delete_before_any_write(self):
+        blade = _array(
+            policies=[_policy("data-tls", "tls-cert")], attached=[("data-tls", "vip1")]
+        )
+        self._refuse(blade, "get_tls_policies_network_interfaces")
+        outcome, result = _run(blade, name="data-tls", state="absent")
+        assert outcome == "fail"
+        assert "Failed to list the network interfaces" in result["msg"]
+        assert _writes(blade) == []
+        assert sorted(blade.policies) == ["data-tls"]
+
+    def test_refused_conflict_read_fails_the_attach(self):
+        blade = _array(policies=[_policy("data-tls", "tls-cert")], interfaces=["vip1"])
+        members = blade.get_tls_policies_network_interfaces.side_effect
+
+        def refuse_by_member(policy_names=None, member_names=None):
+            if member_names is not None:
+                return _answer(error="Operation not permitted.")
+            return members(policy_names=policy_names)
+
+        blade.get_tls_policies_network_interfaces = Mock(side_effect=refuse_by_member)
+        for check_mode in (True, False):
+            outcome, result = _run(
+                blade,
+                check_mode=check_mode,
+                name="data-tls",
+                network_interfaces=["vip1"],
+            )
+            assert outcome == "fail"
+            assert result["msg"] == (
+                "Failed to read the TLS policies of network interface(s) "
+                "['vip1']. Error: Operation not permitted."
+            )
+        assert _writes(blade) == []

@@ -34,7 +34,10 @@ options:
   name:
     description:
     - Name of the Local Directory Service.
-    - Accepts the realm-qualified form C(realm::name) for realm-scoped LDSes.
+    - An LDS in a realm is named C(realm::name). The same name without the
+      realm is a different LDS at the array level.
+    - A realm-scoped administrator must use the realm-qualified name; a bare
+      name is not placed in, or resolved to, the administrator's realm.
     type: str
     required: true
   state:
@@ -49,11 +52,17 @@ options:
   domain:
     description:
     - Domain string for the LDS.
+    - The array accepts at most 15 characters, letters, digits and hyphens
+      (C(-)) only. Anything else, a dot for example, is refused.
     - Optional at create - when omitted, the array defaults the domain to
-      the LDS name.
-    - Patchable, but a domain change is disruptive; the API refuses it while
-      the LDS is attached to a server. The module warns before issuing the
-      PATCH in that case and surfaces the API error verbatim if rejected.
+      the first 15 characters of the LDS name; the realm of an LDS in a
+      realm is not part of it. Where that default is not a valid domain, for
+      a name with an underscore for example, the array refuses the create;
+      give I(domain) in that case.
+    - Patchable, but a domain change is disruptive while the LDS is attached
+      to a server. The module warns before issuing the PATCH in that case.
+      The array may refuse the change; the module then surfaces the API
+      error verbatim.
     - When omitted from the play on an existing LDS, the module does not
       touch the domain field (never "reset to LDS-name-default").
     type: str
@@ -76,16 +85,23 @@ EXAMPLES = r"""
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
-- name: Create a local directory service, letting the array default the domain
+- name: Create a local directory service, letting the array default the domain to its name
   everpure.flashblade.purefb_local_ds:
-    name: myserver_local
+    name: myserver-local
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
-- name: Change the domain on an existing LDS (must be detached from any server)
+- name: Create a local directory service in realm realm1
+  everpure.flashblade.purefb_local_ds:
+    name: realm1::tenant_local
+    domain: tenant1
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Change the domain on an existing LDS (the module warns when it is attached to a server)
   everpure.flashblade.purefb_local_ds:
     name: myserver_local
-    domain: corp.local
+    domain: corp-local
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 

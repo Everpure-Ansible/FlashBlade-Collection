@@ -1,0 +1,13 @@
+bugfixes:
+  - purefb_info - the ``filesystems`` subset no longer ends in a traceback when a file system is
+    eradicated while it is gathered; the file system is reported without quotas.
+  - purefb_info - the ``access_policies``, ``nfs_policies``, ``smb_share_policies``,
+    ``smb_client_policies``, ``network_policies`` and ``worm_policies`` counters of the default
+    subset were always 0; they now count the policies of their type.
+minor_changes:
+  - purefb_info - file systems, object store accounts, account exports, virtual hosts, certificates,
+    DNS configurations and Active Directory accounts report ``realms``.
+  - purefb_info - the ``config`` subset adds ``directory_services``, every directory service under
+    its full name with the ones of the servers, ``local_directory_services``, the local directory
+    services with their users and groups (REST 2.24 or later), and ``saml2_idps``, every SAML2
+    identity provider by name.

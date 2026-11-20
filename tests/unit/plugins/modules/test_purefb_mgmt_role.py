@@ -2371,13 +2371,13 @@ class TestPurefbMgmtRoleRefusedReads:
     @patch(GEM, return_value=ROLE_MISSING)
     def test_get_role_realm_style_name_reads_as_missing(self, mock_gem):
         """Test a realm-style role name gets the same does-not-exist answer"""
-        mock_module = _module(name="rzaudit::backup-operator")
+        mock_module = _module(name="tenant1::backup-operator")
         mock_blade = Mock()
         mock_blade.get_management_access_policies_roles.return_value = _err()
 
         assert _get_role(mock_module, mock_blade, {}) is None
         mock_blade.get_management_access_policies_roles.assert_called_once_with(
-            names=["rzaudit::backup-operator"]
+            names=["tenant1::backup-operator"]
         )
         mock_module.fail_json.assert_not_called()
 
@@ -2442,13 +2442,13 @@ class TestPurefbMgmtRoleRefusedReads:
     def test_subject_exists_false_for_realm_style_admin(self, mock_gem):
         """Test a realm-style admin name gets the same does-not-exist answer"""
         mock_module = _module(
-            object="admin_attach", admin="rzaudit::svc-automation", policies=["p1"]
+            object="admin_attach", admin="tenant1::svc-automation", policies=["p1"]
         )
         mock_blade = Mock()
         mock_blade.get_admins.return_value = _err()
 
         assert _subject_exists(mock_module, mock_blade, "admin", {}) is False
-        mock_blade.get_admins.assert_called_once_with(names=["rzaudit::svc-automation"])
+        mock_blade.get_admins.assert_called_once_with(names=["tenant1::svc-automation"])
         mock_module.fail_json.assert_not_called()
 
     @patch(GEM, return_value=REFUSED)
@@ -2545,7 +2545,7 @@ class TestPurefbMgmtRoleRefusedReads:
     ):
         """Test state=absent on a realm-style name the array does not know is ok"""
         mock_loose_version.return_value.__gt__ = Mock(return_value=False)
-        mock_module = _module(state="absent", name="rzaudit::backup-operator")
+        mock_module = _module(state="absent", name="tenant1::backup-operator")
         mock_blade = Mock()
         mock_blade.get_management_access_policies_roles.return_value = _err()
 
@@ -2669,7 +2669,7 @@ class TestPurefbMgmtRoleRefusedReads:
         mock_loose_version.return_value.__gt__ = Mock(return_value=False)
         mock_module = _module(
             object="admin_attach",
-            admin="rzaudit::svc-automation",
+            admin="tenant1::svc-automation",
             policies=["tenant-a-ops"],
         )
         mock_blade = Mock()
@@ -2678,7 +2678,7 @@ class TestPurefbMgmtRoleRefusedReads:
         _run(_handle_attach, mock_module, mock_blade, "2.30", {}, "admin")
 
         mock_module.fail_json.assert_called_once_with(
-            msg="admin rzaudit::svc-automation does not exist"
+            msg="admin tenant1::svc-automation does not exist"
         )
         mock_blade.post_management_access_policies_admins.assert_not_called()
 
@@ -2692,7 +2692,7 @@ class TestPurefbMgmtRoleRefusedReads:
         mock_module = _module(
             object="ds_attach",
             state="absent",
-            ds_role="rzaudit::tenant-a-admins",
+            ds_role="tenant1::tenant-a-admins",
             policies=["tenant-a-ops"],
         )
         mock_blade = Mock()

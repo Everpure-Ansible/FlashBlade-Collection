@@ -46,6 +46,9 @@ options:
   member_url:
     description:
     - Management IP address/FQDN of array to add to fleet.
+    - A fleet key is created only when that array is not yet a member of
+      the fleet, and never in check mode. A new fleet key invalidates the
+      fleet keys created before it.
     type: str
   member_api:
     description:
@@ -350,15 +353,8 @@ def delete_fleet(module, blade):
 def add_fleet_members(module, blade):
     """Add new member to the fleet"""
     changed = False
-    existing = False
     if not module.params["member_url"] or not module.params["member_api"]:
         module.fail_json(msg="missing required arguments: member_api, member_url")
-    res = blade.post_fleets_fleet_key()
-    if res.status_code != 200:
-        module.fail_json(
-            msg="Fleet key generation failed. Error: {0}".format(get_error_message(res))
-        )
-    fleet_key = list(res.items)[0].fleet_key
     if HAS_URLLIB3 and module.params["disable_warnings"]:
         urllib3.disable_warnings()
     if HAS_DISTRO:
@@ -401,14 +397,20 @@ def add_fleet_members(module, blade):
                 msg="FlashArray must be a minimum of Purity//FA 6.8.5"
                 " to join a fleet containing FlashBlades"
             )
-    local_name = list(remote_system.get_arrays().items)[0].name
-    members = list(blade.get_fleets_members().items)
-    for member in members:
-        if member.member.name == local_name:
-            existing = True
-    if not existing:
+    local_name = _remote_array_name(module, remote_system)
+    if local_name not in _get_fleet_members(module, blade):
         changed = True
         if not module.check_mode:
+            # a new fleet key invalidates the keys created before it, so one
+            # is requested only when the array is about to join
+            res = blade.post_fleets_fleet_key()
+            if res.status_code != 200:
+                module.fail_json(
+                    msg="Fleet key generation failed. Error: {0}".format(
+                        get_error_message(res)
+                    )
+                )
+            fleet_key = list(res.items)[0].fleet_key
             res = remote_system.post_fleets_members(
                 fleet_names=[module.params["name"]],
                 members=FleetMemberPost(
@@ -464,9 +466,8 @@ def delete_fleet_members(module, blade):
             api_token=module.params["member_api"],
             user_agent=user_agent,
         )
-    local_name = list(remote_system.get_arrays().items)[0].name
-    members = list(blade.get_fleets_members().items)
-    for member in members:
+    local_name = _remote_array_name(module, remote_system)
+    for member in _get_fleet_members(module, blade).values():
         if member.member.name == local_name:
             changed = True
             if not module.check_mode:
@@ -525,6 +526,18 @@ def _get_fleet_members(module, blade):
             )
         )
     return {member.member.name: member for member in list(res.items)}
+
+
+def _remote_array_name(module, remote_system):
+    """Return the name of the array at I(member_url)"""
+    res = remote_system.get_arrays()
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to read the array name from {0}. Error: {1}".format(
+                module.params["member_url"], get_error_message(res)
+            )
+        )
+    return list(res.items)[0].name
 
 
 def _batch_entry(module, member):
@@ -826,16 +839,17 @@ def main():
             "(Purity//FB 4.8.3) or later".format(BATCH_API_VERSION)
         )
     state = module.params["state"]
-    fleet = True
     fleet_res = blade.get_fleets()
     if fleet_res.status_code == 404:
         module.fail_json(
             msg="Fusion is not enabled on this system. "
             "Please speak to Pure Support to enable this feature"
         )
-    else:
-        if not list(fleet_res.items):
-            fleet = False
+    if fleet_res.status_code != 200:
+        module.fail_json(
+            msg="Failed to read fleets. Error: {0}".format(get_error_message(fleet_res))
+        )
+    fleet = bool(list(fleet_res.items))
 
     if state == "present" and module.params["members"]:
         add_fleet_members_batch(module, blade)

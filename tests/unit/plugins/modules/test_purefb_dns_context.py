@@ -147,7 +147,7 @@ def _existing(name=NAME, domain="cc76.example.com", nameservers=None, source=Non
     return dns
 
 
-def _run(module, blade, api_version="2.30"):
+def _run(module, blade, api_version="2.30", error="Cannot find array in fleet"):
     """Run main() against a mocked array negotiated at api_version."""
     with patch(MODULE + ".AnsibleModule", return_value=module), patch(
         MODULE + ".get_system", return_value=blade
@@ -156,7 +156,7 @@ def _run(module, blade, api_version="2.30"):
     ), patch(
         MODULE + ".remove_duplicates", side_effect=lambda value: value
     ), patch(
-        MODULE + ".get_error_message", return_value="Cannot find array in fleet"
+        MODULE + ".get_error_message", return_value=error
     ):
         try:
             main()
@@ -317,7 +317,7 @@ class TestPurefbDnsContext:
         blade.get_dns.return_value = _response(items=[_existing(name="management")])
         blade.get_network_interfaces.return_value = _response(status_code=400)
 
-        _run(module, blade)
+        _run(module, blade, error="Network does not exist.")
 
         blade.get_network_interfaces.assert_called_once_with(names=["cc76-vip"])
         module.fail_json.assert_called_once()

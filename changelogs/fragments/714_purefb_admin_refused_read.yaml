@@ -1,0 +1,4 @@
+bugfixes:
+  - purefb_admin - a read of the Global Admin settings that the array refuses or fails now fails
+    with the error of the array instead of a traceback, in check mode too. Purity//FB refuses this
+    read to an administrator whose management access is limited to a realm.

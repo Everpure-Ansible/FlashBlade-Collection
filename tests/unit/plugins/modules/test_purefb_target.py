@@ -567,6 +567,26 @@ class TestRealmQualifiedName:
         _no_writes(blade)
 
 
+class TestNameIsOneName:
+    """The name is compared as a whole, in the module: it reaches one target"""
+
+    def test_comma_separated_name_matches_no_target(self):
+        """The targets are listed and compared here, never looked up by names."""
+        module = _module(name="acme-s3,other", state="absent", address=None)
+        blade = _blade(targets=[("acme-s3", "10.10.10.20"), ("other", "10.10.10.99")])
+        _run(module, blade)
+        assert _changed(module) is False
+        blade.get_targets.assert_called_once_with()
+        _no_writes(blade)
+
+    def test_blank_name_matches_no_target(self):
+        module = _module(name="", state="absent", address=None)
+        blade = _blade(targets=[("acme-s3", "10.10.10.20")])
+        _run(module, blade)
+        assert _changed(module) is False
+        _no_writes(blade)
+
+
 class TestModule:
     """Module plumbing and documentation"""
 

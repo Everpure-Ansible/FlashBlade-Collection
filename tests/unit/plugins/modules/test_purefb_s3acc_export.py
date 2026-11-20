@@ -94,6 +94,8 @@ class TestPurefbS3accExport:
         }
 
         existing_export = Mock()
+        existing_export.member.name = "acme"
+        existing_export.server.name = "fb-01"
         existing_export.name = "acme/fb-01"
 
         mock_blade = Mock()
@@ -119,6 +121,8 @@ class TestPurefbS3accExport:
         }
 
         existing_export = Mock()
+        existing_export.member.name = "acme"
+        existing_export.server.name = "fb-01"
         existing_export.name = "acme/fb-01"
 
         mock_blade = Mock()
@@ -447,6 +451,8 @@ class TestPurefbS3accExport:
         mock_get_system.return_value = mock_blade
 
         existing_export = Mock()
+        existing_export.member.name = "acme"
+        existing_export.server.name = "fb-01"
         existing_export.name = "acme/fb-01"
         existing_export.enabled = True
         existing_export.policy = Mock()
@@ -509,6 +515,8 @@ class TestPurefbS3accExport:
         mock_get_system.return_value = mock_blade
 
         existing_export = Mock()
+        existing_export.member.name = "acme"
+        existing_export.server.name = "fb-01"
         existing_export.name = "acme/fb-01"
         existing_export.enabled = True
         existing_export.policy = Mock()
@@ -562,6 +570,8 @@ class TestPurefbS3accExport:
         mock_get_system.return_value = mock_blade
 
         existing_export = Mock()
+        existing_export.member.name = "acme"
+        existing_export.server.name = "fb-01"
         existing_export.name = "acme/fb-01"
         existing_export.enabled = True
         existing_export.policy = Mock()
@@ -618,6 +628,8 @@ class TestPurefbS3accExport:
         mock_get_system.return_value = mock_blade
 
         existing_export = Mock()
+        existing_export.member.name = "acme"
+        existing_export.server.name = "fb-01"
         existing_export.name = "acme/fb-01"
         existing_export.enabled = True
         existing_export.policy = Mock()
@@ -679,6 +691,8 @@ class TestPurefbS3accExport:
         mock_get_system.return_value = mock_blade
 
         existing_export = Mock()
+        existing_export.member.name = "acme"
+        existing_export.server.name = "fb-01"
         existing_export.name = "acme/fb-01"
 
         get_response = Mock()
@@ -774,6 +788,8 @@ class TestPurefbS3accExport:
         mock_get_system.return_value = mock_blade
 
         existing_export = Mock()
+        existing_export.member.name = "acme"
+        existing_export.server.name = "fb-01"
         existing_export.name = "acme/fb-01"
 
         get_response = Mock()
@@ -820,6 +836,8 @@ class TestPurefbS3accExport:
         mock_get_system.return_value = mock_blade
 
         existing_export = Mock()
+        existing_export.member.name = "acme"
+        existing_export.server.name = "fb-01"
         existing_export.name = "acme/fb-01"
 
         get_response = Mock()
@@ -879,6 +897,8 @@ class TestPurefbS3accExport:
         mock_get_system.return_value = mock_blade
 
         existing_export = Mock()
+        existing_export.member.name = "acme"
+        existing_export.server.name = "fb-01"
         existing_export.name = "fb-01::acme"
 
         get_response = Mock()
@@ -993,6 +1013,8 @@ class TestPurefbS3accExport:
         mock_get_system.return_value = mock_blade
 
         existing_export = Mock()
+        existing_export.member.name = "acme"
+        existing_export.server.name = "fb-01"
         existing_export.name = "fb-01::acme"
 
         get_response = Mock()
@@ -1835,3 +1857,228 @@ class TestPurefbS3accExportRealm:
             lookup.assert_not_called()
         blade.patch_object_store_account_exports.assert_not_called()
         assert module.exit_json.call_args[1]["changed"] is True
+
+
+class TestPurefbS3accExportOneExport:
+    """Names that are not the name of one object, and blanks around a name"""
+
+    # ---------------- only the export the task names ----------------
+
+    def test_get_export_ignores_the_export_of_another_account(self):
+        """The filter of the lookup matches a pattern, so its answer can hold
+        the export of another account: that export is not the one named"""
+        module = _module(account="acm*", state="absent")
+        blade = _blade(_export("acme", "fb-01", "acme-export"))
+
+        assert _get_export(module, blade) is None
+        module.fail_json.assert_not_called()
+
+    def test_get_export_ignores_the_export_on_another_server(self):
+        """The same holds for the server"""
+        module = _module(server="*")
+        blade = _blade(_export("acme", "fb-02", "acme-export"))
+
+        assert _get_export(module, blade) is None
+
+    def test_get_export_takes_the_named_export_among_several(self):
+        """Of several exports in the answer only the named one is taken"""
+        named = _export("acme", "fb-01", "acme-export")
+        blade = _blade()
+        blade.get_object_store_account_exports.return_value = _found(
+            [
+                _export("acme-two", "fb-01", "acme-export"),
+                _export("acme", "fb-02", "acme-export"),
+                named,
+            ]
+        )
+
+        assert _get_export(_module(), blade) is named
+
+    def test_get_export_matches_the_names_without_regard_to_case(self):
+        """The array returns the stored spelling of the account and server"""
+        named = _export("tenant1::acme", "tenant1::fb-01", "tenant1::acme-export")
+        module = _module(account="Tenant1::ACME", server="TENANT1::fb-01")
+
+        assert _get_export(module, _blade(named)) is named
+
+    def test_absent_with_a_pattern_does_not_delete_another_export(self):
+        """state=absent with a pattern as account removes no export"""
+        module = _module(account="acm*", state="absent")
+        blade = _blade(_export("acme", "fb-01", "acme-export"))
+
+        _run(module, blade)
+
+        blade.delete_object_store_account_exports.assert_not_called()
+        module.fail_json.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    def test_absent_with_a_quote_reports_no_change_in_check_mode(self):
+        """A quote ends the quoted text of the filter: the export the rest of
+        the name selects is not reported as one to remove"""
+        module = _module(
+            check_mode=True, account="x' or member.name='acme", state="absent"
+        )
+        blade = _blade(_export("acme", "fb-01", "acme-export"))
+
+        _run(module, blade)
+
+        blade.delete_object_store_account_exports.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    def test_present_with_a_quote_does_not_change_another_export(self):
+        """state=present does not disable the export the filter answered with"""
+        module = _module(account="x' or member.name='acme", enabled=False)
+        blade = _blade(_export("acme", "fb-01", "acme-export"))
+
+        _run(module, blade)
+
+        blade.patch_object_store_account_exports.assert_not_called()
+        blade.post_object_store_account_exports.assert_not_called()
+        module.fail_json.assert_called_once_with(
+            msg="policy is required when creating a new account export."
+        )
+
+    # ---------------- a pattern is not one name ----------------
+
+    def test_present_pattern_as_account_is_refused(self):
+        """The array reads an asterisk as a pattern: the export it selects is
+        not disabled, and no export is asked for"""
+        module = _module(account="acm*", enabled=False)
+        blade = _blade(_export("acme", "fb-01", "acme-export"))
+
+        _run(module, blade)
+
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert msg.startswith("account acm* is not valid")
+        assert "pattern" in msg
+        assert "one object store account" in msg
+        blade.get_object_store_account_exports.assert_not_called()
+        blade.patch_object_store_account_exports.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    def test_present_pattern_as_account_is_refused_in_check_mode(self):
+        """Check mode does not look up a pattern, which the array finds when
+        an account fits it, and so does not report a create the array
+        refuses"""
+        module = _module(check_mode=True, account="acm*", policy="acme-export")
+        blade = _blade()
+
+        _run(module, blade)
+
+        module.fail_json.assert_called_once()
+        assert module.fail_json.call_args[1]["msg"].startswith(
+            "account acm* is not valid"
+        )
+        for lookup in _lookups(blade):
+            lookup.assert_not_called()
+        module.exit_json.assert_not_called()
+
+    def test_present_pattern_as_server_is_refused(self):
+        """A server is one server"""
+        module = _module(server="tenant1::fb-*", account="tenant1::acme")
+        blade = _blade()
+
+        _run(module, blade)
+
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert msg.startswith("server tenant1::fb-* is not valid")
+        assert "one server" in msg
+        blade.post_object_store_account_exports.assert_not_called()
+
+    def test_present_pattern_as_policy_is_refused(self):
+        """An existing export is not re-pointed at a pattern"""
+        module = _module(policy="acme-*")
+        blade = _blade(_export("acme", "fb-01", "acme-export"))
+
+        _run(module, blade)
+
+        module.fail_json.assert_called_once()
+        msg = module.fail_json.call_args[1]["msg"]
+        assert msg.startswith("policy acme-* is not valid")
+        assert "one S3 export policy" in msg
+        blade.patch_object_store_account_exports.assert_not_called()
+
+    # ---------------- blanks around a name ----------------
+
+    def test_create_sends_the_names_without_blanks(self):
+        """The array ignores blanks around a name: the export is looked up
+        and created under the name without them"""
+        module = _module(account="acme ", server=" fb-01", policy=" acme-export ")
+        blade = _blade()
+
+        _run(module, blade)
+
+        blade.get_object_store_account_exports.assert_called_once_with(
+            filter="member.name='acme' and server.name='fb-01'"
+        )
+        blade.post_object_store_account_exports.assert_called_once_with(
+            member_names=["acme"],
+            policy_names=["acme-export"],
+            object_store_account_export={"server": {"name": "fb-01"}},
+        )
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_second_run_with_a_blank_after_the_name_is_unchanged(self):
+        """The export created by the first run is found by the second"""
+        module = _module(account="acme ", server="fb-01 ", policy="acme-export ")
+        blade = _blade(_export("acme", "fb-01", "acme-export"))
+
+        _run(module, blade)
+
+        blade.get_object_store_account_exports.assert_called_once_with(
+            filter="member.name='acme' and server.name='fb-01'"
+        )
+        blade.post_object_store_account_exports.assert_not_called()
+        blade.patch_object_store_account_exports.assert_not_called()
+        module.fail_json.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False
+
+    def test_absent_with_a_blank_after_the_name_removes_the_export(self):
+        """state=absent finds the export of the name without the blank"""
+        module = _module(account="acme ", state="absent")
+        blade = _blade(_export("acme", "fb-01", "acme-export"))
+
+        _run(module, blade)
+
+        blade.get_object_store_account_exports.assert_called_once_with(
+            filter="member.name='acme' and server.name='fb-01'"
+        )
+        blade.delete_object_store_account_exports.assert_called_once_with(
+            names=["fb-01::acme"]
+        )
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_check_mode_looks_up_the_names_without_blanks(self):
+        """The lookups of check mode use the names the real run sends"""
+        module = _module(
+            check_mode=True, account=" acme", server="fb-01 ", policy="acme-export "
+        )
+        blade = _blade()
+
+        _run(module, blade)
+
+        blade.get_object_store_accounts.assert_called_once_with(names=["acme"])
+        blade.get_servers.assert_called_once_with(names=["fb-01"])
+        blade.get_s3_export_policies.assert_called_once_with(names=["acme-export"])
+        assert module.exit_json.call_args[1]["changed"] is True
+
+    def test_a_name_of_blanks_stays_an_empty_name(self):
+        """Blanks alone are no name: state=present refuses them and
+        state=absent finds no export"""
+        module = _module(account="  ", policy="acme-export")
+        blade = _blade()
+
+        _run(module, blade)
+
+        module.fail_json.assert_called_once_with(msg="account cannot be empty.")
+
+        module = _module(account="  ", state="absent")
+        blade = _blade()
+
+        _run(module, blade)
+
+        module.fail_json.assert_not_called()
+        blade.delete_object_store_account_exports.assert_not_called()
+        assert module.exit_json.call_args[1]["changed"] is False

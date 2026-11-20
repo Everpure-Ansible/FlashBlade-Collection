@@ -26,6 +26,11 @@ description:
   that server.
 - The account export is uniquely identified by the (I(account), I(server))
   pair.
+- I(account), I(server) and I(policy) each name one object, and only the
+  export of the named account on the named server is changed or removed.
+  With I(state=present) an empty name and a name that holds a comma or an
+  asterisk, which the array reads as a list of names or as a pattern, are
+  refused. Blanks around a name are ignored.
 - A new object store account is created by the array with a default export
   on its default object store server (normally C(_array_server)) bound to
   the built-in C(_s3_export_allow_everything) policy. On that server this
@@ -177,6 +182,11 @@ REFERENCE_READS = {
     "server": ("server", "get_servers"),
     "policy": ("S3 export policy", "get_s3_export_policies"),
 }
+# character: what it makes of a name when the array reads it
+NOT_ONE_NAME = {
+    ",": "a comma separates the names of a list",
+    "*": "an asterisk makes the name a pattern that several names can match",
+}
 
 
 def _context_kwargs(module):
@@ -196,13 +206,29 @@ def _same_name(first, second):
     return (first or "").lower() == (second or "").lower()
 
 
+def _strip_names(module):
+    """Take the blanks from around the names of the task.
+
+    A blank before or after a name is not part of the name. The array
+    ignores it in the account of a new export, while the lookup of the
+    export compares the name as it is given: an account with a blank at its
+    end was exported, and the next run did not find the export, created it
+    again and failed.
+    """
+    for option in REFERENCE_READS:
+        value = module.params[option]
+        if value and value.strip():
+            module.params[option] = value.strip()
+
+
 def _check_names(module):
     """Fail on names that cannot address an account export.
 
     An export has one account, one server and one policy. An empty name
     addresses nothing. The array reads a comma as the separator of a list of
-    names, so a lookup of such a name passes when every name in it exists,
-    although the array does not export more than one object at a time.
+    names and an asterisk as a pattern, so a lookup of such a name passes
+    when the names in it, or a name that fits it, exist, although the array
+    does not export more than one object at a time.
 
     An export is in the realm of its account and of its server. The array
     creates one only where both are in the same realm or both outside of any
@@ -219,13 +245,13 @@ def _check_names(module):
             continue
         if not (value or "").strip():
             module.fail_json(msg="{0} cannot be empty.".format(option))
-        if "," in value:
-            module.fail_json(
-                msg=(
-                    "{0} {1} is not valid: a comma separates the names of a "
-                    "list, and an account export has one {2}."
-                ).format(option, value, REFERENCE_READS[option][0])
-            )
+        for character, meaning in NOT_ONE_NAME.items():
+            if character in value:
+                module.fail_json(
+                    msg="{0} {1} is not valid: {2}, and an account export has one {3}.".format(
+                        option, value, meaning, REFERENCE_READS[option][0]
+                    )
+                )
     account = module.params["account"]
     server = module.params["server"]
     account_realm = _realm_of(account)
@@ -284,6 +310,11 @@ def _get_export(module, blade):
     A failed lookup is reported, never treated as "no export": doing so would
     turn an API error into a silent no-op for state=absent or into a POST that
     then fails with a misleading message for state=present.
+
+    The filter of the lookup matches an asterisk as a pattern, and a quote in
+    a name ends the quoted text of the filter, so the answer can hold the
+    export of another account or server. Only the export of the account and
+    the server the task names is returned.
     """
     filter_string = "member.name='{0}' and server.name='{1}'".format(
         module.params["account"], module.params["server"]
@@ -299,8 +330,14 @@ def _get_export(module, blade):
                 get_error_message(res),
             )
         )
-    items = list(res.items)
-    return items[0] if items else None
+    for item in list(res.items):
+        member = getattr(getattr(item, "member", None), "name", None)
+        server = getattr(getattr(item, "server", None), "name", None)
+        if _same_name(member, module.params["account"]) and _same_name(
+            server, module.params["server"]
+        ):
+            return item
+    return None
 
 
 def delete_export(module, blade, export):
@@ -422,6 +459,7 @@ def main():
             "Minimum version required: {0}".format(MIN_REQUIRED_API_VERSION)
         )
 
+    _strip_names(module)
     if module.params["state"] == "present":
         _check_names(module)
 

@@ -29,6 +29,10 @@ options:
   name:
     description:
     - Unique identifier for the syslog server address
+    - The array matches the name without regard to letter case and ignores
+      white space around it, and so does the module.
+    - This is the name of one syslog server. A name that holds a comma, which
+      the array reads as a list of names, is refused.
     type: str
     required: true
   state:
@@ -113,12 +117,29 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
 SYSLOG_SERVICES_API = "2.14"
 
 
+def _refuse_name_list(module):
+    """Refuse a name that the array does not read as the name of one server.
+
+    In a request the array reads a comma as a separator of names, so such a
+    name is a list of syslog servers, or one server named with a stray
+    comma. This module manages the one server that has the name given, so
+    the name is refused before any request.
+    """
+    name = module.params["name"]
+    if "," in name:
+        module.fail_json(
+            msg="name must be the name of one syslog server: in {0} the array "
+            "reads a comma as a separator of names.".format(name)
+        )
+
+
 def _get_syslog_server(module, blade):
     """Return the syslog server I(name), or None if it is not configured.
 
-    The servers are listed and matched by name without regard to case, as
-    the array matches names. A read the array refuses or fails is reported
-    with the message of the array: it says nothing about the server.
+    The servers are listed and matched by name as the array matches names:
+    without regard to case and ignoring white space around the name. A read
+    the array refuses or fails is reported with the message of the array: it
+    says nothing about the server.
     """
     res = blade.get_syslog_servers()
     if res.status_code != 200:
@@ -127,9 +148,9 @@ def _get_syslog_server(module, blade):
                 get_error_message(res)
             )
         )
-    wanted = module.params["name"].lower()
+    wanted = module.params["name"].strip().lower()
     for server in list(res.items):
-        if (server.name or "").lower() == wanted:
+        if (server.name or "").strip().lower() == wanted:
             return server
     return None
 
@@ -290,6 +311,8 @@ def main():
     module = AnsibleModule(
         argument_spec, required_if=required_if, supports_check_mode=True
     )
+
+    _refuse_name_list(module)
 
     blade = get_system(module)
 

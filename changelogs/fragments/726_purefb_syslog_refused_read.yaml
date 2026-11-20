@@ -4,5 +4,8 @@ bugfixes:
     refuses this read to an administrator whose management access is limited to a realm.
   - purefb_syslog - ``state=test`` for a syslog server that is not configured now fails instead of
     returning no result.
-  - purefb_syslog - the name of the server is matched without regard to case, as the array matches
-    it, so ``state=test`` returns the results of a server named in another spelling.
+  - purefb_syslog - the name of the server is matched as the array matches it, without regard to
+    case and ignoring white space around it, so ``state=test`` returns the results of a server
+    named in another spelling.
+  - purefb_syslog - a ``name`` that holds a comma, which the array reads as a list of names, is
+    refused.

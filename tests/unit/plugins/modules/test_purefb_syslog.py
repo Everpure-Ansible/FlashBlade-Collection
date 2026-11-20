@@ -80,8 +80,13 @@ from plugins.modules.purefb_syslog import main
 MOD = "plugins.modules.purefb_syslog"
 REFUSED = "Operation not permitted."
 NOT_FOUND = "Syslog connection does not exist."
+NO_NAME = "Missing or invalid parameter."
 LIST_FAILED = "Failed to list syslog servers. Error: {0}"
 NOT_CONFIGURED = "Syslog server {0} is not configured"
+NAME_LIST = (
+    "name must be the name of one syslog server: in {0} the array reads a comma "
+    "as a separator of names."
+)
 ADD_FAILED = "Failed to add syslog server. Error: {0}"
 ADD_FAILED_OLD = "Failed to add syslog server {0} - {1}. Error: {2}"
 UPDATE_FAILED = "Updating syslog server {0} failed. Error: {1}"
@@ -93,6 +98,10 @@ FABRIC = ("CH1.FM1", "CH1.FM2")
 URI = "tcp://192.0.2.10:514"
 # the settings of the server that every stand-in array holds as syslog1
 SAME = {"protocol": "tcp", "address": "192.0.2.10", "port": "514"}
+# spellings the array reads as the server syslog1
+UNTIDY = [" syslog1", "syslog1 ", "syslog1\n", "\tSYSLOG1 "]
+# names the array reads as a list of names
+LISTS = ["syslog1,syslog2", "syslog1,", ",syslog1", "syslog1, SYSLOG1"]
 
 
 class ExitJson(Exception):
@@ -211,10 +220,13 @@ def _error_message(response, default="Unknown error"):
 def _blade(servers=None, read=None, results=None, test=None, write=None):
     """An array that holds the given syslog servers (default: syslog1).
 
-    A read answers as the array does: every server when no name is given;
-    for a name, the server of that name, matched without regard to case, or
-    the refusal of an unknown name. read, test and write replace the answer
-    to every read, to the syslog test and to every write.
+    A read answers as the array does: every server when no name is given.
+    A name is read as the array reads it: a comma separates names, white
+    space around a name is ignored and case does not matter. The answer is
+    the servers named, each once, the refusal of an unknown name when one
+    of them is not configured, or the refusal of a name that is blank.
+    read, test and write replace the answer to every read, to the syslog
+    test and to every write.
     """
     servers = [_server()] if servers is None else list(servers)
 
@@ -223,12 +235,16 @@ def _blade(servers=None, read=None, results=None, test=None, write=None):
             return read
         if names is None:
             return _valid(servers)
+        asked = [part.strip().lower() for part in ",".join(names).split(",")]
+        asked = [part for part in asked if part]
+        if not asked:
+            return _error(NO_NAME)
         found = []
-        for name in names:
-            match = [srv for srv in servers if srv.name.lower() == name.lower()]
+        for name in asked:
+            match = [srv for srv in servers if srv.name.lower() == name]
             if not match:
                 return _error(NOT_FOUND)
-            found.extend(match)
+            found.extend(srv for srv in match if srv not in found)
         return _valid(found)
 
     blade = Mock()
@@ -256,7 +272,7 @@ def _run(module, blade, api_version="2.30"):
             patch(MOD + ".AnsibleModule", return_value=module)
         )
         stack.enter_context(patch(MOD + ".purefb_argument_spec", return_value={}))
-        stack.enter_context(patch(MOD + ".get_system", return_value=blade))
+        get_system = stack.enter_context(patch(MOD + ".get_system", return_value=blade))
         stack.enter_context(
             patch(MOD + ".get_error_message", side_effect=_error_message)
         )
@@ -278,7 +294,9 @@ def _run(module, blade, api_version="2.30"):
         except FailJson:
             outcome = "fail"
     assert outcome is not None, "main() ended without exit_json or fail_json"
-    return SimpleNamespace(outcome=outcome, ansible_module=ansible_module)
+    return SimpleNamespace(
+        outcome=outcome, ansible_module=ansible_module, get_system=get_system
+    )
 
 
 def _failure(module):
@@ -385,6 +403,112 @@ class TestPurefbSyslogLookup:
             syslog_server={"uri": URI, "services": ["management"]},
         )
         blade.patch_syslog_servers.assert_not_called()
+
+
+class TestPurefbSyslogUntidyName:
+    """White space around a name is ignored, as the array ignores it."""
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("name", UNTIDY)
+    def test_same_settings_change_nothing(self, name, check_mode):
+        """The configured server is found: no create is sent or predicted."""
+        module = _module(check_mode=check_mode, name=name, **SAME)
+        blade = _blade()
+        assert _run(module, blade).outcome == "exit"
+        assert _result(module) == {"changed": False}
+        _no_write(blade)
+
+    @pytest.mark.parametrize("name", UNTIDY)
+    def test_update_names_the_server_as_the_array_does(self, name):
+        module = _module(name=name, protocol="tcp", address="192.0.2.20")
+        blade = _blade()
+        assert _run(module, blade).outcome == "exit"
+        assert _result(module) == {"changed": True}
+        blade.patch_syslog_servers.assert_called_once_with(
+            names=["syslog1"],
+            syslog_server={"uri": "tcp://192.0.2.20", "services": ["management"]},
+        )
+        blade.post_syslog_servers.assert_not_called()
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("name", UNTIDY)
+    def test_delete_finds_the_server(self, name, check_mode):
+        """state=absent does not report a configured server as absent."""
+        module = _module(check_mode=check_mode, name=name, state="absent")
+        blade = _blade()
+        assert _run(module, blade).outcome == "exit"
+        assert _result(module) == {"changed": True}
+        if check_mode:
+            _no_write(blade)
+        else:
+            blade.delete_syslog_servers.assert_called_once_with(names=["syslog1"])
+
+    @pytest.mark.parametrize("name", UNTIDY)
+    def test_test_returns_the_results(self, name):
+        module = _module(name=name, state="test")
+        blade = _blade()
+        assert _run(module, blade).outcome == "exit"
+        assert _result(module) == {
+            "changed": False,
+            "test_response": [
+                _reported("syslog1", "CH1.FM1"),
+                _reported("syslog1", "CH1.FM2"),
+            ],
+        }
+
+    def test_new_name_is_sent_as_given(self):
+        """A create carries the name of the task; the array trims it."""
+        module = _module(name=" syslog2 ", protocol="udp", address="192.0.2.20")
+        blade = _blade()
+        assert _run(module, blade).outcome == "exit"
+        assert _result(module) == {"changed": True}
+        blade.post_syslog_servers.assert_called_once_with(
+            names=[" syslog2 "],
+            syslog_server={"uri": "udp://192.0.2.20", "services": ["management"]},
+        )
+
+    @pytest.mark.parametrize("name", ["", " ", "\n"])
+    def test_blank_name_is_no_server(self, name):
+        module = _module(name=name, state="absent")
+        blade = _blade()
+        assert _run(module, blade).outcome == "exit"
+        assert _result(module) == {"changed": False}
+        _no_write(blade)
+
+    @pytest.mark.parametrize("name", ["", " ", "\n"])
+    def test_test_of_a_blank_name_fails(self, name):
+        module = _module(name=name, state="test")
+        blade = _blade()
+        assert _run(module, blade).outcome == "fail"
+        assert _failure(module) == NOT_CONFIGURED.format(name)
+        _no_test(blade)
+
+
+class TestPurefbSyslogNameList:
+    """A name the array reads as a list of names is refused."""
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("state", STATES)
+    @pytest.mark.parametrize("name", LISTS)
+    def test_list_of_names_is_refused_before_any_request(self, name, state, check_mode):
+        module = _module(check_mode=check_mode, name=name, state=state, **SAME)
+        blade = _blade(servers=[_server(), _server("syslog2")])
+        run = _run(module, blade)
+        assert run.outcome == "fail"
+        assert _failure(module) == NAME_LIST.format(name)
+        run.get_system.assert_not_called()
+        blade.get_syslog_servers.assert_not_called()
+        _no_test(blade)
+        _no_write(blade)
+
+    @pytest.mark.parametrize("state", STATES)
+    def test_refused_whoever_may_read_the_servers(self, state):
+        """The name is refused before the read that the array may refuse."""
+        module = _module(name="syslog1,syslog2", state=state, **SAME)
+        blade = _blade(read=_error())
+        assert _run(module, blade).outcome == "fail"
+        assert _failure(module) == NAME_LIST.format("syslog1,syslog2")
+        blade.get_syslog_servers.assert_not_called()
 
 
 class TestPurefbSyslogCreate:

@@ -1,0 +1,3 @@
+bugfixes:
+  - purefb_ra - a read of the support settings or a Remote Assist test that the array refuses or
+    fails is now reported with the array's message instead of a traceback.

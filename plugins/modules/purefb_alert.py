@@ -20,9 +20,9 @@ module: purefb_alert
 version_added: '1.0.0'
 short_description: Configure Everpure FlashBlade alert email settings
 description:
-- Configure alert email configuration for Everpure FlashArrays.
-- Add or delete an individual syslog server to the existing
-  list of serves.
+- Manage the alert email recipients (alert watchers) of an Everpure
+  FlashBlade.
+- Create, update, delete or test an individual alert watcher.
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
@@ -149,12 +149,17 @@ def _stored_address(watchers, address):
 
     The array reads and tests an alert watcher without regard to the letter
     case of its address, and refuses a second watcher on it, but changes and
-    deletes the watcher only under the spelling it stored. Returns None when
-    no alert watcher has the address.
+    deletes the watcher only under the spelling it stored. A watcher stored
+    in exactly the spelling asked for is preferred, so a task that names a
+    stored address always gets that watcher. Returns None when no alert
+    watcher has the address.
     """
-    for watcher in watchers:
-        if watcher.name.lower() == address.lower():
-            return watcher.name
+    names = [watcher.name for watcher in watchers]
+    if address in names:
+        return address
+    for name in names:
+        if name.lower() == address.lower():
+            return name
     return None
 
 

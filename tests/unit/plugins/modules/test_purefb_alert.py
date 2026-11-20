@@ -566,6 +566,20 @@ class TestPurefbAlertLetterCase:
     def test_stored_address_without_watchers(self):
         assert purefb_alert._stored_address([], ADDRESS) is None
 
+    @pytest.mark.parametrize(
+        "first,second", [(OTHER_CASE, ADDRESS), (ADDRESS, OTHER_CASE)]
+    )
+    def test_stored_address_prefers_the_exact_spelling(self, first, second):
+        """A task that names a stored address always gets that watcher.
+
+        The array refuses a second watcher whose address differs only in
+        letter case, so it does not list two such watchers. The exact
+        spelling is preferred all the same, whatever the order of the list.
+        """
+        watchers = [_watcher(first), _watcher(second)]
+        assert purefb_alert._stored_address(watchers, ADDRESS) == ADDRESS
+        assert purefb_alert._stored_address(watchers, OTHER_CASE) == OTHER_CASE
+
 
 class TestPurefbAlertResourceName:
     """The watcher a test result refers to."""

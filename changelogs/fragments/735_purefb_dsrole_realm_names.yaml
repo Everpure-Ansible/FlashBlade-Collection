@@ -1,0 +1,4 @@
+bugfixes:
+  - purefb_dsrole - a realm-qualified ``name`` or policy name (``realm::name``) and a name with a
+    comma are refused before any request, and a mapping named in another letter case is addressed
+    by its stored name.

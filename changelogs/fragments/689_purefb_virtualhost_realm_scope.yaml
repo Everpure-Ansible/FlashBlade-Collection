@@ -1,0 +1,10 @@
+bugfixes:
+  - purefb_virtualhost - a create is no longer refused by the module once it can list ten virtual
+    hosts. The array decides how many it holds and its refusal is reported.
+  - purefb_virtualhost - a look-up that the array refuses is reported with the array's message
+    instead of being read as an absent virtual host.
+  - purefb_virtualhost - a virtual host named in another letter case than the array stores is now
+    changed and deleted. It is addressed by the name the array reports.
+  - purefb_virtualhost - a ``name`` with a ``*`` or a comma, which the array reads as a pattern or
+    as a list of names, is refused. Only the virtual host that has the given name is changed or
+    deleted.

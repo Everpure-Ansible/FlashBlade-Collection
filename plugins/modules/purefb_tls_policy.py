@@ -25,12 +25,27 @@ description:
 - A TLS policy controls the server certificate presented on a network
   interface, the TLS versions and ciphers permitted, and optional
   mutual-TLS settings for verifying client certificates.
+- A TLS policy that lives in a realm is addressed by its full name
+  C(realm::policy). A policy and the certificate, or certificate group, it
+  names must be in the same realm, or both at array level.
 author:
 - Pure Storage Ansible Team (@avk) <pure-ansible-team@everpuredata.com>
 options:
   name:
     description:
     - Name of the TLS policy.
+    - A TLS policy that lives in a realm is named C(realm::policy).
+    - A realm-scoped administrator must use the realm-qualified name; a
+      bare name is not placed in, or resolved to, the administrator's
+      realm.
+    - This is the name of one policy. The array reads C(*) in a name as a
+      pattern and a comma as a separator of names, so a name that holds
+      either is refused.
+    - The policy is found without regard to letter case. The module then
+      uses the name as the array stores it, and creates a new policy in a
+      realm with the realm prefix as the array stores it, because the array
+      compares the realm of a certificate with the realm prefix as it is
+      written in the request.
     type: str
     required: true
   state:
@@ -50,10 +65,18 @@ options:
       TLS negotiation with clients connecting to network interfaces
       covered by this policy.
     - Required when creating a policy; the array rejects a policy without
-      an appliance certificate. Use C(global) for the built-in certificate.
-    - Set to C(global) to reset the policy to the built-in appliance
-      certificate, effectively removing a previously assigned custom
-      certificate.
+      an appliance certificate.
+    - C(global) is the built-in certificate of the array and can only be
+      used by an array-level policy. Use C(global) to create such a policy
+      with the built-in certificate, or to reset one to it, which removes
+      a previously assigned custom certificate.
+    - A policy that lives in a realm needs a certificate of that realm,
+      written C(realm::certificate). The array refuses C(global), any
+      other array-level certificate and a certificate of another realm
+      for such a policy, and a certificate of a realm for an array-level
+      policy, so the module fails such a task before it changes anything.
+    - The name is compared with the current certificate without regard to
+      letter case, as the array does.
     type: str
   client_certificates_required:
     description:
@@ -73,6 +96,13 @@ options:
     - Set to an empty string (C("")) to clear a previously assigned
       trusted CA reference. This only applies on update; on create an
       empty string is treated the same as omitting the parameter.
+    - For a policy that lives in a realm, name a certificate or
+      certificate group of that realm, written C(realm::name). An
+      array-level policy can only use an array-level one. The module
+      fails a task that names one from another scope before it changes
+      anything.
+    - The name is compared with the current reference without regard to
+      letter case, as the array does.
     - Requires Purity//FB REST API 2.18 or later.
     type: str
   verify_client_certificate_trust:
@@ -109,6 +139,11 @@ options:
     - Use an empty list to detach the policy from all interfaces.
     - On create, an empty list creates the policy with no interfaces
       attached; this is equivalent to omitting the parameter.
+    - A network interface that lives in a realm is named
+      C(realm::interface) and must be given in that form.
+    - Names are compared with the attached interfaces without regard to
+      letter case, as the array does, and an interface is attached by the
+      name the array stores.
     type: list
     elements: str
 extends_documentation_fragment:
@@ -156,11 +191,21 @@ EXAMPLES = r"""
     fb_url: 10.10.10.2
     api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
 
-- name: Reset appliance cert to the built-in global cert and clear the trusted CA
+- name: Reset an array-level policy to the built-in global cert and clear the trusted CA
   everpure.flashblade.purefb_tls_policy:
     name: secure_data_plane
     appliance_certificate: global
     trusted_client_certificate_authority: ""
+    fb_url: 10.10.10.2
+    api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
+
+- name: Create a TLS policy in a realm with a certificate and a trusted CA group of that realm
+  everpure.flashblade.purefb_tls_policy:
+    name: realm1::data-tls
+    appliance_certificate: realm1::tls-cert
+    trusted_client_certificate_authority: realm1::corp-ca-group
+    verify_client_certificate_trust: true
+    min_tls_version: '1.2'
     fb_url: 10.10.10.2
     api_token: T-68618f31-0c9e-4e57-aa44-5306a2cf10e3
 
@@ -200,11 +245,172 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.version import
 
 MIN_REQUIRED_API_VERSION = "2.17"
 MIN_MUTUAL_TLS_API_VERSION = "2.18"
+REALM_API_VERSION = "2.19"
 MUTUAL_TLS_PARAMS = (
     "client_certificates_required",
     "trusted_client_certificate_authority",
     "verify_client_certificate_trust",
 )
+REFERENCE_PARAMS = (
+    "appliance_certificate",
+    "trusted_client_certificate_authority",
+)
+
+
+def _realm_of(name):
+    """Return the realm of a realm::name name, empty for an array-level name."""
+    return name.rpartition("::")[0].strip()
+
+
+def _same_name(first, second):
+    """Tell whether two names are the same name on the array.
+
+    The array matches a name without regard to letter case and returns
+    the stored spelling. White space around a name is not part of it.
+    """
+    return str(first or "").strip().lower() == str(second or "").strip().lower()
+
+
+def _in_names(name, names):
+    """Tell whether name is one of names, as the array compares names."""
+    return any(_same_name(name, other) for other in names)
+
+
+def _check_one_name(module):
+    """Refuse a name that the array does not read as the name of one policy.
+
+    In a request the array reads * in a name as a pattern and a comma as a
+    separator of names, so such a name reaches every policy that matches
+    it, or several at once. This module manages the one policy that has the
+    name given, so the name is refused before anything is read.
+    """
+    name = module.params["name"]
+    if "*" in name or "," in name:
+        module.fail_json(
+            msg="name must be the name of one TLS policy: in {0} the array "
+            "reads * as a pattern and a comma as a separator of "
+            "names.".format(name)
+        )
+
+
+def _check_reference_scope(module):
+    """Fail when a certificate reference is outside the scope of the policy.
+
+    A TLS policy and the certificate, or certificate group, it names are in
+    one scope: both carry the same realm prefix, or neither does. The
+    built-in certificate global belongs to the array. The array refuses any
+    other pair when a policy is created or changed, so such a pair is
+    refused before anything is read or written, in check mode too.
+    """
+    name = module.params["name"]
+    realm = _realm_of(name)
+    for option in REFERENCE_PARAMS:
+        reference = module.params[option]
+        if not reference:
+            continue
+        reference_realm = _realm_of(reference)
+        if _same_name(realm, reference_realm):
+            continue
+        if not realm:
+            reason = (
+                "{0} is in realm {1} and {2} is an array-level policy. A TLS "
+                "policy of that realm is named {1}::<policy>".format(
+                    reference, reference_realm, name
+                )
+            )
+        else:
+            if reference_realm:
+                where = "{0} is in realm {1}".format(reference, reference_realm)
+            elif _same_name(reference, "global"):
+                where = "global is the built-in certificate of the array"
+            else:
+                where = "{0} is an array-level name".format(reference)
+            reason = (
+                "{0} and {1} is in realm {2}. Name a certificate{3} of that "
+                "realm, written {2}::<name>".format(
+                    where,
+                    name,
+                    realm,
+                    (
+                        ""
+                        if option == "appliance_certificate"
+                        else " or certificate group"
+                    ),
+                )
+            )
+        module.fail_json(
+            msg="{0} {1} cannot be used by TLS policy {2}: a TLS policy and "
+            "the certificates it names must be in the same realm, or all at "
+            "array level. {3}.".format(option, reference, name, reason)
+        )
+
+
+def _check_realm(module, blade, api_version):
+    """Fail when a new policy is named into a realm that cannot take it.
+
+    The array refuses to create a policy in a realm that does not exist or
+    has been destroyed, which check mode cannot foresee, so the realm is
+    read before a change is reported. Only a definite answer fails the
+    task; anything else is left to the create request.
+
+    The array finds a realm without regard to letter case, but it compares
+    the realm of a certificate with the realm prefix as it is written in the
+    name of the new policy. The new policy therefore takes the realm prefix
+    as the array stores it.
+    """
+    name = module.params["name"]
+    realm = _realm_of(name)
+    if not realm or LooseVersion(REALM_API_VERSION) > LooseVersion(api_version):
+        return
+    res = blade.get_realms(names=[realm])
+    if res.status_code == 200:
+        items = list(res.items)
+        if not items:
+            return
+        if getattr(items[0], "destroyed", False) is not True:
+            stored = getattr(items[0], "name", None)
+            if isinstance(stored, str) and _same_name(stored, realm):
+                module.params["name"] = "{0}::{1}".format(
+                    stored, name.rpartition("::")[2]
+                )
+            return
+        reason = "Realm has been destroyed."
+    else:
+        reason = get_error_message(res)
+        if "does not exist" not in str(reason).lower():
+            return
+    module.fail_json(
+        msg="TLS policy {0} was not found and cannot be created in realm {1}. "
+        "Error: {2}".format(name, realm, reason)
+    )
+
+
+def _fail_certificate_required(module):
+    """Fail a create that names no appliance certificate.
+
+    The array refuses a policy without one. The built-in certificate global
+    is only offered for an array-level name, because the array refuses it
+    for every policy in a realm.
+    """
+    name = module.params["name"]
+    realm = _realm_of(name)
+    if realm:
+        hint = (
+            "name a certificate of realm {0}, written {0}::<certificate>. The "
+            "built-in certificate global belongs to the array and cannot be "
+            "used by a TLS policy in a realm".format(realm)
+        )
+    else:
+        hint = (
+            "an array-level policy can use 'global', the built-in appliance "
+            "certificate of the array. A TLS policy that lives in a realm is "
+            "named <realm>::<policy>, and a realm-scoped administrator must "
+            "use that form"
+        )
+    module.fail_json(
+        msg="TLS policy {0} was not found and appliance_certificate is "
+        "required to create it: {1}.".format(name, hint)
+    )
 
 
 def _check_mutual_tls_support(module, api_version):
@@ -229,9 +435,13 @@ def _validate_attachable(module, blade, interfaces):
 
     Called for the to-attach subset only: interfaces already bound to *this* policy
     do not conflict and are left alone.
+
+    Returns the interfaces by the names the array stores, each once, in the
+    order given. The attach request carries these names, so that a name
+    given in another letter case is sent as the array stores it.
     """
     if not interfaces:
-        return
+        return []
     res = blade.get_network_interfaces(
         names=interfaces,
     )
@@ -241,8 +451,8 @@ def _validate_attachable(module, blade, interfaces):
                 interfaces, get_error_message(res)
             )
         )
-    found = {getattr(i, "name", None) for i in (res.items or [])}
-    missing = [i for i in interfaces if i not in found]
+    found = [getattr(i, "name", None) for i in (res.items or [])]
+    missing = [i for i in interfaces if not _in_names(i, found)]
     if missing:
         module.fail_json(msg="Network interface(s) not found: {0}".format(missing))
 
@@ -250,13 +460,16 @@ def _validate_attachable(module, blade, interfaces):
         member_names=interfaces,
     )
     if res.status_code != 200:
-        return
+        module.fail_json(
+            msg="Failed to read the TLS policies of network interface(s) {0}. "
+            "Error: {1}".format(interfaces, get_error_message(res))
+        )
     our_name = module.params["name"]
     conflicts = []
     for item in res.items or []:
         policy_name = getattr(getattr(item, "policy", None), "name", None)
         member_name = getattr(getattr(item, "member", None), "name", None)
-        if policy_name and policy_name != our_name:
+        if policy_name and not _same_name(policy_name, our_name):
             conflicts.append((member_name, policy_name))
     if conflicts:
         formatted = ", ".join("{0}=>{1}".format(m, p) for m, p in conflicts)
@@ -267,26 +480,66 @@ def _validate_attachable(module, blade, interfaces):
                 "policy before re-attaching."
             ).format(our_name, formatted)
         )
+    stored = []
+    for interface in interfaces:
+        for name in found:
+            if isinstance(name, str) and _same_name(interface, name):
+                break
+        else:
+            name = interface
+        if name not in stored:
+            stored.append(name)
+    return stored
 
 
 def _get_policy(module, blade):
-    """Return the existing TLS policy object or None."""
+    """Return the TLS policy called name, or None when it does not exist.
+
+    Only the array's "does not exist" means that there is no such policy.
+    Any other answer fails the task with the array's message: read as absent
+    it would let state=absent report that there is nothing to delete, and
+    state=present ask for a policy to be created that may exist.
+    """
+    name = module.params["name"]
     res = blade.get_tls_policies(
-        names=[module.params["name"]],
+        names=[name],
     )
-    if res.status_code != 200:
+    if res.status_code == 200:
+        items = list(res.items)
+        for item in items:
+            if _same_name(getattr(item, "name", None), name):
+                return item
+        if items:
+            module.fail_json(
+                msg="Failed to read TLS policy {0}: the array answered with "
+                "{1}, which does not have that name.".format(
+                    name,
+                    ", ".join(str(getattr(item, "name", None)) for item in items[:5]),
+                )
+            )
         return None
-    items = list(res.items)
-    return items[0] if items else None
+    error = get_error_message(res)
+    if "does not exist" in str(error).lower():
+        return None
+    module.fail_json(
+        msg="Failed to read TLS policy {0}. Error: {1}".format(name, error)
+    )
 
 
 def _get_attached_interfaces(module, blade):
-    """Return a sorted list of network interface names this policy is applied to."""
+    """Return a sorted list of network interface names this policy is applied to.
+
+    A list the array does not return fails the task with the array's
+    message: read as empty it would report that nothing is attached.
+    """
     res = blade.get_tls_policies_network_interfaces(
         policy_names=[module.params["name"]],
     )
     if res.status_code != 200:
-        return []
+        module.fail_json(
+            msg="Failed to list the network interfaces of TLS policy {0}. "
+            "Error: {1}".format(module.params["name"], get_error_message(res))
+        )
     names = []
     for item in res.items or []:
         member = getattr(item, "member", None)
@@ -329,18 +582,20 @@ def _build_post_kwargs(module):
 def _reconcile_interfaces(module, blade):
     """Reconcile policy network-interface attachments to the desired set.
 
-    Returns True if any attach/detach was needed.
+    Returns True if any attach/detach was needed. Names are compared as the
+    array compares them, so an attached interface given in another letter
+    case is neither attached again nor detached.
     """
     desired = sorted(module.params["network_interfaces"])
     current = _get_attached_interfaces(module, blade)
-    to_attach = [i for i in desired if i not in current]
-    to_detach = [i for i in current if i not in desired]
+    to_attach = [i for i in desired if not _in_names(i, current)]
+    to_detach = [i for i in current if not _in_names(i, desired)]
 
     if not (to_attach or to_detach):
         return False
 
     if to_attach:
-        _validate_attachable(module, blade, to_attach)
+        to_attach = _validate_attachable(module, blade, to_attach)
 
     if module.check_mode:
         return True
@@ -415,18 +670,17 @@ def delete_policy(module, blade):
     module.exit_json(changed=changed)
 
 
-def create_policy(module, blade):
+def create_policy(module, blade, api_version):
     """Create a new TLS policy and optionally attach it to interfaces."""
     changed = True
+    _check_realm(module, blade, api_version)
     if not module.params["appliance_certificate"]:
-        module.fail_json(
-            msg=(
-                "appliance_certificate is required to create TLS policy {0} "
-                "(use 'global' for the built-in appliance certificate)."
-            ).format(module.params["name"])
-        )
+        _fail_certificate_required(module)
+    interfaces = []
     if module.params["network_interfaces"]:
-        _validate_attachable(module, blade, module.params["network_interfaces"])
+        interfaces = _validate_attachable(
+            module, blade, module.params["network_interfaces"]
+        )
     if not module.check_mode:
         res = blade.post_tls_policies(
             names=[module.params["name"]],
@@ -439,7 +693,7 @@ def create_policy(module, blade):
                 )
             )
         attached = []
-        for iface in module.params["network_interfaces"] or []:
+        for iface in interfaces:
             res = blade.post_tls_policies_network_interfaces(
                 policy_names=[module.params["name"]],
                 member_names=[iface],
@@ -496,7 +750,7 @@ def update_policy(module, blade, policy):
 
     if module.params["appliance_certificate"]:
         current = getattr(getattr(policy, "appliance_certificate", None), "name", None)
-        if module.params["appliance_certificate"] != current:
+        if not _same_name(module.params["appliance_certificate"], current):
             patch_kwargs["appliance_certificate"] = ReferenceWritable(
                 name=module.params["appliance_certificate"]
             )
@@ -510,7 +764,9 @@ def update_policy(module, blade, policy):
             )
             or ""
         )
-        if module.params["trusted_client_certificate_authority"] != current:
+        if not _same_name(
+            module.params["trusted_client_certificate_authority"], current
+        ):
             patch_kwargs["trusted_client_certificate_authority"] = ReferenceWritable(
                 name=module.params["trusted_client_certificate_authority"]
             )
@@ -578,6 +834,11 @@ def main():
     if not HAS_PYPURECLIENT:
         module.fail_json(msg="py-pure-client sdk is required for this module")
 
+    state = module.params["state"]
+    _check_one_name(module)
+    if state == "present":
+        _check_reference_scope(module)
+
     blade = get_system(module)
     api_version = get_rest_api_version(blade)
     if LooseVersion(MIN_REQUIRED_API_VERSION) > LooseVersion(api_version):
@@ -587,11 +848,16 @@ def main():
         )
     _check_mutual_tls_support(module, api_version)
 
-    state = module.params["state"]
     policy = _get_policy(module, blade)
+    if policy is not None and isinstance(getattr(policy, "name", None), str):
+        # The array finds a policy without regard to letter case, but it
+        # compares the realm of a certificate, or certificate group, with the
+        # realm prefix as it is written in the name of the request. From here
+        # on the policy goes by the name the array stores.
+        module.params["name"] = policy.name
 
     if state == "present" and policy is None:
-        create_policy(module, blade)
+        create_policy(module, blade, api_version)
     elif state == "present" and policy is not None:
         update_policy(module, blade, policy)
     elif state == "absent" and policy is not None:

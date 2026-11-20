@@ -27,6 +27,11 @@ options:
   name:
     description:
     - Name of the SSL Certificate
+    - A certificate that lives in a realm is named C(realm::certificate).
+    - A realm-scoped administrator must use the realm-qualified name; a bare
+      name is not placed in, or resolved to, the administrator's realm.
+    - The name of exactly one certificate. A name that holds C(*) or C(,)
+      is refused.
     type: str
     required: true
   state:
@@ -37,6 +42,7 @@ options:
     - I(sign) will construct a Certificate Signing request (CSR) from an existing (self signed) certificate
     - I(export) will export the existing SSL certificate
     - I(import) will import or create a provided certificate.
+    - I(sign) and I(export) fail when the certificate does not exist.
     default: present
     choices: [ absent, present, import, export, sign ]
     type: str
@@ -161,6 +167,15 @@ EXAMPLES = r"""
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
+- name: Create self-signed SSL certificate tls-cert in realm realm1
+  everpure.flashblade.purefb_certs:
+    name: realm1::tls-cert
+    common_name: s3.realm1.example.com
+    country: US
+    organization: "Acme Inc"
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
 - name: Delete SSL certificate foo
   everpure.flashblade.purefb_certs:
     name: foo
@@ -237,6 +252,7 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
 )
 
 CERT_TYPE_VERSION = "2.15"
+REALM_API_VERSION = "2.19"
 CSR_API_VERSION = "2.20"
 
 
@@ -259,6 +275,124 @@ KEY_FIELDS = {
 def _text_differs(requested, current):
     """Compare PEM text ignoring surrounding whitespace"""
     return (requested or "").strip() != (current or "").strip()
+
+
+def _realm_of(name):
+    """Return the realm of a realm::certificate name, or an empty string."""
+    if name and "::" in name:
+        return name.rsplit("::", 1)[0]
+    return ""
+
+
+def _check_name(module):
+    """Refuse a name the array reads as a pattern or as a list of names.
+
+    A read matches a * in a name as a pattern and takes a comma as the
+    separator of several names, so such a name can address more than one
+    certificate while the module looks at the first. No certificate can be
+    created under such a name.
+    """
+    name = module.params["name"]
+    if "*" in name or "," in name:
+        module.fail_json(
+            msg=(
+                "Certificate name {0} is not valid. A name cannot hold '*' "
+                "or ',': name exactly one certificate."
+            ).format(name)
+        )
+
+
+def _cert_exists(module, blade):
+    """Return whether the certificate called I(name) exists.
+
+    The array answers a GET for an unknown name with an error ("Certificate
+    does not exist."), so only that answer reads as absent. Any other
+    failure fails the task with the array's message instead of passing for
+    a missing certificate, which would let state=absent report ok and
+    state=present attempt a create.
+    """
+    res = blade.get_certificates(names=[module.params["name"]])
+    if res.status_code == 200:
+        return True
+    error = get_error_message(res)
+    if "does not exist" in str(error).lower():
+        return False
+    module.fail_json(
+        msg="Failed to read SSL certificate {0}. Error: {1}".format(
+            module.params["name"], error
+        )
+    )
+    return False
+
+
+def _fail_missing(module):
+    """Fail a signing request or an export of a certificate that does not exist.
+
+    Neither can do anything without the certificate, so this is settled
+    before the check mode branch and check mode agrees with a real run.
+    """
+    name = module.params["name"]
+    if module.params["state"] == "sign":
+        action = "Creating a Certificate Signing Request"
+    else:
+        action = "Exporting Certificate"
+    hint = ""
+    if not _realm_of(name):
+        hint = " A certificate that lives in a realm is named realm::certificate."
+    module.fail_json(
+        msg="{0} failed. Error: Certificate {1} does not exist.{2}".format(
+            action, name, hint
+        )
+    )
+
+
+def _check_realm(module, blade, api_version):
+    """Fail a check mode run that would create a certificate in an unusable realm.
+
+    The array refuses to create a certificate in a realm that does not
+    exist, that the caller is not allowed to see or that has been destroyed.
+    A real run gets that answer from the create itself; check mode sends
+    nothing, so it reads the realm instead of reporting a change the real
+    run cannot make. Only a definite answer fails the module.
+    """
+    name = module.params["name"]
+    realm = _realm_of(name)
+    if not realm or LooseVersion(REALM_API_VERSION) > LooseVersion(api_version):
+        return
+    res = blade.get_realms(names=[realm])
+    if res.status_code == 200:
+        items = list(res.items)
+        if not items:
+            # a realm outside the scope of the caller is listed as nothing
+            error = "Realm does not exist."
+        elif getattr(items[0], "destroyed", False):
+            error = "Realm has been destroyed."
+        else:
+            return
+    else:
+        error = get_error_message(res)
+        if "does not exist" not in str(error).lower():
+            return
+    module.fail_json(
+        msg="Creating SSL certificate {0} failed. Error: {1}".format(name, error)
+    )
+
+
+def _check_signable(module, blade):
+    """Fail a check mode signing request for a certificate of type external.
+
+    The array creates a signing request only from a certificate of type
+    array. A real run gets that answer from the array; check mode sends
+    nothing, so it reads the type of the certificate instead.
+    """
+    if getattr(get_cert(module, blade), "certificate_type", None) == "external":
+        module.fail_json(
+            msg=(
+                "Creating a Certificate Signing Request for {0} failed. Error: "
+                "Certificate signing request is only supported for array-type "
+                "certificates."
+            ).format(module.params["name"])
+        )
 
 
 def get_cert(module, blade):
@@ -439,7 +573,9 @@ def create_cert(module, blade):
 
 def delete_cert(module, blade):
     changed = True
-    if module.params["name"] == "global":
+    # the array matches names without regard to case and ignores white
+    # space around a name
+    if module.params["name"].strip().lower() == "global":
         module.fail_json(msg="Global certificate cannot be deleted")
     if not module.check_mode:
         res = blade.delete_certificates(names=[module.params["name"]])
@@ -460,7 +596,7 @@ def export_cert(module, blade):
         if ssl.status_code != 200:
             module.fail_json(
                 msg="Exporting Certificate failed. Error: {0}".format(
-                    ssl.errors[0].message
+                    get_error_message(ssl)
                 )
             )
         with open(module.params["export_file"], "w", encoding="utf-8") as ssl_file:
@@ -486,11 +622,17 @@ def create_csr(module, blade):
             state=module.params["province"],
             subject_alternative_names=module.params["subject_alternative_names"],
         )
-        csr = list(
-            blade.post_certificates_certificate_signing_requests(
-                certificate=certificate
-            ).items
-        )[0].certificate_signing_request
+        res = blade.post_certificates_certificate_signing_requests(
+            certificate=certificate
+        )
+        if res.status_code != 200:
+            module.fail_json(
+                msg=(
+                    "Creating a Certificate Signing Request for {0} failed. "
+                    "Error: {1}"
+                ).format(module.params["name"], get_error_message(res))
+            )
+        csr = list(res.items)[0].certificate_signing_request
         with open(module.params["export_file"], "w", encoding="utf-8") as csr_file:
             csr_file.write(csr)
     module.exit_json(changed=changed)
@@ -553,6 +695,8 @@ def main():
     if not HAS_PYCOUNTRY:
         module.fail_json(msg="pycountry sdk is required for this module")
 
+    _check_name(module)
+
     email_pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
     blade = get_system(module)
     api_versions = get_rest_api_version(blade)
@@ -581,17 +725,24 @@ def main():
     state = module.params["state"]
     certificate_type = module.params["certificate_type"]
 
-    exists = bool(
-        blade.get_certificates(names=[module.params["name"]]).status_code == 200
-    )
+    if state == "sign" and LooseVersion(CSR_API_VERSION) > LooseVersion(api_versions):
+        module.fail_json(msg="Purity//FB 4.6.3+ is required for CSRs")
+
+    exists = _cert_exists(module, blade)
+
+    if not exists and state in ("sign", "export"):
+        _fail_missing(module)
+    if module.check_mode:
+        if not exists and state in ("present", "import"):
+            _check_realm(module, blade, api_versions)
+        elif state == "sign":
+            _check_signable(module, blade)
 
     if not exists and state == "present":
         create_cert(module, blade)
     elif exists and state == "present":
         update_cert(module, blade)
     elif state == "sign":
-        if LooseVersion(CSR_API_VERSION) > LooseVersion(api_versions):
-            module.fail_json(msg="Purity//FB 4.6.3+ is required for CSRs")
         create_csr(module, blade)
     elif not exists and state == "import":
         create_cert(module, blade)

@@ -159,7 +159,7 @@ CONTEXT_API_VERSION = "2.17"
 
 
 def get_quota(module, blade):
-    """Return Filesystem User Quota or None"""
+    """Return Filesystem User Quota or None, fail on a read the array refuses"""
     versions = get_rest_api_version(blade)
     # uid 0 (root) is a valid value, so test for presence rather than truth.
     if module.params["uid"] is not None:
@@ -192,7 +192,25 @@ def get_quota(module, blade):
                 file_system_names=[module.params["name"]],
                 filter="user.name='" + module.params["uname"] + "'",
             )
-    if res.status_code == 200 and res.total_item_count != 0:
+    if res.status_code != 200:
+        # Only an answered read can say that the user has no quota.
+        if module.params["uid"] is not None:
+            module.fail_json(
+                msg="Failed to read quota for UID {0} on filesystem {1}. Error: {2}".format(
+                    module.params["uid"],
+                    module.params["name"],
+                    get_error_message(res),
+                )
+            )
+        else:
+            module.fail_json(
+                msg="Failed to read quota for username {0} on filesystem {1}. Error: {2}".format(
+                    module.params["uname"],
+                    module.params["name"],
+                    get_error_message(res),
+                )
+            )
+    if res.total_item_count != 0:
         return list(res.items)[0]
     return None
 

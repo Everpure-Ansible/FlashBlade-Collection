@@ -10,6 +10,7 @@ __metaclass__ = type
 import sys
 import multiprocessing
 import ctypes
+from fnmatch import fnmatchcase
 from unittest.mock import Mock, patch, MagicMock
 
 import pytest
@@ -91,6 +92,8 @@ ARRAY = "array1"
 REFUSED = "refused"
 # Messages of the array, as Purity//FB 4.8.8 sends them
 NO_FS = "File system does not exist."
+NO_MATCH = "File system was not found."
+MANY_FS = "Cannot process more than one File system at a time."
 NOT_PERMITTED = "Operation not permitted."
 NO_NAMES = (
     "Cannot manage quotas using user names without either the NFS directory "
@@ -183,9 +186,15 @@ def _blade(file_systems=(FS,), quotas=None, fleet=None, hidden=()):
     user is the uid or the user name of the task. POST, PATCH and DELETE
     change that state so that a later GET reads it back.
 
+    The SDK sends a name as it is given. GET /file-systems reads a comma as
+    a list of names and a * as a pattern and answers with every match; the
+    quota endpoints take one file system, so they refuse a list and know no
+    file system by the name of a pattern.
+
     fleet "member" puts the array in a fleet, REFUSED makes the fleet read
     fail the way it does for a realm-scoped administrator. blade.fail maps
-    "post", "patch" or "delete" to the message of a refused write.
+    "get", "post", "patch" or "delete" to the message of a refused quota
+    request.
     """
     blade = Mock()
     blade.quotas = dict(quotas or {})
@@ -194,16 +203,29 @@ def _blade(file_systems=(FS,), quotas=None, fleet=None, hidden=()):
     def _visible(name):
         return name in file_systems and name not in hidden
 
+    def _selected(name, part):
+        if "*" in part:
+            return fnmatchcase(name, part)
+        return name == part
+
     def _get_file_systems(**kwargs):
         name = kwargs["names"][0]
-        if name in hidden:
-            return _response([])
-        if name not in file_systems:
-            return _error(NO_FS)
-        return _response([_named(name)])
+        parts = name.split(",")
+        found = [
+            known
+            for known in file_systems
+            if any(_selected(known, part) for part in parts)
+        ]
+        if not found:
+            return _error(NO_MATCH if "*" in name else NO_FS)
+        return _response([_named(known) for known in found if known not in hidden])
 
     def _get(**kwargs):
         name = kwargs["file_system_names"][0]
+        if "get" in blade.fail:
+            return _error(blade.fail["get"])
+        if "," in name:
+            return _error(MANY_FS)
         if not _visible(name):
             return _error(NO_FS)
         user = _filter_user(kwargs["filter"])
@@ -290,7 +312,7 @@ def _lookup(module, blade, api_version="2.30"):
     """Call get_quota() the way main() does."""
     with patch(MOD + ".LooseVersion", RealLooseVersion), patch(
         MOD + ".get_rest_api_version", return_value=api_version
-    ):
+    ), patch(MOD + ".get_error_message", side_effect=_get_error_message):
         return get_quota(module, blade)
 
 
@@ -499,6 +521,16 @@ class TestUpdate:
             "quota": {"quota": 20 * GIB},
         }
 
+    @pytest.mark.parametrize("user", [1234, "bar"])
+    def test_lower_quota_is_a_change(self, user):
+        blade = _blade(quotas={(FS, user): 20 * GIB})
+        key = "uid" if isinstance(user, int) else "uname"
+        module = _module(quota="1G", **{key: user})
+        _run(module, blade)
+        assert _changed(module) is True
+        blade.patch_quotas_users.assert_called_once()
+        assert blade.quotas == {(FS, user): GIB}
+
     @pytest.mark.parametrize("user", [1234, 0, "bar"])
     @pytest.mark.parametrize("check_mode", [False, True])
     def test_same_quota_is_unchanged(self, user, check_mode):
@@ -632,6 +664,102 @@ class TestDelete:
         msg = _failure(module)
         assert "username bar on filesystem foo" in msg
         assert msg.endswith("Error: " + NO_NAMES)
+
+
+class TestRefusedQuotaRead:
+    """Only an answered read says that the user has no quota"""
+
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_refused_read_by_uid_has_the_array_message(self, state, check_mode):
+        blade = _blade(quotas={(FS, 1234): GIB})
+        blade.fail["get"] = NOT_PERMITTED
+        module = _module(check_mode=check_mode, uid=1234, quota="2G", state=state)
+        _run(module, blade)
+        msg = _failure(module)
+        assert "UID 1234 on filesystem foo" in msg
+        assert msg.endswith("Error: " + NOT_PERMITTED)
+        _no_writes(blade)
+        assert blade.quotas == {(FS, 1234): GIB}
+
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_refused_read_by_uname_has_the_array_message(self, state, check_mode):
+        blade = _blade(quotas={(FS, "bar"): GIB})
+        blade.fail["get"] = NOT_PERMITTED
+        module = _module(check_mode=check_mode, uname="bar", quota="2G", state=state)
+        _run(module, blade)
+        msg = _failure(module)
+        assert "username bar on filesystem foo" in msg
+        assert msg.endswith("Error: " + NOT_PERMITTED)
+        _no_writes(blade)
+        assert blade.quotas == {(FS, "bar"): GIB}
+
+    @pytest.mark.parametrize("user", [{"uid": 1234}, {"uname": "bar"}])
+    def test_get_quota_fails_on_a_refused_read(self, user):
+        blade = _blade()
+        blade.fail["get"] = NOT_PERMITTED
+        module = _module(**user)
+        with pytest.raises(SystemExit):
+            _lookup(module, blade)
+        assert _failure(module).endswith("Error: " + NOT_PERMITTED)
+
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_list_of_names_is_refused_with_the_array_message(self, state, check_mode):
+        quotas = {(FS, 1234): 3 * GIB, (REALM_FS, 1234): GIB}
+        blade = _blade(file_systems=(FS, REALM_FS), quotas=quotas)
+        name = FS + "," + REALM_FS
+        module = _module(
+            check_mode=check_mode, name=name, uid=1234, quota="9G", state=state
+        )
+        _run(module, blade)
+        msg = _failure(module)
+        assert "UID 1234 on filesystem foo,tenant1::foo" in msg
+        assert msg.endswith("Error: " + MANY_FS)
+        _no_writes(blade)
+        assert blade.quotas == quotas
+
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_pattern_is_refused_with_the_array_message(self, state, check_mode):
+        quotas = {(FS, 1234): 3 * GIB, (REALM_FS, 1234): GIB}
+        blade = _blade(file_systems=(FS, REALM_FS), quotas=quotas)
+        module = _module(
+            check_mode=check_mode, name="fo*", uid=1234, quota="9G", state=state
+        )
+        _run(module, blade)
+        blade.get_file_systems.assert_called_once_with(names=["fo*"])
+        assert _failure(module).endswith("Error: " + NO_FS)
+        _no_writes(blade)
+        assert blade.quotas == quotas
+
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_realm_administrator_list_of_names_is_refused(self, state, check_mode):
+        quotas = {(FS, 1234): 3 * GIB, (REALM_FS, 1234): GIB}
+        blade = _blade(
+            file_systems=(FS, REALM_FS),
+            quotas=quotas,
+            fleet=REFUSED,
+            hidden=(FS,),
+        )
+        name = FS + "," + REALM_FS
+        module = _module(
+            check_mode=check_mode, name=name, uid=1234, quota="9G", state=state
+        )
+        _run(module, blade)
+        assert _failure(module).endswith("Error: " + MANY_FS)
+        _no_writes(blade)
+        assert blade.quotas == quotas
+
+    def test_pattern_without_a_match_is_a_missing_file_system(self):
+        blade = _blade(quotas={(FS, 1234): GIB})
+        module = _module(name="zz*", uid=1234, state="absent")
+        _run(module, blade)
+        assert _failure(module) == "Filesystem zz* does not exist."
+        blade.get_quotas_users.assert_not_called()
+        _no_writes(blade)
 
 
 class TestRealm:

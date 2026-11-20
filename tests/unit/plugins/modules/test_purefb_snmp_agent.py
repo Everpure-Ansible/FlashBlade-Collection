@@ -78,6 +78,7 @@ from plugins.modules.purefb_snmp_agent import _readable, main
 
 MOD = "plugins.modules.purefb_snmp_agent"
 REFUSED = "Operation not permitted."
+THROTTLED = "API rate limit exceeded"
 READ_FAILED = "Failed to get configuration for SNMP agent. Error: {0}"
 NO_AGENT = "The array returned no SNMP agent."
 V2C_FAILED = "Failed to update v2c SNMP agent. Error: {0}"
@@ -310,7 +311,10 @@ class TestPurefbSnmpAgentRead:
         "message, status_code, reported",
         [
             (REFUSED, 403, REFUSED),
-            (None, 429, "Unknown error"),
+            # the SDK gives a 403 or 429 answer exactly one error, with the
+            # message of the gateway
+            (THROTTLED, 429, THROTTLED),
+            # an answer that holds no list of errors
             (None, 500, "Unknown error"),
             ("Service unavailable.", 503, "Service unavailable."),
         ],

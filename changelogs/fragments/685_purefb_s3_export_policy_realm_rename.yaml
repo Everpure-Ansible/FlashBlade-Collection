@@ -1,0 +1,12 @@
+bugfixes:
+  - purefb_s3_export_policy - a rename now stays in the realm of ``name``. A bare new name for a
+    policy in a realm is taken as a name in that realm, and a new name in another realm is refused
+    before any change, in check mode as well.
+  - purefb_s3_export_policy - when ``name`` does not exist, a policy with the new name in another
+    realm, or outside the realm, is no longer modified, and ``state=absent`` no longer deletes the
+    policy called ``rename``.
+  - purefb_s3_export_policy - a rename to a name that is taken or differs only in case is refused
+    before the rules are changed, and a failed read of the policy or its rules is reported instead
+    of being taken for a missing policy or an empty rule list.
+  - purefb_s3_export_policy - a ``name`` or ``rename`` that holds a comma is refused. The array
+    reads it as a list of names, and a task manages one policy.

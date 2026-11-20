@@ -1,0 +1,15 @@
+bugfixes:
+  - purefb_local_user - the local directory service is read first. A task that names one that does
+    not exist, or that the user cannot manage, fails in check mode as in the real run, with a
+    message that names the ``realm::name`` form.
+  - purefb_local_user - a primary group change no longer fails when the user is not yet a member
+    of the new group; the membership is added first. With ``groups`` set the former primary group
+    is removed in the same run when the list does not name it.
+  - purefb_local_user - a rename task run again continues with the renamed user instead of
+    failing or creating the old name again.
+  - purefb_local_user - user and group names are compared without regard to case, as the array
+    matches them, and a group the local directory service does not have stops the task before
+    anything is written, in check mode too.
+  - purefb_local_user - a name that holds a comma is refused before any request. The array reads
+    a comma as the separator of a list of names, so such a task addressed more than one user or
+    local directory service. An empty group name is refused as well, in check mode too.

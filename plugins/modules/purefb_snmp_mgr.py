@@ -152,6 +152,22 @@ def _readable(value):
     return value
 
 
+def _list_managers(module, blade):
+    """Return the SNMP managers of the array.
+
+    A read the array refuses or fails is reported with the message of the
+    array.
+    """
+    res = blade.get_snmp_managers()
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to list SNMP managers. Error: {0}".format(
+                get_error_message(res)
+            )
+        )
+    return list(res.items)
+
+
 def update_manager(module, blade):
     """Update SNMP Manager"""
     changed = False
@@ -304,7 +320,14 @@ def create_manager(module, blade):
 def test_manager(module, blade):
     """Test SNMP manager configuration"""
     test_response = []
-    response = list(blade.get_snmp_managers_test(names=[module.params["name"]]).items)
+    res = blade.get_snmp_managers_test(names=[module.params["name"]])
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to test SNMP manager {0}. Error: {1}".format(
+                module.params["name"], get_error_message(res)
+            )
+        )
+    response = list(res.items)
     for component in response:
         if component.enabled:
             enabled = "true"
@@ -373,8 +396,7 @@ def main():
         module.fail_json(msg="py-pure-client SDK is required for this module")
 
     mgr_configured = False
-    mgrs = list(blade.get_snmp_managers().items)
-    for mgr in mgrs:
+    for mgr in _list_managers(module, blade):
         if mgr.name == module.params["name"]:
             mgr_configured = True
             break

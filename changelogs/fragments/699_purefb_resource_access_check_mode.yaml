@@ -1,0 +1,9 @@
+bugfixes:
+  - purefb_resource_access - check mode no longer predicts a share that the array refuses. For a
+    new share with a realm scope it reads the realm and the resource and fails, as the create
+    request would, when the array does not hold one of them under the name given. What these
+    reads cannot settle is predicted with a warning.
+  - purefb_resource_access - documentation lists ``targets`` and ``sso/saml2/idps`` among the
+    resources that can be shared with a realm, says that the administrators of a realm can change
+    a DNS configuration that is shared with it, and shares a data DNS configuration in its example
+    instead of ``management``.

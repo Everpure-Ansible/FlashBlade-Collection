@@ -115,13 +115,29 @@ def _readable(value):
     return value
 
 
+def _get_agent(module, blade):
+    """Return the SNMP agent of the array.
+
+    A read the array refuses or fails is reported with the message of the
+    array.
+    """
+    res = blade.get_snmp_agents()
+    if res.status_code != 200:
+        module.fail_json(
+            msg="Failed to get configuration for SNMP agent. Error: {0}".format(
+                get_error_message(res)
+            )
+        )
+    items = list(res.items)
+    if not items:
+        module.fail_json(msg="The array returned no SNMP agent.")
+    return items[0]
+
+
 def update_agent(module, blade):
     """Update SNMP Agent"""
     changed = False
-    res = blade.get_snmp_agents()
-    if res.status_code != 200:
-        module.fail_json(msg="Failed to get configuration for SNMP agent.")
-    agent = list(res.items)[0]
+    agent = _get_agent(module, blade)
     version = module.params["version"] or agent.version
     # The array returns both the v2c and v3 blocks whatever the active
     # version, with the community string and the passphrases masked as

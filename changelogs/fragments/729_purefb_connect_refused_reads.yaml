@@ -1,0 +1,14 @@
+bugfixes:
+  - purefb_connect - ``state=present`` no longer creates a connection key on the target array in
+    check mode. The key is requested only when the connection is about to be created.
+  - purefb_connect - a read on either array that is refused or fails, a failed login to the target
+    array and a refused connection key are now reported with the message of the array instead of a
+    traceback.
+  - purefb_connect - check mode now refuses a disconnect on the array that did not form the
+    connection, as the real run does.
+  - purefb_connect - an update with ``context`` now reads the connection on the fleet member that
+    is changed instead of on the array that received the request.
+  - purefb_connect - an update no longer reports a change on every run when the array lists the
+    replication addresses of the connection in an unsorted order.
+  - purefb_connect - ``state=absent`` without ``target_api`` now names the missing option when a
+    connection that another array formed has to be identified.

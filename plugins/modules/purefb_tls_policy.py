@@ -41,6 +41,11 @@ options:
     - This is the name of one policy. The array reads C(*) in a name as a
       pattern and a comma as a separator of names, so a name that holds
       either is refused.
+    - The policy is found without regard to letter case. The module then
+      uses the name as the array stores it, and creates a new policy in a
+      realm with the realm prefix as the array stores it, because the array
+      compares the realm of a certificate with the realm prefix as it is
+      written in the request.
     type: str
     required: true
   state:
@@ -137,7 +142,8 @@ options:
     - A network interface that lives in a realm is named
       C(realm::interface) and must be given in that form.
     - Names are compared with the attached interfaces without regard to
-      letter case, as the array does.
+      letter case, as the array does, and an interface is attached by the
+      name the array stores.
     type: list
     elements: str
 extends_documentation_fragment:
@@ -346,6 +352,11 @@ def _check_realm(module, blade, api_version):
     has been destroyed, which check mode cannot foresee, so the realm is
     read before a change is reported. Only a definite answer fails the
     task; anything else is left to the create request.
+
+    The array finds a realm without regard to letter case, but it compares
+    the realm of a certificate with the realm prefix as it is written in the
+    name of the new policy. The new policy therefore takes the realm prefix
+    as the array stores it.
     """
     name = module.params["name"]
     realm = _realm_of(name)
@@ -354,7 +365,14 @@ def _check_realm(module, blade, api_version):
     res = blade.get_realms(names=[realm])
     if res.status_code == 200:
         items = list(res.items)
-        if not items or getattr(items[0], "destroyed", False) is not True:
+        if not items:
+            return
+        if getattr(items[0], "destroyed", False) is not True:
+            stored = getattr(items[0], "name", None)
+            if isinstance(stored, str) and _same_name(stored, realm):
+                module.params["name"] = "{0}::{1}".format(
+                    stored, name.rpartition("::")[2]
+                )
             return
         reason = "Realm has been destroyed."
     else:
@@ -417,9 +435,13 @@ def _validate_attachable(module, blade, interfaces):
 
     Called for the to-attach subset only: interfaces already bound to *this* policy
     do not conflict and are left alone.
+
+    Returns the interfaces by the names the array stores, each once, in the
+    order given. The attach request carries these names, so that a name
+    given in another letter case is sent as the array stores it.
     """
     if not interfaces:
-        return
+        return []
     res = blade.get_network_interfaces(
         names=interfaces,
     )
@@ -458,6 +480,16 @@ def _validate_attachable(module, blade, interfaces):
                 "policy before re-attaching."
             ).format(our_name, formatted)
         )
+    stored = []
+    for interface in interfaces:
+        for name in found:
+            if isinstance(name, str) and _same_name(interface, name):
+                break
+        else:
+            name = interface
+        if name not in stored:
+            stored.append(name)
+    return stored
 
 
 def _get_policy(module, blade):
@@ -563,7 +595,7 @@ def _reconcile_interfaces(module, blade):
         return False
 
     if to_attach:
-        _validate_attachable(module, blade, to_attach)
+        to_attach = _validate_attachable(module, blade, to_attach)
 
     if module.check_mode:
         return True
@@ -644,8 +676,11 @@ def create_policy(module, blade, api_version):
     _check_realm(module, blade, api_version)
     if not module.params["appliance_certificate"]:
         _fail_certificate_required(module)
+    interfaces = []
     if module.params["network_interfaces"]:
-        _validate_attachable(module, blade, module.params["network_interfaces"])
+        interfaces = _validate_attachable(
+            module, blade, module.params["network_interfaces"]
+        )
     if not module.check_mode:
         res = blade.post_tls_policies(
             names=[module.params["name"]],
@@ -658,7 +693,7 @@ def create_policy(module, blade, api_version):
                 )
             )
         attached = []
-        for iface in module.params["network_interfaces"] or []:
+        for iface in interfaces:
             res = blade.post_tls_policies_network_interfaces(
                 policy_names=[module.params["name"]],
                 member_names=[iface],
@@ -814,6 +849,12 @@ def main():
     _check_mutual_tls_support(module, api_version)
 
     policy = _get_policy(module, blade)
+    if policy is not None and isinstance(getattr(policy, "name", None), str):
+        # The array finds a policy without regard to letter case, but it
+        # compares the realm of a certificate, or certificate group, with the
+        # realm prefix as it is written in the name of the request. From here
+        # on the policy goes by the name the array stores.
+        module.params["name"] = policy.name
 
     if state == "present" and policy is None:
         create_policy(module, blade, api_version)

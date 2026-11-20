@@ -10,6 +10,10 @@ bugfixes:
     as a list of names, is refused. Only the policy that has the given name is changed or deleted.
   - purefb_tls_policy - a certificate, certificate group or network interface written in another
     letter case than the array stores is no longer sent as a change on every run.
+  - purefb_tls_policy - a policy in a realm named in another letter case than the array stores
+    could not be created, or given another certificate or certificate group, because the array
+    compares their realm with the realm prefix as it is written. Requests now carry the name as
+    the array stores it.
   - purefb_tls_policy - a read that the array refuses is reported with the error of the array
     instead of being taken for a missing policy or a policy without interfaces.
   - purefb_tls_policy - documentation and one example name a policy in a realm, its certificates

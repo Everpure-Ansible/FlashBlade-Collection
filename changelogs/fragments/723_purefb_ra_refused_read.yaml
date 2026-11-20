@@ -1,0 +1,5 @@
+bugfixes:
+  - purefb_ra - a read of the support settings that the array refuses or fails now fails with the
+    error of the array instead of a traceback, for every state and in check mode too. Purity//FB
+    refuses this read to an administrator whose management access is limited to a realm. A Remote
+    Assist test that the array refuses or fails is reported with the reason of the array.

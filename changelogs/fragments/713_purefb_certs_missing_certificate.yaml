@@ -1,0 +1,15 @@
+bugfixes:
+  - purefb_certs - ``state=sign`` and ``state=export`` of a certificate that does not exist fail with
+    a message, in check mode too. ``state=sign`` ended in a traceback and check mode reported a
+    change. A signing request the array refuses is reported with the array's message.
+  - purefb_certs - a read of the certificate that the array refuses or cannot answer fails with the
+    array's message instead of being taken for a missing certificate.
+  - purefb_certs - check mode no longer reports a change for a new certificate in a realm that does
+    not exist, is outside the scope of the caller or has been destroyed, nor for a signing request
+    from a certificate of type ``external``.
+  - purefb_certs - the ``global`` certificate is refused for ``state=absent`` whatever the letter
+    case of the name, and a name with a ``*`` or a comma, which the array reads as a pattern or as
+    a list of names, is refused before anything is read.
+minor_changes:
+  - purefb_certs - documented the ``realm::certificate`` form of ``name`` for a certificate in a
+    realm.

@@ -7,6 +7,6 @@ bugfixes:
   - purefb_lifecycle - a bucket name given in another letter case than the array stores no longer
     prevents a rule from being changed.
   - purefb_lifecycle - a pattern for ``bucket``, a ``bucket`` or ``name`` that holds a comma and a
-    rule for a destroyed bucket are refused before any request, in check mode as well.
+    rule for a destroyed bucket are refused before anything is changed, in check mode as well.
   - purefb_lifecycle - a failed read of the bucket or the rule is reported with the message of the
     array instead of being taken for a missing bucket or a missing rule.

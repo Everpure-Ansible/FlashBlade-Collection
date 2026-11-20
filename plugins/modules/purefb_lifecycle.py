@@ -44,6 +44,8 @@ options:
     description:
     - Name of the lifecycle rule
     - The name is given without the bucket and without a realm.
+    - The letter case of a rule name matters, C(Rule1) and C(rule1) are
+      two rules.
     - A name that holds a comma is refused, the array reads it as a list of
       names.
     type: str

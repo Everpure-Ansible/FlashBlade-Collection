@@ -109,6 +109,11 @@ BOTH_CURRENT = (
     "are mutual exclusive."
 )
 MANY_NAMES = "Cannot process more than one name at a time."
+NO_NAME = "Missing or invalid parameter."
+BAD_RULE_NAME = (
+    "The lifecycle rule's name is not in the right format. It should be in the "
+    "format <bucket_name>/<rule_id>."
+)
 REFUSED = "Operation not permitted."
 
 SETTINGS = (
@@ -154,7 +159,8 @@ class _Array:
 
     It answers the bucket and lifecycle rule requests the way Purity//FB 4.8.8
     does: a bucket name is a pattern and is matched whatever its letter case,
-    a comma separates names, a rule name is matched exactly, a rule is changed
+    a comma separates names, a blank around a bucket name is dropped and a
+    blank name is refused, a rule name is matched exactly, a rule is changed
     only under the stored spelling of its bucket name, the rules of a
     destroyed bucket are hidden, a zero for the previous versions is refused
     on create, a duration and a date for current versions exclude each other
@@ -216,8 +222,10 @@ class _Array:
     def _rule(self, name):
         """Return (rule, None) or (None, the message of the array)"""
         bucket_name, sep, rule_id = name.partition("/")
+        if not sep or not rule_id:
+            return None, BAD_RULE_NAME
         bucket = self._bucket(bucket_name)
-        if not sep or bucket is None:
+        if bucket is None:
             return None, NO_BUCKET
         if bucket.destroyed:
             return None, NO_RULE
@@ -239,6 +247,8 @@ class _Array:
             return _response(403, error=self.refuse["get_buckets"])
         found = []
         for wanted in ",".join(names).split(","):
+            if not wanted.strip():
+                return _response(400, error=NO_NAME)
             matches = [
                 bucket
                 for stored, bucket in self.buckets.items()
@@ -1011,6 +1021,63 @@ class TestNames:
             names=["realm1::bkt/rule9"]
         )
         assert _changed(_run(array, **params)) is False
+
+    def test_blank_before_the_bucket_name_is_the_same_bucket(self):
+        """The array drops the blank and finds the bucket"""
+        array = self._array()
+        module = _run(array, bucket=" bkt", keep_previous_for="2d")
+        assert _changed(module) is False
+        module = _run(array, bucket=" bkt", keep_previous_for="6d")
+        assert _changed(module) is True
+        assert module.params["bucket"] == "bkt"
+        call = array.blade.patch_lifecycle_rules.call_args[1]
+        assert call["names"] == ["bkt/rule1"]
+        assert array.rules["bkt/rule1"].keep_previous_version_for == 6 * DAY
+        assert array.writes() == 1
+
+    def test_rule_name_in_another_letter_case_is_another_rule(self):
+        array = self._array()
+        params = {"name": "RULE1", "keep_previous_for": "30d"}
+        assert _changed(_run(array, **params)) is True
+        assert array.rules["bkt/RULE1"].keep_previous_version_for == 30 * DAY
+        assert array.rules["bkt/rule1"].keep_previous_version_for == 2 * DAY
+        assert _changed(_run(array, **params)) is False
+        assert array.writes() == 1
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    def test_blank_bucket_is_reported(self, state, check_mode):
+        array = self._array()
+        module = _run(
+            array,
+            check_mode=check_mode,
+            state=state,
+            bucket="",
+            keep_previous_for="30d",
+        )
+        assert _failure(module) == (
+            "Failed to read bucket . Error: Missing or invalid parameter."
+        )
+        array.blade.get_lifecycle_rules.assert_not_called()
+        assert array.writes() == 0
+
+    @pytest.mark.parametrize("check_mode", [True, False])
+    @pytest.mark.parametrize("state", ["present", "absent"])
+    def test_blank_rule_name_is_reported(self, state, check_mode):
+        """It is not taken for a rule that is missing and has to be created"""
+        array = self._array()
+        module = _run(
+            array,
+            check_mode=check_mode,
+            state=state,
+            name="",
+            keep_previous_for="30d",
+        )
+        assert _failure(module) == (
+            "Failed to read lifecycle rule  for bucket bkt. Error: " + BAD_RULE_NAME
+        )
+        assert array.writes() == 0
+        assert len(array.rules) == 4
 
     def test_failure_names_the_bucket_as_the_array_stores_it(self):
         array = self._array()

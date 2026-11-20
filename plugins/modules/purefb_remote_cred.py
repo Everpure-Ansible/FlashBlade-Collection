@@ -25,6 +25,13 @@ description:
 - The secret access key cannot be read back from the array, so an existing
   credential is only updated when I(access_key) differs from the configured
   access key ID, or when I(force) is set.
+- A remote credential belongs to a realm when I(name) is given as
+  C(realm::name). The realm prefix goes on I(name) only. I(target) is an
+  array-level object and its name never carries a realm prefix.
+- A remote credential in a realm needs an S3 target that is shared with the
+  realm, see M(everpure.flashblade.purefb_resource_access).
+- A realm-scoped administrator must use the realm-qualified name; a bare
+  name is not placed in, or resolved to, the administrator's realm.
 author:
 - Everpure Ansible Team (@sdodsley) <pure-ansible-team@everpuredata.com>
 options:
@@ -36,7 +43,9 @@ options:
     type: str
   name:
     description:
-    - The name of the credential
+    - The name of the credential, without the name of its target.
+    - For a credential in a realm use C(realm::name). The same name without
+      the realm prefix is a different credential, at the array level.
     required: true
     type: str
   access_key:
@@ -49,7 +58,18 @@ options:
     type: str
   target:
     description:
-    - Define whether to initialize the S3 bucket
+    - Name of the connected remote array, or of the S3 target, that the
+      credential is for.
+    - A connected remote array can also be given by its management address.
+    - The name is not case sensitive and never carries a realm prefix.
+    - For a credential in a realm use an S3 target that is shared with the
+      realm, see M(everpure.flashblade.purefb_resource_access) with
+      I(resource_type=targets) and I(scope_type=realms). The array refuses
+      the credential until the target is shared, which check mode cannot
+      foresee.
+    - A realm-scoped administrator sees only the targets that are shared
+      with its realm.
+    - A remote realm cannot be given as the target.
     required: true
     type: str
   force:
@@ -78,6 +98,15 @@ EXAMPLES = r"""
 - name: Create remote credential
   everpure.flashblade.purefb_remote_cred:
     name: cred1
+    access_key: "3794fb12c6204e19195f"
+    secret: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    target: target1
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Create remote credential in realm realm1 for an S3 target shared with the realm
+  everpure.flashblade.purefb_remote_cred:
+    name: realm1::cred1
     access_key: "3794fb12c6204e19195f"
     secret: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
     target: target1
@@ -118,50 +147,101 @@ from ansible_collections.everpure.flashblade.plugins.module_utils.common import 
     get_error_message,
     get_rest_api_version,
 )
-from ansible_collections.everpure.flashblade.plugins.module_utils.common import (
-    get_error_message,
-)
 
 CONTEXT_API_VERSION = "2.17"
+CONNECTED = ("connected", "connecting", "partially_connected")
+
+
+def _realm_of(name):
+    """Return the realm of a realm::name name, empty for an array-level name"""
+    return name.rpartition("::")[0].strip()
+
+
+def _same_name(first, second):
+    """Return True when the array reads both names as the same name
+
+    The array matches names without regard to case. A name the array did
+    not return is the same as no name.
+    """
+    return (first or "").lower() == (second or "").lower()
+
+
+def _items(module, res, what, absent_ok=False):
+    """Return the items a read answered with
+
+    A read that does not answer 200 fails the task with the array's
+    message, so a refusal is never a traceback and never mistaken for a
+    missing object. With absent_ok the array's "does not exist" is an empty
+    list: only that answer means absent.
+    """
+    if res.status_code == 200:
+        return list(res.items)
+    error = get_error_message(res)
+    if not (absent_ok and "does not exist" in str(error).lower()):
+        module.fail_json(msg="Failed to get {0}. Error: {1}".format(what, error))
+    return []
+
+
+def _fail_not_connected(module):
+    """Fail for a target that is not among the connected arrays and targets"""
+    target = module.params["target"]
+    msg = (
+        "Selected target {0} is not connected, or is not visible to "
+        "this user.".format(target)
+    )
+    if "::" in target:
+        msg += (
+            " The name of a target has no realm prefix: for a remote credential"
+            " in a realm give name as realm::name."
+        )
+    elif _realm_of(module.params["name"]):
+        msg += (
+            " A remote credential in a realm needs an S3 target that is shared"
+            " with the realm."
+        )
+    module.fail_json(msg=msg)
 
 
 def get_connected(module, blade):
-    """Return connected device or None"""
+    """Return the name of the connected array or target, or None
+
+    The name the array stores is returned, so that a target given in another
+    letter case, or a connected array given by its management address, is
+    addressed by its own name.
+    """
     api_version = get_rest_api_version(blade)
     if (
         LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
         and module.params["context"]
     ):
-        connected_blades = list(
-            blade.get_array_connections(context_names=[module.params["context"]]).items
+        connected_blades = blade.get_array_connections(
+            context_names=[module.params["context"]]
         )
     else:
-        connected_blades = list(blade.get_array_connections().items)
-    for target in connected_blades:
+        connected_blades = blade.get_array_connections()
+    for target in _items(module, connected_blades, "array connections"):
+        remote = getattr(getattr(target, "remote", None), "name", None)
         if (
-            target.remote.name == module.params["target"]
-            or target.management_address == module.params["target"]
-        ) and target.status in [
-            "connected",
-            "connecting",
-            "partially_connected",
-        ]:
-            return target.remote.name
+            remote
+            and (
+                _same_name(remote, module.params["target"])
+                or target.management_address == module.params["target"]
+            )
+            and target.status in CONNECTED
+        ):
+            return remote
     if (
         LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
         and module.params["context"]
     ):
-        connected_targets = list(
-            blade.get_targets(context_names=[module.params["context"]]).items
-        )
+        connected_targets = blade.get_targets(context_names=[module.params["context"]])
     else:
-        connected_targets = list(blade.get_targets().items)
-    for target in connected_targets:
-        if target.name == module.params["target"] and target.status in [
-            "connected",
-            "connecting",
-            "partially_connected",
-        ]:
+        connected_targets = blade.get_targets()
+    for target in _items(module, connected_targets, "targets"):
+        if (
+            _same_name(target.name, module.params["target"])
+            and target.status in CONNECTED
+        ):
             return target.name
     return None
 
@@ -181,9 +261,15 @@ def get_remote_cred(module, blade):
         res = blade.get_object_store_remote_credentials(
             names=[module.params["target"] + "/" + module.params["name"]]
         )
-    if res.status_code == 200:
-        return list(res.items)[0]
-    return None
+    items = _items(
+        module,
+        res,
+        "remote credential {0}/{1}".format(
+            module.params["target"], module.params["name"]
+        ),
+        absent_ok=True,
+    )
+    return items[0] if items else None
 
 
 def create_credential(module, blade):
@@ -319,9 +405,9 @@ def main():
     target = get_connected(module, blade)
 
     if not target:
-        module.fail_json(
-            msg="Selected target {0} is not connected.".format(module.params["target"])
-        )
+        _fail_not_connected(module)
+    # The credential is addressed by the name the array stores for its target
+    module.params["target"] = target
 
     remote_cred = get_remote_cred(module, blade)
 

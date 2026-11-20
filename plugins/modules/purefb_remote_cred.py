@@ -46,6 +46,9 @@ options:
     - The name of the credential, without the name of its target.
     - For a credential in a realm use C(realm::name). The same name without
       the realm prefix is a different credential, at the array level.
+    - A task manages one credential. A name that holds a comma or C(*) is
+      refused, because the array reads a comma as the separator of a list of
+      names and C(*) as a pattern.
     required: true
     type: str
   access_key:
@@ -164,6 +167,24 @@ def _same_name(first, second):
     not return is the same as no name.
     """
     return (first or "").lower() == (second or "").lower()
+
+
+def _check_name(module):
+    """Refuse a name the array reads as a list of names or as a pattern
+
+    In a read the array takes a comma for the separator of a list of names
+    and * for a pattern, so such a name answers with several credentials, of
+    this target or of another one, and the first of them would be taken for
+    the credential of the task. A credential is created, changed and deleted
+    one name at a time, so the name is refused before the array is asked.
+    """
+    name = module.params["name"]
+    if "," in name or "*" in name:
+        module.fail_json(
+            msg="Remote credential name {0} is not the name of one credential: "
+            "the array reads a comma as the separator of a list of names and "
+            "* as a pattern.".format(name)
+        )
 
 
 def _items(module, res, what, absent_ok=False):
@@ -392,6 +413,7 @@ def main():
     if not HAS_PYPURECLIENT:
         module.fail_json(msg="py-pure-client sdk is required for this module")
 
+    _check_name(module)
     blade = get_system(module)
     api_version = get_rest_api_version(blade)
     if (

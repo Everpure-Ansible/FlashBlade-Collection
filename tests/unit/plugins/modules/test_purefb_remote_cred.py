@@ -10,6 +10,7 @@ __metaclass__ = type
 import sys
 import multiprocessing
 import ctypes
+import fnmatch
 from unittest.mock import Mock, patch, MagicMock
 
 import yaml
@@ -78,6 +79,8 @@ from plugins.modules.purefb_remote_cred import main
 
 MOD = "plugins.modules.purefb_remote_cred"
 ABSENT = "Remote credentials does not exist."
+NO_MATCH = "Remote credentials was not found."
+ONE_NAME = "Cannot process more than one name at a time."
 NOT_PERMITTED = "Operation not permitted."
 KEY = "FAKEACCESSKEY0000001"
 OTHER_KEY = "FAKEACCESSKEY0000002"
@@ -157,8 +160,9 @@ def _blade(creds=(), connections=CONNECTIONS, targets=TARGETS, realm_admin=None)
 
     creds are (full name, access key ID) pairs. The array keeps a remote
     credential under target/name and matches names without regard to case.
-    With realm_admin the array answers an administrator whose management
-    access is limited to that realm.
+    A read takes a comma for the separator of a list of names and * for a
+    pattern; a write takes one name. With realm_admin the array answers an
+    administrator whose management access is limited to that realm.
     """
     blade = Mock()
     blade.creds = dict((name.lower(), (name, key)) for name, key in creds)
@@ -168,12 +172,21 @@ def _blade(creds=(), connections=CONNECTIONS, targets=TARGETS, realm_admin=None)
         return realm_admin is None or realm.lower() == realm_admin
 
     def get_creds(names=None, **kwargs):
-        found = blade.creds.get(names[0].lower())
-        if not found or not visible(names[0]):
-            return _error(ABSENT)
-        return _valid([_cred(*found)])
+        found = []
+        for name in names[0].lower().split(","):
+            matches = [
+                stored
+                for key, stored in sorted(blade.creds.items())
+                if fnmatch.fnmatchcase(key, name) and visible(stored[0])
+            ]
+            if not matches:
+                return _error(NO_MATCH if "*" in name else ABSENT)
+            found.extend(matches)
+        return _valid([_cred(*stored) for stored in found])
 
     def post_creds(names=None, remote_credentials=None, **kwargs):
+        if "," in names[0]:
+            return _error(ONE_NAME)
         remote, name = names[0].split("/", 1)
         realm = name.rpartition("::")[0]
         if not visible(names[0]):
@@ -188,6 +201,8 @@ def _blade(creds=(), connections=CONNECTIONS, targets=TARGETS, realm_admin=None)
         return _valid()
 
     def patch_creds(names=None, remote_credentials=None, **kwargs):
+        if "," in names[0]:
+            return _error(ONE_NAME)
         stored = blade.creds[names[0].lower()]
         blade.creds[names[0].lower()] = (
             stored[0],
@@ -196,6 +211,8 @@ def _blade(creds=(), connections=CONNECTIONS, targets=TARGETS, realm_admin=None)
         return _valid()
 
     def delete_creds(names=None, **kwargs):
+        if "," in names[0]:
+            return _error(ONE_NAME)
         del blade.creds[names[0].lower()]
         return _valid()
 
@@ -278,6 +295,15 @@ def _no_writes(blade):
 def _stored(blade):
     """The remote credentials of the array: full name -> access key ID."""
     return dict(blade.creds.values())
+
+
+def _not_asked(blade):
+    """The task was refused before the array was asked anything."""
+    blade.get_fleets.assert_not_called()
+    blade.get_array_connections.assert_not_called()
+    blade.get_targets.assert_not_called()
+    blade.get_object_store_remote_credentials.assert_not_called()
+    _no_writes(blade)
 
 
 class TestCreate:
@@ -519,6 +545,105 @@ class TestTarget:
         blade = _blade()
         module = _apply(blade, target="realm1::target1", check_mode=True)
         assert "has no realm prefix" in _failure(module)
+
+
+class TestOneName:
+    """name is the name of one credential, never a list or a pattern"""
+
+    CREDS = (
+        ("target1/cred1", KEY),
+        ("target1/cred2", OTHER_KEY),
+        ("target1/realm1::cred1", OTHER_KEY),
+        ("target2/cred1", OTHER_KEY),
+    )
+    LIST = "cred1,target2/cred1"
+
+    @staticmethod
+    def _refusal(name):
+        return (
+            "Remote credential name {0} is not the name of one credential: "
+            "the array reads a comma as the separator of a list of names and "
+            "* as a pattern.".format(name)
+        )
+
+    def test_the_array_reads_a_list_and_a_pattern(self):
+        """What the refusal protects from: one read, several credentials."""
+        blade = _blade(creds=self.CREDS)
+        read = blade.get_object_store_remote_credentials
+        assert [c.name for c in read(names=["target1/" + self.LIST]).items] == [
+            "target1/cred1",
+            "target2/cred1",
+        ]
+        assert [c.name for c in read(names=["target1/*"]).items] == [
+            "target1/cred1",
+            "target1/cred2",
+            "target1/realm1::cred1",
+        ]
+        assert read(names=["target1/nope*"]).errors[0].message == NO_MATCH
+        assert read(names=["target1/nope,target1/cred1"]).errors[0].message == ABSENT
+
+    def test_list_of_names_is_refused_for_absent(self):
+        blade = _blade(creds=self.CREDS)
+        module = _apply(blade, name=self.LIST, state="absent")
+        assert _failure(module) == self._refusal(self.LIST)
+        _not_asked(blade)
+        assert _stored(blade) == dict(self.CREDS)
+
+    def test_list_of_names_is_refused_in_check_mode(self):
+        """Check mode does not predict a change the array refuses."""
+        blade = _blade(creds=self.CREDS)
+        module = _apply(blade, name=self.LIST, state="absent", check_mode=True)
+        assert _failure(module) == self._refusal(self.LIST)
+        _not_asked(blade)
+
+    def test_list_of_names_is_not_compared_by_its_first_credential(self):
+        """target1/cred1 has the key of the task, target2/cred1 has not."""
+        blade = _blade(creds=self.CREDS)
+        module = _apply(blade, name=self.LIST)
+        assert _failure(module) == self._refusal(self.LIST)
+        _not_asked(blade)
+
+    def test_list_of_names_is_refused_with_force(self):
+        blade = _blade(creds=self.CREDS)
+        module = _apply(blade, name=self.LIST, force=True)
+        assert _failure(module) == self._refusal(self.LIST)
+        _not_asked(blade)
+        assert _stored(blade) == dict(self.CREDS)
+
+    def test_list_of_new_names_is_refused(self):
+        blade = _blade()
+        module = _apply(blade, name="cred1,cred2", check_mode=True)
+        assert _failure(module) == self._refusal("cred1,cred2")
+        _not_asked(blade)
+
+    def test_pattern_is_refused_for_absent(self):
+        blade = _blade(creds=self.CREDS)
+        for name in ("*", "cred*", "realm1::*"):
+            for check_mode in (True, False):
+                module = _apply(blade, name=name, state="absent", check_mode=check_mode)
+                assert _failure(module) == self._refusal(name)
+        _not_asked(blade)
+        assert _stored(blade) == dict(self.CREDS)
+
+    def test_pattern_is_refused_for_present(self):
+        blade = _blade(creds=self.CREDS)
+        module = _apply(blade, name="cred*", force=True)
+        assert _failure(module) == self._refusal("cred*")
+        _not_asked(blade)
+        assert _stored(blade) == dict(self.CREDS)
+
+    def test_pattern_without_a_match_is_refused_not_absent(self):
+        blade = _blade(creds=self.CREDS)
+        module = _apply(blade, name="nope*", state="absent")
+        assert _failure(module) == self._refusal("nope*")
+        _not_asked(blade)
+
+    def test_name_documents_the_refusal(self):
+        options = yaml.safe_load(purefb_remote_cred.DOCUMENTATION)["options"]
+        description = " ".join(options["name"]["description"])
+        assert "A task manages one credential" in description
+        assert "comma" in description
+        assert "C(*)" in description
 
 
 class TestRealm:

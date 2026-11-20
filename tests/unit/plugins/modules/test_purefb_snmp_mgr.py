@@ -89,10 +89,11 @@ DELETE_FAILED = "Delete SNMP manager manager1 failed. Error: {0}"
 AUTH_LENGTH = "auth_password must be between 8 and 32 characters"
 PRIVACY_LENGTH = "privacy_password must be between 8 and 63 characters"
 STATES = ["present", "absent", "test"]
-# Names the array does not take for the manager "manager1": another name,
-# another spelling (names are matched with regard to case) and a
+# Names under which the array does not return the manager "manager1":
+# another name, another spelling (a read by name is exact) and a
 # realm-style name (SNMP managers have no realm form).
 OTHER_NAMES = ["manager2", "MANAGER1", "realm1::manager1"]
+EXISTS = "Manager {0} already exists."
 
 
 class ExitJson(Exception):
@@ -136,13 +137,7 @@ def _v2c_manager(name="manager1", host="192.0.2.10", notification="trap"):
         host=host,
         notification=notification,
         v2c=SimpleNamespace(community=MASKED),
-        v3=SimpleNamespace(
-            auth_passphrase=None,
-            auth_protocol=None,
-            privacy_passphrase=None,
-            privacy_protocol=None,
-            user=None,
-        ),
+        v3=SimpleNamespace(),
         version="v2c",
     )
 
@@ -157,7 +152,7 @@ def _v3_manager(name="manager1", host="192.0.2.12", notification="trap"):
         name=name,
         host=host,
         notification=notification,
-        v2c=SimpleNamespace(community=None),
+        v2c=SimpleNamespace(),
         v3=SimpleNamespace(
             auth_passphrase=MASKED,
             auth_protocol="SHA",
@@ -245,9 +240,21 @@ def _blade(managers=(), listing=None, read=None, test=None, write=None):
     listing, read, test and write replace the answer to the list of the
     managers, to the read of one manager by name, to the manager test and
     to every POST, PATCH and DELETE.
+
+    A manager is read by the exact spelling of its name, and the names are
+    unique without regard to case: a create of another spelling of a name
+    the array holds is refused.
     """
     managers = list(managers)
     blade = Mock()
+
+    def post_snmp_managers(names=None, snmp_manager=None):
+        if write is not None:
+            return write
+        for mgr in managers:
+            if mgr.name.lower() == names[0].lower():
+                return _error(EXISTS.format(mgr.name))
+        return _valid([])
 
     def get_snmp_managers(names=None):
         if names is None:
@@ -263,7 +270,8 @@ def _blade(managers=(), listing=None, read=None, test=None, write=None):
     blade.get_snmp_managers_test.return_value = (
         test if test is not None else _valid([_component()])
     )
-    for call in ("post_snmp_managers", "patch_snmp_managers", "delete_snmp_managers"):
+    blade.post_snmp_managers.side_effect = post_snmp_managers
+    for call in ("patch_snmp_managers", "delete_snmp_managers"):
         getattr(blade, call).return_value = write if write is not None else _valid([])
     return blade
 
@@ -470,9 +478,16 @@ def _v3_params(**changes):
 class TestPurefbSnmpMgrCreate:
     """state=present for a name the array does not hold creates the manager."""
 
-    @pytest.mark.parametrize("name", ["manager1"] + OTHER_NAMES)
+    V2C_BODY = {
+        "host": "192.0.2.10",
+        "notification": "trap",
+        "version": "v2c",
+        "v2c": {"community": "public"},
+    }
+
+    @pytest.mark.parametrize("name", ["manager1", "manager2"])
     def test_create_v2c(self, name):
-        """The name is sent as given, next to the managers that exist."""
+        """The manager is created next to the managers that exist."""
         module = _module(
             name=name, version="v2c", community="public", host="192.0.2.10"
         )
@@ -481,13 +496,45 @@ class TestPurefbSnmpMgrCreate:
         assert _run(module, blade) == "exit"
         assert _result(module) == {"changed": True}
         blade.post_snmp_managers.assert_called_once_with(
-            names=[name],
-            snmp_manager={
-                "host": "192.0.2.10",
-                "notification": "trap",
-                "version": "v2c",
-                "v2c": {"community": "public"},
-            },
+            names=[name], snmp_manager=self.V2C_BODY
+        )
+        blade.patch_snmp_managers.assert_not_called()
+        blade.delete_snmp_managers.assert_not_called()
+
+    def test_create_of_another_spelling_reports_the_answer_of_the_array(self):
+        """The array holds manager1 and takes no MANAGER1 beside it.
+
+        The module compares the names exactly, as a read by name does, so
+        it sends the create; the refusal of the array is reported and the
+        manager the array holds is not touched.
+        """
+        module = _module(
+            name="MANAGER1", version="v2c", community="public", host="192.0.2.10"
+        )
+        blade = _blade([_v2c_manager()])
+        assert _run(module, blade) == "fail"
+        assert _failure(module) == (
+            "Failed to create v2c SNMP manager MANAGER1. Error: "
+            + EXISTS.format("manager1")
+        )
+        blade.post_snmp_managers.assert_called_once_with(
+            names=["MANAGER1"], snmp_manager=self.V2C_BODY
+        )
+        blade.patch_snmp_managers.assert_not_called()
+        blade.delete_snmp_managers.assert_not_called()
+
+    def test_realm_style_name_is_sent_as_given(self):
+        """The module has no rule for a realm-style name: the array decides."""
+        module = _module(
+            name="realm1::manager1",
+            version="v2c",
+            community="public",
+            host="192.0.2.10",
+        )
+        blade = _blade([_v2c_manager()])
+        _run(module, blade)
+        blade.post_snmp_managers.assert_called_once_with(
+            names=["realm1::manager1"], snmp_manager=self.V2C_BODY
         )
         blade.patch_snmp_managers.assert_not_called()
         blade.delete_snmp_managers.assert_not_called()

@@ -2300,7 +2300,7 @@ def _module(check_mode=False, **params):
     return module
 
 
-def _blade(policy=None, rules=(), members=(), realms=("rzaudit",)):
+def _blade(policy=None, rules=(), members=(), realms=("tenant1",)):
     """A blade that answers reads as the array does and accepts every write.
 
     ``policy`` is the stored policy, or None when the array has none.
@@ -2408,7 +2408,7 @@ class TestFailedReads:
         assert _writes(blade) == []
 
     def test_main_present_check_mode_fails_instead_of_predicting_a_create(self):
-        module = _module(check_mode=True, rules=[_realm_rule("admin", "rzaudit")])
+        module = _module(check_mode=True, rules=[_realm_rule("admin", "tenant1")])
         blade = _blade()
         blade.get_management_access_policies.return_value = _refused(NOT_PERMITTED)
 
@@ -2502,21 +2502,21 @@ class TestRealmScopes:
         )
 
     def test_realm_qualified_scope_name_fails(self):
-        module = _module(rules=[_realm_rule("viewer", "rzaudit::tenant")])
+        module = _module(rules=[_realm_rule("viewer", "tenant1::tenant")])
         blade = _blade()
 
         _run(_resolve_realm_scopes, module, blade, {}, [])
 
-        blade.get_realms.assert_called_once_with(names=["rzaudit::tenant"])
+        blade.get_realms.assert_called_once_with(names=["tenant1::tenant"])
         module.fail_json.assert_called_once()
         assert (
-            "realm rzaudit::tenant does not exist"
+            "realm tenant1::tenant does not exist"
             in module.fail_json.call_args[1]["msg"]
         )
 
     def test_existing_realm_passes_in_any_case(self):
         module = _module(
-            rules=[_realm_rule("admin", "rzaudit"), _realm_rule("viewer", "RZAudit")]
+            rules=[_realm_rule("admin", "tenant1"), _realm_rule("viewer", "TENant1")]
         )
         blade = _blade()
 
@@ -2524,26 +2524,26 @@ class TestRealmScopes:
 
         module.fail_json.assert_not_called()
         # One read per realm, with the spelling of the first rule that names it.
-        blade.get_realms.assert_called_once_with(names=["rzaudit"])
+        blade.get_realms.assert_called_once_with(names=["tenant1"])
         assert [rule["scope"]["name"] for rule in module.params["rules"]] == [
-            "rzaudit",
-            "rzaudit",
+            "tenant1",
+            "tenant1",
         ]
 
     def test_new_realm_scope_takes_the_stored_spelling(self):
         """The array accepts a rule only with the spelling it holds"""
-        module = _module(rules=[_realm_rule("Admin", "RZAUDIT")])
+        module = _module(rules=[_realm_rule("Admin", "TENANT1")])
         blade = _blade()
 
         _run(_resolve_realm_scopes, module, blade, {}, [])
 
-        blade.get_realms.assert_called_once_with(names=["RZAUDIT"])
-        assert module.params["rules"] == [_realm_rule("Admin", "rzaudit")]
+        blade.get_realms.assert_called_once_with(names=["TENANT1"])
+        assert module.params["rules"] == [_realm_rule("Admin", "tenant1")]
 
     def test_first_unknown_realm_is_named(self):
         module = _module(
             rules=[
-                _realm_rule("admin", "rzaudit"),
+                _realm_rule("admin", "tenant1"),
                 _realm_rule("viewer", "gone"),
                 _realm_rule("viewer", "gone-too"),
             ]
@@ -2558,17 +2558,17 @@ class TestRealmScopes:
     def test_scope_of_a_current_rule_is_not_read_again(self):
         """A second role at a realm the policy already has a rule on"""
         module = _module(
-            rules=[_realm_rule("admin", "rzaudit"), _realm_rule("storage", "RZAUDIT")]
+            rules=[_realm_rule("admin", "tenant1"), _realm_rule("storage", "TENANT1")]
         )
         blade = _blade(realms=())
-        current = [_current_rule("admin", name="rzaudit", resource_type="realms")]
+        current = [_current_rule("admin", name="tenant1", resource_type="realms")]
 
         _run(_resolve_realm_scopes, module, blade, {}, current)
 
         blade.get_realms.assert_not_called()
         module.fail_json.assert_not_called()
         # The added rule carries the spelling of the rule the policy has.
-        assert module.params["rules"][1] == _realm_rule("storage", "rzaudit")
+        assert module.params["rules"][1] == _realm_rule("storage", "tenant1")
 
     def test_array_scopes_are_neither_read_nor_respelled(self):
         module = _module(rules=[_rule_spec("viewer", "FB1"), _rule_spec("storage")])
@@ -2593,7 +2593,7 @@ class TestRealmScopes:
         module.fail_json.assert_called_once()
 
     def test_refused_realm_read_leaves_the_decision_to_the_array(self):
-        module = _module(rules=[_realm_rule("viewer", "RZAudit")])
+        module = _module(rules=[_realm_rule("viewer", "TENant1")])
         blade = _blade()
         blade.get_realms = Mock(return_value=_refused(NOT_PERMITTED))
 
@@ -2601,7 +2601,7 @@ class TestRealmScopes:
 
         blade.get_realms.assert_called_once()
         module.fail_json.assert_not_called()
-        assert module.params["rules"] == [_realm_rule("viewer", "RZAudit")]
+        assert module.params["rules"] == [_realm_rule("viewer", "TENant1")]
 
     def test_no_rules_no_reads(self):
         for rules in (None, []):
@@ -2614,18 +2614,18 @@ class TestRealmScopes:
             module.fail_json.assert_not_called()
 
     def test_context_is_forwarded(self):
-        module = _module(rules=[_realm_rule("viewer", "rzaudit")])
+        module = _module(rules=[_realm_rule("viewer", "tenant1")])
         blade = _blade()
 
         _run(_resolve_realm_scopes, module, blade, {"context_names": ["fb2"]}, [])
 
         blade.get_realms.assert_called_once_with(
-            names=["rzaudit"], context_names=["fb2"]
+            names=["tenant1"], context_names=["fb2"]
         )
 
     def test_current_rule_without_references_is_tolerated(self):
         """A rule whose role was deleted comes back with role: null"""
-        module = _module(rules=[_realm_rule("viewer", "rzaudit")])
+        module = _module(rules=[_realm_rule("viewer", "tenant1")])
         blade = _blade()
         broken = Mock(spec=["id", "name", "role", "scope"])
         broken.role = None
@@ -2633,7 +2633,7 @@ class TestRealmScopes:
 
         _run(_resolve_realm_scopes, module, blade, {}, [broken])
 
-        blade.get_realms.assert_called_once_with(names=["rzaudit"])
+        blade.get_realms.assert_called_once_with(names=["tenant1"])
         module.fail_json.assert_not_called()
 
     # ---- create ----
@@ -2642,7 +2642,7 @@ class TestRealmScopes:
         for check_mode in (True, False):
             module = _module(
                 check_mode=check_mode,
-                rules=[_realm_rule("admin", "rzaudit"), _realm_rule("viewer", "gone")],
+                rules=[_realm_rule("admin", "tenant1"), _realm_rule("viewer", "gone")],
             )
             blade = _blade()
 
@@ -2656,7 +2656,7 @@ class TestRealmScopes:
     def test_create_with_an_existing_realm_is_a_change(self):
         for check_mode in (True, False):
             module = _module(
-                check_mode=check_mode, rules=[_realm_rule("admin", "RZAUDIT")]
+                check_mode=check_mode, rules=[_realm_rule("admin", "TENANT1")]
             )
             blade = _blade()
 
@@ -2664,7 +2664,7 @@ class TestRealmScopes:
 
             module.fail_json.assert_not_called()
             module.exit_json.assert_called_once_with(changed=True)
-            blade.get_realms.assert_called_once_with(names=["RZAUDIT"])
+            blade.get_realms.assert_called_once_with(names=["TENANT1"])
             expected = [] if check_mode else ["post_management_access_policies"]
             assert _writes(blade) == expected
 
@@ -2695,9 +2695,9 @@ class TestRealmScopes:
             module = _module(
                 check_mode=check_mode,
                 enabled=False,
-                rules=[_realm_rule("admin", "rzaudit"), _realm_rule("viewer", "gone")],
+                rules=[_realm_rule("admin", "tenant1"), _realm_rule("viewer", "gone")],
             )
-            current = [_current_rule("viewer", name="rzaudit", resource_type="realms")]
+            current = [_current_rule("viewer", name="tenant1", resource_type="realms")]
             blade = _blade(policy=_stored_policy(), rules=current)
 
             _main(module, blade)
@@ -2711,16 +2711,16 @@ class TestRealmScopes:
         module = _module(
             check_mode=True,
             rules=[
-                _realm_rule("admin", "rzaudit"),
-                _realm_rule("viewer", "rzaudit::x"),
+                _realm_rule("admin", "tenant1"),
+                _realm_rule("viewer", "tenant1::x"),
             ],
         )
-        current = [_current_rule("admin", name="rzaudit", resource_type="realms")]
+        current = [_current_rule("admin", name="tenant1", resource_type="realms")]
         blade = _blade(policy=_stored_policy(), rules=current)
 
         _main(module, blade)
 
-        blade.get_realms.assert_called_once_with(names=["rzaudit::x"])
+        blade.get_realms.assert_called_once_with(names=["tenant1::x"])
         module.fail_json.assert_called_once()
         module.exit_json.assert_not_called()
 
@@ -2729,13 +2729,13 @@ class TestRealmScopes:
             module = _module(
                 check_mode=check_mode,
                 rules=[
-                    _realm_rule("admin", "rzaudit"),
+                    _realm_rule("admin", "tenant1"),
                     _realm_rule("storage", "Other"),
                 ],
             )
-            current = [_current_rule("admin", name="rzaudit", resource_type="realms")]
+            current = [_current_rule("admin", name="tenant1", resource_type="realms")]
             blade = _blade(
-                policy=_stored_policy(), rules=current, realms=("rzaudit", "other")
+                policy=_stored_policy(), rules=current, realms=("tenant1", "other")
             )
 
             _main(module, blade)
@@ -2763,9 +2763,9 @@ class TestRealmScopes:
     def test_update_same_realm_rules_is_unchanged(self):
         for check_mode in (True, False):
             module = _module(
-                check_mode=check_mode, rules=[_realm_rule("ADMIN", "RZAUDIT")]
+                check_mode=check_mode, rules=[_realm_rule("ADMIN", "TENANT1")]
             )
-            current = [_current_rule("admin", name="rzaudit", resource_type="realms")]
+            current = [_current_rule("admin", name="tenant1", resource_type="realms")]
             blade = _blade(policy=_stored_policy(), rules=current, realms=())
 
             _main(module, blade)
@@ -2775,7 +2775,7 @@ class TestRealmScopes:
             assert _writes(blade) == []
 
     def test_update_fails_when_the_rules_cannot_be_read_before_any_write(self):
-        module = _module(enabled=False, rules=[_realm_rule("admin", "rzaudit")])
+        module = _module(enabled=False, rules=[_realm_rule("admin", "tenant1")])
         blade = _blade(policy=_stored_policy())
         blade.get_management_access_policies_rules.return_value = _refused(
             NOT_PERMITTED
@@ -2811,7 +2811,7 @@ class TestRealmScopes:
                 enabled=False,
                 rules=[_realm_rule("viewer", "gone")],
             )
-            stored = _stored_policy(rules=[_inline_rule("viewer", "realms", "rzaudit")])
+            stored = _stored_policy(rules=[_inline_rule("viewer", "realms", "tenant1")])
             blade = _blade(policy=stored)
 
             _main(module, blade, api_version="2.21")
@@ -2823,8 +2823,8 @@ class TestRealmScopes:
             blade.get_management_access_policies_rules.assert_not_called()
 
     def test_inline_update_role_change_at_a_realm_scope_reads_no_realm(self):
-        module = _module(rules=[_realm_rule("admin", "Rzaudit")])
-        stored = _stored_policy(rules=[_inline_rule("viewer", "realms", "rzaudit")])
+        module = _module(rules=[_realm_rule("admin", "Tenant1")])
+        stored = _stored_policy(rules=[_inline_rule("viewer", "realms", "tenant1")])
         blade = _blade(policy=stored, realms=())
 
         _main(module, blade, api_version="2.21")
@@ -2834,28 +2834,28 @@ class TestRealmScopes:
         assert _writes(blade) == ["patch_management_access_policies"]
 
     def test_inline_update_to_an_existing_realm_is_a_change(self):
-        module = _module(check_mode=True, rules=[_realm_rule("viewer", "rzaudit")])
+        module = _module(check_mode=True, rules=[_realm_rule("viewer", "tenant1")])
         stored = _stored_policy(rules=[_inline_rule("viewer", "arrays", "fb1")])
         blade = _blade(policy=stored)
 
         _main(module, blade, api_version="2.21")
 
-        blade.get_realms.assert_called_once_with(names=["rzaudit"])
+        blade.get_realms.assert_called_once_with(names=["tenant1"])
         module.exit_json.assert_called_once_with(changed=True)
         assert _writes(blade) == []
 
     # ---- _reconcile_rules with the rules its caller has read ----
 
     def test_reconcile_uses_the_rules_it_is_given(self):
-        module = _module(rules=[_realm_rule("admin", "rzaudit")])
+        module = _module(rules=[_realm_rule("admin", "tenant1")])
         blade = _blade()
-        current = [_current_rule("admin", name="rzaudit", resource_type="realms")]
+        current = [_current_rule("admin", name="tenant1", resource_type="realms")]
 
         assert _run(_reconcile_rules, module, blade, {}, current) is False
         blade.get_management_access_policies_rules.assert_not_called()
 
     def test_reconcile_given_an_empty_rule_list_does_not_read_again(self):
-        module = _module(rules=[_realm_rule("admin", "rzaudit")])
+        module = _module(rules=[_realm_rule("admin", "tenant1")])
         blade = _blade()
 
         assert _run(_reconcile_rules, module, blade, {}, []) is True
@@ -2875,7 +2875,7 @@ class TestRealmScopes:
 
     def test_create_sends_the_stored_spelling_of_a_realm(self):
         module = _module(
-            rules=[_realm_rule("Admin", "RZAUDIT"), _rule_spec("viewer", "FB1")]
+            rules=[_realm_rule("Admin", "TENANT1"), _rule_spec("viewer", "FB1")]
         )
         blade = _blade()
 
@@ -2884,7 +2884,7 @@ class TestRealmScopes:
 
         module.exit_json.assert_called_once_with(changed=True)
         assert self._sent_scopes(mock_ref) == [
-            ("realms", "rzaudit"),
+            ("realms", "tenant1"),
             ("arrays", "FB1"),
         ]
         # The role travels as the task wrote it.
@@ -2892,11 +2892,11 @@ class TestRealmScopes:
 
     def test_update_sends_the_stored_spelling_of_a_new_realm(self):
         module = _module(
-            rules=[_realm_rule("admin", "rzaudit"), _realm_rule("storage", "OTHER")]
+            rules=[_realm_rule("admin", "tenant1"), _realm_rule("storage", "OTHER")]
         )
-        current = [_current_rule("admin", name="rzaudit", resource_type="realms")]
+        current = [_current_rule("admin", name="tenant1", resource_type="realms")]
         blade = _blade(
-            policy=_stored_policy(), rules=current, realms=("rzaudit", "Other")
+            policy=_stored_policy(), rules=current, realms=("tenant1", "Other")
         )
 
         with patch(MOD + ".ReferenceWritable") as mock_ref:
@@ -2909,9 +2909,9 @@ class TestRealmScopes:
         self,
     ):
         module = _module(
-            rules=[_realm_rule("admin", "rzaudit"), _realm_rule("storage", "RZAUDIT")]
+            rules=[_realm_rule("admin", "tenant1"), _realm_rule("storage", "TENANT1")]
         )
-        current = [_current_rule("admin", name="rzaudit", resource_type="realms")]
+        current = [_current_rule("admin", name="tenant1", resource_type="realms")]
         blade = _blade(policy=_stored_policy(), rules=current, realms=())
 
         with patch(MOD + ".ReferenceWritable") as mock_ref:
@@ -2919,21 +2919,21 @@ class TestRealmScopes:
 
         blade.get_realms.assert_not_called()
         assert _writes(blade) == ["post_management_access_policies_rules"]
-        assert self._sent_scopes(mock_ref) == [("realms", "rzaudit")]
+        assert self._sent_scopes(mock_ref) == [("realms", "tenant1")]
 
     def test_inline_update_sends_the_stored_spelling(self):
         module = _module(
-            rules=[_realm_rule("admin", "RZAUDIT"), _realm_rule("viewer", "OTHER")]
+            rules=[_realm_rule("admin", "TENANT1"), _realm_rule("viewer", "OTHER")]
         )
-        stored = _stored_policy(rules=[_inline_rule("viewer", "realms", "rzaudit")])
-        blade = _blade(policy=stored, realms=("rzaudit", "other"))
+        stored = _stored_policy(rules=[_inline_rule("viewer", "realms", "tenant1")])
+        blade = _blade(policy=stored, realms=("tenant1", "other"))
 
         with patch(MOD + ".ReferenceWritable") as mock_ref:
             _main(module, blade, api_version="2.21")
 
         assert _writes(blade) == ["patch_management_access_policies"]
         assert self._sent_scopes(mock_ref) == [
-            ("realms", "rzaudit"),
+            ("realms", "tenant1"),
             ("realms", "other"),
         ]
 
@@ -2944,7 +2944,7 @@ class TestOneRealmPerScope:
 
     def _refused_scope(self, scope_name, realms, current=()):
         module = _module(
-            rules=[_realm_rule("admin", "rzaudit"), _realm_rule("storage", scope_name)]
+            rules=[_realm_rule("admin", "tenant1"), _realm_rule("storage", scope_name)]
         )
         blade = _blade(realms=realms)
 
@@ -2961,35 +2961,35 @@ class TestOneRealmPerScope:
         assert module.params["rules"][1] == _realm_rule("storage", scope_name)
 
     def test_wildcard_scope_is_not_taken_for_a_realm_it_matches(self):
-        self._refused_scope("tenant-*", ("rzaudit", "tenant-a", "tenant-b"))
+        self._refused_scope("tenant-*", ("tenant1", "tenant-a", "tenant-b"))
 
     def test_wildcard_scope_that_matches_one_realm_is_refused(self):
-        self._refused_scope("tenant-*", ("rzaudit", "tenant-a"))
+        self._refused_scope("tenant-*", ("tenant1", "tenant-a"))
 
     def test_wildcard_scope_that_matches_every_realm_is_refused(self):
-        self._refused_scope("*", ("rzaudit",))
+        self._refused_scope("*", ("tenant1",))
 
     def test_wildcard_scope_that_matches_nothing_is_refused(self):
-        self._refused_scope("tenant-*", ("rzaudit",))
+        self._refused_scope("tenant-*", ("tenant1",))
 
     def test_list_of_realms_as_scope_is_refused(self):
-        self._refused_scope("tenant-a,tenant-b", ("rzaudit", "tenant-a", "tenant-b"))
+        self._refused_scope("tenant-a,tenant-b", ("tenant1", "tenant-a", "tenant-b"))
 
     def test_list_with_one_realm_as_scope_is_refused(self):
-        self._refused_scope("tenant-a,", ("rzaudit", "tenant-a"))
+        self._refused_scope("tenant-a,", ("tenant1", "tenant-a"))
 
     def test_wildcard_scope_is_refused_beside_a_current_rule_on_that_realm(self):
         current = [_current_rule("viewer", name="tenant-a", resource_type="realms")]
-        self._refused_scope("tenant-*", ("rzaudit", "tenant-a"), current)
+        self._refused_scope("tenant-*", ("tenant1", "tenant-a"), current)
 
     def test_blanks_around_a_realm_name_are_ignored(self):
-        module = _module(rules=[_realm_rule("viewer", " RZAudit ")])
+        module = _module(rules=[_realm_rule("viewer", " TENant1 ")])
         blade = _blade()
 
         _run(_resolve_realm_scopes, module, blade, {}, [])
 
         module.fail_json.assert_not_called()
-        assert module.params["rules"] == [_realm_rule("viewer", "rzaudit")]
+        assert module.params["rules"] == [_realm_rule("viewer", "tenant1")]
 
     def test_empty_scope_name_is_left_to_the_array(self):
         """The read answers "Missing or invalid parameter.", which is not a
@@ -3018,13 +3018,13 @@ class TestOneRealmPerScope:
         blade = _blade()
         blade.get_realms = Mock(return_value=_items())
 
-        assert _run(_find_realm, blade, {}, "rzaudit") is None
+        assert _run(_find_realm, blade, {}, "tenant1") is None
 
     def test_find_realm_none_when_the_array_has_no_such_realm(self):
         blade = _blade()
 
         assert _run(_find_realm, blade, {}, "gone") is None
-        assert _run(_find_realm, blade, {}, "rzaudit::x") is None
+        assert _run(_find_realm, blade, {}, "tenant1::x") is None
         assert _run(_find_realm, blade, {}, "gone-*") is None
 
     def test_find_realm_returns_the_name_when_the_read_says_nothing(self):
@@ -3032,15 +3032,15 @@ class TestOneRealmPerScope:
         for message in (NOT_PERMITTED, INVALID_NAME, "Internal error."):
             blade.get_realms = Mock(return_value=_refused(message))
 
-            assert _run(_find_realm, blade, {}, "RZAudit") == "RZAudit"
+            assert _run(_find_realm, blade, {}, "TENant1") == "TENant1"
 
     def test_find_realm_forwards_the_context(self):
         blade = _blade()
 
-        _run(_find_realm, blade, {"context_names": ["fb2"]}, "rzaudit")
+        _run(_find_realm, blade, {"context_names": ["fb2"]}, "tenant1")
 
         blade.get_realms.assert_called_once_with(
-            names=["rzaudit"], context_names=["fb2"]
+            names=["tenant1"], context_names=["fb2"]
         )
 
     def test_create_with_a_wildcard_scope_fails_before_the_post(self):
@@ -3048,7 +3048,7 @@ class TestOneRealmPerScope:
             module = _module(
                 check_mode=check_mode, rules=[_realm_rule("storage", "tenant-*")]
             )
-            blade = _blade(realms=("rzaudit", "tenant-a", "tenant-b"))
+            blade = _blade(realms=("tenant1", "tenant-a", "tenant-b"))
 
             _main(module, blade)
 
@@ -3066,15 +3066,15 @@ class TestOneRealmPerScope:
                 check_mode=check_mode,
                 enabled=False,
                 rules=[
-                    _realm_rule("admin", "rzaudit"),
+                    _realm_rule("admin", "tenant1"),
                     _realm_rule("storage", "tenant-a,tenant-b"),
                 ],
             )
-            current = [_current_rule("admin", name="rzaudit", resource_type="realms")]
+            current = [_current_rule("admin", name="tenant1", resource_type="realms")]
             blade = _blade(
                 policy=_stored_policy(),
                 rules=current,
-                realms=("rzaudit", "tenant-a", "tenant-b"),
+                realms=("tenant1", "tenant-a", "tenant-b"),
             )
 
             _main(module, blade)
@@ -3090,7 +3090,7 @@ class TestOneRealmPerScope:
     def test_inline_update_with_a_wildcard_scope_fails_before_the_patch(self):
         module = _module(rules=[_realm_rule("viewer", "*")])
         stored = _stored_policy(rules=[_inline_rule("viewer", "arrays", "fb1")])
-        blade = _blade(policy=stored, realms=("rzaudit", "tenant-a"))
+        blade = _blade(policy=stored, realms=("tenant1", "tenant-a"))
 
         _main(module, blade, api_version="2.21")
 
@@ -3120,7 +3120,7 @@ class TestOnePolicyName:
 
     def test_check_one_name_passes_a_single_name(self):
         """A realm-qualified name is left to the name rule of the array"""
-        for name in ("tenant-a-ops", "Tenant_A", "a1", "rzaudit::tenant", ""):
+        for name in ("tenant-a-ops", "Tenant_A", "a1", "tenant1::tenant", ""):
             module = _module(name=name)
 
             _run(_check_one_name, module)

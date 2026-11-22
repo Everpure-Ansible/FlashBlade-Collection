@@ -492,6 +492,24 @@ class TestHelpers:
         )
 
     @pytest.mark.parametrize(
+        "name", ["fo*", "*", "*foo", " f*o ", "tenant1::fo*", "*::foo", "t*::foo"]
+    )
+    def test_pattern_is_refused(self, name):
+        module = _module(name=name)
+        with pytest.raises(SystemExit):
+            _check_one_name(module)
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Bucket {0} is a pattern: the array reads * as any characters, and a "
+            "task manages one bucket.".format(name)
+        )
+
+    def test_list_of_patterns_is_refused_as_a_list(self):
+        module = _module(name="fo*,ba*")
+        with pytest.raises(SystemExit):
+            _check_one_name(module)
+        assert "is a list of names" in module.fail_json.call_args[1]["msg"]
+
+    @pytest.mark.parametrize(
         "name,account",
         [
             ("foo", "bar"),
@@ -578,19 +596,77 @@ class TestHelpers:
         [
             ("bar", "tenant1::bar"),
             ("BAR", "tenant1::bar"),
-            ("tenant1::bar", "bar"),
-            ("tenant1::bar", " Bar"),
+            (" bar ", "TENANT1::Bar"),
         ],
     )
-    def test_bare_and_realm_names_of_one_realm_are_one_account(
+    def test_bare_account_name_is_the_account_in_the_realm_of_the_task(
         self, stored, asked, carried_id
     ):
-        bucket = _bucket("foo", _account("tenant1::bar"))
+        bucket = _bucket("tenant1::foo", _account("tenant1::bar"))
         bucket.account.name = stored
         bucket.account.id = carried_id
-        module = _module(account=asked)
+        module = _module(name="tenant1::foo", account=asked)
         _check_account(module, bucket, _account(asked))
         module.fail_json.assert_not_called()
+
+    @pytest.mark.parametrize("carried_id", [ANOTHER_ID, None])
+    def test_bare_name_the_array_returned_for_a_realm_account_is_that_account(
+        self, carried_id
+    ):
+        # the task spells the account in a way only the array resolves, and
+        # the array returns the account under its bare name
+        bucket = _bucket("tenant1::foo", _account("tenant1::bar"))
+        bucket.account.id = carried_id
+        module = _module(name="tenant1::foo", account="tenant1::bar,")
+        _check_account(module, bucket, _account("bar"))
+        module.fail_json.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "carried_id",
+        ["id-of-account-bar", "id-of-account-tenant1::bar", ANOTHER_ID, None],
+    )
+    @pytest.mark.parametrize("asked", ["bar", " Bar", "BAR"])
+    def test_realm_account_is_not_the_array_level_account_of_that_name(
+        self, asked, carried_id
+    ):
+        bucket = _bucket("foo", _account("tenant1::bar"))
+        bucket.account.id = carried_id
+        module = _module(account=asked)
+        with pytest.raises(SystemExit):
+            _check_account(module, bucket, _account("bar"))
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Bucket foo belongs to Object Store Account tenant1::bar, not "
+            "{0}.".format(asked)
+        )
+
+    @pytest.mark.parametrize("carried_id", [ANOTHER_ID, None])
+    @pytest.mark.parametrize(
+        "name,stored,asked,found",
+        [
+            # the array answered a task at array level with an account in a realm
+            ("foo", "bar", "bar,", "tenant1::bar"),
+            ("foo", "bar", "ba*", "tenant1::bar"),
+            # the bucket carries an account of another realm than the task names
+            ("tenant1::foo", "tenant2::bar", "tenant1::bar,", "bar"),
+            ("tenant1::foo", "tenant2::bar", "tenant1::bar,", "tenant1::bar"),
+            # the array answered a task in a realm with an account of another realm
+            ("tenant1::foo", "bar", "tenant1::bar,", "tenant2::bar"),
+            ("tenant1::foo", "tenant2::bar", "tenant1::bar,", "tenant2::bar"),
+        ],
+    )
+    def test_account_outside_the_realm_of_the_task_is_not_the_owner(
+        self, name, stored, asked, found, carried_id
+    ):
+        bucket = _bucket(name, _account(stored))
+        bucket.account.id = carried_id
+        module = _module(name=name, account=asked)
+        with pytest.raises(SystemExit):
+            _check_account(module, bucket, _account(found))
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Bucket {0} belongs to Object Store Account {1}, not {2}.".format(
+                name, stored, asked
+            )
+        )
 
     @pytest.mark.parametrize("carried_id", ["id-of-account-bar", ANOTHER_ID, None])
     @pytest.mark.parametrize(
@@ -944,6 +1020,36 @@ class TestAccountByName:
         assert _changed(module) is True
         assert array.bucket("foo").quota_limit == 3 * GIB
 
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("state,eradicate,destroyed", ADDRESSED)
+    @pytest.mark.parametrize("carried_id", ["id-of-account-bar", ANOTHER_ID])
+    def test_account_found_in_a_realm_does_not_own_an_array_level_bucket(
+        self, carried_id, state, eradicate, destroyed, check_mode
+    ):
+        array = _twins()
+        array.bucket("foo").account.id = carried_id
+        array.bucket("foo").destroyed = destroyed
+        before = (array.bucket("foo").quota_limit, destroyed)
+        # whatever the task calls the account, the array answers with the
+        # account of the same leaf name in a realm
+        array.client.get_object_store_accounts.side_effect = lambda **kwargs: _ok(
+            [array.accounts["tenant1::bar"]]
+        )
+        module = _module(
+            check_mode=check_mode,
+            account="ba*",
+            state=state,
+            eradicate=eradicate,
+            quota="3G",
+        )
+        _run(module, array)
+        assert _failure(module) == (
+            "Bucket foo belongs to Object Store Account bar, not ba*."
+        )
+        assert array.writes == []
+        after = array.bucket("foo")
+        assert (after.quota_limit, after.destroyed) == before
+
     @pytest.mark.parametrize(
         "name,account", [("foo", "bar"), ("tenant1::foo", "tenant1::bar")]
     )
@@ -959,7 +1065,7 @@ class TestAccountByName:
 
 
 class TestNames:
-    """A list of names is not one bucket; blanks around a name are ignored"""
+    """A list of names or a pattern is not one bucket; blanks are ignored"""
 
     @staticmethod
     def _array(destroyed=False):
@@ -1010,6 +1116,49 @@ class TestNames:
         module = _module(check_mode=check_mode, name="new1,new2")
         _run(module, array)
         assert "is a list of names" in _failure(module)
+        assert array.client.mock_calls == []
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("state,eradicate,destroyed", ADDRESSED)
+    @pytest.mark.parametrize(
+        "name,account",
+        [
+            ("fo*", "bar"),
+            ("*foo", "bar"),
+            ("*", "bar"),
+            ("*foo", "other"),
+            ("tenant1::f*", "tenant1::bar"),
+        ],
+    )
+    def test_pattern_as_bucket_name_is_refused(
+        self, name, account, state, eradicate, destroyed, check_mode
+    ):
+        array = self._array(destroyed)
+        module = _module(
+            check_mode=check_mode,
+            name=name,
+            account=account,
+            state=state,
+            eradicate=eradicate,
+            quota="3G",
+        )
+        _run(module, array)
+        assert _failure(module) == (
+            "Bucket {0} is a pattern: the array reads * as any characters, and a "
+            "task manages one bucket.".format(name)
+        )
+        # decided from the name: the array is not even asked
+        assert array.client.mock_calls == []
+        for bucket in array.buckets.values():
+            assert bucket.destroyed is destroyed
+            assert bucket.quota_limit in (GIB, 2 * GIB)
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_pattern_as_new_bucket_name_is_not_created(self, check_mode):
+        array = _Array(accounts=[_account("bar")])
+        module = _module(check_mode=check_mode, name="new*")
+        _run(module, array)
+        assert "is a pattern" in _failure(module)
         assert array.client.mock_calls == []
 
     @pytest.mark.parametrize("check_mode", [False, True])

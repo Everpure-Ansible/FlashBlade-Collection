@@ -28,8 +28,8 @@ options:
   name:
     description:
       - Bucket Name.
-      - A task manages one bucket. A comma-separated list of names is
-        refused.
+      - A task manages one bucket. A name with a C(*) or a comma, which the
+        array reads as a pattern or as a list of names, is refused.
       - A bucket in a realm is named C(realm::bucket) and belongs to an
         account of the same realm, so I(account) carries the same realm
         prefix.
@@ -400,17 +400,29 @@ def _realm_of(name):
 
 
 def _check_one_name(module):
-    """Fail when name is a list of bucket names.
+    """Fail when name is a list of bucket names or a pattern.
 
     The array reads a comma as the separator of a list of names. A read
     answers with every bucket of the list, but a bucket is changed,
     destroyed, recovered and eradicated one name at a time, so such a task
     can only fail and is refused before the array is asked.
+
+    The array reads * in a name as a pattern, and a read answers with every
+    bucket whose name matches it. A bucket found that way is not the bucket
+    of the given name, in the realm that name is in, which is what the
+    checks of the realm and of the account rely on, so a pattern is refused
+    before the array is asked as well.
     """
-    if "," in module.params["name"]:
+    name = module.params["name"]
+    if "," in name:
         module.fail_json(
             msg="Bucket {0} is a list of names: a comma separates names, and a "
-            "task manages one bucket.".format(module.params["name"])
+            "task manages one bucket.".format(name)
+        )
+    if "*" in name:
+        module.fail_json(
+            msg="Bucket {0} is a pattern: the array reads * as any characters, "
+            "and a task manages one bucket.".format(name)
         )
 
 
@@ -442,17 +454,22 @@ def _check_same_realm(module):
     )
 
 
-def _same_account(stored, asked):
-    """Return True when two names of accounts of one realm are one account.
+def _same_account(stored, asked, realm):
+    """Return True when two names are one account of the realm of the task.
 
-    The array matches names without regard to case or to blanks around them.
-    Both names belong to the same realm, so the realm prefix is compared
-    only when both carry one: a bare name next to a realm-qualified one is
-    the account of that name in the realm.
+    realm is the realm the task names for the bucket and its account, in
+    lower case, and is empty for a task at array level. The array matches
+    names without regard to case or to blanks around them. A name with a
+    realm prefix is an account of that realm, so it can only be the same
+    account when that realm is the realm of the task. A bare name is the
+    account of that name in the realm of the task. An account in a realm is
+    therefore never taken for the account of the same name at array level or
+    in another realm.
     """
-    stored_realm, asked_realm = _realm_of(stored).lower(), _realm_of(asked).lower()
-    if stored_realm and asked_realm and stored_realm != asked_realm:
-        return False
+    for name in (stored, asked):
+        prefix = _realm_of(name).lower()
+        if prefix and prefix != realm:
+            return False
     return (
         stored.rpartition("::")[2].strip().lower()
         == asked.rpartition("::")[2].strip().lower()
@@ -466,21 +483,26 @@ def _check_account(module, bucket, account):
     the task names. A bucket of another account is not the bucket the task
     describes and is never modified, destroyed, recovered or eradicated.
 
-    The name of the account decides. The bucket and the account were read
-    under names of one realm, and an account name is unique within a realm,
-    so the bucket belongs to the account of the task when the account name it
-    carries is the name of that account, as the task spells it or as the
-    array returned it. The id the bucket carries for its account is not
-    compared then, because it can differ from the id of the account of that
-    name. The ids decide only for a bucket that carries no account name.
+    The name of the account decides. The task names the bucket and the
+    account in one realm, the bucket was read under a name that is neither a
+    pattern nor a list, and an account name is unique within a realm. So the
+    bucket belongs to the account of the task when the account name it
+    carries is, in that realm, the name of that account, as the task spells
+    it or as the array returned it. A bucket that carries an account of
+    another realm than the task names, and an account the array answered
+    with from another realm, never match. The id the bucket carries for its
+    account is not compared then, because it can differ from the id of the
+    account of that name. The ids decide only for a bucket that carries no
+    account name.
     """
     owner = getattr(bucket, "account", None)
     owner_id = getattr(owner, "id", None)
     owner_name = getattr(owner, "name", None)
     account_id = getattr(account, "id", None)
     if owner_name:
+        realm = _realm_of(module.params["account"]).lower()
         asked = [module.params["account"], getattr(account, "name", None)]
-        if not any(_same_account(owner_name, name) for name in asked if name):
+        if not any(_same_account(owner_name, name, realm) for name in asked if name):
             module.fail_json(
                 msg="Bucket {0} belongs to Object Store Account {1}, not {2}.".format(
                     module.params["name"], owner_name, module.params["account"]

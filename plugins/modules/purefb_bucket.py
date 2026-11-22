@@ -442,28 +442,55 @@ def _check_same_realm(module):
     )
 
 
+def _same_account(stored, asked):
+    """Return True when two names of accounts of one realm are one account.
+
+    The array matches names without regard to case or to blanks around them.
+    Both names belong to the same realm, so the realm prefix is compared
+    only when both carry one: a bare name next to a realm-qualified one is
+    the account of that name in the realm.
+    """
+    stored_realm, asked_realm = _realm_of(stored).lower(), _realm_of(asked).lower()
+    if stored_realm and asked_realm and stored_realm != asked_realm:
+        return False
+    return (
+        stored.rpartition("::")[2].strip().lower()
+        == asked.rpartition("::")[2].strip().lower()
+    )
+
+
 def _check_account(module, bucket, account):
     """Fail when the bucket that was found belongs to another account.
 
     A bucket is looked up by its name alone, which finds it whichever account
     the task names. A bucket of another account is not the bucket the task
     describes and is never modified, destroyed, recovered or eradicated.
+
+    The name of the account decides. The bucket and the account were read
+    under names of one realm, and an account name is unique within a realm,
+    so the bucket belongs to the account of the task when the account name it
+    carries is the name of that account, as the task spells it or as the
+    array returned it. The id the bucket carries for its account is not
+    compared then, because it can differ from the id of the account of that
+    name. The ids decide only for a bucket that carries no account name.
     """
     owner = getattr(bucket, "account", None)
     owner_id = getattr(owner, "id", None)
     owner_name = getattr(owner, "name", None)
     account_id = getattr(account, "id", None)
-    if owner_id and account_id:
-        same = owner_id == account_id
-    elif owner_name:
-        # the array matches names without regard to case or blanks around them
-        same = owner_name.lower() == module.params["account"].strip().lower()
-    else:
-        return
-    if not same:
+    if owner_name:
+        asked = [module.params["account"], getattr(account, "name", None)]
+        if not any(_same_account(owner_name, name) for name in asked if name):
+            module.fail_json(
+                msg="Bucket {0} belongs to Object Store Account {1}, not {2}.".format(
+                    module.params["name"], owner_name, module.params["account"]
+                )
+            )
+    elif owner_id and account_id and owner_id != account_id:
         module.fail_json(
-            msg="Bucket {0} belongs to Object Store Account {1}, not {2}.".format(
-                module.params["name"], owner_name, module.params["account"]
+            msg="Bucket {0} belongs to the Object Store Account with id {1}, "
+            "not to {2}, whose id is {3}.".format(
+                module.params["name"], owner_id, module.params["account"], account_id
             )
         )
 

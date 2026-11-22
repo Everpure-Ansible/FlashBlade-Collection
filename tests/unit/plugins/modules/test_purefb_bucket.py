@@ -232,10 +232,11 @@ class _Array:
     read of a missing name is a 400, as on the array. A name with a comma is
     a list of names: a read answers with every object of the list, sorted by
     name, or with a 400 when one of them is missing, and a change or an
-    eradication of a bucket is refused for more than one name. A new bucket
-    takes the limits the request leaves out from the bucket defaults of its
-    account. Every write is recorded in writes as (verb, name, body) and
-    changes the state a later read returns.
+    eradication of a bucket is refused for more than one name. A read ignores
+    the empty and the repeated names of a list. A new bucket takes the limits
+    the request leaves out from the bucket defaults of its account. Every
+    write is recorded in writes as (verb, name, body) and changes the state a
+    later read returns.
 
     refuse maps a client method to the message it answers with instead of
     acting; hidden names are missed by a read although they exist; fleet is
@@ -287,7 +288,13 @@ class _Array:
     @staticmethod
     def _keys(name):
         """The objects a name addresses: a comma separates the names of a list"""
-        return [part.strip().lower() for part in name.split(",")]
+        keys = []
+        for part in name.split(","):
+            key = part.strip().lower()
+            # a read ignores the empty and the repeated names of a list
+            if key and key not in keys:
+                keys.append(key)
+        return keys
 
     @staticmethod
     def _by_name(item):
@@ -447,6 +454,10 @@ ADDRESSED = [
     ("absent", True, True),
 ]
 
+# an id a bucket carries for its account that the account of that name does
+# not have
+ANOTHER_ID = "another-id-for-the-account"
+
 
 class TestHelpers:
     """The private helpers"""
@@ -517,7 +528,7 @@ class TestHelpers:
         _check_account(module, _bucket("foo", account), account)
         module.fail_json.assert_not_called()
 
-    def test_account_with_another_id_is_not_the_owner(self):
+    def test_another_account_is_not_the_owner(self):
         module = _module(account="other")
         with pytest.raises(SystemExit):
             _check_account(module, _bucket("foo", _account("bar")), _account("other"))
@@ -542,6 +553,103 @@ class TestHelpers:
         bucket.account = None
         module = _module(account="other")
         _check_account(module, bucket, _account("other"))
+        module.fail_json.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "stored,asked",
+        [
+            ("bar", "bar"),
+            ("bar", "BAR"),
+            ("bar", " bar "),
+            ("tenant1::bar", "tenant1::bar"),
+            ("tenant1::bar", "TENANT1::Bar"),
+        ],
+    )
+    def test_account_of_the_same_name_is_the_owner_whatever_the_id(self, stored, asked):
+        bucket = _bucket("foo", _account(stored))
+        bucket.account.id = ANOTHER_ID
+        module = _module(account=asked)
+        _check_account(module, bucket, _account(stored))
+        module.fail_json.assert_not_called()
+
+    @pytest.mark.parametrize("carried_id", [ANOTHER_ID, None])
+    @pytest.mark.parametrize(
+        "stored,asked",
+        [
+            ("bar", "tenant1::bar"),
+            ("BAR", "tenant1::bar"),
+            ("tenant1::bar", "bar"),
+            ("tenant1::bar", " Bar"),
+        ],
+    )
+    def test_bare_and_realm_names_of_one_realm_are_one_account(
+        self, stored, asked, carried_id
+    ):
+        bucket = _bucket("foo", _account("tenant1::bar"))
+        bucket.account.name = stored
+        bucket.account.id = carried_id
+        module = _module(account=asked)
+        _check_account(module, bucket, _account(asked))
+        module.fail_json.assert_not_called()
+
+    @pytest.mark.parametrize("carried_id", ["id-of-account-bar", ANOTHER_ID, None])
+    @pytest.mark.parametrize(
+        "stored,asked",
+        [
+            ("bar", "other"),
+            ("bar", "tenant1::other"),
+            ("tenant1::bar", "tenant1::other"),
+            ("tenant1::bar", "other"),
+            ("tenant2::bar", "tenant1::bar"),
+        ],
+    )
+    def test_account_of_another_name_is_not_the_owner_whatever_the_id(
+        self, stored, asked, carried_id
+    ):
+        bucket = _bucket("foo", _account(stored))
+        bucket.account.id = carried_id
+        module = _module(account=asked)
+        with pytest.raises(SystemExit):
+            _check_account(module, bucket, _account(asked))
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Bucket foo belongs to Object Store Account {0}, not {1}.".format(
+                stored, asked
+            )
+        )
+
+    def test_ids_decide_for_a_bucket_without_an_account_name(self):
+        account = _account("bar")
+        bucket = _bucket("foo", account)
+        bucket.account.name = None
+        module = _module()
+        _check_account(module, bucket, account)
+        module.fail_json.assert_not_called()
+
+    def test_another_id_without_an_account_name_is_not_the_owner(self):
+        bucket = _bucket("foo", _account("bar"))
+        bucket.account.name = None
+        module = _module(account="other")
+        with pytest.raises(SystemExit):
+            _check_account(module, bucket, _account("other"))
+        assert module.fail_json.call_args[1]["msg"] == (
+            "Bucket foo belongs to the Object Store Account with id "
+            "id-of-account-bar, not to other, whose id is id-of-account-other."
+        )
+
+    @pytest.mark.parametrize(
+        "carried_id,account_id",
+        [(None, "id-of-account-other"), ("id-of-account-bar", None), (None, None)],
+    )
+    def test_bucket_without_an_account_name_or_an_id_is_not_judged(
+        self, carried_id, account_id
+    ):
+        bucket = _bucket("foo", _account("bar"))
+        bucket.account.name = None
+        bucket.account.id = carried_id
+        account = _account("other")
+        account.id = account_id
+        module = _module(account="other")
+        _check_account(module, bucket, account)
         module.fail_json.assert_not_called()
 
     def test_get_one_returns_the_item(self):
@@ -662,6 +770,192 @@ class TestAccountOwnership:
         assert array.writes == []
         after = array.bucket(name)
         assert (after.quota_limit, after.destroyed) == before
+
+
+class TestAccountByName:
+    """The account name a bucket carries decides whose bucket it is.
+
+    A bucket can carry, for its account, an id that the account of that name
+    does not have. It is still the bucket of that account and is managed; a
+    bucket that carries the name of another account is left alone whatever
+    the ids are.
+    """
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("state,eradicate,destroyed", ADDRESSED)
+    @pytest.mark.parametrize(
+        "name,account", [("foo", "bar"), ("tenant1::foo", "tenant1::bar")]
+    )
+    def test_bucket_carrying_another_id_for_its_account_is_managed(
+        self, name, account, state, eradicate, destroyed, check_mode
+    ):
+        array = _twins()
+        twin = "foo" if name != "foo" else "tenant1::foo"
+        array.bucket(name).account.id = ANOTHER_ID
+        array.bucket(name).destroyed = destroyed
+        quota = array.bucket(name).quota_limit
+        twin_quota = array.bucket(twin).quota_limit
+        params = dict(name=name, account=account, state=state, eradicate=eradicate)
+        modify = state == "present" and not destroyed
+        if modify:
+            params["quota"] = "3G"
+        module = _module(check_mode=check_mode, **params)
+        _run(module, array)
+        assert _changed(module) is True
+        if check_mode:
+            assert array.writes == []
+            after = array.bucket(name)
+            assert (after.quota_limit, after.destroyed) == (quota, destroyed)
+        elif eradicate:
+            assert name not in array.buckets
+        else:
+            after = array.bucket(name)
+            assert after.destroyed is (state == "absent")
+            assert after.quota_limit == (3 * GIB if modify else quota)
+        if not check_mode:
+            again = _module(**params)
+            _run(again, array)
+            assert _changed(again) is False
+        # the bucket of the same leaf name outside the realm is not touched
+        assert array.bucket(twin).quota_limit == twin_quota
+        assert array.bucket(twin).destroyed is False
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("state,eradicate,destroyed", ADDRESSED)
+    @pytest.mark.parametrize(
+        "name,account,owner",
+        [("foo", "other", "bar"), ("tenant1::foo", "tenant1::other", "tenant1::bar")],
+    )
+    def test_bucket_of_another_account_is_left_alone_whatever_the_id(
+        self, name, account, owner, state, eradicate, destroyed, check_mode
+    ):
+        array = _twins()
+        array.bucket(name).account.id = ANOTHER_ID
+        array.bucket(name).destroyed = destroyed
+        before = (array.bucket(name).quota_limit, destroyed)
+        module = _module(
+            check_mode=check_mode,
+            name=name,
+            account=account,
+            state=state,
+            eradicate=eradicate,
+            quota="3G",
+        )
+        _run(module, array)
+        assert _failure(module) == (
+            "Bucket {0} belongs to Object Store Account {1}, not {2}.".format(
+                name, owner, account
+            )
+        )
+        assert array.writes == []
+        after = array.bucket(name)
+        assert (after.quota_limit, after.destroyed) == before
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("carried_id", [ANOTHER_ID, None])
+    def test_realm_bucket_carrying_the_bare_name_of_its_account_is_managed(
+        self, carried_id, check_mode
+    ):
+        array = _twins()
+        array.bucket("tenant1::foo").account.name = "bar"
+        array.bucket("tenant1::foo").account.id = carried_id
+        module = _module(
+            check_mode=check_mode,
+            name="tenant1::foo",
+            account="tenant1::bar",
+            quota="3G",
+        )
+        _run(module, array)
+        assert _changed(module) is True
+        assert array.bucket("tenant1::foo").quota_limit == (
+            GIB if check_mode else 3 * GIB
+        )
+        # the array-level bucket of the array-level account bar is not touched
+        assert array.bucket("foo").quota_limit == 2 * GIB
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize(
+        "state,eradicate", [("present", False), ("absent", False), ("absent", True)]
+    )
+    @pytest.mark.parametrize(
+        "carried_id", ["id-of-account-tenant1::bar", ANOTHER_ID, None]
+    )
+    def test_realm_bucket_carrying_the_bare_name_of_another_account_is_left_alone(
+        self, carried_id, state, eradicate, check_mode
+    ):
+        array = _twins()
+        array.bucket("tenant1::foo").account.name = "bar"
+        array.bucket("tenant1::foo").account.id = carried_id
+        module = _module(
+            check_mode=check_mode,
+            name="tenant1::foo",
+            account="tenant1::other",
+            state=state,
+            eradicate=eradicate,
+            quota="3G",
+        )
+        _run(module, array)
+        assert _failure(module) == (
+            "Bucket tenant1::foo belongs to Object Store Account bar, not "
+            "tenant1::other."
+        )
+        assert array.writes == []
+        after = array.bucket("tenant1::foo")
+        assert (after.quota_limit, after.destroyed) == (GIB, False)
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    def test_bucket_without_an_account_name_and_the_id_of_the_account_is_managed(
+        self, check_mode
+    ):
+        array = _twins()
+        array.bucket("foo").account.name = None
+        module = _module(check_mode=check_mode, quota="3G")
+        _run(module, array)
+        assert _changed(module) is True
+        assert array.bucket("foo").quota_limit == (2 * GIB if check_mode else 3 * GIB)
+
+    @pytest.mark.parametrize("check_mode", [False, True])
+    @pytest.mark.parametrize("state,eradicate", [("present", False), ("absent", True)])
+    def test_bucket_without_an_account_name_and_another_id_is_left_alone(
+        self, state, eradicate, check_mode
+    ):
+        array = _twins()
+        array.bucket("foo").account.name = None
+        module = _module(
+            check_mode=check_mode,
+            account="other",
+            state=state,
+            eradicate=eradicate,
+            quota="3G",
+        )
+        _run(module, array)
+        assert _failure(module) == (
+            "Bucket foo belongs to the Object Store Account with id "
+            "id-of-account-bar, not to other, whose id is id-of-account-other."
+        )
+        assert array.writes == []
+        assert array.bucket("foo").quota_limit == 2 * GIB
+
+    @pytest.mark.parametrize("account", ["bar,", ",bar", "bar,bar"])
+    def test_account_the_array_finds_under_another_spelling_is_the_owner(self, account):
+        array = _twins()
+        module = _module(account=account, quota="3G")
+        _run(module, array)
+        assert _changed(module) is True
+        assert array.bucket("foo").quota_limit == 3 * GIB
+
+    @pytest.mark.parametrize(
+        "name,account", [("foo", "bar"), ("tenant1::foo", "tenant1::bar")]
+    )
+    def test_bucket_carrying_the_id_of_its_account_is_managed(self, name, account):
+        array = _twins()
+        module = _module(name=name, account=account, quota="3G")
+        _run(module, array)
+        assert _changed(module) is True
+        assert array.bucket(name).quota_limit == 3 * GIB
+        again = _module(name=name, account=account, quota="3G")
+        _run(again, array)
+        assert _changed(again) is False
 
 
 class TestNames:

@@ -1,0 +1,4 @@
+bugfixes:
+  - purefb_user - a realm-qualified ``name`` (``realm::name``) is refused before the array is
+    contacted, with a message that says that user accounts are array-level objects and how an
+    account is confined to a realm. Any other invalid name is refused before the login as well.

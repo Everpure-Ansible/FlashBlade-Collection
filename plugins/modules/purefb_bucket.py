@@ -28,11 +28,24 @@ options:
   name:
     description:
       - Bucket Name.
+      - A task manages one bucket. A name with a C(*) or a comma, which the
+        array reads as a pattern or as a list of names, is refused.
+      - A bucket in a realm is named C(realm::bucket) and belongs to an
+        account of the same realm, so I(account) carries the same realm
+        prefix.
+      - The realm is never taken from I(account) or from the identity that
+        runs the task. A realm-scoped administrator must use the
+        realm-qualified name; a bare name is not placed in, or resolved to,
+        the administrator's realm.
     required: true
     type: str
   account:
     description:
       - Object Store Account for Bucket.
+      - An account in a realm is named C(realm::account).
+      - The task fails, and nothing is changed, when I(name) and I(account)
+        are not in the same realm or when the bucket exists and belongs to
+        another account.
     required: true
     type: str
   versioning:
@@ -72,12 +85,15 @@ options:
       - User byte quota in B, K, M, G, T or P units.
       - Range must be between 1 byte and 9.22 exabytes.
       - Setting to 0 will allow the bucket size to be unlimited.
+      - If not provided when the bucket is created, the default bucket quota
+        of the object store account is used.
     type: str
     version_added: '1.12.0'
   hard_limit:
     description:
      - Whether the I(quota) value is enforced or not.
-     - If not provided the object store account default value will be used.
+     - If not provided when the bucket is created, the default bucket hard
+       limit setting of the object store account is used.
     type: bool
     version_added: '1.12.0'
   retention_lock:
@@ -185,6 +201,13 @@ EXAMPLES = """
     quota: 10G
     hard_limit: false
     account: bar
+    fb_url: 10.10.10.2
+    api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
+
+- name: Create new bucket named foo in account bar of realm tenant1
+  everpure.flashblade.purefb_bucket:
+    name: tenant1::foo
+    account: tenant1::bar
     fb_url: 10.10.10.2
     api_token: T-55a68eb5-c785-4720-a2ca-8b03903bf641
 
@@ -370,40 +393,171 @@ def _object_lock_changes(module, bucket_detail):
     return changes
 
 
+def _realm_of(name):
+    """Return the realm of a realm::name name, empty for an array-level name"""
+    # the array ignores blanks around a name
+    return name.rpartition("::")[0].strip()
+
+
+def _check_one_name(module):
+    """Fail when name is a list of bucket names or a pattern.
+
+    The array reads a comma as the separator of a list of names. A read
+    answers with every bucket of the list, but a bucket is changed,
+    destroyed, recovered and eradicated one name at a time, so such a task
+    can only fail and is refused before the array is asked.
+
+    The array reads * in a name as a pattern, and a read answers with every
+    bucket whose name matches it. A bucket found that way is not the bucket
+    of the given name, in the realm that name is in, which is what the
+    checks of the realm and of the account rely on, so a pattern is refused
+    before the array is asked as well.
+    """
+    name = module.params["name"]
+    if "," in name:
+        module.fail_json(
+            msg="Bucket {0} is a list of names: a comma separates names, and a "
+            "task manages one bucket.".format(name)
+        )
+    if "*" in name:
+        module.fail_json(
+            msg="Bucket {0} is a pattern: the array reads * as any characters, "
+            "and a task manages one bucket.".format(name)
+        )
+
+
+def _check_same_realm(module):
+    """Fail unless the bucket and its account are named in the same realm.
+
+    A bucket belongs to an account of its own realm, so both names carry the
+    same realm prefix or neither does. The array refuses to create any other
+    pair, and a bucket found under such a name is a namesake that cannot
+    belong to the account, so the pair is refused before anything is read or
+    written.
+    """
+    name = module.params["name"]
+    account = module.params["account"]
+    realm = _realm_of(account)
+    # the array matches names without regard to case
+    if _realm_of(name).lower() == realm.lower():
+        return
+    if realm:
+        hint = "A bucket of this account is named {0}::<bucket>".format(realm)
+    else:
+        hint = (
+            "A bucket in realm {0} needs an account of that realm, named "
+            "{0}::<account>".format(_realm_of(name))
+        )
+    module.fail_json(
+        msg="Bucket {0} cannot belong to Object Store Account {1}: a bucket "
+        "and its account must be in the same realm. {2}.".format(name, account, hint)
+    )
+
+
+def _same_account(stored, asked, realm):
+    """Return True when two names are one account of the realm of the task.
+
+    realm is the realm the task names for the bucket and its account, in
+    lower case, and is empty for a task at array level. The array matches
+    names without regard to case or to blanks around them. A name with a
+    realm prefix is an account of that realm, so it can only be the same
+    account when that realm is the realm of the task. A bare name is the
+    account of that name in the realm of the task. An account in a realm is
+    therefore never taken for the account of the same name at array level or
+    in another realm.
+    """
+    for name in (stored, asked):
+        prefix = _realm_of(name).lower()
+        if prefix and prefix != realm:
+            return False
+    return (
+        stored.rpartition("::")[2].strip().lower()
+        == asked.rpartition("::")[2].strip().lower()
+    )
+
+
+def _check_account(module, bucket, account):
+    """Fail when the bucket that was found belongs to another account.
+
+    A bucket is looked up by its name alone, which finds it whichever account
+    the task names. A bucket of another account is not the bucket the task
+    describes and is never modified, destroyed, recovered or eradicated.
+
+    The name of the account decides. The task names the bucket and the
+    account in one realm, the bucket was read under a name that is neither a
+    pattern nor a list, and an account name is unique within a realm. So the
+    bucket belongs to the account of the task when the account name it
+    carries is, in that realm, the name of that account, as the task spells
+    it or as the array returned it. A bucket that carries an account of
+    another realm than the task names, and an account the array answered
+    with from another realm, never match. The id the bucket carries for its
+    account is not compared then, because it can differ from the id of the
+    account of that name. The ids decide only for a bucket that carries no
+    account name.
+    """
+    owner = getattr(bucket, "account", None)
+    owner_id = getattr(owner, "id", None)
+    owner_name = getattr(owner, "name", None)
+    account_id = getattr(account, "id", None)
+    if owner_name:
+        realm = _realm_of(module.params["account"]).lower()
+        asked = [module.params["account"], getattr(account, "name", None)]
+        if not any(_same_account(owner_name, name, realm) for name in asked if name):
+            module.fail_json(
+                msg="Bucket {0} belongs to Object Store Account {1}, not {2}.".format(
+                    module.params["name"], owner_name, module.params["account"]
+                )
+            )
+    elif owner_id and account_id and owner_id != account_id:
+        module.fail_json(
+            msg="Bucket {0} belongs to the Object Store Account with id {1}, "
+            "not to {2}, whose id is {3}.".format(
+                module.params["name"], owner_id, module.params["account"], account_id
+            )
+        )
+
+
+def _get_one(module, res, what, name):
+    """Return the object a read by name answered with, or None when absent.
+
+    Only the array's "does not exist" means absent. Any other refusal fails
+    the task with the array's message, so it is never mistaken for a missing
+    object. A name the array reads as a list of names answers with several
+    objects; the task describes one, so it fails rather than act on the
+    first of them.
+    """
+    if res.status_code == 200:
+        items = list(res.items)
+        if len(items) > 1:
+            module.fail_json(
+                msg="{0} {1} matches {2} objects. The name of one {0} is "
+                "needed.".format(what, name, len(items))
+            )
+        return items[0] if items else None
+    error = get_error_message(res)
+    if "does not exist" not in str(error).lower():
+        module.fail_json(
+            msg="Failed to get {0} {1}. Error: {2}".format(what, name, error)
+        )
+    return None
+
+
 def get_s3acc(module, blade):
     """Return Object Store Account or None"""
-    api_version = get_rest_api_version(blade)
-    if (
-        LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-        and module.params["context"]
-    ):
-        res = blade.get_object_store_accounts(
-            context_names=[module.params["context"]],
-            names=[module.params["account"]],
-        )
-    else:
-        res = blade.get_object_store_accounts(names=[module.params["account"]])
-    if res.status_code == 200:
-        return list(res.items)[0]
-    return None
+    res = blade.get_object_store_accounts(
+        names=[module.params["account"]],
+        **_context_kwargs(module, get_rest_api_version(blade))
+    )
+    return _get_one(module, res, "Object Store Account", module.params["account"])
 
 
 def get_bucket(module, blade):
     """Return Bucket or None"""
-    api_version = get_rest_api_version(blade)
-    if (
-        LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-        and module.params["context"]
-    ):
-        res = blade.get_buckets(
-            context_names=[module.params["context"]],
-            names=[module.params["name"]],
-        )
-    else:
-        res = blade.get_buckets(names=[module.params["name"]])
-    if res.status_code == 200:
-        return list(res.items)[0]
-    return None
+    res = blade.get_buckets(
+        names=[module.params["name"]],
+        **_context_kwargs(module, get_rest_api_version(blade))
+    )
+    return _get_one(module, res, "Object Store Bucket", module.params["name"])
 
 
 def create_bucket(module, blade):
@@ -412,34 +566,19 @@ def create_bucket(module, blade):
     api_version = get_rest_api_version(blade)
     if not module.check_mode:
         if LooseVersion(VSO_VERSION) <= LooseVersion(api_version):
-            if (
-                LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-                and module.params["context"]
-            ):
-                account_defaults = list(
-                    blade.get_object_store_accounts(
-                        names=[module.params["account"]],
-                        context_names=[module.params["context"]],
-                    ).items
-                )[0]
-            else:
-                account_defaults = list(
-                    blade.get_object_store_accounts(
-                        names=[module.params["account"]]
-                    ).items
-                )[0]
             if LooseVersion(QUOTA_VERSION) <= LooseVersion(api_version):
-                if module.params["hard_limit"] is None:
-                    # Not requested: inherit the account default. An explicit
-                    # false must not be replaced by the account default.
-                    module.params["hard_limit"] = account_defaults.hard_limit_enabled
-                if module.params["quota"]:
-                    quota = str(human_to_bytes(module.params["quota"]))
-                else:
-                    if not account_defaults.quota_limit:
-                        quota = ""
-                    else:
-                        quota = str(account_defaults.quota_limit)
+                # Only the limits the task asks for are sent. The array gives
+                # a bucket created without them the bucket defaults of its
+                # object store account, not the account's own quota.
+                limits = {}
+                if module.params["hard_limit"] is not None:
+                    limits["hard_limit_enabled"] = module.params["hard_limit"]
+                if module.params["quota"] == "0":
+                    # 0 asks for an unlimited bucket, as it does on an update
+                    limits["quota_limit"] = ""
+                    limits["hard_limit_enabled"] = False
+                elif module.params["quota"]:
+                    limits["quota_limit"] = str(human_to_bytes(module.params["quota"]))
                 if not module.params["retention_mode"]:
                     module.params["retention_mode"] = ""
                 retention_ms = _retention_to_ms(
@@ -448,20 +587,11 @@ def create_bucket(module, blade):
                 module.params["default_retention"] = (
                     str(retention_ms) if retention_ms else ""
                 )
-                if module.params["object_lock_enabled"]:
-                    bucket = BucketPost(
-                        account=ReferenceWritable(name=module.params["account"]),
-                        bucket_type=module.params["mode"],
-                        hard_limit_enabled=module.params["hard_limit"],
-                        quota_limit=quota,
-                    )
-                else:
-                    bucket = BucketPost(
-                        account=ReferenceWritable(name=module.params["account"]),
-                        bucket_type=module.params["mode"],
-                        hard_limit_enabled=module.params["hard_limit"],
-                        quota_limit=quota,
-                    )
+                bucket = BucketPost(
+                    account=ReferenceWritable(name=module.params["account"]),
+                    bucket_type=module.params["mode"],
+                    **limits
+                )
             else:
                 bucket = BucketPost(
                     account=ReferenceWritable(name=module.params["account"]),
@@ -479,7 +609,6 @@ def create_bucket(module, blade):
             else:
                 res = blade.post_buckets(names=[module.params["name"]], bucket=bucket)
             if res.status_code != 200:
-                _delete_bucket(module, blade)
                 module.fail_json(
                     msg="Object Store Bucket {0} creation failed. Error: {1}".format(
                         module.params["name"],
@@ -559,7 +688,6 @@ def create_bucket(module, blade):
             else:
                 res = blade.post_buckets(names=[module.params["name"]], bucket=bucket)
             if res.status_code != 200:
-                _delete_bucket(module, blade)
                 module.fail_json(
                     msg="Object Store Bucket {0} creation failed. Error: {1}".format(
                         module.params["name"],
@@ -571,13 +699,13 @@ def create_bucket(module, blade):
                     LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
                     and module.params["context"]
                 ):
-                    res = blade.buckets.patch_buckets(
+                    res = blade.patch_buckets(
                         names=[module.params["name"]],
                         bucket=BucketPatch(versioning=module.params["versioning"]),
                         context_names=[module.params["context"]],
                     )
                 else:
-                    res = blade.buckets.patch_buckets(
+                    res = blade.patch_buckets(
                         names=[module.params["name"]],
                         bucket=BucketPatch(versioning=module.params["versioning"]),
                     )
@@ -664,28 +792,6 @@ def create_bucket(module, blade):
     module.exit_json(changed=changed)
 
 
-def _delete_bucket(module, blade):
-    api_version = get_rest_api_version(blade)
-    if (
-        LooseVersion(CONTEXT_API_VERSION) <= LooseVersion(api_version)
-        and module.params["context"]
-    ):
-        blade.patch_buckets(
-            names=[module.params["name"]],
-            bucket=BucketPatch(destroyed=True),
-            context_names=[module.params["context"]],
-        )
-        blade.buckets.delete_buckets(
-            names=[module.params["name"]], context_names=[module.params["context"]]
-        )
-    else:
-        blade.patch_buckets(
-            names=[module.params["name"]],
-            bucket=BucketPatch(destroyed=True),
-        )
-        blade.buckets.delete_buckets(names=[module.params["name"]])
-
-
 def delete_bucket(module, blade):
     """Delete Bucket"""
     changed = True
@@ -764,9 +870,7 @@ def update_bucket(module, blade, bucket):
     change_lock = False
     api_version = get_rest_api_version(blade)
     ctx = _context_kwargs(module, api_version)
-    bucket_detail = list(blade.get_buckets(names=[module.params["name"]], **ctx).items)[
-        0
-    ]
+    bucket_detail = bucket
     if LooseVersion(VSO_VERSION) <= LooseVersion(api_version):
         if module.params["mode"] and bucket_detail.bucket_type != module.params["mode"]:
             module.warn("Changing bucket type is not permitted.")
@@ -1064,6 +1168,10 @@ def main():
             "per bucket."
         )
 
+    # Decided from the names alone, before the array is asked or changed
+    _check_one_name(module)
+    _check_same_realm(module)
+
     state = module.params["state"]
     blade = get_system(module)
     api_version = get_rest_api_version(blade)
@@ -1082,13 +1190,16 @@ def main():
             module.params["mode"] = "multi-site-writable"
     elif not module.params["mode"]:
         module.params["mode"] = "classic"
-    bucket = get_bucket(module, blade)
-    if not get_s3acc(module, blade):
+    account = get_s3acc(module, blade)
+    if not account:
         module.fail_json(
             msg="Object Store Account {0} does not exist.".format(
                 module.params["account"]
             )
         )
+    bucket = get_bucket(module, blade)
+    if bucket:
+        _check_account(module, bucket, account)
     if (
         module.params["quota"]
         and human_to_bytes(module.params["quota"]) > 9223372036854775807

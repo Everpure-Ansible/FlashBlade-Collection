@@ -60,7 +60,7 @@ jobs:
       run: |
         pwd
         mkdir -p ansible_collections/everpure/flashblade
-        rsync -av . ansible_collections/everpure/flashblade --exclude ansible_collection/everpure/flashblade
+        rsync -av . ansible_collections/everpure/flashblade --exclude /ansible_collections
         cd ansible_collections/everpure/flashblade
         ansible-test sanity -v --color --python ${{ matrix.python-version }} --docker
 
